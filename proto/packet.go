@@ -50,11 +50,11 @@ type Packet struct {
 // Timestamp is left 0 here for determinism; the transport sets wall-clock time.
 func NewPacket(cmd XBridgeCommand, body []byte) *Packet {
 	return &Packet{
-		Version:   ProtocolVersion,
-		Command:   cmd,
-		Size:      uint32(len(body)),
-		OldSize:   uint32(len(body)) + headerDifference,
-		Body:      body,
+		Version: ProtocolVersion,
+		Command: cmd,
+		Size:    uint32(len(body)),
+		OldSize: uint32(len(body)) + headerDifference,
+		Body:    body,
 	}
 }
 

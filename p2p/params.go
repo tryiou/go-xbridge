@@ -4,7 +4,7 @@ package p2p
 var (
 	MainnetMagic = [4]byte{0xa1, 0xa0, 0xa2, 0xa3} // port 41412
 	TestnetMagic = [4]byte{0x45, 0x76, 0x65, 0xbb} // port 41474
-	StagingMagic  = [4]byte{0xa1, 0xcf, 0x7e, 0xac} // port 41489
+	StagingMagic = [4]byte{0xa1, 0xcf, 0x7e, 0xac} // port 41489
 )
 
 // XBridgeNetCommand is the Bitcoin P2P message command under which XBridge

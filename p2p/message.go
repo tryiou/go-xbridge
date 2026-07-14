@@ -9,7 +9,8 @@ import (
 const cmdSize = 12
 
 // Message is a Bitcoin-style P2P message:
-//   magic(4) || command(12, null-padded) || length(4, LE) || checksum(4) || payload
+//
+//	magic(4) || command(12, null-padded) || length(4, LE) || checksum(4) || payload
 type Message struct {
 	Magic    [4]byte
 	Command  string
