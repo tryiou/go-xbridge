@@ -3,6 +3,7 @@ package p2p
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"math/rand"
 	"net"
 	"time"
@@ -143,4 +144,111 @@ func NewVersion(remote net.Addr) *VersionMessage {
 		StartHeight: 0, // thin client has no chain height
 		Relay:       false,
 	}
+}
+
+// UnmarshalVersion parses a `version` payload from the wire (inverse of
+// Marshal). It is used to inspect the peer's advertised version.
+func UnmarshalVersion(b []byte) (*VersionMessage, error) {
+	m := &VersionMessage{}
+	if len(b) < 4+8+8 {
+		return nil, errors.New("p2p: version payload too short")
+	}
+	pos := 0
+	m.Version = int32(binary.LittleEndian.Uint32(b[pos:]))
+	pos += 4
+	m.Services = binary.LittleEndian.Uint64(b[pos:])
+	pos += 8
+	m.Timestamp = int64(binary.LittleEndian.Uint64(b[pos:]))
+	pos += 8
+	addrRecv, n, err := unmarshalNetAddr(b[pos:])
+	if err != nil {
+		return nil, err
+	}
+	m.AddrRecv = addrRecv
+	pos += n
+	addrFrom, n, err := unmarshalNetAddr(b[pos:])
+	if err != nil {
+		return nil, err
+	}
+	m.AddrFrom = addrFrom
+	pos += n
+	if pos+8 > len(b) {
+		return nil, errors.New("p2p: version payload too short (nonce)")
+	}
+	m.Nonce = binary.LittleEndian.Uint64(b[pos:])
+	pos += 8
+	ua, n, err := unmarshalVarStr(b[pos:])
+	if err != nil {
+		return nil, err
+	}
+	m.UserAgent = ua
+	pos += n
+	if pos+4 > len(b) {
+		return nil, errors.New("p2p: version payload too short (start height)")
+	}
+	m.StartHeight = int32(binary.LittleEndian.Uint32(b[pos:]))
+	pos += 4
+	if pos < len(b) {
+		m.Relay = b[pos] != 0
+	}
+	return m, nil
+}
+
+// unmarshalNetAddr parses a 26-byte net_addr (services || ip(16) || port(2 BE)).
+func unmarshalNetAddr(b []byte) (NetAddr, int, error) {
+	if len(b) < 26 {
+		return NetAddr{}, 0, errors.New("p2p: net_addr too short")
+	}
+	a := NetAddr{}
+	a.Services = binary.LittleEndian.Uint64(b[0:8])
+	var ip16 [16]byte
+	copy(ip16[:], b[8:24])
+	a.IP = netIPFrom16(ip16)
+	a.Port = binary.BigEndian.Uint16(b[24:26])
+	return a, 26, nil
+}
+
+// netIPFrom16 converts a 16-byte address; IPv4-mapped (::ffff:a.b.c.d) becomes
+// an IPv4 address, matching ipTo16's inverse.
+func netIPFrom16(b [16]byte) net.IP {
+	if b[10] == 0xff && b[11] == 0xff {
+		return net.IPv4(b[12], b[13], b[14], b[15])
+	}
+	return net.IP(b[:])
+}
+
+// unmarshalVarStr parses a Bitcoin VarInt-prefixed string.
+func unmarshalVarStr(b []byte) (string, int, error) {
+	if len(b) < 1 {
+		return "", 0, errors.New("p2p: varstr too short")
+	}
+	first := b[0]
+	pos := 1
+	var n int
+	switch {
+	case first < 0xfd:
+		n = int(first)
+	case first == 0xfd:
+		if len(b) < 3 {
+			return "", 0, errors.New("p2p: varstr too short")
+		}
+		n = int(binary.LittleEndian.Uint16(b[1:3]))
+		pos = 3
+	case first == 0xfe:
+		if len(b) < 5 {
+			return "", 0, errors.New("p2p: varstr too short")
+		}
+		n = int(binary.LittleEndian.Uint32(b[1:5]))
+		pos = 5
+	default:
+		if len(b) < 9 {
+			return "", 0, errors.New("p2p: varstr too short")
+		}
+		n = int(binary.LittleEndian.Uint64(b[1:9]))
+		pos = 9
+	}
+	if pos+n > len(b) {
+		return "", 0, errors.New("p2p: varstr length exceeds payload")
+	}
+	return string(b[pos : pos+n]), pos + n, nil
 }

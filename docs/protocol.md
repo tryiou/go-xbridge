@@ -41,11 +41,26 @@ magic     : 4 bytes  (network-specific, see 1.1)
 command   : 12 bytes (ASCII, null-padded)  -> "xbridge\0\0\0\0\0"
 length    : 4 bytes  (little-endian uint32) = payload length
 checksum  : 4 bytes  (first 4 bytes of double-SHA256(payload))
-payload   : `length` bytes  == the XBridge packet (section 2)
+payload   : `length` bytes  == the XBridge transport envelope (below)
 ```
 
+The `xbridge` payload is **not** the packet directly. It is wrapped in a
+transport envelope (`src/xbridge/xbridgeapp.cpp` `onSend`; `src/net_processing.cpp`
+XBRIDGE handling):
+
+```
+varint(28 + packetLen)        // Bitcoin CompactSize length of the rest
+[ 20 bytes ] destination address (uint160); 20 zero bytes == broadcast
+[  8 bytes ] uint64 LE timestamp (ms since Unix epoch, set by the sender)
+[  packet  ] the XBridgePacket (129-byte header + body, section 2)
+```
+
+`varint` is a Bitcoin CompactSize integer. On send, `p2p/conn.go` builds this
+envelope via `encodeXBridgePayload`; on receive, `DecodeXBridgePayload` strips
+the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
+
 Implemented in `p2p/message.go` (`Message`, `Checksum`, `Marshal`,
-`UnmarshalMessage`).
+`UnmarshalMessage`) and `p2p/envelope.go`.
 
 ### 1.3 Handshake
 
@@ -70,9 +85,11 @@ The handshake sends `version`, then reads until it has seen both the peer's
 `version` (to which it replies `verack`) and the peer's `verack`; unrelated
 messages are ignored. A 30 s deadline bounds the exchange.
 
-**Live-verify still TODO** **[VERIFY]:** exercise against a real Blocknet
-service node (mainnet `41412`, magic `a1 a0 a2 a3`) to confirm the node accepts
-the handshake and begins emitting `xbridge` messages.
+**VERIFIED (2026-07-14):** the version/verack handshake was exercised against a
+live Blocknet 4.4.1 service node (`coreproxy.airdns.org:42111`, magic
+`a1 a0 a2 a3`). The peer returned `proto=70713`, `ua="/Blocknet:4.4.1/"`,
+`relay=true`, and immediately began emitting `xbridge` messages. The `xbridge`
+command string is confirmed to be `"xbridge"`.
 
 ---
 
@@ -215,9 +232,8 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
 
 ## 6. Open questions / TODO for next phases
 
-1. **`version` handshake payload** (§1.3) — implement + verify on live node.
-2. **`NetMsgType::XBRIDGE` command string** — assumed `"xbridge"`; confirm in
-   `src/net.h`.
+1. **`version` handshake payload** (§1.3) — ✅ DONE + VERIFIED live (2026-07-14).
+2. **`NetMsgType::XBRIDGE` command string** — ✅ confirmed `"xbridge"` live.
 3. **uint256 byte order** — confirm Bitcoin internal LE order is preserved
    verbatim on the wire (no reversal) by inspecting how `xbridgeapp` appends
    uint256 fields.

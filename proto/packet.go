@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"time"
 )
 
 const (
@@ -46,15 +47,17 @@ type Packet struct {
 	Body      []byte
 }
 
-// NewPacket builds a packet for cmd with the given body.
-// Timestamp is left 0 here for determinism; the transport sets wall-clock time.
+// NewPacket builds a packet for cmd with the given body. The packet timestamp
+// is set to the current wall-clock time, matching C++ (time(0) in the ctor);
+// the transport envelope adds its own 8-byte timestamp on send.
 func NewPacket(cmd XBridgeCommand, body []byte) *Packet {
 	return &Packet{
-		Version: ProtocolVersion,
-		Command: cmd,
-		Size:    uint32(len(body)),
-		OldSize: uint32(len(body)) + headerDifference,
-		Body:    body,
+		Version:   ProtocolVersion,
+		Command:   cmd,
+		Timestamp: uint32(time.Now().Unix()),
+		Size:      uint32(len(body)),
+		OldSize:   uint32(len(body)) + headerDifference,
+		Body:      body,
 	}
 }
 

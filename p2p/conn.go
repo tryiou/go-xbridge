@@ -18,9 +18,10 @@ const handshakeTimeout = 30 * time.Second
 // Conn is a thin XBridge peer connection over the Bitcoin P2P transport.
 // It performs the version/verack handshake and streams decoded XBridge packets.
 type Conn struct {
-	netConn net.Conn
-	magic   [4]byte
-	reader  *bufio.Reader
+	netConn     net.Conn
+	magic       [4]byte
+	reader      *bufio.Reader
+	peerVersion *VersionMessage
 }
 
 // Dial connects to a Blocknet peer and completes the handshake.
@@ -29,6 +30,14 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewConn(nc, magic)
+}
+
+// NewConn completes the handshake over an already-established transport (e.g. a
+// TCP connection, or a stream tunneled through an HTTP CONNECT proxy). The
+// caller is responsible for dialing; NewConn only performs version/verack and
+// takes ownership of nc (closing it on handshake failure).
+func NewConn(nc net.Conn, magic [4]byte) (*Conn, error) {
 	c := &Conn{netConn: nc, magic: magic, reader: bufio.NewReader(nc)}
 	if err := c.handshake(); err != nil {
 		nc.Close()
@@ -62,6 +71,9 @@ func (c *Conn) handshake() error {
 		switch msg.Command {
 		case "version":
 			seenVersion = true
+			if v, err := UnmarshalVersion(msg.Payload); err == nil {
+				c.peerVersion = v
+			}
 			if err := c.writeVerack(); err != nil {
 				return err
 			}
@@ -97,7 +109,9 @@ func (c *Conn) writeVerack() error {
 }
 
 // ReadPacket reads the next XBridge packet from the stream, skipping any
-// non-XBridge P2P messages (ping/pong, addr, etc.).
+// non-XBridge P2P messages (ping/pong, addr, etc.). The `xbridge` payload is
+// unwrapped from its transport envelope (varint length + 20-byte dest addr + 8-byte
+// timestamp) before being parsed as a proto.Packet.
 func (c *Conn) ReadPacket() (*proto.Packet, error) {
 	for {
 		msg, err := c.readMessage()
@@ -107,13 +121,19 @@ func (c *Conn) ReadPacket() (*proto.Packet, error) {
 		if msg.Command != XBridgeNetCommand {
 			continue
 		}
-		return proto.Unmarshal(msg.Payload)
+		pktBytes, err := DecodeXBridgePayload(msg.Payload)
+		if err != nil {
+			return nil, err
+		}
+		return proto.Unmarshal(pktBytes)
 	}
 }
 
-// WritePacket sends an XBridge packet as a `xbridge` P2P message.
+// WritePacket sends an XBridge packet as a `xbridge` P2P message, wrapping it
+// in the transport envelope (varint length + 20-byte broadcast addr + 8-byte
+// timestamp) expected by service nodes.
 func (c *Conn) WritePacket(p *proto.Packet) error {
-	payload := p.Marshal()
+	payload := encodeXBridgePayload(p.Marshal())
 	msg := &Message{
 		Magic:    c.magic,
 		Command:  XBridgeNetCommand,
@@ -139,5 +159,17 @@ func (c *Conn) readMessage() (*Message, error) {
 	}
 	return UnmarshalMessage(append(hdr, payload...))
 }
+
+// PeerVersion returns the peer's advertised version message, captured during
+// the handshake, or nil if it was not seen/parsed.
+func (c *Conn) PeerVersion() *VersionMessage { return c.peerVersion }
+
+// NetConn returns the underlying TCP connection (e.g. to set a read deadline).
+func (c *Conn) NetConn() net.Conn { return c.netConn }
+
+// ReadMessage reads the next raw P2P message (any command), skipping nothing.
+// Useful for diagnostics (e.g. discovering the XBridge command name) and for
+// callers that need to see non-XBridge traffic.
+func (c *Conn) ReadMessage() (*Message, error) { return c.readMessage() }
 
 func (c *Conn) Close() error { return c.netConn.Close() }
