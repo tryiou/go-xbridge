@@ -11,6 +11,10 @@ import (
 	"xbridge-go/proto"
 )
 
+// handshakeTimeout bounds the version/verack exchange so a misbehaving peer
+// cannot hang Dial indefinitely.
+const handshakeTimeout = 30 * time.Second
+
 // Conn is a thin XBridge peer connection over the Bitcoin P2P transport.
 // It performs the version/verack handshake and streams decoded XBridge packets.
 type Conn struct {
@@ -33,25 +37,61 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 	return c, nil
 }
 
-// handshake performs the Bitcoin P2P version/verack exchange.
+// handshake performs the Bitcoin P2P version/verack exchange:
 //
-// TODO: implement the `version` message payload. Blocknet nodes expect a valid
-// Bitcoin version message (version, services, timestamp, addr_recv, addr_from,
-// nonce, user-agent, start_height, relay). See docs/protocol.md §Handshake and
-// verify against a live node. Until then this sends a minimal placeholder and
-// waits for one inbound message; treat as NOT yet functional for real peering.
+//	us  -- version -->  peer
+//	us  <-- version --  peer
+//	us  -- verack  -->  peer   (sent once we see the peer's version)
+//	us  <-- verack  --  peer
+//
+// Unrelated messages (ping, pong, addr, …) observed during the exchange are
+// ignored. A deadline bounds the whole exchange (see handshakeTimeout).
 func (c *Conn) handshake() error {
+	_ = c.netConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	defer c.netConn.SetDeadline(time.Time{})
+
 	if err := c.writeVersion(); err != nil {
 		return err
 	}
-	if _, err := c.readMessage(); err != nil {
-		return err
+	seenVersion, seenVerack := false, false
+	for !(seenVersion && seenVerack) {
+		msg, err := c.readMessage()
+		if err != nil {
+			return err
+		}
+		switch msg.Command {
+		case "version":
+			seenVersion = true
+			if err := c.writeVerack(); err != nil {
+				return err
+			}
+		case "verack":
+			seenVerack = true
+		default:
+			// Ignore unrelated messages during the handshake.
+		}
 	}
 	return nil
 }
 
 func (c *Conn) writeVersion() error {
-	msg := &Message{Magic: c.magic, Command: "version", Payload: []byte{}}
+	payload := NewVersion(c.netConn.RemoteAddr()).Marshal()
+	msg := &Message{
+		Magic:    c.magic,
+		Command:  "version",
+		Payload:  payload,
+		Checksum: Checksum(payload),
+	}
+	_, err := c.netConn.Write(msg.Marshal())
+	return err
+}
+
+func (c *Conn) writeVerack() error {
+	msg := &Message{
+		Magic:    c.magic,
+		Command:  "verack",
+		Checksum: Checksum(nil),
+	}
 	_, err := c.netConn.Write(msg.Marshal())
 	return err
 }

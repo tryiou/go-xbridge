@@ -47,13 +47,32 @@ payload   : `length` bytes  == the XBridge packet (section 2)
 Implemented in `p2p/message.go` (`Message`, `Checksum`, `Marshal`,
 `UnmarshalMessage`).
 
-### 1.3 Handshake  **[VERIFY / TODO]**
+### 1.3 Handshake
 
 Before any `xbridge` traffic, a standard Bitcoin `version` / `verack` exchange
 is required. The C++ node expects a well-formed `version` message
 (version, services, timestamp, addr_recv, addr_from, nonce, user-agent,
-start_height, relay). The current `p2p/conn.go` sends a **placeholder** and
-must be completed and validated against a live node.
+start_height, relay). Implemented in `p2p/version.go` (`VersionMessage`,
+`NetAddr`, `Marshal`, `NewVersion`) and driven by `p2p/conn.go`'s `handshake()`.
+
+Field values (`p2p/version.go`):
+
+- `version` = `70713` (`BitcoinProtocolVersion`, from `src/version.h:12`).
+- `services` = `0` (thin client advertises no services).
+- `addr_recv` = the peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from`
+  left zeroed. Port is **big-endian** in `net_addr` (network byte order).
+- `nonce` = random `uint64`.
+- `user_agent` = `"/xbridge-go:0.1.0/"`.
+- `start_height` = `0` (thin client has no chain).
+- `relay` = `false`.
+
+The handshake sends `version`, then reads until it has seen both the peer's
+`version` (to which it replies `verack`) and the peer's `verack`; unrelated
+messages are ignored. A 30 s deadline bounds the exchange.
+
+**Live-verify still TODO** **[VERIFY]:** exercise against a real Blocknet
+service node (mainnet `41412`, magic `a1 a0 a2 a3`) to confirm the node accepts
+the handshake and begins emitting `xbridge` messages.
 
 ---
 
