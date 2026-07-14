@@ -45,11 +45,33 @@ version bytes) first, then native segwit (when `SegWit`). `Address.String()`
 re-encodes. Tests use the Satoshi genesis P2PKH vector and the BIP173 bech32
 vector (`BC1QW508D6…V8F3T4`) as external oracles.
 
+## Transaction construction (deposit / refund / payment)
+
+The swap deposit layer is now in `coins/` (`script.go`, `tx.go`, `htlc.go`),
+ported from `xbridgewalletconnectorbtc.cpp`:
+
+- **`script.go`** — opcodes + minimal `pushData`/`pushNum` (CScript semantics)
+  and `BuildP2PKHScript` / `BuildP2SHScript`.
+- **`tx.go`** — `Tx`/`TxIn`/`TxOut`/`OutPoint` + classic/segwit `Serialize`,
+  legacy `HashForSigning(idx, prevScript)` (SIGHASH_ALL, matches C++
+  `SignatureHash`), and `SignTxInput` / `VerifyTxInput` (DER sig + SIGHASH byte
+  via `btcd/btcec/v2`).
+- **`htlc.go`** — `KeyID(pubKey)` = HASH160(pubKey); `BuildDepositUnlockScript`
+  builds the XBridge HTLC redeem script (the C++ `createDepositUnlockScript`):
+  IF branch = `<lockTime> CLTV OP_DROP DUP HASH160 <KeyID(my)> EQUALVERIFY
+  CHECKSIG`; ELSE branch = `DUP HASH160 <KeyID(other)> EQUALVERIFY
+  CHECKSIGVERIFY SIZE 33 EQUALVERIFY HASH160 <secretHash> EQUAL`. Also
+  `BuildRefundScriptSig` (`<sig> <myPubKey> OP_1 <inner>`) and
+  `BuildPaymentScriptSig` (`<xPubKey> <sig> <myPubKey> OP_0 <inner>`).
+
+The deposit output is a P2SH of `BuildDepositUnlockScript(...)`; the refund and
+payment transactions spend it via the two `scriptSig` builders above, signing
+with `SignTxInput`.
+
 ## Not yet here
 
-- **Transaction construction** (`xbitcointransaction*` in C++): building/serializing
-  deposit + refund UTXO transactions per coin. That belongs in `coins/` once the
-  wallet connector can sign.
 - **Non-UTXO chains** (Decred, Particl) need their own adapters — out of scope
   for this foundation.
-- Per-coin fee/utxo/dust rules.
+- **Wallet connector** (`wallet/`): an RPC client to the connected SPV wallet
+  that broadcasts/signs; the local `coins` signer can also sign directly.
+- Per-coin fee/utxo/dust rules; segwit (BIP143) sighash.
