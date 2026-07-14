@@ -20,7 +20,7 @@ wallet-connector abstraction.
 | `p2p`   | partial | Bitcoin P2P message framing + connection read/write; `version`/`verack` handshake implemented (`p2p/version.go`), **live-verify against a real node still TODO** (see `docs/protocol.md` §1.3). |
 | `crypto`| wired + tested | `BtcSigner` over `btcd/btcec/v2`: 64-byte compact ECDSA over `Packet.Digest()`; round-trip + tamper tests pass. |
 | `coins` | partial | Stdlib-only: coin registry + amount parsing + address codec (base58/bech32) **+ UTXO tx model, serialization, HTLC script, and SIGHASH_ALL signing/verification** (`script.go`, `tx.go`, `htlc.go`); unit-tested (`docs/coins.md`). Non-UTXO chains (DCR/PART) still todo. |
-| `wallet`| todo | RPC wallet-connector (signs + pays fees via connected SPV wallet). |
+| `wallet`| partial | `Connector` contract + two impls: `RPCConnector` (JSON-RPC to a Blocknet-core-compatible wallet/node — `getnewaddress`, `listunspent`, `signrawtransactionwithwallet`, `sendrawtransaction`, `estimatesmartfee`) and `LocalConnector` (signs locally via a `LocalSigner`, optional `Broadcaster`). Unit-tested via httptest + a real HTLC sign/verify round-trip (`docs/wallet.md`). Address/UTXO/fee queries still flow from the connected wallet, not synthesized. |
 | `swap`  | partial | `Transaction` state machine (port of `xbridgetransaction*`): join + two-confirmation progression + expiry; unit-tested. Session/deposit layer still todo. |
 | `api`   | todo | `dx*` operations as Go calls (port of `rpcxbridge.cpp`). |
 
@@ -41,7 +41,7 @@ xbridge-go/
   crypto/    secp256k1 Signer interface (btcec recipe)
   docs/      protocol.md, swap.md, coins.md — canonical specs
   coins/     coin registry, amount parsing, address codec (base58/bech32)
-  wallet/    (todo) RPC wallet connectors
+  wallet/    Connector contract + RPC/local wallet connectors (sign/broadcast)
   swap/      Transaction state machine (port of xbridgetransaction*)
   api/       (todo) dx* API surface
 ```
@@ -62,3 +62,9 @@ xbridge-go/
    (`coins/`, `docs/coins.md`). Remaining: non-UTXO adapters (DCR/PART) and the
    `wallet/` RPC connector to drive the `swap` Session/deposit layer
    (`trSigned`/`trCommited`).
+5. ~~Build `wallet/` connector to the connected SPV wallet (signs + broadcasts +
+   pays fee).~~ ✅ done (`wallet/`, `docs/wallet.md`): `RPCConnector` (JSON-RPC
+   to a Blocknet-core-compatible wallet) + `LocalConnector` (local keys +
+   optional broadcast). Remaining: compose with `swap/` into a `Session`/deposit
+   driver (`trSigned`/`trCommited`), non-UTXO adapters (DCR/PART), segwit BIP143
+   sighash.

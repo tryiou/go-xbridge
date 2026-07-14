@@ -16,6 +16,54 @@ var (
 	genPub, _ = hex.DecodeString("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
 )
 
+func TestTxRoundTrip(t *testing.T) {
+	inner := BuildDepositUnlockScript(genPub, genPub, []byte("0123456789abcdef0123456789abcdef01234567"), 600)
+	p2sh := BuildP2SHScript(KeyID(inner))
+
+	tx := &Tx{
+		Version: 2,
+		Inputs: []TxIn{{
+			PrevOut:   OutPoint{Index: 3},
+			ScriptSig: []byte{0x01, 0x02, 0x03},
+			Sequence:  0xffffffff,
+		}, {
+			PrevOut:  OutPoint{Index: 1},
+			Sequence: 0,
+		}},
+		Outputs: []TxOut{{
+			Value:        1_000_000,
+			ScriptPubKey: p2sh,
+		}},
+		LockTime: 0,
+	}
+	raw := tx.Serialize()
+	back, err := Deserialize(raw)
+	if err != nil {
+		t.Fatalf("Deserialize: %v", err)
+	}
+	if back.Version != tx.Version {
+		t.Errorf("version %d != %d", back.Version, tx.Version)
+	}
+	if len(back.Inputs) != len(tx.Inputs) {
+		t.Fatalf("inputs %d != %d", len(back.Inputs), len(tx.Inputs))
+	}
+	if back.Inputs[0].PrevOut.Index != 3 || back.Inputs[0].Sequence != 0xffffffff {
+		t.Errorf("input 0 mismatch: %+v", back.Inputs[0])
+	}
+	if string(back.Inputs[0].ScriptSig) != string(tx.Inputs[0].ScriptSig) {
+		t.Errorf("scriptsig mismatch")
+	}
+	if len(back.Outputs) != 1 || back.Outputs[0].Value != 1_000_000 {
+		t.Errorf("output mismatch: %+v", back.Outputs)
+	}
+	if string(back.Outputs[0].ScriptPubKey) != string(p2sh) {
+		t.Errorf("scriptpubkey mismatch")
+	}
+	if string(back.Serialize()) != string(raw) {
+		t.Error("re-serialize mismatch")
+	}
+}
+
 func TestKeyID(t *testing.T) {
 	id := KeyID(genPub)
 	if len(id) != 20 {

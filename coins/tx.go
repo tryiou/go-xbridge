@@ -23,6 +23,7 @@ type TxIn struct {
 	PrevOut   OutPoint
 	ScriptSig []byte
 	Sequence  uint32
+	Witness   [][]byte // segwit witness stack (nil for legacy/P2SH inputs)
 }
 
 // TxOut is a transaction output.
@@ -97,7 +98,163 @@ func (t *Tx) Serialize() []byte {
 	var lt [4]byte
 	binary.LittleEndian.PutUint32(lt[:], t.LockTime)
 	buf = append(buf, lt[:]...)
+	if t.SegWit {
+		for _, in := range t.Inputs {
+			buf = append(buf, varInt(len(in.Witness))...)
+			for _, w := range in.Witness {
+				buf = append(buf, varInt(len(w))...)
+				buf = append(buf, w...)
+			}
+		}
+	}
 	return buf
+}
+
+// Deserialize parses wire bytes (classic, or segwit-marker form) into a Tx.
+// It mirrors Serialize: legacy inputs carry only ScriptSig; segwit inputs
+// additionally carry their Witness stack.
+func Deserialize(b []byte) (*Tx, error) {
+	t := &Tx{}
+	pos := 0
+	need := func(n int) ([]byte, error) {
+		if pos+n > len(b) {
+			return nil, errors.New("coins: tx truncated")
+		}
+		s := b[pos : pos+n]
+		pos += n
+		return s, nil
+	}
+	le32 := func(x []byte) uint32 { return binary.LittleEndian.Uint32(x) }
+
+	ver, err := need(4)
+	if err != nil {
+		return nil, err
+	}
+	t.Version = int32(le32(ver))
+
+	if len(b) >= pos+2 && b[pos] == 0x00 && b[pos+1] == 0x01 {
+		t.SegWit = true
+		pos += 2
+	}
+
+	nIn, err := readVarInt(b, &pos)
+	if err != nil {
+		return nil, err
+	}
+	t.Inputs = make([]TxIn, nIn)
+	for i := range t.Inputs {
+		h, err := need(32)
+		if err != nil {
+			return nil, err
+		}
+		copy(t.Inputs[i].PrevOut.Hash[:], h)
+		ix, err := need(4)
+		if err != nil {
+			return nil, err
+		}
+		t.Inputs[i].PrevOut.Index = le32(ix)
+		slen, err := readVarInt(b, &pos)
+		if err != nil {
+			return nil, err
+		}
+		ss, err := need(slen)
+		if err != nil {
+			return nil, err
+		}
+		t.Inputs[i].ScriptSig = append([]byte(nil), ss...)
+		seq, err := need(4)
+		if err != nil {
+			return nil, err
+		}
+		t.Inputs[i].Sequence = le32(seq)
+	}
+
+	nOut, err := readVarInt(b, &pos)
+	if err != nil {
+		return nil, err
+	}
+	t.Outputs = make([]TxOut, nOut)
+	for i := range t.Outputs {
+		val, err := need(8)
+		if err != nil {
+			return nil, err
+		}
+		t.Outputs[i].Value = binary.LittleEndian.Uint64(val)
+		slen, err := readVarInt(b, &pos)
+		if err != nil {
+			return nil, err
+		}
+		spk, err := need(slen)
+		if err != nil {
+			return nil, err
+		}
+		t.Outputs[i].ScriptPubKey = append([]byte(nil), spk...)
+	}
+
+	lt, err := need(4)
+	if err != nil {
+		return nil, err
+	}
+	t.LockTime = le32(lt)
+
+	if t.SegWit {
+		for i := range t.Inputs {
+			wc, err := readVarInt(b, &pos)
+			if err != nil {
+				return nil, err
+			}
+			t.Inputs[i].Witness = make([][]byte, wc)
+			for w := 0; w < wc; w++ {
+				wl, err := readVarInt(b, &pos)
+				if err != nil {
+					return nil, err
+				}
+				ws, err := need(wl)
+				if err != nil {
+					return nil, err
+				}
+				t.Inputs[i].Witness[w] = append([]byte(nil), ws...)
+			}
+		}
+	}
+	if pos != len(b) {
+		return nil, errors.New("coins: trailing bytes in tx")
+	}
+	return t, nil
+}
+
+// readVarInt reads a Bitcoin variable-length integer at *pos, advancing pos.
+func readVarInt(b []byte, pos *int) (int, error) {
+	if *pos >= len(b) {
+		return 0, errors.New("coins: tx truncated")
+	}
+	first := b[*pos]
+	*pos++
+	switch {
+	case first < 0xfd:
+		return int(first), nil
+	case first == 0xfd:
+		if *pos+2 > len(b) {
+			return 0, errors.New("coins: tx truncated")
+		}
+		v := binary.LittleEndian.Uint16(b[*pos:])
+		*pos += 2
+		return int(v), nil
+	case first == 0xfe:
+		if *pos+4 > len(b) {
+			return 0, errors.New("coins: tx truncated")
+		}
+		v := binary.LittleEndian.Uint32(b[*pos:])
+		*pos += 4
+		return int(v), nil
+	default:
+		if *pos+8 > len(b) {
+			return 0, errors.New("coins: tx truncated")
+		}
+		v := binary.LittleEndian.Uint64(b[*pos:])
+		*pos += 8
+		return int(v), nil
+	}
 }
 
 // HashForSigning computes the legacy SIGHASH_ALL digest for input idx, with that
