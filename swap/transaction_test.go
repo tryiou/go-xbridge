@@ -1,0 +1,178 @@
+package swap
+
+import (
+	"testing"
+	"time"
+)
+
+var (
+	aMakerSrc = Addr{0x01}
+	aMakerDst = Addr{0x02}
+	aTakerSrc = Addr{0x03}
+	aTakerDst = Addr{0x04}
+	aUnknown  = Addr{0xee}
+)
+
+func makerOrder() *Transaction {
+	var id [32]byte
+	copy(id[:], []byte("maker-order-id-00000000000000000000"))
+	return NewTransaction(id, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, time.Unix(1000, 0))
+}
+
+func takerOrder() *Transaction {
+	var id [32]byte
+	copy(id[:], []byte("taker-order-id-00000000000000000000"))
+	// Complementary: gives LTC (maker's dest), wants BTC (maker's source).
+	return NewTransaction(id, "LTC", "BTC", 200, 100,
+		Member{Source: aTakerSrc, Dest: aTakerDst}, false, 0, time.Unix(1000, 0))
+}
+
+// TestTryJoin covers the complementary-match, currency-mismatch, amount-mismatch,
+// and wrong-state cases of Transaction::tryJoin.
+func TestTryJoin(t *testing.T) {
+	mk := makerOrder()
+	tk := takerOrder()
+
+	if !mk.TryJoin(tk) {
+		t.Fatal("complementary orders should join")
+	}
+	if mk.State != TrJoined {
+		t.Errorf("state after join = %s, want trJoined", mk.State)
+	}
+	// B becomes the taker's member A.
+	if mk.B.Source != aTakerSrc || mk.B.Dest != aTakerDst {
+		t.Errorf("member B not taken from taker: %+v", mk.B)
+	}
+
+	// Currency mismatch.
+	mk2 := makerOrder()
+	badCur := takerOrder()
+	badCur.SourceCurrency, badCur.DestCurrency = "DOGE", "BTC"
+	if mk2.TryJoin(badCur) {
+		t.Error("currency-mismatched orders should not join")
+	}
+
+	// Amount mismatch (non-partial requires exact amounts).
+	mk3 := makerOrder()
+	badAmt := takerOrder()
+	badAmt.DestAmount = 99 // maker wants 100 BTC
+	if mk3.TryJoin(badAmt) {
+		t.Error("amount-mismatched orders should not join")
+	}
+
+	// Cannot join from a non-trNew order.
+	mk4 := makerOrder()
+	tk4 := takerOrder()
+	tk4.State = TrJoined
+	if mk4.TryJoin(tk4) {
+		t.Error("joining a non-trNew order should fail")
+	}
+}
+
+// TestIncreaseStateCounterProgression walks both participants through every
+// phase and asserts the state advances only after the second confirmation.
+func TestIncreaseStateCounterProgression(t *testing.T) {
+	mk := makerOrder()
+	if !mk.TryJoin(takerOrder()) {
+		t.Fatal("join failed")
+	}
+
+	// Phase trJoined -> trHold (both via Source).
+	if s := mk.IncreaseStateCounter(TrJoined, aMakerSrc); s != TrJoined {
+		t.Fatalf("after A's joined-confirm: %s, want trJoined", s)
+	}
+	if s := mk.IncreaseStateCounter(TrJoined, aTakerSrc); s != TrHold {
+		t.Fatalf("after B's joined-confirm: %s, want trHold", s)
+	}
+
+	// Phase trHold -> trInitialized (both via Dest).
+	if s := mk.IncreaseStateCounter(TrHold, aMakerDst); s != TrHold {
+		t.Fatalf("after A's hold-confirm: %s, want trHold", s)
+	}
+	if s := mk.IncreaseStateCounter(TrHold, aTakerDst); s != TrInitialized {
+		t.Fatalf("after B's hold-confirm: %s, want trInitialized", s)
+	}
+
+	// Phase trInitialized -> trCreated (both via Source).
+	if s := mk.IncreaseStateCounter(TrInitialized, aMakerSrc); s != TrInitialized {
+		t.Fatalf("after A's init-confirm: %s, want trInitialized", s)
+	}
+	if s := mk.IncreaseStateCounter(TrInitialized, aTakerSrc); s != TrCreated {
+		t.Fatalf("after B's init-confirm: %s, want trCreated", s)
+	}
+
+	// Phase trCreated -> trFinished (both via Dest).
+	if s := mk.IncreaseStateCounter(TrCreated, aMakerDst); s != TrCreated {
+		t.Fatalf("after A's created-confirm: %s, want trCreated", s)
+	}
+	if s := mk.IncreaseStateCounter(TrCreated, aTakerDst); s != TrFinished {
+		t.Fatalf("after B's created-confirm: %s, want trFinished", s)
+	}
+	if !mk.IsFinished() {
+		t.Error("transaction should be finished")
+	}
+}
+
+// TestIncreaseStateCounterNoopInvalid checks that an unrecognized confirmer is
+// a no-op, and that confirming the wrong phase returns trInvalid.
+func TestIncreaseStateCounterNoopInvalid(t *testing.T) {
+	mk := makerOrder()
+	if !mk.TryJoin(takerOrder()) {
+		t.Fatal("join failed")
+	}
+	// Unknown confirmer: no-op, stays trJoined, returns trJoined.
+	if s := mk.IncreaseStateCounter(TrJoined, aUnknown); s != TrJoined {
+		t.Errorf("unknown confirmer returned %s, want trJoined", s)
+	}
+	if mk.State != TrJoined {
+		t.Errorf("unknown confirmer must not advance state, got %s", mk.State)
+	}
+	// Confirming a phase we are not in returns trInvalid and leaves state.
+	if s := mk.IncreaseStateCounter(TrHold, aMakerDst); s != TrInvalid {
+		t.Errorf("wrong-phase confirm returned %s, want trInvalid", s)
+	}
+	if mk.State != TrJoined {
+		t.Errorf("wrong-phase confirm must not change state, got %s", mk.State)
+	}
+}
+
+// TestIsExpired checks the trNew (deadline/pending) and post-trNew (TTL) rules.
+func TestIsExpired(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+
+	// Fresh trNew order (created just now) must not be expired.
+	mk := NewTransaction([32]byte{}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, now)
+	if mk.IsExpired(now) {
+		t.Error("fresh trNew order must not be expired")
+	}
+
+	// trNew idle past pendingTTL -> expired.
+	idle := NewTransaction([32]byte{}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, now)
+	idle.LastAt = now.Add(-(PendingTTL + 10) * time.Second).Unix()
+	if !idle.IsExpired(now) {
+		t.Error("trNew idle past pendingTTL should be expired")
+	}
+
+	// trNew past creation deadline -> expired.
+	stale := NewTransaction([32]byte{}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, now)
+	stale.CreatedAt = now.Add(-(DeadlineTTL + 10) * time.Second).Unix()
+	if !stale.IsExpired(now) {
+		t.Error("trNew past deadlineTTL should be expired")
+	}
+
+	// Post-trNew, idle past TTL -> expired.
+	joined := makerOrder()
+	joined.TryJoin(takerOrder())
+	joined.LastAt = now.Add(-(TTL + 10) * time.Second).Unix()
+	if !joined.IsExpired(now) {
+		t.Error("post-trNew idle past TTL should be expired")
+	}
+	joined.LastAt = now.Add(-(TTL - 10) * time.Second).Unix()
+	if joined.IsExpired(now) {
+		t.Error("post-trNew within TTL must not be expired")
+	}
+}

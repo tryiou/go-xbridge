@@ -21,7 +21,7 @@ wallet-connector abstraction.
 | `crypto`| wired + tested | `BtcSigner` over `btcd/btcec/v2`: 64-byte compact ECDSA over `Packet.Digest()`; round-trip + tamper tests pass. |
 | `coins` | todo | Per-coin tx build/serialize, address/amount parsing. |
 | `wallet`| todo | RPC wallet-connector (signs + pays fees via connected SPV wallet). |
-| `swap`  | todo | `Transaction` state machine + `Session` (port of `xbridgetransaction*`/`xbridgesession*`). |
+| `swap`  | partial | `Transaction` state machine (port of `xbridgetransaction*`): join + two-confirmation progression + expiry; unit-tested. Session/deposit layer still todo. |
 | `api`   | todo | `dx*` operations as Go calls (port of `rpcxbridge.cpp`). |
 
 ## Build
@@ -42,7 +42,7 @@ xbridge-go/
   docs/      protocol.md — canonical wire spec
   coins/     (todo) per-coin handlers
   wallet/    (todo) RPC wallet connectors
-  swap/      (todo) swap state machine
+  swap/      Transaction state machine (port of xbridgetransaction*)
   api/       (todo) dx* API surface
 ```
 
@@ -52,5 +52,9 @@ xbridge-go/
 2. ~~Implement the Bitcoin `version`/`verack` handshake (`p2p/conn.go`,
    `p2p/version.go`).~~ ✅ done (unit-tested; **live-verify against a real node
    still TODO** — see `docs/protocol.md` §1.3).
-3. Build `swap/` state machine, porting `xbridge_tests.cpp` / `bswap_tests.cpp`
-   as the acceptance oracle.
+3. ~~Build `swap/` state machine core (join + two-confirmation progression +
+   expiry), unit-tested.~~ ✅ done (`swap/`, `docs/swap.md`). `Session`/deposit
+   layer (`trSigned`/`trCommited`, per-coin tx) still todo — needs `coins/` +
+   `wallet/`.
+4. Build `coins/` (per-coin tx build/serialize, address/amount parsing) and
+   `wallet/` (RPC connector) to drive the deposit/refund layer.
