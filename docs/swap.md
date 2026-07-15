@@ -98,5 +98,35 @@ The block-height variant (`isExpiredByBlockNumber`) needs chain context and is
 ## 6. Not yet ported
 
 - `isExpiredByBlockNumber` (requires block-index lookup).
-- The `xbridgesession*` deposit/refund construction and the
-  `trSigned`/`trCommited` steps (per-coin tx in `coins/` + `wallet/`).
+- The full `xbridgesession*` coordination loop: the lockTime exchange
+  (xbcTransactionInit, command 8), broadcasting/observing deposit txids, and the
+  claim/refund *spending* of the HTLC outputs (the ELSE payment branch reveals
+  the secret; the IF branch is the CLTV refund). `swap/deposit.go` already
+  builds the deposit tx + HTLC scripts and `swap/session.go` advances the gate
+  when both deposits confirm; the P2P packet exchange + output spending remain.
+
+## 7. Deposit layer (`swap/deposit.go`, `swap/session.go`)
+
+The deposit/refund (`xbridgesession*`) layer is ported at the construction +
+gating level:
+
+- `DepositSpec` describes one side's HTLC deposit: `RedeemScript()` builds the
+  script via `coins.BuildDepositUnlockScript`; `P2SHScript()` wraps it;
+  `BuildDepositTx` locks `Amount` into the P2SH, spending funding UTXOs with a
+  CLTV-enabled input sequence; `SignInput`/`RefundScriptSig` sign + assemble the
+  refund. The depositor generates a 33-byte `Secret`; `SecretHash()` is
+  HASH160(Secret). The counterparty adopts only the `Hash` (it never learns the
+  secret).
+- `Session` wraps a joined `Transaction` for the local `Role`. `CreateLocalDeposit`
+  generates the secret + builds the local `DepositSpec` (amount/currency derived
+  from the role: maker locks SourceAmount/SourceCurrency, taker locks
+  DestAmount/DestCurrency). `AdoptCounterparty` records the revealed `Hash` +
+  lockTime. `ConfirmLocalDeposit`/`ConfirmOtherDeposit` advance the progression
+  gate (trJoined → trHold) once both sides' deposits confirm.
+
+**Fidelity note:** C++ never assigns `trSigned`/`trCommited` to the transaction
+state (grep `xbridgetransaction.cpp` / `xbridgesession.cpp` — only trHold /
+trInitialized / trCreated / trFinished / trCancelled / trDropped are set). Those
+two enum values are vestigial; deposits instead *gate* the progression. This port
+mirrors that: the `Session` tracks the deposit lifecycle on its own fields and
+calls `IncreaseStateCounter`, and does not set `trSigned`/`trCommited`.
