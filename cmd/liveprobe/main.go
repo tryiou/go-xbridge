@@ -75,6 +75,8 @@ func main() {
 	}
 	count := 0
 	var parsed, parseErrs int
+	var bodyOK, bodyErr int
+	cmdCounts := map[uint32]int{}
 	for {
 		if time.Now().After(deadline) {
 			break
@@ -109,14 +111,31 @@ func main() {
 			if perr != nil {
 				parseErrs++
 				fmt.Printf("       proto.Unmarshal: %v\n", perr)
+				continue
+			}
+			parsed++
+			fmt.Printf("       proto: version=%d command=%d(0x%x) size=%d body=%d bytes\n",
+				p.Version, uint32(p.Command), uint32(p.Command), p.Size, len(p.Body))
+			// Live-verify the per-command body layout against the real struct.
+			cmdCounts[uint32(p.Command)]++
+			b, berr := proto.DecodeBody(p.Command, p.Body)
+			if berr != nil {
+				bodyErr++
+				fmt.Printf("       body DECODE ERROR: %v\n", berr)
 			} else {
-				parsed++
-				fmt.Printf("       proto: version=%d command=%d(0x%x) size=%d body=%d bytes\n",
-					p.Version, uint32(p.Command), uint32(p.Command), p.Size, len(p.Body))
+				bodyOK++
+				fmt.Printf("       body OK: %+v\n", b)
 			}
 		}
 	}
-	fmt.Printf("read %d message(s); xbridge parsed=%d errors=%d\n", count, parsed, parseErrs)
+	fmt.Printf("read %d message(s); xbridge parsed=%d errors=%d; body decoded OK=%d err=%d\n",
+		count, parsed, parseErrs, bodyOK, bodyErr)
+	if len(cmdCounts) > 0 {
+		fmt.Println("commands seen (cmd=value count):")
+		for cmd, n := range cmdCounts {
+			fmt.Printf("  %d(0x%x): %d\n", cmd, cmd, n)
+		}
+	}
 }
 
 // rawDiag connects, sends a version message, and dumps the first bytes the

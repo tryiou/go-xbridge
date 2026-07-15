@@ -38,6 +38,12 @@ type Transaction struct {
 
 	State State
 
+	// BlockNumber is the chain height at which the transaction was created / last
+	// observed (C++ Transaction::m_blockNumber). It is the reference for the
+	// block-height expiry check. Set it from Connector.GetBlockCount() when the
+	// order is first seen.
+	BlockNumber uint32
+
 	// changedA/changedB are the per-phase confirmation flags. C++ reuses a
 	// single pair across every phase (reset after each transition), so we do
 	// the same.
@@ -211,4 +217,18 @@ func (t *Transaction) IsExpired(now time.Time) bool {
 		return ageCreated > DeadlineTTL || ageLast > PendingTTL
 	}
 	return t.State > TrNew && ageLast > TTL
+}
+
+// IsExpiredByBlockNumber reports whether the transaction has exceeded its
+// block-height TTL (C++ Transaction::isExpiredByBlockNumber). currentBlock is
+// the chain tip height (e.g. from Connector.GetBlockCount). For trNew the check
+// is purely block-based: currentBlock - BlockNumber > BlocksTTL (the
+// block-height analog of DeadlineTTL). For later states XBridge still gates on
+// the time-based TTL, so we delegate to IsExpired; the block parameter is only
+// consulted for the trNew block window.
+func (t *Transaction) IsExpiredByBlockNumber(currentBlock uint32) bool {
+	if t.State == TrNew {
+		return int64(currentBlock)-int64(t.BlockNumber) > BlocksTTL
+	}
+	return t.IsExpired(time.Now())
 }

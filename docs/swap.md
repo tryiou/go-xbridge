@@ -92,12 +92,18 @@ transition), matching C++'s single `m_a_stateChanged`/`m_b_stateChanged` pair.
   → expired;
 - state > `trNew` && age-since-last > `TTL` → expired.
 
-The block-height variant (`isExpiredByBlockNumber`) needs chain context and is
-**not** ported yet.
+`IsExpiredByBlockNumber(currentBlock)`:
+
+- `trNew` && `currentBlock - BlockNumber > BlocksTTL` → expired (the block-height
+  analog of `DeadlineTTL`; `BlockNumber` is the chain height when the order was
+  created, set from `Connector.GetBlockCount`).
+- state > `trNew` → delegates to the time-based `IsExpired(now)` (XBridge still
+  gates post-`trNew` on the time TTL; the block parameter is only consulted for
+  the `trNew` block window).
 
 ## 6. Porting status
 
-- `isExpiredByBlockNumber` (requires block-index lookup) — **not yet ported**.
+- `isExpiredByBlockNumber` — **ported** (`swap/transaction.go` `Transaction.IsExpiredByBlockNumber`, unit-tested in `swap/transaction_test.go`). `Transaction.BlockNumber` is the chain height at creation; set it from `Connector.GetBlockCount` where the order is observed.
 - The **three-party CLIENT driver** (the `xbridgesession*` coordination loop as a
   thin client) is implemented in `api/swap.go`, NOT in `swap/`. It is the
   XBridge CLIENT side of the Maker ⇄ ServiceNode HUB ⇄ Taker protocol: the local

@@ -229,3 +229,43 @@ func TestIsExpired(t *testing.T) {
 		t.Error("post-trNew within TTL must not be expired")
 	}
 }
+
+// TestIsExpiredByBlockNumber checks the block-height expiry variant: a trNew
+// order expires once the chain advances more than BlocksTTL beyond the block it
+// was created at, and stays valid within that window. Post-trNew delegates to
+// the time-based TTL.
+func TestIsExpiredByBlockNumber(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	const createdAtBlock = 1_000_000
+
+	mk := NewTransaction([32]byte{}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, now)
+	mk.BlockNumber = createdAtBlock
+
+	// Within the block window: not expired.
+	if mk.IsExpiredByBlockNumber(createdAtBlock) {
+		t.Error("trNew within block window must not be expired (same block)")
+	}
+	if mk.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL - 1) {
+		t.Error("trNew just inside BlocksTTL must not be expired")
+	}
+	// One block past the window: expired.
+	if !mk.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL + 1) {
+		t.Error("trNew past BlocksTTL must be expired")
+	}
+
+	// Post-trNew delegates to the time-based TTL (block height ignored), so an
+	// order that is fresh by time is not expired by this check either.
+	joined := makerOrder()
+	joined.TryJoin(takerOrder())
+	joined.BlockNumber = createdAtBlock
+	joined.LastAt = time.Now().Unix()
+	if joined.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL + 1) {
+		t.Error("post-trNew fresh by time must not be expired by block check")
+	}
+	// And an order idle past the time TTL is expired even with a low block.
+	joined.LastAt = time.Now().Add(-(TTL + 10) * time.Second).Unix()
+	if !joined.IsExpiredByBlockNumber(createdAtBlock) {
+		t.Error("post-trNew idle past time TTL must be expired")
+	}
+}
