@@ -201,6 +201,110 @@ func TestTxSerializeAndSign(t *testing.T) {
 	}
 }
 
+// hash32 copies hex into a [32]byte (wire/internal byte order, verbatim).
+func hash32(t *testing.T, s string) [32]byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		t.Fatalf("bad 32-byte hex %q: %v", s, err)
+	}
+	var h [32]byte
+	copy(h[:], b)
+	return h
+}
+
+func mustDecode(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("bad hex %q: %v", s, err)
+	}
+	return b
+}
+
+// TestBIP143NativeP2WPKH checks HashForSigningSegwit against the canonical
+// BIP143 native-P2WPKH vector (input 1). The final digest must equal the
+// spec's published sigHash, which validates hashPrevouts/hashSequence/
+// hashOutputs and the preimage layout end-to-end.
+// https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki#native-p2wpkh
+func TestBIP143NativeP2WPKH(t *testing.T) {
+	tx := &Tx{
+		Version: 1,
+		Inputs: []TxIn{
+			{
+				PrevOut:  OutPoint{Hash: hash32(t, "fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f"), Index: 0},
+				Sequence: 0xffffffee,
+			},
+			{
+				PrevOut:  OutPoint{Hash: hash32(t, "ef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57b90ec68a"), Index: 1},
+				Sequence: 0xffffffff,
+			},
+		},
+		Outputs: []TxOut{
+			{Value: 112340000, ScriptPubKey: mustDecode(t, "76a9148280b37df378db99f66f85c95a783a76ac7a6d5988ac")},
+			{Value: 223450000, ScriptPubKey: mustDecode(t, "76a9143bde42dbee7e4dbe6a21b2d50ce2f0167faa815988ac")},
+		},
+		LockTime: 17,
+	}
+
+	pub := mustDecode(t, "025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357")
+	// The P2WPKH scriptCode is the implied P2PKH script over HASH160(pubkey).
+	keyHash := KeyID(pub)
+	if got := hex.EncodeToString(keyHash[:]); got != "1d0f172a0ecb48aee1be1f2687d2963ae33f71a1" {
+		t.Fatalf("KeyID(pub) = %s, want the BIP143 witness program hash", got)
+	}
+	scriptCode := P2WPKHScriptCode(keyHash[:])
+
+	const amount = 600000000
+	got := tx.HashForSigningSegwit(1, scriptCode, amount)
+	want := "c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670"
+	if hex.EncodeToString(got[:]) != want {
+		t.Errorf("BIP143 native P2WPKH sigHash\n got %s\nwant %s", hex.EncodeToString(got[:]), want)
+	}
+
+	// Sign with the vector's private key and verify the round-trip.
+	priv := mustDecode(t, "619c335025c7f4012e556c2a58b2506e30b8511b53ade95ea316fd8c3286feb9")
+	sig, err := SignTxInputSegwit(tx, 1, scriptCode, amount, priv)
+	if err != nil {
+		t.Fatalf("SignTxInputSegwit: %v", err)
+	}
+	ok, err := VerifyTxInputSegwit(tx, 1, scriptCode, pub, amount, sig)
+	if err != nil || !ok {
+		t.Fatalf("VerifyTxInputSegwit ok=%v err=%v", ok, err)
+	}
+	// Tampering the spent amount must break verification (BIP143 commits to it).
+	if ok, _ := VerifyTxInputSegwit(tx, 1, scriptCode, pub, amount+1, sig); ok {
+		t.Error("verification should fail when the committed amount changes")
+	}
+}
+
+// TestBIP143NestedP2SHP2WPKH checks HashForSigningSegwit against the canonical
+// BIP143 P2SH-P2WPKH vector. The scriptCode is again the implied P2PKH script
+// over the witness key hash.
+// https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki#p2sh-p2wpkh
+func TestBIP143NestedP2SHP2WPKH(t *testing.T) {
+	tx := &Tx{
+		Version: 1,
+		Inputs: []TxIn{{
+			PrevOut:  OutPoint{Hash: hash32(t, "db6b1b20aa0fd7b23880be2ecbd4a98130974cf4748fb66092ac4d3ceb1a5477"), Index: 1},
+			Sequence: 0xfffffffe,
+		}},
+		Outputs: []TxOut{
+			{Value: 199996600, ScriptPubKey: mustDecode(t, "76a914a457b684d7f0d539a46a45bbc043f35b59d0d96388ac")},
+			{Value: 800000000, ScriptPubKey: mustDecode(t, "76a914fd270b1ee6abcaea97fea7ad0402e8bd8ad6d77c88ac")},
+		},
+		LockTime: 1170,
+	}
+	// Witness key hash from the vector's redeemScript 0014{keyhash}.
+	scriptCode := P2WPKHScriptCode(mustDecode(t, "79091972186c449eb1ded22b78e40d009bdf0089"))
+	const amount = 1000000000
+	got := tx.HashForSigningSegwit(0, scriptCode, amount)
+	want := "64f3b0f4dd2bb3aa1ce8566d220cc74dda9df97d8490cc81d89d735c92e59fb6"
+	if hex.EncodeToString(got[:]) != want {
+		t.Errorf("BIP143 P2SH-P2WPKH sigHash\n got %s\nwant %s", hex.EncodeToString(got[:]), want)
+	}
+}
+
 func testTx() *Tx {
 	var prev [32]byte
 	copy(prev[:], []byte("0123456789abcdef0123456789abcdef"))

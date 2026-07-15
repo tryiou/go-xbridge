@@ -1,6 +1,7 @@
 package coins
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -24,6 +25,10 @@ type TxIn struct {
 	ScriptSig []byte
 	Sequence  uint32
 	Witness   [][]byte // segwit witness stack (nil for legacy/P2SH inputs)
+	// Amount is the value (base units) of the output this input spends. It is
+	// NOT part of the wire encoding; BIP143 requires it in the segwit sighash
+	// commitment, so callers signing a segwit input must populate it.
+	Amount uint64
 }
 
 // TxOut is a transaction output.
@@ -302,6 +307,92 @@ func (t *Tx) HashForSigning(idx int, prevScript []byte) [32]byte {
 	return d2
 }
 
+// HashForSigningSegwit computes the BIP143 SIGHASH_ALL digest for input idx.
+// scriptCode is the script being executed (for P2WPKH this is the implied
+// P2PKH script `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`; for a
+// P2WSH / nested-witness HTLC input it is the witness/redeem script). amount is
+// the value (base units) of the output being spent. Reference:
+// https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki
+//
+//	hashPrevouts = dSHA256(all input outpoints)
+//	hashSequence = dSHA256(all input sequences)
+//	hashOutputs  = dSHA256(all outputs)
+//	preimage = version ‖ hashPrevouts ‖ hashSequence ‖ outpoint ‖
+//	           scriptCode ‖ amount ‖ nSequence ‖ hashOutputs ‖ locktime ‖ sighash
+func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) [32]byte {
+	dsha := func(b []byte) [32]byte {
+		h1 := sha256.Sum256(b)
+		return sha256.Sum256(h1[:])
+	}
+
+	var prevoutsBuf bytes.Buffer
+	var sequenceBuf bytes.Buffer
+	for _, in := range t.Inputs {
+		prevoutsBuf.Write(in.PrevOut.Hash[:])
+		var ix [4]byte
+		binary.LittleEndian.PutUint32(ix[:], in.PrevOut.Index)
+		prevoutsBuf.Write(ix[:])
+		var seq [4]byte
+		binary.LittleEndian.PutUint32(seq[:], in.Sequence)
+		sequenceBuf.Write(seq[:])
+	}
+	hashPrevouts := dsha(prevoutsBuf.Bytes())
+	hashSequence := dsha(sequenceBuf.Bytes())
+
+	var outputsBuf bytes.Buffer
+	for _, out := range t.Outputs {
+		var val [8]byte
+		binary.LittleEndian.PutUint64(val[:], out.Value)
+		outputsBuf.Write(val[:])
+		outputsBuf.Write(varInt(len(out.ScriptPubKey)))
+		outputsBuf.Write(out.ScriptPubKey)
+	}
+	hashOutputs := dsha(outputsBuf.Bytes())
+
+	var buf bytes.Buffer
+	var v [4]byte
+	binary.LittleEndian.PutUint32(v[:], uint32(t.Version))
+	buf.Write(v[:])
+	buf.Write(hashPrevouts[:])
+	buf.Write(hashSequence[:])
+	// outpoint of the input being signed
+	buf.Write(t.Inputs[idx].PrevOut.Hash[:])
+	var ix [4]byte
+	binary.LittleEndian.PutUint32(ix[:], t.Inputs[idx].PrevOut.Index)
+	buf.Write(ix[:])
+	// scriptCode (length-prefixed)
+	buf.Write(varInt(len(scriptCode)))
+	buf.Write(scriptCode)
+	// amount of the output being spent
+	var amt [8]byte
+	binary.LittleEndian.PutUint64(amt[:], amount)
+	buf.Write(amt[:])
+	// nSequence of the input being signed
+	var seq [4]byte
+	binary.LittleEndian.PutUint32(seq[:], t.Inputs[idx].Sequence)
+	buf.Write(seq[:])
+	buf.Write(hashOutputs[:])
+	var lt [4]byte
+	binary.LittleEndian.PutUint32(lt[:], t.LockTime)
+	buf.Write(lt[:])
+	var sh [4]byte
+	binary.LittleEndian.PutUint32(sh[:], SigHashAll)
+	buf.Write(sh[:])
+
+	return dsha(buf.Bytes())
+}
+
+// P2WPKHScriptCode returns the BIP143 scriptCode for spending a P2WPKH output
+// committing to keyHash (the 20-byte HASH160 of the compressed pubkey): the
+// implied P2PKH script `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`.
+func P2WPKHScriptCode(keyHash []byte) []byte {
+	s := make([]byte, 0, 25)
+	s = append(s, 0x76, 0xa9, 0x14) // OP_DUP OP_HASH160 push(20)
+	s = append(s, keyHash...)
+	s = append(s, 0x88, 0xac) // OP_EQUALVERIFY OP_CHECKSIG
+	return s
+}
+
 // SignTxInput signs input idx for prevScript with the 32-byte private scalar,
 // returning the DER signature with the SIGHASH_ALL byte appended (the form that
 // goes into a scriptSig). Mirrors C++ m_cp.sign + push_back(SIGHASH_ALL).
@@ -310,11 +401,27 @@ func SignTxInput(tx *Tx, idx int, prevScript, priv []byte) ([]byte, error) {
 		return nil, errors.New("coins: private key must be 32 bytes")
 	}
 	h := tx.HashForSigning(idx, prevScript)
+	return signDigest(h, priv)
+}
+
+// SignTxInputSegwit signs input idx as a BIP143 (segwit) input: scriptCode is
+// the witness script (or P2WPKH implied P2PKH script via P2WPKHScriptCode) and
+// amount is the spent output's value. Returns the DER signature with the
+// SIGHASH_ALL byte appended (the form that goes into the witness stack).
+func SignTxInputSegwit(tx *Tx, idx int, scriptCode []byte, amount uint64, priv []byte) ([]byte, error) {
+	if len(priv) != 32 {
+		return nil, errors.New("coins: private key must be 32 bytes")
+	}
+	h := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	return signDigest(h, priv)
+}
+
+// signDigest signs a 32-byte digest and appends the SIGHASH_ALL byte.
+func signDigest(h [32]byte, priv []byte) ([]byte, error) {
 	key, _ := btcec.PrivKeyFromBytes(priv)
 	sig := ecdsa.Sign(key, h[:])
-	der := sig.Serialize() // DER
-	out := append(der, byte(SigHashAll))
-	return out, nil
+	der := sig.Serialize()
+	return append(der, byte(SigHashAll)), nil
 }
 
 // VerifyTxInput checks a DER+SIGHASH signature (from SignTxInput) against the
@@ -324,6 +431,22 @@ func VerifyTxInput(tx *Tx, idx int, prevScript, pub, sigWithSighash []byte) (boo
 		return false, errors.New("coins: empty signature")
 	}
 	h := tx.HashForSigning(idx, prevScript)
+	return verifyDigest(h, pub, sigWithSighash)
+}
+
+// VerifyTxInputSegwit checks a DER+SIGHASH signature (from SignTxInputSegwit)
+// against the 33-byte compressed pubkey for input idx, using the BIP143 digest
+// over scriptCode and the spent amount.
+func VerifyTxInputSegwit(tx *Tx, idx int, scriptCode, pub []byte, amount uint64, sigWithSighash []byte) (bool, error) {
+	if len(sigWithSighash) < 1 {
+		return false, errors.New("coins: empty signature")
+	}
+	h := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	return verifyDigest(h, pub, sigWithSighash)
+}
+
+// verifyDigest parses a DER+sighash signature and verifies it against pub.
+func verifyDigest(h [32]byte, pub, sigWithSighash []byte) (bool, error) {
 	der := sigWithSighash[:len(sigWithSighash)-1]
 	sig, err := ecdsa.ParseSignature(der)
 	if err != nil {

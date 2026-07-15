@@ -80,6 +80,11 @@ returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
    examples show 6 decimals, but the code uses 7. If real blocknetd is observed
    emitting 6, change `formatXAmount`/`formatXPrice` to 6.
 3. **Take-order handshake.** `dxTakeOrder` broadcasts the accepting packet and
-   returns the shaped response, but does not yet drive the full
-   accept→hold→init→create→confirm deposit handshake (the `swap` package, not
-   yet wired to P2P). This is the remaining swap-phase work.
+   registers a client-side `SwapSession`; the hold→init→create→confirm deposit
+   handshake **is now wired** — `dxMakeOrder`/`dxTakeOrder` spawn sessions
+   (`newMakerSession`/`newTakerSession`) and `Node.feed` dispatches the
+   hub-originated handshake packets (Hold/Init/CreateA/CreateB/ConfirmA/ConfirmB/
+   Finished) to the session handlers in `api/swap.go`, which build/broadcast the
+   HTLC deposits and claim/refund spends. Covered by `TestSwapHandshake` with
+   in-memory connectors; the remaining gap is verification against a **live**
+   Blocknet hub over `p2p`.

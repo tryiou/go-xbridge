@@ -55,7 +55,14 @@ ported from `xbridgewalletconnectorbtc.cpp`:
 - **`tx.go`** — `Tx`/`TxIn`/`TxOut`/`OutPoint` + classic/segwit `Serialize`,
   legacy `HashForSigning(idx, prevScript)` (SIGHASH_ALL, matches C++
   `SignatureHash`), and `SignTxInput` / `VerifyTxInput` (DER sig + SIGHASH byte
-  via `btcd/btcec/v2`).
+  via `btcd/btcec/v2`). **Segwit (BIP143):** `HashForSigningSegwit(idx,
+  scriptCode, amount)` computes the witness-v0 SIGHASH_ALL digest
+  (hashPrevouts/hashSequence/hashOutputs commitment + committed spent amount);
+  `P2WPKHScriptCode(keyHash)` returns the implied P2PKH scriptCode; and
+  `SignTxInputSegwit` / `VerifyTxInputSegwit` sign/verify over it. Validated
+  against the canonical BIP143 native-P2WPKH and P2SH-P2WPKH known-answer
+  vectors in `tx_test.go`. (`TxIn.Amount` carries the spent value for the
+  commitment; it is not serialized.)
 - **`htlc.go`** — `KeyID(pubKey)` = HASH160(pubKey); `BuildDepositUnlockScript`
   builds the XBridge HTLC redeem script (the C++ `createDepositUnlockScript`):
   IF branch = `<lockTime> CLTV OP_DROP DUP HASH160 <KeyID(my)> EQUALVERIFY
@@ -74,4 +81,4 @@ with `SignTxInput`.
   for this foundation.
 - **Wallet connector** (`wallet/`): an RPC client to the connected SPV wallet
   that broadcasts/signs; the local `coins` signer can also sign directly.
-- Per-coin fee/utxo/dust rules; segwit (BIP143) sighash.
+- Per-coin fee/utxo/dust rules.
