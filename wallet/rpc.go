@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -226,6 +227,42 @@ func (c *RPCConnector) EstimateFee(confTarget int) (uint64, error) {
 		satPerVByte = 1
 	}
 	return uint64(satPerVByte), nil
+}
+
+// GetBlockCount returns the best block height of the coin's chain via the
+// wallet's getblockcount RPC.
+func (c *RPCConnector) GetBlockCount() (int64, error) {
+	var h int64
+	if err := c.cli.Call("getblockcount", nil, &h); err != nil {
+		return 0, err
+	}
+	return h, nil
+}
+
+// GetBlockHash returns the block hash at height as a 32-byte internal
+// (little-endian) hash, matching the XBridge wire order. Bitcoin Core's
+// getblockhash returns the hash in display (big-endian) order, so it is
+// reversed — the same convention api's reverseTxidHex uses for txids.
+func (c *RPCConnector) GetBlockHash(height int64) ([32]byte, error) {
+	var hexStr string
+	if err := c.cli.Call("getblockhash", []interface{}{height}, &hexStr); err != nil {
+		return [32]byte{}, err
+	}
+	return revHashHex(hexStr)
+}
+
+// revHashHex converts a display-order block-hash hex into the 32-byte internal
+// (little-endian) form XBridge carries on the wire.
+func revHashHex(s string) ([32]byte, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return [32]byte{}, fmt.Errorf("wallet: bad block hash %q", s)
+	}
+	var out [32]byte
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return out, nil
 }
 
 // amountFloatToBase converts a wallet float amount (coin units) to base units

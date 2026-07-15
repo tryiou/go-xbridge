@@ -49,12 +49,8 @@ A taker order `o` joins maker `t` iff:
 - **non-partial:** `t.SourceAmount == o.DestAmount` and `t.DestAmount == o.SourceAmount`
   (exact amounts);
 - **partial:** `t.SourceAmount >= o.DestAmount`, `t.DestAmount >= o.SourceAmount`,
-  and `o.DestAmount >= t.MinFromAmount`.
-
-> **[DEV]** C++ also applies `xBridgePartialOrderDriftCheck` (a price-tolerance
-> window) for partial orders. The Go port requires an exact price match for
-> determinism; relax this with a configurable tolerance when the connector layer
-> is built.
+  and `o.DestAmount >= t.MinFromAmount`; plus `xBridgePartialOrderDriftCheck`
+  (price-integrity / satoshi-level drift band, ported in `swap/price.go`).
 
 On success `t.B = o.A` and state → `trJoined`.
 
@@ -104,4 +100,3 @@ The block-height variant (`isExpiredByBlockNumber`) needs chain context and is
 - `isExpiredByBlockNumber` (requires block-index lookup).
 - The `xbridgesession*` deposit/refund construction and the
   `trSigned`/`trCommited` steps (per-coin tx in `coins/` + `wallet/`).
-- `xBridgePartialOrderDriftCheck` price tolerance.

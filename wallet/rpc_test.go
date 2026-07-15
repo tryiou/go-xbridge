@@ -36,6 +36,13 @@ func mockRPC(t *testing.T) *httptest.Server {
 			res(`"txid1234567890"`)
 		case "estimatesmartfee":
 			res(`{"feerate":0.0001,"errors":[]}`)
+		case "getblockcount":
+			res(`100`)
+		case "getblockhash":
+			// Display (big-endian) order: MSB-first. Reversed to internal
+			// (little-endian) order by revHashHex, so the internal form has
+			// 0xff in its last byte.
+			res(`"ff00000000000000000000000000000000000000000000000000000000000000"`)
 		default:
 			res(`null`)
 		}
@@ -113,6 +120,27 @@ func TestRPCConnector(t *testing.T) {
 		}
 		if fee != 10 {
 			t.Fatalf("fee = %d sat/vB, want 10", fee)
+		}
+	})
+	t.Run("GetBlockCount", func(t *testing.T) {
+		h, err := c.GetBlockCount()
+		if err != nil {
+			t.Fatalf("GetBlockCount: %v", err)
+		}
+		if h != 100 {
+			t.Fatalf("count = %d, want 100", h)
+		}
+	})
+	t.Run("GetBlockHash", func(t *testing.T) {
+		// Display-order "ff00..00" reverses to internal "00..00ff" (last byte 0xff).
+		var want [32]byte
+		want[31] = 0xff
+		h, err := c.GetBlockHash(99)
+		if err != nil {
+			t.Fatalf("GetBlockHash: %v", err)
+		}
+		if h != want {
+			t.Fatalf("hash = %x, want %x", h, want)
 		}
 	})
 }

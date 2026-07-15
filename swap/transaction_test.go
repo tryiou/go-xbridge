@@ -70,6 +70,59 @@ func TestTryJoin(t *testing.T) {
 	}
 }
 
+// TestTryJoinPartial covers the partial-order price-integrity / drift
+// check (C++ xBridgePartialOrderDriftCheck, ported in swap/price.go).
+// A taker may join when its amounts clear the maker's quoted price
+// within a satoshi-level drift band, not only on an exact match —
+// the behaviour corenet dapps depend on.
+func TestTryJoinPartial(t *testing.T) {
+	// Maker: 1 BTC (source) -> 200 LTC (dest), partial, min 10.
+	mk := NewTransaction([32]byte{1}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, true, 10, time.Unix(1000, 0))
+
+	// Taker: gives LTC (maker dest), wants BTC (maker source).
+	taker := func(src, dst uint64) *Transaction {
+		id := [32]byte{2}
+		return NewTransaction(id, "LTC", "BTC", src, dst,
+			Member{Source: aTakerSrc, Dest: aTakerDst}, true, 0, time.Unix(1000, 0))
+	}
+
+	// Exact complementary amounts join.
+	if !mk.TryJoin(taker(200, 100)) {
+		t.Error("exact partial amounts should join")
+	}
+
+	// Drift-tolerant: taker's receive (100) is within the satoshi
+	// band of the maker's quoted price, so it must join (this is
+	// what the old exact-match check incorrectly rejected).
+	mk2 := NewTransaction([32]byte{3}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, true, 10, time.Unix(1000, 0))
+	if !mk2.TryJoin(taker(199, 100)) {
+		t.Error("within-drift partial (199 LTC for 100 BTC) should join")
+	}
+
+	// Below the maker's minimum partial size -> rejected.
+	mk3 := NewTransaction([32]byte{4}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, true, 50, time.Unix(1000, 0))
+	if mk3.TryJoin(taker(49, 100)) {
+		t.Error("taker below maker minPartial should not join")
+	}
+
+	// Out-of-drift: taker takes far too little / mismatched price -> rejected.
+	mk4 := NewTransaction([32]byte{5}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, true, 10, time.Unix(1000, 0))
+	if mk4.TryJoin(taker(150, 100)) {
+		t.Error("out-of-drift partial should not join")
+	}
+
+	// Taker wants more than the maker offers -> rejected (bounds).
+	mk5 := NewTransaction([32]byte{6}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, true, 10, time.Unix(1000, 0))
+	if mk5.TryJoin(taker(200, 101)) {
+		t.Error("taker wanting more than maker source should not join")
+	}
+}
+
 // TestIncreaseStateCounterProgression walks both participants through every
 // phase and asserts the state advances only after the second confirmation.
 func TestIncreaseStateCounterProgression(t *testing.T) {

@@ -74,4 +74,11 @@ type Connector interface {
 	SendRawTransaction(txHex string) (txid string, err error)
 	// EstimateFee returns the fee rate in sat/vB for confTarget confirmations.
 	EstimateFee(confTarget int) (uint64, error)
+	// GetBlockCount returns the best block height of the coin's chain.
+	GetBlockCount() (int64, error)
+	// GetBlockHash returns the block hash at height as a 32-byte internal
+	// (little-endian) hash, matching the XBridge wire order. Used to stamp
+	// orders' anti-replay blockHash (C++ uses the BLOCK chain's
+	// chainActive.Tip()->pprev).
+	GetBlockHash(height int64) ([32]byte, error)
 }

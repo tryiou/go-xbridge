@@ -86,3 +86,12 @@ func (l *LocalConnector) SendRawTransaction(txHex string) (string, error) {
 func (l *LocalConnector) EstimateFee(confTarget int) (uint64, error) {
 	return 0, errors.New("wallet: LocalConnector has no fee source")
 }
+
+// GetBlockCount / GetBlockHash have no local blockchain source.
+func (l *LocalConnector) GetBlockCount() (int64, error) {
+	return 0, errors.New("wallet: LocalConnector has no block source")
+}
+
+func (l *LocalConnector) GetBlockHash(height int64) ([32]byte, error) {
+	return [32]byte{}, errors.New("wallet: LocalConnector has no block source")
+}

@@ -66,8 +66,11 @@ func NewTransaction(id [32]byte, srcCur, dstCur string, srcAmt, dstAmt uint64,
 }
 
 // tryJoinMatches reports whether a taker order (o) is compatible with this maker
-// order for joining. Extracted from Transaction::tryJoin
-// (xbridgetransaction.cpp:495-540).
+// order for joining. Ports Transaction::tryJoin
+// (xbridgetransaction.cpp:490-545). For partial orders it applies
+// xBridgePartialOrderDriftCheck (src/xbridge/util/xutil.cpp) on the
+// derived prices — a satoshi-level tolerance, not an exact match — so
+// partially-taken orders join the same way Blocknet core does.
 func (t *Transaction) tryJoinMatches(o *Transaction) bool {
 	if t.State != TrNew || o.State != TrNew {
 		return false
@@ -78,21 +81,23 @@ func (t *Transaction) tryJoinMatches(o *Transaction) bool {
 	if t.PartialAllowed != o.PartialAllowed {
 		return false
 	}
-	if !t.PartialAllowed {
-		if t.SourceAmount != o.DestAmount || t.DestAmount != o.SourceAmount {
+	if t.PartialAllowed {
+		// Price-integrity / drift check (C++ xBridgePartialOrderDriftCheck).
+		if !PartialOrderDriftCheck(t.SourceAmount, t.DestAmount, o.SourceAmount, o.DestAmount) {
+			return false
+		}
+		// Taker must take no more than the maker offers and give no less
+		// than the maker asks; taker's receive amount must clear the
+		// maker's minimum partial size.
+		if t.SourceAmount < o.DestAmount || t.DestAmount < o.SourceAmount {
+			return false
+		}
+		if o.DestAmount < t.MinFromAmount {
 			return false
 		}
 		return true
 	}
-	// Partial: taker wants no more than the maker offers, and gives no less
-	// than the maker asks; the taker's receive amount must clear the maker's
-	// minimum. (C++ also applies xBridgePartialOrderDriftCheck for price
-	// tolerance; we require an exact price match for determinism — see
-	// docs/swap.md §Join.)
-	if t.SourceAmount < o.DestAmount || t.DestAmount < o.SourceAmount {
-		return false
-	}
-	if o.DestAmount < t.MinFromAmount {
+	if t.SourceAmount != o.DestAmount || t.DestAmount != o.SourceAmount {
 		return false
 	}
 	return true

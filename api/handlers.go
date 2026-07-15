@@ -11,6 +11,16 @@ import (
 	"xbridge-go/wallet"
 )
 
+// fillOut is one entry of dxGetOrderFills' recent-fills list.
+type fillOut struct {
+	ID        string `json:"id"`
+	Time      string `json:"time"`
+	Maker     string `json:"maker"`
+	MakerSize string `json:"maker_size"`
+	Taker     string `json:"taker"`
+	TakerSize string `json:"taker_size"`
+}
+
 // ---------------------------------------------------------------------------
 // dxGetOrderFills — recent filled orders (session-scoped, like C++).
 // ---------------------------------------------------------------------------
@@ -26,14 +36,6 @@ func (h *HandlerCtx) dxGetOrderFills(params []json.RawMessage) (interface{}, *rp
 	}
 	combined, _ := boolParam(params, 2, true)
 
-	type fillOut struct {
-		ID        string `json:"id"`
-		Time      string `json:"time"`
-		Maker     string `json:"maker"`
-		MakerSize string `json:"maker_size"`
-		Taker     string `json:"taker"`
-		TakerSize string `json:"taker_size"`
-	}
 	out := []fillOut{}
 	for _, f := range h.Store.Fills() {
 		match := (f.Maker == maker && f.Taker == taker)

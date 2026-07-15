@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"fmt"
+	"sync"
 	"time"
 
 	"xbridge-go/coins"
@@ -45,6 +46,13 @@ type Node struct {
 	signer crypto.Signer
 	pubkey [33]byte
 	stop   chan struct{}
+
+	// blockMu guards the cached anti-replay blockHash stamped on outgoing
+	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
+	// we mirror that by querying the BLOCK connector's getblockcount/getblockhash.
+	blockMu sync.RWMutex
+	block   [32]byte
+	blockAt time.Time
 }
 
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
@@ -70,6 +78,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		n.conn = conn
 		go n.feed()
 	}
+	go n.blockLoop()
 	return n, nil
 }
 
@@ -84,6 +93,68 @@ func (n *Node) Close() error {
 		return n.conn.Close()
 	}
 	return nil
+}
+
+// blockConnector returns the connector for the BLOCK chain, whose block height
+// backs XBridge order anti-replay (C++ stamps chainActive.Tip()->pprev).
+func (n *Node) blockConnector() wallet.Connector {
+	if n.cfg == nil || n.cfg.Connectors == nil {
+		return nil
+	}
+	return n.cfg.Connectors["BLOCK"]
+}
+
+// refreshBlock fetches the BLOCK best-block hash (tip-1, mirroring C++) and
+// caches it for stamping on outgoing orders. No-op without a BLOCK connector.
+func (n *Node) refreshBlock() {
+	conn := n.blockConnector()
+	if conn == nil {
+		return
+	}
+	count, err := conn.GetBlockCount()
+	if err != nil || count < 1 {
+		return
+	}
+	h, err := conn.GetBlockHash(count - 1)
+	if err != nil {
+		return
+	}
+	n.blockMu.Lock()
+	n.block = h
+	n.blockAt = time.Now()
+	n.blockMu.Unlock()
+}
+
+// currentBlockHash returns the cached anti-replay block hash, refreshing it if
+// empty or older than a BLOCK block (~60s).
+func (n *Node) currentBlockHash() [32]byte {
+	n.blockMu.RLock()
+	fresh := n.blockAt.After(time.Now().Add(-60*time.Second)) && n.block != [32]byte{}
+	h := n.block
+	n.blockMu.RUnlock()
+	if fresh {
+		return h
+	}
+	n.refreshBlock()
+	n.blockMu.RLock()
+	h = n.block
+	n.blockMu.RUnlock()
+	return h
+}
+
+// blockLoop keeps the cached block hash fresh.
+func (n *Node) blockLoop() {
+	n.refreshBlock()
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.stop:
+			return
+		case <-t.C:
+			n.refreshBlock()
+		}
+	}
 }
 
 // feed reads packets from the peer and stores orders.
@@ -207,7 +278,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		ToCurrency:     p.Taker,
 		ToAmount:       toAmt,
 		Created:        NowMicro(),
-		BlockHash:      [32]byte{},
+		BlockHash:      n.currentBlockHash(),
 		PartialAllowed: partial,
 		MinFromAmount:  minFrom,
 	}
