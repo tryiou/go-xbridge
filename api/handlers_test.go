@@ -254,3 +254,37 @@ func TestDxWriteCommandsNoSession(t *testing.T) {
 		t.Error("dxCancelOrder(no conn) should error")
 	}
 }
+
+func TestGetNetworkInfo(t *testing.T) {
+	// Defaults when Config leaves the version blank (fall back to 4.4.1).
+	ctx := &HandlerCtx{Store: NewStore(), Node: &Node{}, Config: &Config{}}
+	res, err := ctx.getNetworkInfo(nil)
+	if err != nil {
+		t.Fatalf("getNetworkInfo: %v", err)
+	}
+	m, ok := res.(map[string]interface{})
+	if !ok {
+		t.Fatalf("getNetworkInfo result = %T", res)
+	}
+	if m["version"] != 4040100 {
+		t.Errorf("version = %v, want 4040100", m["version"])
+	}
+	if m["subversion"] != "/blocknet:4.4.1/" {
+		t.Errorf("subversion = %v, want /blocknet:4.4.1/", m["subversion"])
+	}
+	if m["connections"] != 0 {
+		t.Errorf("connections = %v, want 0 (no live conn)", m["connections"])
+	}
+	// Rejects params.
+	if _, err := ctx.getNetworkInfo([]json.RawMessage{jstr("x")}); err == nil {
+		t.Error("getNetworkInfo should reject params")
+	}
+
+	// Explicit Config overrides the defaults.
+	ctx2 := &HandlerCtx{Store: NewStore(), Node: &Node{}, Config: &Config{WalletVersion: 4120000, WalletVersionStr: "/blocknet:4.12.0/"}}
+	res2, _ := ctx2.getNetworkInfo(nil)
+	m2 := res2.(map[string]interface{})
+	if m2["version"] != 4120000 || m2["subversion"] != "/blocknet:4.12.0/" {
+		t.Errorf("override = %v / %v", m2["version"], m2["subversion"])
+	}
+}

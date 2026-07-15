@@ -46,6 +46,7 @@ var dispatch = map[string]Handler{
 	"dxSplitAddress":             (*HandlerCtx).dxSplitAddress,
 	"dxSplitInputs":              (*HandlerCtx).dxSplitInputs,
 	"dxGetUtxos":                 (*HandlerCtx).dxGetUtxos,
+	"getnetworkinfo":             (*HandlerCtx).getNetworkInfo,
 }
 
 // Lookup returns the handler for a method name, or nil if unknown.

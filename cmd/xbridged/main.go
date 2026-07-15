@@ -41,6 +41,8 @@ func main() {
 	keyHex := flag.String("key", "", "hex-encoded 32-byte secp256k1 private key (enables dxMakeOrder/dxTakeOrder/dxCancelOrder)")
 	confPath := flag.String("conf", defaultConfPath(), "path to xbridge.conf (read-only; never created)")
 	magicHex := flag.String("magic", "", "network magic (hex, 4 bytes); derived from -network if empty")
+	walletVersion := flag.Int("walletversion", 4040100, "Blocknet CLIENT_VERSION advertised in getnetworkinfo (default Blocknet 4.4.1)")
+	walletVersionStr := flag.String("walletversionstr", "/blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	flag.Parse()
 
 	var magic [4]byte
@@ -107,15 +109,17 @@ func main() {
 
 	store := api.NewStore()
 	cfg := &api.Config{
-		NodeAddr:        *nodeAddr,
-		Network:         *network,
-		AddNodes:        addNodes,
-		Magic:           magic,
-		PrivKey:         priv,
-		Confs:           conf.Coins,
-		Connectors:      connectors,
-		ExchangeWallets: conf.Main.ExchangeWallets,
-		NetworkTokens:   networkTokens,
+		NodeAddr:         *nodeAddr,
+		Network:          *network,
+		AddNodes:         addNodes,
+		Magic:            magic,
+		PrivKey:          priv,
+		Confs:            conf.Coins,
+		Connectors:       connectors,
+		ExchangeWallets:  conf.Main.ExchangeWallets,
+		NetworkTokens:    networkTokens,
+		WalletVersion:    *walletVersion,
+		WalletVersionStr: *walletVersionStr,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {

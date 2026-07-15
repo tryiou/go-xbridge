@@ -44,6 +44,11 @@ type Config struct {
 	// AddNodes are explicit peer addresses (host:port) to connect to in addition
 	// to discovered peers (the -addnode flag). Used only when NodeAddr is empty.
 	AddNodes []string
+	// WalletVersion / WalletVersionStr are advertised in the getnetworkinfo
+	// response. BLOCK-DX pings getnetworkinfo for its wallet-version gate; we
+	// advertise Blocknet 4.4.1 (CLIENT_VERSION 4040100) by default.
+	WalletVersion    int
+	WalletVersionStr string
 }
 
 // XConn is the connection surface the Node needs. Both *p2p.Conn (a single

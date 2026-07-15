@@ -8,6 +8,7 @@ import (
 
 	"xbridge-go/coins"
 	"xbridge-go/config"
+	discovery "xbridge-go/p2p/discovery"
 	"xbridge-go/wallet"
 )
 
@@ -743,4 +744,57 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 		})
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// getnetworkinfo — standard Bitcoin-core-style RPC that BLOCK-DX pings
+// (via its getinfo() wrapper) for its wallet-version gate before it will talk
+// to the wallet. We advertise a Blocknet version/subversion (configurable via
+// -walletversion/-walletversionstr, defaulting to 4.4.1) and the live peer
+// count so the dapp reports the wallet as connected. Only the fields BLOCK-DX
+// actually reads (version, subversion, connections) are meaningful; the rest
+// mirror bitcoind's shape for compatibility.
+// ---------------------------------------------------------------------------
+
+func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpcError) {
+	if len(params) != 0 {
+		return nil, makeError(errInvalidParameters, "getnetworkinfo", "no parameters")
+	}
+	ver := h.Config.WalletVersion
+	if ver == 0 {
+		ver = 4040100
+	}
+	sub := h.Config.WalletVersionStr
+	if sub == "" {
+		sub = "/blocknet:4.4.1/"
+	}
+	conns := 0
+	if h.Node != nil && h.Node.conn != nil {
+		// Discovery pool reports its live peer count; a single explicit -node
+		// conn counts as one.
+		if pm, ok := h.Node.conn.(*discovery.PeerManager); ok {
+			conns = len(pm.Peers())
+		} else {
+			conns = 1
+		}
+	}
+	return map[string]interface{}{
+		"version":         ver,
+		"subversion":      sub,
+		"protocolversion": 70015,
+		"localservices":   "000000000000000d",
+		"localrelay":      true,
+		"timeoffset":      0,
+		"networkactive":   true,
+		"connections":     conns,
+		"networks": []map[string]interface{}{
+			{"name": "ipv4", "limited": false, "reachable": true, "proxy": ""},
+			{"name": "ipv6", "limited": false, "reachable": true, "proxy": ""},
+			{"name": "onion", "limited": true, "reachable": false, "proxy": ""},
+		},
+		"relayfee":       0.00001,
+		"incrementalfee": 0.00000001,
+		"localaddresses": []interface{}{},
+		"warnings":       "",
+	}, nil
 }
