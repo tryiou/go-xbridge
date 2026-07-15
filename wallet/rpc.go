@@ -19,13 +19,13 @@ import (
 // {"result":...,"error":null|{...},"id":...} responses. The jsonrpc version and
 // content-type are configurable to honor each wallet's xbridge.conf values.
 type RPCClient struct {
-	url          string
-	user         string
-	pass         string
-	jsonVersion  string
-	contentType  string
-	http         *http.Client
-	nextID       int64
+	url         string
+	user        string
+	pass        string
+	jsonVersion string
+	contentType string
+	http        *http.Client
+	nextID      int64
 }
 
 type rpcRequest struct {

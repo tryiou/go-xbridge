@@ -215,7 +215,7 @@ func stripEnvelope(t *testing.T, rawHex string) []byte {
 		off = 1
 	}
 	start := off + 28 // skip 28-byte transport envelope
-	end := off + n     // n covers envelope + packet
+	end := off + n    // n covers envelope + packet
 	if end > len(raw) {
 		t.Fatalf("envelope length %d exceeds payload %d", n, len(raw)-start)
 	}

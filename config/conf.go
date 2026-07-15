@@ -27,10 +27,10 @@ type Main struct {
 // mirror the original createConf() keys exactly; nothing is defaulted to a
 // coin's "real" value — every value comes from the file.
 type CoinConf struct {
-	Ticker  string // section name, e.g. "BTC"
-	Title   string
-	Ip      string
-	Port    int
+	Ticker   string // section name, e.g. "BTC"
+	Title    string
+	Ip       string
+	Port     int
 	Username string
 	Password string
 
@@ -48,7 +48,7 @@ type CoinConf struct {
 
 	// Coin is the base-unit multiplier (e.g. 100000000). Decimals are derived
 	// from it (number of trailing zeros).
-	Coin uint64
+	Coin          uint64
 	MinimumAmount uint64
 	TxVersion     int
 	DustAmount    uint64
@@ -57,9 +57,9 @@ type CoinConf struct {
 	FeePerByte    uint64
 	Confirmations int
 
-	TxWithTimeField          bool
-	LockCoinsSupported       bool
-	GetNewKeySupported       bool
+	TxWithTimeField           bool
+	LockCoinsSupported        bool
+	GetNewKeySupported        bool
 	ImportWithNoScanSupported bool
 
 	// JSONVersion / ContentType are the RPC client version and content-type the
@@ -228,8 +228,8 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		Password:                  s.str("Password", ""),
 		CreateTxMethod:            s.str("CreateTxMethod", ""),
 		AddressPrefix:             s.intp("AddressPrefix", 0),
-		ScriptPrefix:             s.intp("ScriptPrefix", 0),
-		SecretPrefix:             s.intp("SecretPrefix", 0),
+		ScriptPrefix:              s.intp("ScriptPrefix", 0),
+		SecretPrefix:              s.intp("SecretPrefix", 0),
 		Coin:                      s.uintp("COIN", 0),
 		MinimumAmount:             s.uintp("MinimumAmount", 0),
 		TxVersion:                 s.intp("TxVersion", 0),

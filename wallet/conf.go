@@ -20,16 +20,16 @@ func NewConnectorFromConf(c *config.CoinConf) (Connector, error) {
 		return nil, err
 	}
 	chain := Chain{
-		Ticker:        c.Ticker,
-		Endpoint:      fmt.Sprintf("http://%s:%d", c.Ip, c.Port),
-		User:          c.Username,
-		Pass:          c.Password,
-		Decimals:      coin.Decimals,
+		Ticker:         c.Ticker,
+		Endpoint:       fmt.Sprintf("http://%s:%d", c.Ip, c.Port),
+		User:           c.Username,
+		Pass:           c.Password,
+		Decimals:       coin.Decimals,
 		CreateTxMethod: c.CreateTxMethod,
-		SegWit:        coin.SegWit,
-		JSONVersion:   c.JSONVersion,
-		ContentType:   c.ContentType,
-		Confirmations: c.Confirmations,
+		SegWit:         coin.SegWit,
+		JSONVersion:    c.JSONVersion,
+		ContentType:    c.ContentType,
+		Confirmations:  c.Confirmations,
 	}
 	return NewRPCConnector(chain), nil
 }

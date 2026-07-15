@@ -85,13 +85,13 @@ func main() {
 
 	store := api.NewStore()
 	cfg := &api.Config{
-		NodeAddr:       *nodeAddr,
-		Magic:          magic,
-		PrivKey:        priv,
-		Confs:          conf.Coins,
-		Connectors:     connectors,
+		NodeAddr:        *nodeAddr,
+		Magic:           magic,
+		PrivKey:         priv,
+		Confs:           conf.Coins,
+		Connectors:      connectors,
 		ExchangeWallets: conf.Main.ExchangeWallets,
-		NetworkTokens:  networkTokens,
+		NetworkTokens:   networkTokens,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {

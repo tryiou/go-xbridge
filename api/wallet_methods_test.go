@@ -34,7 +34,7 @@ func (s *stubConn) SendRawTransaction(txHex string) (string, error) {
 func (s *stubConn) EstimateFee(confTarget int) (uint64, error) {
 	return 2, nil
 }
-func (s *stubConn) GetBlockCount() (int64, error)        { return 100, nil }
+func (s *stubConn) GetBlockCount() (int64, error) { return 100, nil }
 func (s *stubConn) GetBlockHash(height int64) ([32]byte, error) {
 	var h [32]byte
 	h[0] = 0xab
