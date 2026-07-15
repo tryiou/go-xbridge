@@ -241,6 +241,15 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
    + `xbitcointransaction*`: build/serialize each coin's deposit/refund tx and
    parse addresses/amounts. UTXO coins share `xbitcointransaction`; Decred
    (`xbridgesessiondcr`) is special.
+   - **Body field layouts: DONE (2026-07-15).** `proto/body_types.go` ports
+     every `XBridgeCommand`'s body 1:1 from the C++ writers
+     (`xbridgeapp.cpp` `sendPendingTransaction` for `xbcTransaction` (3);
+     `xbridgesession.cpp` for `xbcPendingTransaction` (4) and the swap
+     commands; `xbridgeapp.cpp` `acceptXBridgeTransaction` for
+     `xbcTransactionAccepting` (5)). The C++ header enum comments are STALE and
+     were deliberately NOT followed where they disagree with the real writers
+     (see the note at the top of `body_types.go`). `xbcTransaction` is decoded
+     end-to-end from a live captured packet in `proto/body_test.go`.
 5. **Wallet connector RPC** — `src/xbridge/bitcoinrpcconnector*` exposes
    Blocknet core RPC; the connected SPV wallet (incl. BLOCK) signs + pays the
    service-node fee. Implement the connector interface in `wallet/`.

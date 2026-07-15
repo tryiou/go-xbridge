@@ -25,6 +25,16 @@ func (w *BodyWriter) Uint64(v uint64) {
 	w.buf = append(w.buf, b[:]...)
 }
 
+// Uint16 appends a little-endian uint16 (matches C++ append(uint16_t)).
+func (w *BodyWriter) Uint16(v uint16) {
+	var b [2]byte
+	binary.LittleEndian.PutUint16(b[:], v)
+	w.buf = append(w.buf, b[:]...)
+}
+
+// PubKey appends a 33-byte compressed secp256k1 public key.
+func (w *BodyWriter) PubKey(p [33]byte) { w.buf = append(w.buf, p[:]...) }
+
 // Bytes appends raw bytes unchanged.
 func (w *BodyWriter) Bytes(b []byte) { w.buf = append(w.buf, b...) }
 
@@ -75,6 +85,25 @@ func (r *BodyReader) Uint64() (uint64, error) {
 	v := binary.LittleEndian.Uint64(r.data[r.pos:])
 	r.pos += 8
 	return v, nil
+}
+
+func (r *BodyReader) Uint16() (uint16, error) {
+	if r.remaining() < 2 {
+		return 0, errors.New("xbridge: body underflow (uint16)")
+	}
+	v := binary.LittleEndian.Uint16(r.data[r.pos:])
+	r.pos += 2
+	return v, nil
+}
+
+func (r *BodyReader) PubKey() ([33]byte, error) {
+	var p [33]byte
+	b, err := r.Bytes(33)
+	if err != nil {
+		return p, err
+	}
+	copy(p[:], b)
+	return p, nil
 }
 
 func (r *BodyReader) Bytes(n int) ([]byte, error) {

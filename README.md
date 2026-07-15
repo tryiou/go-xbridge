@@ -16,7 +16,7 @@ wallet-connector abstraction.
 
 | Package | State | What it does |
 |---------|-------|--------------|
-| `proto` | foundational | Packet header/body codec, command set, signing digest. Stdlib only; unit-tested. |
+| `proto` | wired + tested | Packet header/body codec, command set, signing digest, **and per-`XBridgeCommand` body layouts** (all commands 2–50 ported 1:1 from the C++ writers, incl. `xbcTransaction`/`xbcPendingTransaction`/`xbcTransactionAccepting`). `DecodeBody` dispatches to typed structs. The `xbcTransaction` layout is **validated against a live captured packet** (decodes `DOGE→BLOCK` with 1 UTXO). Stdlib only; unit-tested. |
 | `p2p`   | partial | Bitcoin P2P framing + `version`/`verack` handshake **live-verified** against a real Blocknet 4.4.1 node; `xbridge` transport envelope (varint + 20-byte dest addr + 8-byte ts) wrap/unwrap the `XBridgePacket` (`p2p/envelope.go`); `ReadPacket`/`WritePacket` decode/encode it. `cmd/liveprobe` exercises a live node. |
 | `crypto`| wired + tested | `BtcSigner` over `btcd/btcec/v2`: 64-byte compact ECDSA over `Packet.Digest()`; round-trip + tamper tests pass. |
 | `coins` | partial | Stdlib-only: coin registry + amount parsing + address codec (base58/bech32) **+ UTXO tx model, serialization, HTLC script, and SIGHASH_ALL signing/verification** (`script.go`, `tx.go`, `htlc.go`); unit-tested (`docs/coins.md`). Non-UTXO chains (DCR/PART) still todo. |
