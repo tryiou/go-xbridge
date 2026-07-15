@@ -12,16 +12,19 @@ import (
 	"xbridge-go/coins"
 )
 
-// RPCClient is a minimal Bitcoin-Core-style JSON-RPC 1.0 client (HTTP + basic
+// RPCClient is a minimal Bitcoin-Core-style JSON-RPC client (HTTP + basic
 // auth), used to talk to the connected SPV wallet / node. Bitcoin Core uses
 // {"jsonrpc":"1.0","id":...,"method":...,"params":[...]} requests and
-// {"result":...,"error":null|{...},"id":...} responses.
+// {"result":...,"error":null|{...},"id":...} responses. The jsonrpc version and
+// content-type are configurable to honor each wallet's xbridge.conf values.
 type RPCClient struct {
-	url    string
-	user   string
-	pass   string
-	http   *http.Client
-	nextID int64
+	url          string
+	user         string
+	pass         string
+	jsonVersion  string
+	contentType  string
+	http         *http.Client
+	nextID       int64
 }
 
 type rpcRequest struct {
@@ -43,15 +46,23 @@ type rpcResponse struct {
 }
 
 // NewRPCClient builds a client for the given endpoint + basic-auth credentials.
-func NewRPCClient(url, user, pass string) *RPCClient {
-	return &RPCClient{url: url, user: user, pass: pass, http: &http.Client{}}
+// jsonVersion and contentType honor the wallet's xbridge.conf (defaults applied
+// by the caller if empty).
+func NewRPCClient(url, user, pass, jsonVersion, contentType string) *RPCClient {
+	if jsonVersion == "" {
+		jsonVersion = "1.0"
+	}
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	return &RPCClient{url: url, user: user, pass: pass, jsonVersion: jsonVersion, contentType: contentType, http: &http.Client{}}
 }
 
 // Call invokes method with params and unmarshals the result into out.
 func (c *RPCClient) Call(method string, params []interface{}, out interface{}) error {
 	id := fmt.Sprintf("xbg-%d", c.nextID)
 	c.nextID++
-	body, err := json.Marshal(rpcRequest{JSONRPC: "1.0", ID: id, Method: method, Params: params})
+	body, err := json.Marshal(rpcRequest{JSONRPC: c.jsonVersion, ID: id, Method: method, Params: params})
 	if err != nil {
 		return err
 	}
@@ -60,7 +71,7 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 		return err
 	}
 	req.SetBasicAuth(c.user, c.pass)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", c.contentType)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -97,17 +108,17 @@ type RPCConnector struct {
 
 // NewRPCConnector builds a Connector for the given chain endpoint.
 func NewRPCConnector(chain Chain) *RPCConnector {
-	return &RPCConnector{chain: chain, cli: NewRPCClient(chain.Endpoint, chain.User, chain.Pass)}
+	return &RPCConnector{chain: chain, cli: NewRPCClient(chain.Endpoint, chain.User, chain.Pass, chain.JSONVersion, chain.ContentType)}
 }
 
 func (c *RPCConnector) Ticker() string { return c.chain.Ticker }
 
-// GetNewAddress returns a fresh receive address (native segwit when available,
-// otherwise the wallet default).
+// GetNewAddress returns a fresh receive address (native segwit when the chain
+// supports it, otherwise the wallet default P2PKH).
 func (c *RPCConnector) GetNewAddress() (string, error) {
-	addrType := "bech32"
-	if !coins.MustGet(c.chain.Ticker).SegWit {
-		addrType = ""
+	addrType := ""
+	if c.chain.SegWit {
+		addrType = "bech32"
 	}
 	var addr string
 	if err := c.cli.Call("getnewaddress", []interface{}{"", addrType}, &addr); err != nil {

@@ -1,0 +1,101 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+const sampleConf = `
+[Main]
+ExchangeWallets=BTC,DOGE,BLOCK
+ShowAllOrders=1
+FullLog=0
+
+[BTC]
+Title=Bitcoin
+Ip=127.0.0.1
+Port=8332
+Username=bitcoinrpc
+Password=secret
+CreateTxMethod=BTC
+AddressPrefix=0
+ScriptPrefix=5
+SecretPrefix=128
+COIN=100000000
+TxVersion=1
+DustAmount=546
+MinTxFee=1000
+BlockTime=600
+FeePerByte=2
+Confirmations=2
+JSONVersion=1.0
+ContentType=application/json
+
+[BLOCK]
+Title=Blocknet
+Ip=127.0.0.1
+Port=41414
+Username=blockrpc
+Password=blocksecret
+CreateTxMethod=BLOCK
+AddressPrefix=26
+ScriptPrefix=28
+SecretPrefix=154
+COIN=100000000
+TxVersion=1
+DustAmount=1000
+BlockTime=60
+FeePerByte=20
+Confirmations=10
+`
+
+func writeConf(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "xbridge.conf")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write conf: %v", err)
+	}
+	return p
+}
+
+func TestLoadSample(t *testing.T) {
+	p := writeConf(t, sampleConf)
+	conf, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(conf.Main.ExchangeWallets) != 3 ||
+		conf.Main.ExchangeWallets[0] != "BTC" ||
+		conf.Main.ExchangeWallets[1] != "DOGE" ||
+		conf.Main.ExchangeWallets[2] != "BLOCK" {
+		t.Errorf("ExchangeWallets = %v", conf.Main.ExchangeWallets)
+	}
+	if !conf.Main.ShowAllOrders {
+		t.Error("ShowAllOrders should be true")
+	}
+
+	btc, ok := conf.Coins["BTC"]
+	if !ok {
+		t.Fatal("BTC section missing")
+	}
+	if btc.Port != 8332 || btc.Coin != 100000000 || btc.CreateTxMethod != "BTC" {
+		t.Errorf("BTC conf wrong: %+v", btc)
+	}
+
+	// BLOCK is configured exactly like any other coin (no special-casing).
+	block, ok := conf.Coins["BLOCK"]
+	if !ok {
+		t.Fatal("BLOCK section missing")
+	}
+	if block.Port != 41414 || block.CreateTxMethod != "BLOCK" || block.Ip != "127.0.0.1" {
+		t.Errorf("BLOCK conf wrong: %+v", block)
+	}
+}
+
+func TestLoadMissing(t *testing.T) {
+	if _, err := Load(filepath.Join(t.TempDir(), "does-not-exist.conf")); err == nil {
+		t.Fatal("expected error for missing conf")
+	}
+}

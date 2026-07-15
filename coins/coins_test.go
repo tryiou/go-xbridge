@@ -2,9 +2,63 @@ package coins
 
 import (
 	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
+
+	"xbridge-go/config"
 )
+
+// TestMain seeds the coin registry from a fixture xbridge.conf so the existing
+// codec tests (which call MustGet) run against conf-derived coins rather than a
+// hardcoded map.
+func TestMain(m *testing.M) {
+	f, err := os.CreateTemp("", "xbridge-*.conf")
+	if err != nil {
+		panic(err)
+	}
+	defer os.Remove(f.Name())
+	body := `[Main]
+ExchangeWallets=BTC,BLOCK,DOGE
+
+[BTC]
+Title=Bitcoin
+CreateTxMethod=BTC
+AddressPrefix=0
+ScriptPrefix=5
+SecretPrefix=128
+COIN=100000000
+TxVersion=1
+
+[BLOCK]
+Title=Blocknet
+CreateTxMethod=BLOCK
+AddressPrefix=26
+ScriptPrefix=28
+SecretPrefix=154
+COIN=100000000
+
+[DOGE]
+Title=Dogecoin
+CreateTxMethod=DOGE
+AddressPrefix=30
+ScriptPrefix=22
+SecretPrefix=158
+COIN=100000000
+`
+	if _, err := f.WriteString(body); err != nil {
+		panic(err)
+	}
+	f.Close()
+	conf, err := config.Load(f.Name())
+	if err != nil {
+		panic(err)
+	}
+	if err := InitFromConf(conf.Coins); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
 
 func TestBase58RoundTrip(t *testing.T) {
 	samples := []string{

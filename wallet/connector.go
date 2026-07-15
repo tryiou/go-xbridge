@@ -16,13 +16,26 @@
 package wallet
 
 // Chain identifies a coin wallet endpoint: the connected SPV wallet (or full
-// node) exposing Blocknet-core-compatible RPC for that ticker.
+// node) exposing Blocknet-core-compatible RPC for that ticker. Every field is
+// derived from the coin's [TICKER] section in xbridge.conf (nothing hardcoded).
 type Chain struct {
 	Ticker   string // wire ticker, e.g. "BTC"
 	Endpoint string // http(s)://host:port
 	User     string // RPC auth user
 	Pass     string // RPC auth pass
-	Decimals int    // base-unit precision (8 for BTC/BLOCK/…)
+	Decimals int    // base-unit precision (from COIN in conf)
+
+	// CreateTxMethod selects the transaction-construction path (from conf).
+	CreateTxMethod string
+	// SegWit is whether the chain has native segwit addresses (derived from
+	// CreateTxMethod, mirroring C++'s connector classes).
+	SegWit bool
+	// JSONVersion / ContentType are the RPC client version and content-type the
+	// wallet expects (from conf; defaults applied by the builder).
+	JSONVersion string
+	ContentType string
+	// Confirmations is the min confirmations for spendable UTXOs (from conf).
+	Confirmations int
 }
 
 // Utxo is a spendable output usable to fund a deposit transaction.

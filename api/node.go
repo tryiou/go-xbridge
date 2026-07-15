@@ -6,9 +6,11 @@ import (
 	"time"
 
 	"xbridge-go/coins"
+	"xbridge-go/config"
 	"xbridge-go/crypto"
 	"xbridge-go/p2p"
 	"xbridge-go/proto"
+	"xbridge-go/wallet"
 )
 
 // Config tunes a Node.
@@ -22,10 +24,14 @@ type Config struct {
 	// Empty disables order creation (dxMakeOrder/dxTakeOrder/dxCancelOrder
 	// return a no-session error, matching Blocknet when no wallet is loaded).
 	PrivKey []byte
-	// LocalTokens overrides the token list returned by dxGetLocalTokens. Nil
-	// means "all coins known to the registry".
-	LocalTokens []string
-	// NetworkTokens overrides the token list returned by dxGetNetworkTokens.
+	// Confs holds the parsed [TICKER] sections from xbridge.conf.
+	Confs map[string]*config.CoinConf
+	// Connectors maps ticker -> the wallet connector xbridge-go drives for it
+	// (built from xbridge.conf). Wallet-backed dx* methods use this.
+	Connectors map[string]wallet.Connector
+	// ExchangeWallets is the local-wallet list from [Main].ExchangeWallets.
+	ExchangeWallets []string
+	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
 }
 
@@ -128,7 +134,7 @@ type MakeOrderParams struct {
 }
 
 func decodeAddr(currency, addrStr string) ([20]byte, *rpcError) {
-	c, ok := coins.Coins[currency]
+	c, ok := coins.Get(currency)
 	if !ok {
 		return [20]byte{}, makeError(errInvalidParameters, "dxMakeOrder", "unsupported currency: "+currency)
 	}

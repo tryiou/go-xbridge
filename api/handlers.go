@@ -1,10 +1,14 @@
 package api
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	"xbridge-go/coins"
+	"xbridge-go/config"
+	"xbridge-go/wallet"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,10 +74,10 @@ func (h *HandlerCtx) dxGetOrders(params []json.RawMessage) (interface{}, *rpcErr
 		}
 		// Only show orders for assets we know about (mirrors the local-wallet
 		// filter in C++; a thin client without a wallet shows all known coins).
-		if _, ok := coins.Coins[o.FromCurrency]; !ok {
+		if !coins.Has(o.FromCurrency) {
 			continue
 		}
-		if _, ok := coins.Coins[o.ToCurrency]; !ok {
+		if !coins.Has(o.ToCurrency) {
 			continue
 		}
 		out = append(out, o.toListResult())
@@ -102,23 +106,31 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *rpcError) {
-	return knownTokens(h.Config.LocalTokens), nil
+	return knownTokens(h.Config.ExchangeWallets), nil
 }
 
 func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, *rpcError) {
 	return knownTokens(h.Config.NetworkTokens), nil
 }
 
-func knownTokens(override []string) []string {
-	if override != nil {
-		return override
-	}
-	out := make([]string, 0, len(coins.Coins))
-	for k := range coins.Coins {
-		out = append(out, k)
-	}
+func knownTokens(tickers []string) []string {
+	out := make([]string, 0, len(tickers))
+	out = append(out, tickers...)
 	sort.Strings(out)
 	return out
+}
+
+// connector returns the wallet connector configured for ticker, or a no-session
+// business error (mirroring C++ when no wallet is loaded for that coin).
+func (h *HandlerCtx) connector(ticker string) (wallet.Connector, *rpcError) {
+	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
+		return nil, makeError(errNoSession, "dx", "no wallet configured")
+	}
+	conn, ok := h.Node.cfg.Connectors[ticker]
+	if !ok || conn == nil {
+		return nil, makeError(errNoSession, "dx", "no wallet configured for "+ticker)
+	}
+	return conn, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -133,15 +145,24 @@ func (h *HandlerCtx) dxLoadXBridgeConf(params []json.RawMessage) (interface{}, *
 // dxGetNewTokenAddress — fresh address(es) for a token (requires wallet).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// dxGetNewTokenAddress — fresh address(es) for a token (requires wallet).
+// ---------------------------------------------------------------------------
+
 func (h *HandlerCtx) dxGetNewTokenAddress(params []json.RawMessage) (interface{}, *rpcError) {
 	ticker, ok := strParam(params, 0)
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetNewTokenAddress", "(ticker)")
 	}
-	_ = ticker
-	// A wallet connector is required to derive addresses; the thin client
-	// returns an empty array when none is configured.
-	return []string{}, nil
+	conn, e := h.connector(ticker)
+	if e != nil {
+		return nil, e
+	}
+	addr, err := conn.GetNewAddress()
+	if err != nil {
+		return nil, makeError(errUnknown, "dxGetNewTokenAddress", err.Error())
+	}
+	return []string{addr}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +317,28 @@ func bookEntry(detail int, price, size string, id [32]byte, count int) []interfa
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, *rpcError) {
-	// Returns an object keyed by ticker -> balance string, plus a "Wallet" key.
-	return map[string]string{}, nil
+	out := map[string]string{}
+	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
+		return out, nil
+	}
+	for _, ticker := range h.Node.cfg.ExchangeWallets {
+		conn, ok := h.Node.cfg.Connectors[ticker]
+		if !ok || conn == nil {
+			continue
+		}
+		utxos, err := conn.ListUnspent(0)
+		if err != nil {
+			continue
+		}
+		var total uint64
+		for _, u := range utxos {
+			total += u.Amount
+		}
+		if c, ok := coins.Get(ticker); ok {
+			out[ticker] = coins.FormatAmount(c, total)
+		}
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -441,14 +482,229 @@ func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpc
 	if len(params) < 3 {
 		return nil, makeError(errInvalidParameters, "dxSplitAddress", "(token) (splitamount) (address) (include_fees, default=true)[optional] (show_rawtx, default=false)[optional] (submit, default=true)[optional]")
 	}
-	return nil, makeError(errNoSession, "dxSplitAddress", "a wallet connector is required to split UTXOs")
+	ticker, _ := strParam(params, 0)
+	splitAmt, _ := strParam(params, 1)
+	address, _ := strParam(params, 2)
+	includeFees, _ := boolParam(params, 3, true)
+	showRawTx, _ := boolParam(params, 4, false)
+	submit, _ := boolParam(params, 5, true)
+	return h.splitTx(ticker, splitAmt, address, includeFees, showRawTx, submit, nil)
 }
 
 func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcError) {
 	if len(params) < 6 {
 		return nil, makeError(errInvalidParameters, "dxSplitInputs", "(token) (splitamount) (address) (include_fees) (show_rawtx) (submit) (utxos)[optional]")
 	}
-	return nil, makeError(errNoSession, "dxSplitInputs", "a wallet connector is required to split UTXOs")
+	ticker, _ := strParam(params, 0)
+	splitAmt, _ := strParam(params, 1)
+	address, _ := strParam(params, 2)
+	includeFees, _ := boolParam(params, 3, true)
+	showRawTx, _ := boolParam(params, 4, false)
+	submit, _ := boolParam(params, 5, true)
+
+	var utxos []wallet.Utxo
+	if len(params) > 6 {
+		c, ok := coins.Get(ticker)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxSplitInputs", "unknown coin: "+ticker)
+		}
+		u, e := parseUtxoParam(c, params[6])
+		if e != nil {
+			return nil, e
+		}
+		utxos = u
+	}
+	return h.splitTx(ticker, splitAmt, address, includeFees, showRawTx, submit, utxos)
+}
+
+// splitTx builds, signs and optionally submits a UTXO-split transaction for the
+// given coin: it sends `splitAmount` (base units) to `address` across as many
+// outputs as the selected inputs allow, returning change to a fresh address.
+// Legacy P2PKH/P2SH outputs only (native segwit split is a follow-up). VERIFY:
+// exact C++ return shape/semantics (include_fees handling, rawtx/txid, utxos
+// field names).
+func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees, showRawTx, submit bool, utxos []wallet.Utxo) (interface{}, *rpcError) {
+	conn, e := h.connector(ticker)
+	if e != nil {
+		return nil, e
+	}
+	c, ok := coins.Get(ticker)
+	if !ok {
+		return nil, makeError(errInvalidParameters, "dxSplit", "unknown coin: "+ticker)
+	}
+	target, err := coins.ParseAmount(c, splitAmountStr)
+	if err != nil {
+		return nil, makeError(errInvalidParameters, "dxSplit", "invalid split amount")
+	}
+	cc, _ := h.Node.cfg.Confs[ticker]
+
+	if len(utxos) == 0 {
+		minConf := 0
+		if cc != nil {
+			minConf = cc.Confirmations
+		}
+		utxos, err = conn.ListUnspent(minConf)
+		if err != nil {
+			return nil, makeError(errUnknown, "dxSplit", err.Error())
+		}
+	}
+	if len(utxos) == 0 {
+		return nil, makeError(errInsufficientFunds, "dxSplit", "no UTXOs to split")
+	}
+
+	destScript, e := legacyOutputScript(c, address)
+	if e != nil {
+		return nil, e
+	}
+	changeAddr, err := conn.GetNewAddress()
+	if err != nil {
+		return nil, makeError(errUnknown, "dxSplit", err.Error())
+	}
+	changeScript, e := legacyOutputScript(c, changeAddr)
+	if e != nil {
+		return nil, e
+	}
+
+	var total uint64
+	var prevTxs []wallet.PrevTx
+	for _, u := range utxos {
+		total += u.Amount
+		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
+	}
+
+	// Fee estimate (fallback to conf FeePerByte when estimatesmartfee is absent).
+	fee := estimateFee(cc, len(utxos), 2)
+	nSplits := total / target
+	for nSplits > 0 && total < nSplits*target+fee {
+		nSplits--
+	}
+	if nSplits == 0 {
+		return nil, makeError(errInsufficientFunds, "dxSplit", "insufficient funds for split amount")
+	}
+
+	spent := nSplits*target + fee
+	change := uint64(0)
+	if total > spent {
+		change = total - spent
+	}
+	if cc != nil && change < cc.DustAmount {
+		fee += change
+		change = 0
+	}
+
+	tx := &coins.Tx{Version: 1}
+	if cc != nil && cc.TxVersion != 0 {
+		tx.Version = int32(cc.TxVersion)
+	}
+	for _, u := range utxos {
+		hash, err := reverseTxidHex(u.TxID)
+		if err != nil {
+			return nil, makeError(errInvalidParameters, "dxSplit", "bad utxo txid: "+u.TxID)
+		}
+		tx.Inputs = append(tx.Inputs, coins.TxIn{
+			PrevOut:  coins.OutPoint{Hash: hash, Index: u.Vout},
+			Sequence: 0xffffffff,
+		})
+	}
+	for i := uint64(0); i < nSplits; i++ {
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: target, ScriptPubKey: destScript})
+	}
+	if change > 0 {
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: change, ScriptPubKey: changeScript})
+	}
+
+	unsigned := hex.EncodeToString(tx.Serialize())
+	signedHex, complete, err := conn.SignRawTransaction(unsigned, prevTxs)
+	if err != nil {
+		return nil, makeError(errUnknown, "dxSplit", err.Error())
+	}
+	if !complete {
+		return nil, makeError(errUnknown, "dxSplit", "signing incomplete (wallet missing keys?)")
+	}
+
+	res := map[string]interface{}{"address": address}
+	if submit {
+		txid, err := conn.SendRawTransaction(signedHex)
+		if err != nil {
+			return nil, makeError(errUnknown, "dxSplit", err.Error())
+		}
+		res["txid"] = txid
+		if showRawTx {
+			res["rawtx"] = signedHex
+		}
+	} else {
+		res["rawtx"] = signedHex
+	}
+	return res, nil
+}
+
+// estimateFee returns a rough satoshi fee for a tx with nIn inputs and nOut
+// outputs, using the connector's estimate when available and conf FeePerByte
+// otherwise.
+func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
+	// Rough virtual-size estimate (legacy inputs/outputs).
+	vsize := nIn*148 + nOut*34 + 10
+	if cc == nil || cc.FeePerByte == 0 {
+		// 2 sat/vB default.
+		return uint64(vsize * 2)
+	}
+	return cc.FeePerByte * uint64(vsize)
+}
+
+// legacyOutputScript builds a P2PKH/P2SH output script for addr. Native segwit
+// destinations are rejected in A1 (BIP143 signing not yet implemented).
+func legacyOutputScript(c coins.Coin, addr string) ([]byte, *rpcError) {
+	a, err := c.DecodeAddress(addr)
+	if err != nil {
+		return nil, makeError(errInvalidAddress, "dxSplit", addr)
+	}
+	var h [20]byte
+	copy(h[:], a.Hash)
+	switch a.Kind {
+	case coins.P2PKH:
+		return coins.BuildP2PKHScript(h), nil
+	case coins.P2SH:
+		return coins.BuildP2SHScript(h), nil
+	default:
+		return nil, makeError(errInvalidAddress, "dxSplit", "segwit destinations not supported for split in A1: "+addr)
+	}
+}
+
+// reverseTxidHex converts a display-order txid hex into the 32-byte internal
+// (little-endian) form Bitcoin uses in outpoints.
+func reverseTxidHex(s string) ([32]byte, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return [32]byte{}, fmt.Errorf("bad txid %q", s)
+	}
+	var out [32]byte
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return out, nil
+}
+
+// parseUtxoParam parses the explicit-utxos array argument of dxSplitInputs.
+func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError) {
+	var arr []struct {
+		TxID         string `json:"txid"`
+		Vout         uint32 `json:"vout"`
+		Amount       string `json:"amount"`
+		ScriptPubKey string `json:"scriptPubKey"`
+		Address      string `json:"address"`
+	}
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxos array")
+	}
+	out := make([]wallet.Utxo, 0, len(arr))
+	for _, x := range arr {
+		amt, err := coins.ParseAmount(c, x.Amount)
+		if err != nil {
+			return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxo amount")
+		}
+		out = append(out, wallet.Utxo{TxID: x.TxID, Vout: x.Vout, Address: x.Address, Amount: amt, ScriptPubKey: x.ScriptPubKey})
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +716,29 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetUtxos", "(token) (include_used, default=false)[optional]")
 	}
-	_ = ticker
-	return []interface{}{}, nil
+	conn, e := h.connector(ticker)
+	if e != nil {
+		return nil, e
+	}
+	minConf := 0
+	if cc, ok := h.Node.cfg.Confs[ticker]; ok {
+		minConf = cc.Confirmations
+	}
+	utxos, err := conn.ListUnspent(minConf)
+	if err != nil {
+		return nil, makeError(errUnknown, "dxGetUtxos", err.Error())
+	}
+	c, _ := coins.Get(ticker)
+	out := make([]map[string]interface{}, 0, len(utxos))
+	for _, u := range utxos {
+		out = append(out, map[string]interface{}{
+			"txid":          u.TxID,
+			"vout":          u.Vout,
+			"address":       u.Address,
+			"amount":        coins.FormatAmount(c, u.Amount),
+			"scriptPubKey":  u.ScriptPubKey,
+			"confirmations": u.Confirmations,
+		})
+	}
+	return out, nil
 }

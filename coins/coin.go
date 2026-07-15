@@ -1,10 +1,17 @@
 package coins
 
+import (
+	"fmt"
+
+	"xbridge-go/config"
+)
+
 // Coin describes a UTXO-based blockchain traded over XBridge. The address
 // parameters are the version bytes / HRP the connected wallet uses; they drive
-// address decoding/encoding in address.go. Values for the coins below are taken
-// from each chain's mainnet chainparams. Entries marked [VERIFY] should be
-// double-checked against the upstream source before being relied on.
+// address decoding/encoding in address.go. NO coin values are hardcoded: every
+// Coin is built at startup from its [TICKER] section in xbridge.conf via
+// InitFromConf. The original core-wallet XBridge supplies these same values
+// through xbridge.conf, so xbridge-go simply mirrors that (read-only).
 type Coin struct {
 	Ticker    string // wire ticker, e.g. "BTC"
 	Name      string
@@ -15,14 +22,83 @@ type Coin struct {
 	SegWit    bool   // whether native segwit (bech32/bech32m) addresses exist
 }
 
-// Known mainnet coins. XBridge's wallet connectors cover more chains; this is
-// the initial, foundation set needed by coins/.
-var Coins = map[string]Coin{
-	"BTC":   {Ticker: "BTC", Name: "Bitcoin", Decimals: 8, P2PKH: 0x00, P2SH: 0x05, Bech32HRP: "bc", SegWit: true},
-	"LTC":   {Ticker: "LTC", Name: "Litecoin", Decimals: 8, P2PKH: 0x30, P2SH: 0x32, Bech32HRP: "ltc", SegWit: true},
-	"DOGE":  {Ticker: "DOGE", Name: "Dogecoin", Decimals: 8, P2PKH: 0x1e, P2SH: 0x16, Bech32HRP: "", SegWit: false},
-	"DGB":   {Ticker: "DGB", Name: "Digibyte", Decimals: 8, P2PKH: 0x1e, P2SH: 0x3f, Bech32HRP: "dgb", SegWit: true}, // [VERIFY]
-	"BLOCK": {Ticker: "BLOCK", Name: "Blocknet", Decimals: 8, P2PKH: 0x1a, P2SH: 0x1c, Bech32HRP: "", SegWit: false},
+// Coins is the runtime registry, populated entirely from xbridge.conf by
+// InitFromConf. It starts empty — there is no baked-in set.
+var Coins = map[string]Coin{}
+
+// InitFromConf populates the registry from parsed xbridge.conf sections. It
+// clears any previous contents first, so the registry always reflects exactly
+// the coins named in conf (nothing more, nothing less).
+func InitFromConf(confs map[string]*config.CoinConf) error {
+	Coins = map[string]Coin{}
+	for ticker, c := range confs {
+		coin, err := FromConf(c)
+		if err != nil {
+			return err
+		}
+		Coins[ticker] = coin
+	}
+	return nil
+}
+
+// FromConf builds a Coin from a single [TICKER] conf section.
+func FromConf(c *config.CoinConf) (Coin, error) {
+	if c.Coin == 0 {
+		return Coin{}, fmt.Errorf("coins: %s: COIN not set in xbridge.conf", c.Ticker)
+	}
+	return Coin{
+		Ticker:    c.Ticker,
+		Name:      c.Title,
+		Decimals:  decimalsFromCoin(c.Coin),
+		P2PKH:     byte(c.AddressPrefix),
+		P2SH:      byte(c.ScriptPrefix),
+		Bech32HRP: bech32HRPFromMethod(c.CreateTxMethod),
+		SegWit:    segWitFromMethod(c.CreateTxMethod),
+	}, nil
+}
+
+// decimalsFromCoin returns the number of decimal places implied by the base-unit
+// multiplier (e.g. 100000000 -> 8). COIN is always a power of ten in XBridge.
+func decimalsFromCoin(coin uint64) int {
+	d := 0
+	for coin > 0 && coin%10 == 0 {
+		d++
+		coin /= 10
+	}
+	if d == 0 {
+		// Fallback for a malformed COIN; most chains use 8.
+		return 8
+	}
+	return d
+}
+
+// segWitFromMethod maps a CreateTxMethod to whether the chain supports native
+// segwit. The original XBridge encodes this inside each wallet-connector class;
+// the method string is supplied by xbridge.conf, so the table merely reproduces
+// C++'s per-connector selection (no coin is hardcoded in the registry itself).
+func segWitFromMethod(m string) bool {
+	switch normalizeTicker(m) {
+	case "BTC", "LTC", "DGB":
+		return true
+	default:
+		return false
+	}
+}
+
+// bech32HRPFromMethod maps a CreateTxMethod to its native-segwit HRP. Empty
+// string means the chain has no native segwit addresses. Mirrors the per-chain
+// HRP constant in C++'s connector classes; the method string comes from conf.
+func bech32HRPFromMethod(m string) string {
+	switch normalizeTicker(m) {
+	case "BTC":
+		return "bc"
+	case "LTC":
+		return "ltc"
+	case "DGB":
+		return "dgb"
+	default:
+		return ""
+	}
 }
 
 // Get returns the Coin for a ticker (case-insensitive), or false.
@@ -39,6 +115,12 @@ func MustGet(ticker string) Coin {
 		panic("coins: unknown coin " + ticker)
 	}
 	return c
+}
+
+// Has reports whether a ticker is registered.
+func Has(ticker string) bool {
+	_, ok := Coins[normalizeTicker(ticker)]
+	return ok
 }
 
 func normalizeTicker(t string) string {
