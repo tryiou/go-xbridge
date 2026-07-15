@@ -15,8 +15,8 @@ func TestVersionMarshalShape(t *testing.T) {
 	payload := m.Marshal()
 
 	// version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26)
-	// + nonce(8) + varstr(userAgent) + start_height(4) + relay(1)
-	wantLen := 4 + 8 + 8 + 26 + 26 + 8 + (1 + len(UserAgent)) + 4 + 1
+	// + nonce(8) + varstr(userAgent) + start_height(4) + relay(1) + fxrouter(1)
+	wantLen := 4 + 8 + 8 + 26 + 26 + 8 + (1 + len(UserAgent)) + 4 + 1 + 1
 	if len(payload) != wantLen {
 		t.Fatalf("version payload len = %d, want %d", len(payload), wantLen)
 	}
@@ -28,9 +28,12 @@ func TestVersionMarshalShape(t *testing.T) {
 	if m.Services != ServiceNodeNone {
 		t.Errorf("services = %d, want %d", m.Services, ServiceNodeNone)
 	}
-	// relay bool is the final byte.
+	// fxrouter bool is the final byte; relay is the second-to-last.
 	if payload[len(payload)-1] != 0 {
-		t.Errorf("relay byte = %d, want 0", payload[len(payload)-1])
+		t.Errorf("fxrouter byte = %d, want 0", payload[len(payload)-1])
+	}
+	if payload[len(payload)-2] != 0 {
+		t.Errorf("relay byte = %d, want 0", payload[len(payload)-2])
 	}
 	// addr_recv begins at offset 20 (version 4 + services 8 + timestamp 8),
 	// so its port (big-endian) sits at 20+8+16 = 44.
@@ -59,5 +62,49 @@ func TestVersionMarshalNilRemote(t *testing.T) {
 	payload := m.Marshal()
 	if len(payload) == 0 {
 		t.Fatal("marshalled payload is empty")
+	}
+}
+
+// TestVersionFXRouterRoundTrip verifies the trailing fXRouter byte marshals and
+// unmarshals independently of Relay, and that a payload without the fXRouter
+// byte (older peers / best-effort parsing) still parses with fXRouter=false.
+func TestVersionFXRouterRoundTrip(t *testing.T) {
+	remote, _ := net.ResolveTCPAddr("tcp", "1.2.3.4:41412")
+	m := NewVersion(remote)
+	payload := m.Marshal()
+
+	got, err := UnmarshalVersion(payload)
+	if err != nil {
+		t.Fatalf("UnmarshalVersion: %v", err)
+	}
+	if got.FXRouter != false {
+		t.Errorf("fXRouter = %v, want false", got.FXRouter)
+	}
+	if got.Relay != false {
+		t.Errorf("relay = %v, want false", got.Relay)
+	}
+
+	// A payload that explicitly sets fXRouter=true must round-trip.
+	m.FXRouter = true
+	got2, err := UnmarshalVersion(m.Marshal())
+	if err != nil {
+		t.Fatalf("UnmarshalVersion(true): %v", err)
+	}
+	if !got2.FXRouter {
+		t.Errorf("fXRouter = %v, want true", got2.FXRouter)
+	}
+
+	// Back-compat: drop the final byte (no fXRouter). Relay stays readable and
+	// fXRouter defaults to false (so discovery is enabled, as C++ requires).
+	short := payload[:len(payload)-1]
+	got3, err := UnmarshalVersion(short)
+	if err != nil {
+		t.Fatalf("UnmarshalVersion(short): %v", err)
+	}
+	if got3.FXRouter != false {
+		t.Errorf("short fXRouter = %v, want false", got3.FXRouter)
+	}
+	if got3.Relay != false {
+		t.Errorf("short relay = %v, want false", got3.Relay)
 	}
 }

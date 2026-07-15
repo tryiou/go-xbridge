@@ -33,6 +33,13 @@ type VersionMessage struct {
 	UserAgent   string
 	StartHeight int32
 	Relay       bool
+	// FXRouter is the trailing byte in Blocknet's version message. Service
+	// nodes (XRouter) set it true; a thin client leaves it false. C++ only
+	// reads it `if (!vRecv.empty())`, so a peer that omits the byte defaults
+	// to false — which is what enables address gossip (the peer sends us
+	// getaddr and advertises its addr list). We send it explicitly false so
+	// discovery works against stock service nodes.
+	FXRouter bool
 }
 
 // NetAddr is a Bitcoin net_addr (services, IP, port) without a timestamp. The
@@ -99,7 +106,7 @@ func marshalVarStr(s string) []byte {
 //
 //	version(4 LE) || services(8 LE) || timestamp(8 LE) ||
 //	addr_recv(26) || addr_from(26) || nonce(8 LE) ||
-//	user_agent(varstr) || start_height(4 LE) || relay(1)
+//	user_agent(varstr) || start_height(4 LE) || relay(1) || fxrouter(1)
 func (m *VersionMessage) Marshal() []byte {
 	buf := new(bytes.Buffer)
 	var f [8]byte
@@ -117,6 +124,11 @@ func (m *VersionMessage) Marshal() []byte {
 	binary.LittleEndian.PutUint32(f[:4], uint32(m.StartHeight))
 	buf.Write(f[:4])
 	if m.Relay {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+	if m.FXRouter {
 		buf.WriteByte(1)
 	} else {
 		buf.WriteByte(0)
@@ -143,6 +155,7 @@ func NewVersion(remote net.Addr) *VersionMessage {
 		UserAgent:   UserAgent,
 		StartHeight: 0, // thin client has no chain height
 		Relay:       false,
+		FXRouter:    false, // thin client is not an XRouter hub
 	}
 }
 
@@ -190,6 +203,10 @@ func UnmarshalVersion(b []byte) (*VersionMessage, error) {
 	pos += 4
 	if pos < len(b) {
 		m.Relay = b[pos] != 0
+		pos++
+	}
+	if pos < len(b) {
+		m.FXRouter = b[pos] != 0
 	}
 	return m, nil
 }

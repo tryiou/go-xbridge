@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"xbridge-go/config"
 	"xbridge-go/crypto"
 	"xbridge-go/p2p"
+	discovery "xbridge-go/p2p/discovery"
 	"xbridge-go/proto"
 	"xbridge-go/wallet"
 )
@@ -35,17 +38,34 @@ type Config struct {
 	ExchangeWallets []string
 	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
+	// Network is the Blocknet network to discover on: "mainnet" (default),
+	// "testnet", or "staging". Used only when NodeAddr is empty (discovery).
+	Network string
+	// AddNodes are explicit peer addresses (host:port) to connect to in addition
+	// to discovered peers (the -addnode flag). Used only when NodeAddr is empty.
+	AddNodes []string
+}
+
+// XConn is the connection surface the Node needs. Both *p2p.Conn (a single
+// explicit service node, used when Config.NodeAddr is set) and
+// *discovery.PeerManager (an automatically-discovered pool, used when NodeAddr
+// is empty) satisfy it, so PeerManager is a drop-in replacement.
+type XConn interface {
+	ReadPacket() (*proto.Packet, error)
+	WritePacket(*proto.Packet) error
+	Close() error
 }
 
 // Node is the live XBridge client: it maintains a P2P connection to a service
-// node, ingests order broadcasts into the Store, and builds/signs/broadcasts
-// the packets for dxMakeOrder / dxTakeOrder / dxCancelOrder. It also drives the
-// client side of the three-party swap handshake (maker⇄hub⇄taker) when a local
-// order is taken: each SwapSession responds to hub-originated packets and builds
-// /broadcasts the HTLC deposits and their claim/refund spends.
+// node (or a discovered pool of them), ingests order broadcasts into the Store,
+// and builds/signs/broadcasts the packets for dxMakeOrder / dxTakeOrder /
+// dxCancelOrder. It also drives the client side of the three-party swap
+// handshake (maker⇄hub⇄taker) when a local order is taken: each SwapSession
+// responds to hub-originated packets and builds /broadcasts the HTLC deposits
+// and their claim/refund spends.
 type Node struct {
 	cfg    *Config
-	conn   *p2p.Conn
+	conn   XConn
 	store  *Store
 	signer crypto.Signer
 	pubkey [33]byte
@@ -82,13 +102,30 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		n.pubkey = pk
 	}
 	if cfg.NodeAddr != "" {
+		// Explicit single-peer override: skip discovery, dial the given
+		// service node directly (the legacy behaviour).
 		conn, err := p2p.Dial(cfg.NodeAddr, cfg.Magic, 30*time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("api: dial service node: %w", err)
 		}
 		n.conn = conn
-		go n.feed()
+		log.Printf("xbridge-go: connected to explicit service node %s", cfg.NodeAddr)
+	} else {
+		// No explicit node: discover the Blocknet P2P network like a core
+		// wallet would — pick seeds, connect, then gossip to learn peers.
+		network := cfg.Network
+		if network == "" {
+			network = "mainnet"
+		}
+		pm := discovery.New(cfg.Magic, network, discovery.Options{
+			ExplicitAddrs: cfg.AddNodes,
+			TargetPeers:   8,
+		})
+		pm.Start(context.Background())
+		n.conn = pm
+		log.Printf("xbridge-go: network discovery started on %q (target %d peers)", network, 8)
 	}
+	go n.feed()
 	go n.blockLoop()
 	return n, nil
 }

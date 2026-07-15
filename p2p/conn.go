@@ -173,3 +173,23 @@ func (c *Conn) NetConn() net.Conn { return c.netConn }
 func (c *Conn) ReadMessage() (*Message, error) { return c.readMessage() }
 
 func (c *Conn) Close() error { return c.netConn.Close() }
+
+// WriteMessage sends a raw, already-constructed P2P message (any command).
+// Used by the discovery layer to exchange getaddr/addr/ping/pong directly.
+func (c *Conn) WriteMessage(m *Message) error {
+	_, err := c.netConn.Write(m.Marshal())
+	return err
+}
+
+// SendCommand sends a P2P message with the given command name and payload.
+// The caller is responsible for the payload being correctly framed for that
+// command (e.g. via p2p.MarshalAddr for an "addr" message).
+func (c *Conn) SendCommand(cmd string, payload []byte) error {
+	msg := &Message{
+		Magic:    c.magic,
+		Command:  cmd,
+		Payload:  payload,
+		Checksum: Checksum(payload),
+	}
+	return c.WriteMessage(msg)
+}
