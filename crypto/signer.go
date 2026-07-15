@@ -95,3 +95,15 @@ func (BtcSigner) Verify(p *proto.Packet) (bool, error) {
 	d := p.Digest()
 	return sig.Verify(d[:], pub), nil
 }
+
+// CompressedPubKey derives the 33-byte compressed secp256k1 public key for a
+// 32-byte private scalar, without signing anything.
+func CompressedPubKey(priv []byte) ([33]byte, error) {
+	if len(priv) != 32 {
+		return [33]byte{}, errors.New("crypto: private key must be 32 bytes")
+	}
+	key, _ := btcec.PrivKeyFromBytes(priv)
+	var p [33]byte
+	copy(p[:], key.PubKey().SerializeCompressed())
+	return p, nil
+}
