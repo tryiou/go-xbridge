@@ -211,6 +211,55 @@ Timing constants (`xbridgetransaction.h:54-67`):
 highest-risk part of the reimplementation.** Port `src/test/xbridge_tests.cpp`
 and `src/test/bswap_tests.cpp` as the acceptance oracle.
 
+### 4.1 Swap command body layouts (authoritative — CORRECTED 2026-07-15)
+
+These are the exact on-the-wire field orders for the 8 swap commands. They were
+read from the **real C++ writers** (`xbridgeapp.cpp` / `xbridgesession.cpp`),
+**not** from the `xbridgepacket.h` enum comments, which are STALE and must NOT
+be trusted. The most important correction: the `Create*` / `Created*` /
+`Confirm*` / `Confirmed*` bodies carry **no `ClientAddress`** — only `HoldApply`
+(7), `Init` (8) and `Initialized` (9) do. (See the note at the top of
+`proto/body_types.go`.)
+
+| Cmd | Name | Field order |
+|-----|------|-------------|
+| 6  | `xbcTransactionHold`       | Hub ‖ ID |
+| 7  | `xbcTransactionHoldApply`  | Hub ‖ Client ‖ ID |
+| 8  | `xbcTransactionInit`       | Client ‖ Hub ‖ ID ‖ FromAddr ‖ FromCur ‖ FromAmt ‖ ToAddr ‖ ToCur ‖ ToAmt |
+| 9  | `xbcTransactionInitialized`| Hub ‖ Client ‖ ID |
+| 10 | `xbcTransactionCreateA`    | Hub ‖ ID ‖ BPubKey |
+| 11 | `xbcTransactionCreatedA`   | Hub ‖ ID ‖ ADepositTxID ‖ HashedSecret ‖ ALockTime ‖ RefTxID ‖ RefTx |
+| 12 | `xbcTransactionCreateB`    | Hub ‖ ID ‖ APubKey ‖ ADepositTxID ‖ HashedSecret ‖ ALockTime |
+| 13 | `xbcTransactionCreatedB`   | Hub ‖ ID ‖ BDepositTxID ‖ BLockTime ‖ RefTxID ‖ RefTx |
+| 18 | `xbcTransactionConfirmA`   | Hub ‖ ID ‖ BDepositTxID ‖ BLockTime |
+| 19 | `xbcTransactionConfirmedA` | Hub ‖ ID ‖ APayTxID |
+| 20 | `xbcTransactionConfirmB`   | Hub ‖ ID ‖ APayTxID |
+| 21 | `xbcTransactionConfirmedB` | Hub ‖ ID ‖ BPayTxID |
+| 24 | `xbcTransactionFinished`   | ID |
+
+Notes:
+
+- **`HashedSecret`** is the 20-byte HASH160 of the maker's secret preimage (the
+  maker's 33-byte compressed xPubKey). Both deposits share it.
+- **`RefTx`** (11, 13) is the pre-signed IF-branch CLTV refund (hex), spendable
+  only after the deposit's `ALockTime` / `BLockTime`. `RefTxID` is its txid.
+- **Locktimes** are absolute block heights: `currentBlock + target / blockTime`,
+  with target 7200 s (maker, A) / 1800 s (taker, B) per `xbridgewallet.h`. The
+  deposit tx itself carries `LockTime = 0`; the CLTV lives on the refund/payment
+  *spend*.
+- The **HTLC redeem script** (`coins.BuildDepositUnlockScript`) is:
+  - IF branch: `CLTV refund to DepositorPub` (enabled by input sequence
+    `< 0xffffffff` on the refund tx);
+  - ELSE branch: `pay CounterpartyPub if HASH160(preimage) == secretHash`.
+  - The maker's deposit A has `DepositorPub = makerPubKey`,
+    `CounterpartyPub = takerPubKey`; the taker's deposit B is mirrored. Both use
+    the same `secretHash`.
+- The maker reveals the secret by broadcasting the ELSE-branch payTx that spends
+  B's deposit; the taker recovers the 33-byte preimage from A's payTx
+  (`GetRawTransaction(APayTxID)`, first 33-byte push of input[0].ScriptSig) and
+  spends A's deposit. This is implemented in `api/swap.go` (`TestSwapHandshake`
+  in `api/swap_test.go` drives it end-to-end with fake connectors).
+
 ---
 
 ## 5. Signing

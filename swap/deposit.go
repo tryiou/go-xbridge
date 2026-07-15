@@ -68,7 +68,9 @@ func (d *DepositSpec) P2SHScript() []byte {
 // BuildDepositTx builds the unsigned deposit transaction that locks Amount into
 // the P2SH HTLC, spending funding UTXOs and returning change to changeAddr.
 // Input sequence is set below 0xffffffff so the CLTV refund branch is
-// spendable. Legacy (P2PKH) change only — native segwit change is a follow-up.
+// spendable. The deposit tx itself has LockTime 0 so it confirms immediately;
+// the CLTV (d.LockTime) is enforced on the *refund spend*, not the deposit.
+// Legacy (P2PKH) change only — native segwit change is a follow-up.
 func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee uint64) (*coins.Tx, error) {
 	if len(funding) == 0 {
 		return nil, errors.New("swap: no funding UTXOs for deposit")
@@ -80,7 +82,7 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 	if total < d.Amount+fee {
 		return nil, errors.New("swap: funding insufficient for deposit + fee")
 	}
-	tx := &coins.Tx{Version: 1, LockTime: d.LockTime}
+	tx := &coins.Tx{Version: 1, LockTime: 0}
 	for _, u := range funding {
 		h, err := reverseHashHex(u.TxID)
 		if err != nil {

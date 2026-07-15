@@ -501,18 +501,29 @@ func (b *InitializedBody) Unmarshal(data []byte) error {
 // ---------------------------------------------------------------------------
 // xbcTransactionCreateA (10) / xbcTransactionCreatedA (11)
 // xbcTransactionCreateB (12) / xbcTransactionCreatedB (13)
+//
+// Authoritative field orders (src/xbridge/xbridgesession.cpp writers —
+// the xbridgepacket.h prose comments for these commands are STALE and were
+// NOT followed):
+//   CreateA  (10, hub→maker): hubAddr | id | B_pubkey
+//   CreatedA (11, maker→hub): hubAddr | id | ADepositTxID | HashedSecret
+//                                  | ALockTime | refTxId | refTx
+//                                  (NO BLockTime)
+//   CreateB  (12, hub→taker): hubAddr | id | A_pubkey | ADepositTxID
+//                                  | HashedSecret | ALockTime
+//                                  (NO BLockTime)
+//   CreatedB (13, taker→hub): hubAddr | id | BDepositTxID | BLockTime
+//                                  | refTxId | refTx
 // ---------------------------------------------------------------------------
 
 type CreateABody struct {
-	ClientAddress [20]byte
-	HubAddress    [20]byte
-	ID            [32]byte
-	BPubKey       [33]byte
+	HubAddress [20]byte
+	ID         [32]byte
+	BPubKey    [33]byte
 }
 
 func (b *CreateABody) Marshal() []byte {
 	w := NewBodyWriter()
-	w.Addr(b.ClientAddress)
 	w.Addr(b.HubAddress)
 	w.Hash(b.ID)
 	w.PubKey(b.BPubKey)
@@ -522,9 +533,6 @@ func (b *CreateABody) Marshal() []byte {
 func (b *CreateABody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
@@ -538,24 +546,24 @@ func (b *CreateABody) Unmarshal(data []byte) error {
 }
 
 type CreatedABody struct {
-	HubAddress    [20]byte
-	ClientAddress [20]byte
-	ID            [32]byte
-	ADepositTxID  string // null-terminated string
-	HashedSecret  [20]byte
-	ALockTime     uint32
-	BLockTime     uint32
+	HubAddress   [20]byte
+	ID           [32]byte
+	ADepositTxID string // null-terminated string
+	HashedSecret [20]byte
+	ALockTime    uint32
+	RefTxID      string // null-terminated refund-tx id string
+	RefTx        string // null-terminated full refund-tx hex
 }
 
 func (b *CreatedABody) Marshal() []byte {
 	w := NewBodyWriter()
 	w.Addr(b.HubAddress)
-	w.Addr(b.ClientAddress)
 	w.Hash(b.ID)
 	w.String(b.ADepositTxID)
 	w.Addr(b.HashedSecret)
 	w.Uint32(b.ALockTime)
-	w.Uint32(b.BLockTime)
+	w.String(b.RefTxID)
+	w.String(b.RefTx)
 	return w.Payload()
 }
 
@@ -563,9 +571,6 @@ func (b *CreatedABody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
 	if b.HubAddress, err = r.Addr(); err != nil {
-		return err
-	}
-	if b.ClientAddress, err = r.Addr(); err != nil {
 		return err
 	}
 	if b.ID, err = r.Hash(); err != nil {
@@ -580,42 +585,38 @@ func (b *CreatedABody) Unmarshal(data []byte) error {
 	if b.ALockTime, err = r.Uint32(); err != nil {
 		return err
 	}
-	if b.BLockTime, err = r.Uint32(); err != nil {
+	if b.RefTxID, err = r.String(); err != nil {
+		return err
+	}
+	if b.RefTx, err = r.String(); err != nil {
 		return err
 	}
 	return nil
 }
 
 type CreateBBody struct {
-	ClientAddress [20]byte
-	HubAddress    [20]byte
-	ID            [32]byte
-	APubKey       [33]byte
-	ADepositTxID  string
-	HashedSecret  [20]byte
-	ALockTime     uint32
-	BLockTime     uint32
+	HubAddress   [20]byte
+	ID           [32]byte
+	APubKey      [33]byte
+	ADepositTxID string
+	HashedSecret [20]byte
+	ALockTime    uint32
 }
 
 func (b *CreateBBody) Marshal() []byte {
 	w := NewBodyWriter()
-	w.Addr(b.ClientAddress)
 	w.Addr(b.HubAddress)
 	w.Hash(b.ID)
 	w.PubKey(b.APubKey)
 	w.String(b.ADepositTxID)
 	w.Addr(b.HashedSecret)
 	w.Uint32(b.ALockTime)
-	w.Uint32(b.BLockTime)
 	return w.Payload()
 }
 
 func (b *CreateBBody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
@@ -634,25 +635,26 @@ func (b *CreateBBody) Unmarshal(data []byte) error {
 	if b.ALockTime, err = r.Uint32(); err != nil {
 		return err
 	}
-	if b.BLockTime, err = r.Uint32(); err != nil {
-		return err
-	}
 	return nil
 }
 
 type CreatedBBody struct {
-	HubAddress    [20]byte
-	ClientAddress [20]byte
-	ID            [32]byte
-	BDepositTxID  string
+	HubAddress   [20]byte
+	ID           [32]byte
+	BDepositTxID string
+	BLockTime    uint32
+	RefTxID      string
+	RefTx        string
 }
 
 func (b *CreatedBBody) Marshal() []byte {
 	w := NewBodyWriter()
 	w.Addr(b.HubAddress)
-	w.Addr(b.ClientAddress)
 	w.Hash(b.ID)
 	w.String(b.BDepositTxID)
+	w.Uint32(b.BLockTime)
+	w.String(b.RefTxID)
+	w.String(b.RefTx)
 	return w.Payload()
 }
 
@@ -662,13 +664,19 @@ func (b *CreatedBBody) Unmarshal(data []byte) error {
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
 	}
 	if b.BDepositTxID, err = r.String(); err != nil {
+		return err
+	}
+	if b.BLockTime, err = r.Uint32(); err != nil {
+		return err
+	}
+	if b.RefTxID, err = r.String(); err != nil {
+		return err
+	}
+	if b.RefTx, err = r.String(); err != nil {
 		return err
 	}
 	return nil
@@ -680,27 +688,24 @@ func (b *CreatedBBody) Unmarshal(data []byte) error {
 // ---------------------------------------------------------------------------
 
 type ConfirmABody struct {
-	ClientAddress [20]byte
-	HubAddress    [20]byte
-	ID            [32]byte
-	BDepositTxID  string
+	HubAddress   [20]byte
+	ID           [32]byte
+	BDepositTxID string
+	BLockTime    uint32
 }
 
 func (b *ConfirmABody) Marshal() []byte {
 	w := NewBodyWriter()
-	w.Addr(b.ClientAddress)
 	w.Addr(b.HubAddress)
 	w.Hash(b.ID)
 	w.String(b.BDepositTxID)
+	w.Uint32(b.BLockTime)
 	return w.Payload()
 }
 
 func (b *ConfirmABody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
@@ -710,22 +715,24 @@ func (b *ConfirmABody) Unmarshal(data []byte) error {
 	if b.BDepositTxID, err = r.String(); err != nil {
 		return err
 	}
+	if b.BLockTime, err = r.Uint32(); err != nil {
+		return err
+	}
 	return nil
 }
 
 type ConfirmedABody struct {
-	HubAddress    [20]byte
-	ClientAddress [20]byte
-	ID            [32]byte
-	XPubKey       [33]byte
+	HubAddress [20]byte
+	ID         [32]byte
+	APayTxID   string // null-terminated string; the secret preimage is
+	// revealed on-chain in this payTx, NOT carried in the packet.
 }
 
 func (b *ConfirmedABody) Marshal() []byte {
 	w := NewBodyWriter()
 	w.Addr(b.HubAddress)
-	w.Addr(b.ClientAddress)
 	w.Hash(b.ID)
-	w.PubKey(b.XPubKey)
+	w.String(b.APayTxID)
 	return w.Payload()
 }
 
@@ -735,68 +742,56 @@ func (b *ConfirmedABody) Unmarshal(data []byte) error {
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
 	}
-	if b.XPubKey, err = r.PubKey(); err != nil {
+	if b.APayTxID, err = r.String(); err != nil {
 		return err
 	}
 	return nil
 }
 
 type ConfirmBBody struct {
-	ClientAddress [20]byte
-	HubAddress    [20]byte
-	ID            [32]byte
-	XPubKey       [33]byte
-	ADepositTxID  string
+	HubAddress [20]byte
+	ID         [32]byte
+	APayTxID   string // null-terminated string; carries A's payTx id so the
+	// taker can recover the secret preimage from it.
 }
 
 func (b *ConfirmBBody) Marshal() []byte {
 	w := NewBodyWriter()
-	w.Addr(b.ClientAddress)
 	w.Addr(b.HubAddress)
 	w.Hash(b.ID)
-	w.PubKey(b.XPubKey)
-	w.String(b.ADepositTxID)
+	w.String(b.APayTxID)
 	return w.Payload()
 }
 
 func (b *ConfirmBBody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
 	}
-	if b.XPubKey, err = r.PubKey(); err != nil {
-		return err
-	}
-	if b.ADepositTxID, err = r.String(); err != nil {
+	if b.APayTxID, err = r.String(); err != nil {
 		return err
 	}
 	return nil
 }
 
 type ConfirmedBBody struct {
-	HubAddress    [20]byte
-	ClientAddress [20]byte
-	ID            [32]byte
+	HubAddress [20]byte
+	ID         [32]byte
+	BPayTxID   string
 }
 
 func (b *ConfirmedBBody) Marshal() []byte {
 	w := NewBodyWriter()
 	w.Addr(b.HubAddress)
-	w.Addr(b.ClientAddress)
 	w.Hash(b.ID)
+	w.String(b.BPayTxID)
 	return w.Payload()
 }
 
@@ -806,10 +801,10 @@ func (b *ConfirmedBBody) Unmarshal(data []byte) error {
 	if b.HubAddress, err = r.Addr(); err != nil {
 		return err
 	}
-	if b.ClientAddress, err = r.Addr(); err != nil {
+	if b.ID, err = r.Hash(); err != nil {
 		return err
 	}
-	if b.ID, err = r.Hash(); err != nil {
+	if b.BPayTxID, err = r.String(); err != nil {
 		return err
 	}
 	return nil
@@ -872,13 +867,11 @@ func (b *RejectBody) Unmarshal(data []byte) error {
 // ---------------------------------------------------------------------------
 
 type FinishedBody struct {
-	ClientAddress [20]byte
-	ID            [32]byte
+	ID [32]byte
 }
 
 func (b *FinishedBody) Marshal() []byte {
 	w := NewBodyWriter()
-	w.Addr(b.ClientAddress)
 	w.Hash(b.ID)
 	return w.Payload()
 }
@@ -886,9 +879,6 @@ func (b *FinishedBody) Marshal() []byte {
 func (b *FinishedBody) Unmarshal(data []byte) error {
 	r := NewBodyReader(data)
 	var err error
-	if b.ClientAddress, err = r.Addr(); err != nil {
-		return err
-	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
 	}

@@ -95,15 +95,24 @@ transition), matching C++'s single `m_a_stateChanged`/`m_b_stateChanged` pair.
 The block-height variant (`isExpiredByBlockNumber`) needs chain context and is
 **not** ported yet.
 
-## 6. Not yet ported
+## 6. Porting status
 
-- `isExpiredByBlockNumber` (requires block-index lookup).
-- The full `xbridgesession*` coordination loop: the lockTime exchange
-  (xbcTransactionInit, command 8), broadcasting/observing deposit txids, and the
-  claim/refund *spending* of the HTLC outputs (the ELSE payment branch reveals
-  the secret; the IF branch is the CLTV refund). `swap/deposit.go` already
-  builds the deposit tx + HTLC scripts and `swap/session.go` advances the gate
-  when both deposits confirm; the P2P packet exchange + output spending remain.
+- `isExpiredByBlockNumber` (requires block-index lookup) — **not yet ported**.
+- The **three-party CLIENT driver** (the `xbridgesession*` coordination loop as a
+  thin client) is implemented in `api/swap.go`, NOT in `swap/`. It is the
+  XBridge CLIENT side of the Maker ⇄ ServiceNode HUB ⇄ Taker protocol: the local
+  `SwapSession` responds to hub-originated packets and performs the on-chain work
+  (build/broadcast the HTLC deposit, redeem the counterparty's deposit revealing
+  the secret, pre-build the CLTV refund). It is driven end-to-end by
+  `TestSwapHandshake` in `api/swap_test.go`.
+  - `swap/deposit.go` builds the deposit tx + HTLC scripts; `swap/session.go`
+    advances the two-confirmation gate when both deposits confirm (the
+    authoritative-hub state machine is owned by the service node, so the client
+    only tracks its own handshake step in `SwapSession.state`).
+  - The CLTV refund (`BuildRefundScriptSig`) and ELSE-branch payment
+    (`BuildPaymentScriptSig`, revealing the secret) are built locally by the
+    client in `api/swap.go`. The taker recovers the secret from the maker's payTx
+    via `conn.GetRawTransaction(APayTxID)`.
 
 ## 7. Deposit layer (`swap/deposit.go`, `swap/session.go`)
 

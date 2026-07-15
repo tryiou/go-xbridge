@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -38,7 +39,10 @@ type Config struct {
 
 // Node is the live XBridge client: it maintains a P2P connection to a service
 // node, ingests order broadcasts into the Store, and builds/signs/broadcasts
-// the packets for dxMakeOrder / dxTakeOrder / dxCancelOrder.
+// the packets for dxMakeOrder / dxTakeOrder / dxCancelOrder. It also drives the
+// client side of the three-party swap handshake (maker⇄hub⇄taker) when a local
+// order is taken: each SwapSession responds to hub-originated packets and builds
+// /broadcasts the HTLC deposits and their claim/refund spends.
 type Node struct {
 	cfg    *Config
 	conn   *p2p.Conn
@@ -46,6 +50,12 @@ type Node struct {
 	signer crypto.Signer
 	pubkey [33]byte
 	stop   chan struct{}
+
+	// sessMu guards sessions, the set of in-flight swaps we are a party to
+	// (keyed by order-id hex). The live hub drives each one through its packet
+	// sequence; the local SwapSession responds and signs the on-chain ops.
+	sessMu   sync.Mutex
+	sessions map[string]*SwapSession
 
 	// blockMu guards the cached anti-replay blockHash stamped on outgoing
 	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
@@ -58,10 +68,11 @@ type Node struct {
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		cfg:    cfg,
-		store:  store,
-		signer: crypto.NewBtcSigner(),
-		stop:   make(chan struct{}),
+		cfg:      cfg,
+		store:    store,
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		sessions: map[string]*SwapSession{},
 	}
 	if len(cfg.PrivKey) == 32 {
 		pk, err := crypto.CompressedPubKey(cfg.PrivKey)
@@ -186,8 +197,83 @@ func (n *Node) feed() {
 		case *proto.PendingTransactionBody:
 			o := normalizeFromPendingBody(b, maker)
 			n.store.Add(o)
+
+		// --- swap handshake (client side, hub-driven) ---
+		case *proto.HoldBody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnHold(b)
+			})
+		case *proto.InitBody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnInit(b)
+			})
+		case *proto.CreateABody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnCreateA(b)
+			})
+		case *proto.CreateBBody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnCreateB(b)
+			})
+		case *proto.ConfirmABody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnConfirmA(b)
+			})
+		case *proto.ConfirmBBody:
+			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnConfirmB(b)
+			})
+		case *proto.FinishedBody:
+			n.dispatchSwap(b.ID, [20]byte{}, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return s.OnFinished(b)
+			})
 		}
 	}
+}
+
+// responseBody is implemented by every proto body the swap driver returns.
+type responseBody interface {
+	Marshal() []byte
+}
+
+// dispatchSwap routes a hub-originated handshake packet to the local session for
+// the given order id, runs the session handler, and (if it produced a response)
+// signs and broadcasts it. Packets for order ids we are not a party to are
+// ignored. The optional hub address is recorded on the session so responses are
+// addressed correctly.
+func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
+	n.sessMu.Lock()
+	s := n.sessions[hexEncode(id[:])]
+	n.sessMu.Unlock()
+	if s == nil {
+		return
+	}
+	if hub != ([20]byte{}) {
+		s.hub = hub
+	}
+	cmd, body, err := fn(s)
+	if err != nil {
+		return
+	}
+	if body == nil {
+		return
+	}
+	_ = n.send(cmd, body)
+}
+
+// send signs and broadcasts a handshake response packet.
+func (n *Node) send(cmd proto.XBridgeCommand, body responseBody) error {
+	if n.conn == nil {
+		return errors.New("api: not connected to a service node")
+	}
+	if len(n.cfg.PrivKey) != 32 {
+		return errors.New("api: no private key configured")
+	}
+	pkt := proto.NewPacket(cmd, body.Marshal())
+	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
+		return err
+	}
+	return n.conn.WritePacket(pkt)
 }
 
 // MakeOrderParams are the parsed dxMakeOrder / dxMakePartialOrder arguments.
@@ -305,6 +391,8 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	}
 	if !p.DryRun {
 		n.store.Add(o)
+		// Begin driving the client-side deposit handshake for this order.
+		n.newMakerSession(o, p)
 	}
 	return o, nil
 }
@@ -368,6 +456,8 @@ func (n *Node) TakeOrder(p TakeOrderParams) (*Order, *rpcError) {
 	}
 	o.Updated = NowMicro()
 	o.Status = "accepting"
+	// Begin driving the client-side deposit handshake for this taken order.
+	n.newTakerSession(o, p)
 	return o, nil
 }
 

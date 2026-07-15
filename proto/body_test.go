@@ -135,42 +135,42 @@ func TestSwapBodiesRoundTrip(t *testing.T) {
 		func(d []byte) error { var b InitializedBody; return b.Unmarshal(d) })
 	roundTrip(t, "CreateABody",
 		func() []byte {
-			return (&CreateABody{ClientAddress: [20]byte{1}, HubAddress: [20]byte{2}, ID: [32]byte{3}, BPubKey: [33]byte{4}}).Marshal()
+			return (&CreateABody{HubAddress: [20]byte{2}, ID: [32]byte{3}, BPubKey: [33]byte{4}}).Marshal()
 		},
 		func(d []byte) error { var b CreateABody; return b.Unmarshal(d) })
 	roundTrip(t, "CreatedABody",
 		func() []byte {
-			return (&CreatedABody{HubAddress: [20]byte{1}, ClientAddress: [20]byte{2}, ID: [32]byte{3}, ADepositTxID: "abc", HashedSecret: [20]byte{4}, ALockTime: 5, BLockTime: 6}).Marshal()
+			return (&CreatedABody{HubAddress: [20]byte{1}, ID: [32]byte{3}, ADepositTxID: "abc", HashedSecret: [20]byte{4}, ALockTime: 5, RefTxID: "r1", RefTx: "deadbeef"}).Marshal()
 		},
 		func(d []byte) error { var b CreatedABody; return b.Unmarshal(d) })
 	roundTrip(t, "CreateBBody",
 		func() []byte {
-			return (&CreateBBody{ClientAddress: [20]byte{1}, HubAddress: [20]byte{2}, ID: [32]byte{3}, APubKey: [33]byte{4}, ADepositTxID: "abc", HashedSecret: [20]byte{5}, ALockTime: 6, BLockTime: 7}).Marshal()
+			return (&CreateBBody{HubAddress: [20]byte{2}, ID: [32]byte{3}, APubKey: [33]byte{4}, ADepositTxID: "abc", HashedSecret: [20]byte{5}, ALockTime: 6}).Marshal()
 		},
 		func(d []byte) error { var b CreateBBody; return b.Unmarshal(d) })
 	roundTrip(t, "CreatedBBody",
 		func() []byte {
-			return (&CreatedBBody{HubAddress: [20]byte{1}, ClientAddress: [20]byte{2}, ID: [32]byte{3}, BDepositTxID: "xyz"}).Marshal()
+			return (&CreatedBBody{HubAddress: [20]byte{1}, ID: [32]byte{3}, BDepositTxID: "xyz", BLockTime: 9, RefTxID: "r2", RefTx: "cafe"}).Marshal()
 		},
 		func(d []byte) error { var b CreatedBBody; return b.Unmarshal(d) })
 	roundTrip(t, "ConfirmABody",
 		func() []byte {
-			return (&ConfirmABody{ClientAddress: [20]byte{1}, HubAddress: [20]byte{2}, ID: [32]byte{3}, BDepositTxID: "bdeps"}).Marshal()
+			return (&ConfirmABody{HubAddress: [20]byte{2}, ID: [32]byte{3}, BDepositTxID: "bdeps", BLockTime: 8}).Marshal()
 		},
 		func(d []byte) error { var b ConfirmABody; return b.Unmarshal(d) })
 	roundTrip(t, "ConfirmedABody",
 		func() []byte {
-			return (&ConfirmedABody{HubAddress: [20]byte{1}, ClientAddress: [20]byte{2}, ID: [32]byte{3}, XPubKey: [33]byte{4}}).Marshal()
+			return (&ConfirmedABody{HubAddress: [20]byte{1}, ID: [32]byte{3}, APayTxID: "apay"}).Marshal()
 		},
 		func(d []byte) error { var b ConfirmedABody; return b.Unmarshal(d) })
 	roundTrip(t, "ConfirmBBody",
 		func() []byte {
-			return (&ConfirmBBody{ClientAddress: [20]byte{1}, HubAddress: [20]byte{2}, ID: [32]byte{3}, XPubKey: [33]byte{4}, ADepositTxID: "adep"}).Marshal()
+			return (&ConfirmBBody{HubAddress: [20]byte{2}, ID: [32]byte{3}, APayTxID: "apay"}).Marshal()
 		},
 		func(d []byte) error { var b ConfirmBBody; return b.Unmarshal(d) })
 	roundTrip(t, "ConfirmedBBody",
 		func() []byte {
-			return (&ConfirmedBBody{HubAddress: [20]byte{1}, ClientAddress: [20]byte{2}, ID: [32]byte{3}}).Marshal()
+			return (&ConfirmedBBody{HubAddress: [20]byte{1}, ID: [32]byte{3}, BPayTxID: "bpay"}).Marshal()
 		},
 		func(d []byte) error { var b ConfirmedBBody; return b.Unmarshal(d) })
 	roundTrip(t, "CancelBody",
@@ -180,7 +180,7 @@ func TestSwapBodiesRoundTrip(t *testing.T) {
 		func() []byte { return (&RejectBody{ID: [32]byte{1}, Reason: 8}).Marshal() },
 		func(d []byte) error { var b RejectBody; return b.Unmarshal(d) })
 	roundTrip(t, "FinishedBody",
-		func() []byte { return (&FinishedBody{ClientAddress: [20]byte{1}, ID: [32]byte{2}}).Marshal() },
+		func() []byte { return (&FinishedBody{ID: [32]byte{2}}).Marshal() },
 		func(d []byte) error { var b FinishedBody; return b.Unmarshal(d) })
 	roundTrip(t, "ServicesPingBody",
 		func() []byte { return (&ServicesPingBody{Services: []string{"dx", "blocknet"}}).Marshal() },

@@ -265,6 +265,17 @@ func revHashHex(s string) ([32]byte, error) {
 	return out, nil
 }
 
+// GetRawTransaction returns the full serialized (hex) transaction for txid via
+// getrawtransaction (verbosity 0). The taker reads the maker's payTx to recover
+// the HTLC secret preimage.
+func (c *RPCConnector) GetRawTransaction(txid string) (string, error) {
+	var hexStr string
+	if err := c.cli.Call("getrawtransaction", []interface{}{txid, 0}, &hexStr); err != nil {
+		return "", err
+	}
+	return hexStr, nil
+}
+
 // amountFloatToBase converts a wallet float amount (coin units) to base units
 // using the coin's decimals, via string formatting to avoid float drift.
 func amountFloatToBase(decimals int, f float64) (uint64, error) {

@@ -81,4 +81,8 @@ type Connector interface {
 	// orders' anti-replay blockHash (C++ uses the BLOCK chain's
 	// chainActive.Tip()->pprev).
 	GetBlockHash(height int64) ([32]byte, error)
+	// GetRawTransaction returns the full serialized (hex) transaction for txid.
+	// The taker uses it to read the maker's payTx and recover the HTLC secret
+	// preimage (C++ getSecretFromPaymentTransaction → getrawtransaction).
+	GetRawTransaction(txid string) (string, error)
 }

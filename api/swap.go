@@ -1,0 +1,567 @@
+package api
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+
+	"xbridge-go/coins"
+	"xbridge-go/config"
+	"xbridge-go/crypto"
+	"xbridge-go/proto"
+	"xbridge-go/swap"
+	"xbridge-go/wallet"
+)
+
+// Locktime targets mirror xbridgewallet.h: the maker (role A) locks for 2h, the
+// taker (role B) for 30m. C++ computes the absolute block height as
+// currentBlock + target/blockTime; we do the same via the connector's
+// getblockcount. XLOCKTIME_DRIFT (15m) is the tolerance applied to the taker's
+// CreateB locktime — checked but not strictly enforced here.
+const (
+	makerLockTimeSec = 7200
+	takerLockTimeSec = 1800
+)
+
+// clientState tracks the local client's progress through the hub-driven swap.
+// The hub owns the authoritative Transaction state; this is just our side's view
+// of which handshake step we have completed.
+type clientState int
+
+const (
+	csIdle clientState = iota
+	csMaker
+	csTaker
+	csHoldApplied
+	csInitialized
+	csCreatedA // maker broadcast its deposit
+	csCreatedB // taker broadcast its deposit
+	csConfirmedA
+	csConfirmedB
+	csFinished
+)
+
+// SwapSession is the XBridge CLIENT side of one order's swap. XBridge is a
+// three-party protocol: the service-node HUB holds the authoritative Transaction
+// state machine and relays packets; the maker (role A) and taker (role B) never
+// talk directly. Our thin client responds to hub-originated packets and performs
+// the on-chain work the C++ client would: building/broadcasting the HTLC deposit,
+// redeeming the counterparty's deposit by revealing (maker) or recovering (taker)
+// the secret, and pre-building the CLTV refund for the cancel/expiry path.
+type SwapSession struct {
+	n       *Node
+	isMaker bool
+	id      [32]byte
+
+	srcCur, dstCur string // currencies we give / receive
+	srcAmt, dstAmt uint64 // amounts we lock / expect
+
+	ourSourceAddr, ourDestAddr string // our addresses for srcCur / dstCur
+
+	theirPub   [33]byte // counterparty's deposit pubkey (from CreateA/B)
+	secret     [33]byte // maker: xPubKey preimage; taker: recovered from A's payTx
+	secretHash [20]byte // HASH160(secret); both deposits share it
+
+	ourLockTime    uint32
+	ourDepositTxID string
+	refundHex      string // pre-signed IF-branch refund, for cancel/expiry
+
+	theirDepositTxID string // counterparty's deposit txid (from ConfirmA/CreateB)
+	theirLockTime    uint32
+	theirSecretHash  [20]byte
+
+	hub   [20]byte // service-node address, learned from inbound packets
+	state clientState
+}
+
+// newMakerSession registers the client-side maker for a freshly created order and
+// generates the 33-byte HTLC secret (xPubKey); HASH160(xPubKey) is the secretHash
+// carried in the deposit. Both deposits use the same secretHash.
+func (n *Node) newMakerSession(o *Order, p MakeOrderParams) {
+	if len(n.cfg.PrivKey) != 32 {
+		return
+	}
+	priv, err := crypto.NewPrivateKey()
+	if err != nil {
+		return
+	}
+	xPub, err := crypto.CompressedPubKey(priv)
+	if err != nil {
+		return
+	}
+	s := &SwapSession{
+		n:             n,
+		isMaker:       true,
+		id:            o.ID,
+		srcCur:        o.FromCurrency,
+		dstCur:        o.ToCurrency,
+		srcAmt:        o.FromAmount,
+		dstAmt:        o.ToAmount,
+		ourSourceAddr: p.MakerAddress,
+		ourDestAddr:   p.TakerAddress,
+		secret:        xPub,
+		secretHash:    coins.KeyID(xPub[:]),
+		state:         csMaker,
+	}
+	n.sessMu.Lock()
+	n.sessions[hexEncode(o.ID[:])] = s
+	n.sessMu.Unlock()
+}
+
+// newTakerSession registers the client-side taker for a taken order. The secret
+// is unknown until CreateB teaches us the secretHash; the actual preimage is
+// recovered from the maker's payTx at ConfirmB.
+func (n *Node) newTakerSession(o *Order, p TakeOrderParams) {
+	if len(n.cfg.PrivKey) != 32 {
+		return
+	}
+	s := &SwapSession{
+		n:             n,
+		isMaker:       false,
+		id:            o.ID,
+		srcCur:        o.ToCurrency,
+		dstCur:        o.FromCurrency,
+		srcAmt:        o.ToAmount,
+		dstAmt:        o.FromAmount,
+		ourSourceAddr: p.FromAddress,
+		ourDestAddr:   p.ToAddress,
+		state:         csTaker,
+	}
+	n.sessMu.Lock()
+	n.sessions[hexEncode(o.ID[:])] = s
+	n.sessMu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Handshake handlers — each returns the response body to broadcast (or nil) plus
+// an error. Side effects (building/broadcasting deposits and their claim/refund
+// spends) happen inside; the caller signs + broadcasts the response.
+// ---------------------------------------------------------------------------
+
+// OnHold (hub→both) → HoldApply (7): echo our source address as the client's own.
+func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseBody, error) {
+	c, ok := coins.Get(s.srcCur)
+	if !ok {
+		return 0, nil, fmt.Errorf("api: unknown coin %s", s.srcCur)
+	}
+	a, err := c.DecodeAddress(s.ourSourceAddr)
+	if err != nil {
+		return 0, nil, err
+	}
+	src := [20]byte{}
+	copy(src[:], a.Hash)
+	s.state = csHoldApplied
+	return proto.XbcTransactionHoldApply, &proto.HoldApplyBody{
+		HubAddress: s.hub, ClientAddress: src, ID: s.id,
+	}, nil
+}
+
+// OnInit (hub→each) → Initialized (9): echo back our destination address.
+func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseBody, error) {
+	s.state = csInitialized
+	return proto.XbcTransactionInitialized, &proto.InitializedBody{
+		HubAddress: s.hub, ClientAddress: b.ClientAddress, ID: s.id,
+	}, nil
+}
+
+// OnCreateA (hub→maker) → CreatedA (11): build + broadcast our deposit A.
+func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, responseBody, error) {
+	if !s.isMaker {
+		return 0, nil, fmt.Errorf("api: CreateA received by taker session %s", hexEncode(s.id[:]))
+	}
+	if b.BPubKey == [33]byte{} {
+		return 0, nil, fmt.Errorf("api: CreateA missing B pubkey")
+	}
+	s.theirPub = b.BPubKey
+	txid, refundHex, err := s.buildDeposit(true)
+	if err != nil {
+		return 0, nil, err
+	}
+	s.state = csCreatedA
+	return proto.XbcTransactionCreatedA, &proto.CreatedABody{
+		HubAddress: s.hub, ID: s.id,
+		ADepositTxID: txid, HashedSecret: s.secretHash, ALockTime: s.ourLockTime,
+		RefTx: refundHex,
+	}, nil
+}
+
+// OnCreateB (hub→taker) → CreatedB (13): learn maker's deposit + build ours.
+func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, responseBody, error) {
+	if s.isMaker {
+		return 0, nil, fmt.Errorf("api: CreateB received by maker session %s", hexEncode(s.id[:]))
+	}
+	if b.APubKey == [33]byte{} {
+		return 0, nil, fmt.Errorf("api: CreateB missing A pubkey")
+	}
+	s.theirPub = b.APubKey
+	s.theirDepositTxID = b.ADepositTxID
+	s.theirSecretHash = b.HashedSecret
+	s.theirLockTime = b.ALockTime
+	txid, refundHex, err := s.buildDeposit(false)
+	if err != nil {
+		return 0, nil, err
+	}
+	s.state = csCreatedB
+	return proto.XbcTransactionCreatedB, &proto.CreatedBBody{
+		HubAddress: s.hub, ID: s.id,
+		BDepositTxID: txid, BLockTime: s.ourLockTime,
+		RefTx: refundHex,
+	}, nil
+}
+
+// OnConfirmA (hub→maker's dest) → ConfirmedA (19): redeem taker's deposit B by
+// revealing our secret on-chain, then broadcast A's payTx.
+func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, responseBody, error) {
+	if !s.isMaker {
+		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", hexEncode(s.id[:]))
+	}
+	s.theirDepositTxID = b.BDepositTxID
+	s.theirLockTime = b.BLockTime
+
+	payHex, cur, err := s.redeemCounterparty(true)
+	if err != nil {
+		return 0, nil, err
+	}
+	payTxID, err := s.n.cfg.Connectors[cur].SendRawTransaction(payHex)
+	if err != nil {
+		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
+	}
+	s.state = csConfirmedA
+	return proto.XbcTransactionConfirmedA, &proto.ConfirmedABody{
+		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
+	}, nil
+}
+
+// OnConfirmB (hub→taker's dest) → ConfirmedB (21): recover the secret from A's
+// payTx, then redeem maker's deposit A.
+func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, responseBody, error) {
+	if s.isMaker {
+		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", hexEncode(s.id[:]))
+	}
+	// Recover the 33-byte secret preimage from the maker's payTx.
+	conn := s.n.cfg.Connectors[s.srcCur]
+	if conn == nil {
+		return 0, nil, fmt.Errorf("api: no connector for %s", s.srcCur)
+	}
+	payHex, err := conn.GetRawTransaction(b.APayTxID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("api: getrawtransaction %s: %w", b.APayTxID, err)
+	}
+	secret, ok := secretFromPayTx(payHex)
+	if !ok {
+		return 0, nil, fmt.Errorf("api: could not recover secret from payTx %s", b.APayTxID)
+	}
+	s.secret = secret
+
+	payHex2, cur, err := s.redeemCounterparty(false)
+	if err != nil {
+		return 0, nil, err
+	}
+	payTxID, err := s.n.cfg.Connectors[cur].SendRawTransaction(payHex2)
+	if err != nil {
+		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
+	}
+	s.state = csConfirmedB
+	return proto.XbcTransactionConfirmedB, &proto.ConfirmedBBody{
+		HubAddress: s.hub, ID: s.id, BPayTxID: payTxID,
+	}, nil
+}
+
+// OnFinished (hub→both): the swap is complete on the hub; record the fill.
+func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, responseBody, error) {
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.Status = "completed"
+		o.Updated = NowMicro()
+	}
+	s.state = csFinished
+	return 0, nil, nil
+}
+
+// ---------------------------------------------------------------------------
+// Deposit / claim / refund construction
+// ---------------------------------------------------------------------------
+
+// computeLockTime returns the absolute block height to embed in the deposit's
+// HTLC (mirrors C++: currentBlock + target/blockTime).
+func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
+	cur := s.srcCur
+	conn := s.n.cfg.Connectors[cur]
+	cc := s.conf(cur)
+	if conn == nil {
+		return 0
+	}
+	n, err := conn.GetBlockCount()
+	if err != nil || n < 1 {
+		return 0
+	}
+	bt := 60
+	if cc != nil && cc.BlockTime > 0 {
+		bt = cc.BlockTime
+	}
+	target := makerLockTimeSec
+	if !isMaker {
+		target = takerLockTimeSec
+	}
+	return uint32(n) + uint32(target/bt)
+}
+
+// buildDeposit builds the local participant's HTLC deposit, funds it from the
+// wallet connector, signs the funding inputs via the wallet, broadcasts it, and
+// pre-builds the CLTV refund. It returns the broadcast deposit txid and the
+// pre-signed refund hex.
+func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err error) {
+	cur := s.srcCur
+	amt := s.srcAmt
+	conn := s.n.cfg.Connectors[cur]
+	cc := s.conf(cur)
+	if conn == nil {
+		return "", "", fmt.Errorf("api: no connector for %s", cur)
+	}
+	c, ok := coins.Get(cur)
+	if !ok {
+		return "", "", fmt.Errorf("api: unknown coin %s", cur)
+	}
+	funding, err := conn.ListUnspent(s.minConf(cc))
+	if err != nil {
+		return "", "", err
+	}
+	if len(funding) == 0 {
+		return "", "", fmt.Errorf("api: no funding UTXOs for %s", cur)
+	}
+	changeStr, err := conn.GetNewAddress()
+	if err != nil {
+		return "", "", err
+	}
+	var change [20]byte
+	if a, derr := c.DecodeAddress(changeStr); derr != nil {
+		return "", "", derr
+	} else {
+		copy(change[:], a.Hash)
+	}
+	fee := estimateFee(cc, len(funding), 2)
+	lockTime := s.computeLockTime(isMaker)
+
+	hash := s.secretHash
+	if !isMaker {
+		hash = s.theirSecretHash
+	}
+	spec := &swap.DepositSpec{
+		Currency:        cur,
+		Amount:          amt,
+		DepositorPub:    s.n.pubkey,
+		CounterpartyPub: s.theirPub,
+		Hash:            hash,
+		LockTime:        lockTime,
+	}
+	tx, err := spec.BuildDepositTx(c, funding, change, fee)
+	if err != nil {
+		return "", "", err
+	}
+	prevTxs := make([]wallet.PrevTx, 0, len(funding))
+	for _, u := range funding {
+		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
+	}
+	unsigned := hex.EncodeToString(tx.Serialize())
+	signed, complete, serr := conn.SignRawTransaction(unsigned, prevTxs)
+	if serr != nil {
+		return "", "", serr
+	}
+	if !complete {
+		return "", "", fmt.Errorf("api: deposit signing incomplete for %s", cur)
+	}
+	txid, err = conn.SendRawTransaction(signed)
+	if err != nil {
+		return "", "", err
+	}
+	s.ourDepositTxID = txid
+	s.ourLockTime = lockTime
+
+	refundHex, err = s.buildRefundTx(spec, cur)
+	if err != nil {
+		return "", "", err
+	}
+	s.refundHex = refundHex
+	return txid, refundHex, nil
+}
+
+// buildRefundTx pre-signs the IF-branch (CLTV) refund that returns the deposit to
+// our source address, spendable only after the deposit's lockTime.
+func (s *SwapSession) buildRefundTx(spec *swap.DepositSpec, cur string) (string, error) {
+	dest, err := s.destScript(cur, s.ourSourceAddr)
+	if err != nil {
+		return "", err
+	}
+	fee := estimateFee(s.conf(cur), 1, 1)
+	if fee >= spec.Amount {
+		return "", fmt.Errorf("api: deposit amount too small for refund fee")
+	}
+	h, err := reverseTxidHex(s.ourDepositTxID)
+	if err != nil {
+		return "", err
+	}
+	tx := &coins.Tx{Version: 1, LockTime: spec.LockTime}
+	tx.Inputs = append(tx.Inputs, coins.TxIn{
+		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
+		Sequence: 0xfffffffe, // enable CLTV
+	})
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount - fee, ScriptPubKey: dest})
+
+	inner := spec.RedeemScript()
+	sig, err := coins.SignTxInput(tx, 0, inner, s.n.cfg.PrivKey)
+	if err != nil {
+		return "", err
+	}
+	tx.Inputs[0].ScriptSig = coins.BuildRefundScriptSig(sig, spec.DepositorPub[:], inner)
+	return hex.EncodeToString(tx.Serialize()), nil
+}
+
+// redeemCounterparty builds and returns the ELSE-branch payment that claims the
+// counterparty's deposit, revealing (maker) or using (taker) the secret. We always
+// redeem the counterparty's deposit, which is the currency we receive (dstCur)
+// and the amount we receive (dstAmt): the maker redeems the taker's LTC deposit,
+// the taker redeems the maker's BTC deposit.
+func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur string, err error) {
+	theirSpec := swap.DepositSpec{
+		Currency:        s.dstCur,
+		Amount:          s.dstAmt,
+		DepositorPub:    s.theirPub,
+		CounterpartyPub: s.n.pubkey,
+		LockTime:        s.theirLockTime,
+	}
+	if s.isMaker {
+		theirSpec.Hash = s.secretHash
+	} else {
+		theirSpec.Hash = s.theirSecretHash
+	}
+	depositCur = s.dstCur
+
+	dest, err := s.destScript(depositCur, s.ourDestAddr)
+	if err != nil {
+		return "", "", err
+	}
+	fee := estimateFee(s.conf(depositCur), 1, 1)
+	if fee >= theirSpec.Amount {
+		return "", "", fmt.Errorf("api: counterparty deposit amount too small for claim fee")
+	}
+	h, err := reverseTxidHex(s.theirDepositTxID)
+	if err != nil {
+		return "", "", err
+	}
+	tx := &coins.Tx{Version: 1, LockTime: 0} // ELSE branch, no CLTV
+	tx.Inputs = append(tx.Inputs, coins.TxIn{
+		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
+		Sequence: 0xffffffff,
+	})
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: theirSpec.Amount - fee, ScriptPubKey: dest})
+
+	inner := theirSpec.RedeemScript()
+	sig, err := coins.SignTxInput(tx, 0, inner, s.n.cfg.PrivKey)
+	if err != nil {
+		return "", "", err
+	}
+	// The ELSE branch requires <secret> <sig> <myPubKey> OP_0 <inner>, where
+	// myPubKey is the deposit's CounterpartyPub (== our trader key).
+	tx.Inputs[0].ScriptSig = coins.BuildPaymentScriptSig(s.secret[:], sig, s.n.pubkey[:], inner)
+	return hex.EncodeToString(tx.Serialize()), depositCur, nil
+}
+
+// destScript returns the P2PKH output script for addr on cur.
+func (s *SwapSession) destScript(cur, addrStr string) ([]byte, error) {
+	c, ok := coins.Get(cur)
+	if !ok {
+		return nil, fmt.Errorf("api: unknown coin %s", cur)
+	}
+	a, err := c.DecodeAddress(addrStr)
+	if err != nil {
+		return nil, err
+	}
+	var h [20]byte
+	copy(h[:], a.Hash)
+	return coins.BuildP2PKHScript(h), nil
+}
+
+func (s *SwapSession) conf(cur string) *config.CoinConf {
+	if s.n.cfg.Confs != nil {
+		return s.n.cfg.Confs[cur]
+	}
+	return nil
+}
+
+// minConf returns the connector's minimum confirmations for spendable UTXOs,
+// defaulting to 0 when no conf is configured.
+func (s *SwapSession) minConf(cc *config.CoinConf) int {
+	if cc == nil {
+		return 0
+	}
+	return cc.Confirmations
+}
+
+// secretFromPayTx extracts the 33-byte HTLC secret preimage (the first data push
+// of the payment scriptSig) from a serialized payTx. C++ does the same in
+// getSecretFromPaymentTransaction by reading the reveal script.
+func secretFromPayTx(payHex string) ([33]byte, bool) {
+	raw, err := hex.DecodeString(payHex)
+	if err != nil {
+		return [33]byte{}, false
+	}
+	tx, err := coins.Deserialize(raw)
+	if err != nil || len(tx.Inputs) == 0 {
+		return [33]byte{}, false
+	}
+	return secretFromScriptSig(tx.Inputs[0].ScriptSig)
+}
+
+// secretFromScriptSig parses a payment scriptSig (<secret 33> <sig> <myPubKey>
+// OP_0 <inner>) and returns the first 33-byte push as the secret preimage.
+func secretFromScriptSig(script []byte) ([33]byte, bool) {
+	i := 0
+	var secret [33]byte
+	for i < len(script) {
+		op := script[i]
+		i++
+		var n int
+		switch {
+		case op <= 0x4b: // direct push OP_1..OP_75
+			n = int(op)
+		case op == 0x4c: // OP_PUSHDATA1
+			if i >= len(script) {
+				return secret, false
+			}
+			n = int(script[i])
+			i++
+		case op == 0x4d: // OP_PUSHDATA2
+			if i+2 > len(script) {
+				return secret, false
+			}
+			n = int(script[i]) | int(script[i+1])<<8
+			i += 2
+		default:
+			continue // not a data push; skip
+		}
+		if i+n > len(script) {
+			return secret, false
+		}
+		if n == 33 {
+			copy(secret[:], script[i:i+33])
+			return secret, true
+		}
+		i += n
+	}
+	return secret, false
+}
+
+// txIDFromHex returns the display-order txid of a serialized tx (used to label
+// the locally-built refund/claim txs).
+func txIDFromHex(rawHex string) (string, error) {
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return "", err
+	}
+	h1 := sha256.Sum256(raw)
+	h2 := sha256.Sum256(h1[:])
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		out[i] = h2[31-i]
+	}
+	return hex.EncodeToString(out), nil
+}

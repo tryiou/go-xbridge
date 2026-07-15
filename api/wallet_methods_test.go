@@ -10,6 +10,13 @@ import (
 	"xbridge-go/wallet"
 )
 
+// stubErr is a trivial error type used by fake connectors.
+type stubErr string
+
+func (e stubErr) Error() string { return string(e) }
+
+var errStub = stubErr("stub: not supported")
+
 // stubConn is a fake wallet.Connector for unit-testing the wallet-backed dx*
 // methods without a live wallet.
 type stubConn struct {
@@ -39,6 +46,9 @@ func (s *stubConn) GetBlockHash(height int64) ([32]byte, error) {
 	var h [32]byte
 	h[0] = 0xab
 	return h, nil
+}
+func (s *stubConn) GetRawTransaction(txid string) (string, error) {
+	return "", errStub
 }
 
 // valid BTC P2PKH address (prefix 0x00), used as both destination and change.

@@ -7,6 +7,7 @@
 package crypto
 
 import (
+	"crypto/rand"
 	"errors"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
@@ -94,6 +95,20 @@ func (BtcSigner) Verify(p *proto.Packet) (bool, error) {
 	}
 	d := p.Digest()
 	return sig.Verify(d[:], pub), nil
+}
+
+// NewPrivateKey returns a fresh 32-byte secp256k1 scalar. XBridge uses
+// this for the per-order HTLC secret keypair (xPubKey/xPrivKey), generated
+// at order-creation time (C++ xbridgeapp.cpp:2001).
+func NewPrivateKey() ([]byte, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	// Clear the high bits so the scalar is a valid secp256k1 private key
+	// (< curve order); btcec rejects out-of-range scalars.
+	b[0] &= 0x7f
+	return b[:], nil
 }
 
 // CompressedPubKey derives the 33-byte compressed secp256k1 public key for a
