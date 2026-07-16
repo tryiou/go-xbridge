@@ -3,11 +3,11 @@ package api
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
-
-	"xbridge-go/proto"
 )
 
 // ---------------------------------------------------------------------------
@@ -128,26 +128,76 @@ const (
 // misleading; the code uses 7.)
 // ---------------------------------------------------------------------------
 
+// coinScale is the XBridge base-unit factor: COIN = 1e6 (6 decimal places of
+// coin value). Amounts are carried on the wire as uint64 base units.
+const coinScale = 1_000_000
+
+// maxXAmount is the largest base-unit value parseXAmount will accept
+// (math.MaxUint64); larger inputs overflow uint64 and are rejected.
+var maxXAmount = new(big.Int).SetUint64(^uint64(0))
+
 // formatXAmount renders a base-unit (COIN=1e6) amount as the fixed 7-decimal
-// string Blocknet returns. Mirrors xBridgeStringValueFromAmount.
+// string Blocknet returns. Mirrors xBridgeStringValueFromAmount: integer base
+// units scaled to coin value and rendered with C++ setprecision(7). Base units
+// carry 6 decimals, so the 7th digit is always 0. Computed with integer
+// division to avoid float drift.
 func formatXAmount(amt uint64) string {
-	v := float64(amt)/1e6 + 1e-8
-	return strconv.FormatFloat(v, 'f', 7, 64)
+	q := amt / coinScale
+	r := amt % coinScale
+	return strconv.FormatUint(q, 10) + "." + fmt.Sprintf("%06d", r) + "0"
 }
 
 // parseXAmount converts a user-supplied decimal amount string (e.g. "1.5") into
 // XBridge base units (COIN=1e6). Mirrors xBridgeAmountFromString /
-// xBridgeIntFromReal: floor(val*COIN + 1/::COIN).
+// xBridgeIntFromReal (floor(val*COIN)) but uses big.Int so values up to
+// math.MaxUint64 parse exactly — float64's 2^53 precision cliff is eliminated.
+// The fractional part is truncated to base-unit (6-decimal) precision; overflow
+// beyond uint64 and non-numeric / negative input are rejected.
 func parseXAmount(s string) (uint64, error) {
-	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil {
-		return 0, err
-	}
-	d := f*1e6 + 1e-8
-	if d < 0 {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return 0, errInvalidAmount
 	}
-	return uint64(d), nil
+	if s[0] == '-' {
+		return 0, errInvalidAmount
+	}
+	dot := strings.IndexByte(s, '.')
+	intStr := s
+	fracStr := ""
+	if dot >= 0 {
+		intStr = s[:dot]
+		fracStr = s[dot+1:]
+	}
+	for _, c := range intStr {
+		if c < '0' || c > '9' {
+			return 0, errInvalidAmount
+		}
+	}
+	for _, c := range fracStr {
+		if c < '0' || c > '9' {
+			return 0, errInvalidAmount
+		}
+	}
+	if intStr == "" {
+		intStr = "0"
+	}
+	// Scale the fractional part to base-unit precision (6 decimals), dropping any
+	// sub-base-unit digits (C++ truncates to COIN precision).
+	frac := fracStr
+	if len(frac) > 6 {
+		frac = frac[:6]
+	}
+	for len(frac) < 6 {
+		frac += "0"
+	}
+	combined := new(big.Int)
+	if _, ok := combined.SetString(intStr+frac, 10); !ok {
+		return 0, errInvalidAmount
+	}
+	if combined.Sign() < 0 || combined.Cmp(maxXAmount) > 0 {
+		return 0, errInvalidAmount
+	}
+	return combined.Uint64(), nil
 }
 
 // formatXPrice renders a price ratio (double) as the fixed 7-decimal string
@@ -246,5 +296,3 @@ func hexEncode(b []byte) string { return hex.EncodeToString(b) }
 
 // orderIDString renders a 32-byte order id as hex (matches uint256::GetHex).
 func orderIDString(id [32]byte) string { return hexEncode(id[:]) }
-
-var _ = proto.ProtocolVersion // keep proto import referenced for codec parity

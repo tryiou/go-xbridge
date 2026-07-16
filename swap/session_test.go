@@ -47,10 +47,59 @@ func TestSessionDepositGatesProgression(t *testing.T) {
 		t.Fatalf("state = %s, want trJoined after local-only confirm", s.T.State)
 	}
 
-	// Counterparty confirms -> gate advances to trHold.
+	// Counterparty confirms -> both deposits are on-chain, so the two-confirmation
+	// progression drives every gate to trFinished (C++ reaches a finished
+	// transaction once both deposits confirm).
 	s.ConfirmOtherDeposit()
-	if s.T.State != TrHold {
-		t.Fatalf("state = %s, want trHold after both confirm", s.T.State)
+	if s.T.State != TrFinished {
+		t.Fatalf("state = %s, want trFinished after both confirm", s.T.State)
+	}
+}
+
+// TestSessionAdvancesToFinished drives the full maker⇄taker session: create the
+// local deposit, adopt the counterparty's, then confirm each side and assert the
+// swap reaches trFinished (not stalling at trHold as the pre-fix bug did). Both
+// confirmations may arrive in either order; the gate must still finish.
+func TestSessionAdvancesToFinished(t *testing.T) {
+	for _, order := range []string{"local-first", "other-first"} {
+		t2, lp, op := joinedForSession()
+		s := NewSession(t2, RoleMaker, lp, op)
+		if _, err := s.CreateLocalDeposit(600); err != nil {
+			t.Fatalf("CreateLocalDeposit: %v", err)
+		}
+		var sh [20]byte
+		sh[0] = 0xaa
+		s.AdoptCounterparty(sh, 600)
+
+		if order == "local-first" {
+			s.ConfirmLocalDeposit()
+			s.ConfirmOtherDeposit()
+		} else {
+			s.ConfirmOtherDeposit()
+			s.ConfirmLocalDeposit()
+		}
+		if s.T.State != TrFinished {
+			t.Fatalf("[%s] state = %s, want trFinished", order, s.T.State)
+		}
+	}
+}
+
+// TestSessionTakerRoleAdvancesToFinished confirms the taker-side session mirrors
+// the maker progression (its local/other Source/Dest are swapped) and also
+// reaches trFinished once both deposits confirm.
+func TestSessionTakerRoleAdvancesToFinished(t *testing.T) {
+	t2, lp, op := joinedForSession()
+	s := NewSession(t2, RoleTaker, lp, op)
+	if _, err := s.CreateLocalDeposit(600); err != nil {
+		t.Fatalf("CreateLocalDeposit: %v", err)
+	}
+	var sh [20]byte
+	sh[0] = 0xaa
+	s.AdoptCounterparty(sh, 600)
+	s.ConfirmLocalDeposit()
+	s.ConfirmOtherDeposit()
+	if s.T.State != TrFinished {
+		t.Fatalf("taker state = %s, want trFinished", s.T.State)
 	}
 }
 

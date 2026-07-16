@@ -2,6 +2,17 @@ package proto
 
 import "errors"
 
+// maxUtxoEntries caps the number of UtxoEntry values an order/pending/accepting
+// body may carry. Peer-supplied counts are untrusted; this (plus the
+// remaining-bytes check in unmarshalUtxoArray) prevents a crafted count from
+// allocating a huge slice. Real orders carry a handful of UTXOs.
+const maxUtxoEntries = 1 << 16
+
+// minUtxoEntryBytes is the minimum on-wire size of one UtxoEntry
+// (TxID 32 + Vout 4 + Addr 20 + Signature 65 = 121 bytes). Used to bound the
+// allocation by the bytes actually remaining in the body.
+const minUtxoEntryBytes = 121
+
 // This file ports the per-XBridgeCommand body layouts from the Blocknet C++
 // source. The authoritative encoder for each command is its C++ packet writer
 // (src/xbridge/xbridgeapp.cpp, src/xbridge/xbridgesession.cpp); the enum-block
@@ -68,6 +79,16 @@ func unmarshalUtxoArray(r *BodyReader) ([]UtxoEntry, error) {
 	n, err := r.Uint32()
 	if err != nil {
 		return nil, err
+	}
+	if n > maxUtxoEntries {
+		return nil, errors.New("xbridge: too many utxos in body")
+	}
+	// Bound the slice allocation by the bytes actually remaining. Each entry is
+	// at least minUtxoEntryBytes on the wire, so a count that cannot fit is a
+	// malformed (or hostile) body, not a real order. This prevents an OOM from a
+	// crafted count while the per-field reads below catch shorter truncations.
+	if uint64(n)*minUtxoEntryBytes > uint64(r.remaining()) {
+		return nil, errors.New("xbridge: utxo count exceeds body length")
 	}
 	utxos := make([]UtxoEntry, n)
 	for i := range utxos {

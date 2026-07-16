@@ -8,6 +8,12 @@ import (
 
 const cmdSize = 12
 
+// MaxPayloadSize bounds the declared payload length of a P2P message. Peer-
+// supplied lengths are untrusted; this cap prevents a huge m.Length from
+// allocating an enormous Payload (and avoids uint32 overflow in the length
+// check). 64 MiB is far beyond any real Bitcoin/XBridge message.
+const MaxPayloadSize = 1 << 26
+
 // Message is a Bitcoin-style P2P message:
 //
 //	magic(4) || command(12, null-padded) || length(4, LE) || checksum(4) || payload
@@ -58,7 +64,13 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 	m.Command = string(data[4:i])
 	m.Length = binary.LittleEndian.Uint32(data[4+cmdSize : 4+cmdSize+4])
 	copy(m.Checksum[:], data[4+cmdSize+4:4+cmdSize+8])
-	if uint32(len(data)) < uint32(4+cmdSize+8)+m.Length {
+	// m.Length is untrusted. Reject absurd sizes up front (cheap), then verify
+	// it fits the buffer using uint64 math so a near-max uint32 cannot wrap the
+	// comparison and slip a truncated/oversized payload through.
+	if m.Length > MaxPayloadSize {
+		return nil, errors.New("p2p: declared payload too large")
+	}
+	if uint64(len(data)) < uint64(4+cmdSize+8)+uint64(m.Length) {
 		return nil, errors.New("p2p: payload shorter than declared length")
 	}
 	m.Payload = make([]byte, m.Length)

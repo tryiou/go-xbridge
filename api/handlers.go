@@ -35,7 +35,10 @@ func (h *HandlerCtx) dxGetOrderFills(params []json.RawMessage) (interface{}, *rp
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetOrderFills", "(maker) (taker) (combined, default=true)[optional]")
 	}
-	combined, _ := boolParam(params, 2, true)
+	combined, e := mustBool(params, 2, true, "dxGetOrderFills")
+	if e != nil {
+		return nil, e
+	}
 
 	out := []fillOut{}
 	for _, f := range h.Store.Fills() {
@@ -184,8 +187,14 @@ func (h *HandlerCtx) dxMakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 	takerSize, _ := strParam(params, 4)
 	takerAddr, _ := strParam(params, 5)
 	typ, _ := strParam(params, 6)
-	useAll, _ := boolParam(params, 7, true)
-	dryRun, _ := boolParam(params, 8, false)
+	useAll, e := mustBool(params, 7, true, "dxMakeOrder")
+	if e != nil {
+		return nil, e
+	}
+	dryRun, e := mustBool(params, 8, false, "dxMakeOrder")
+	if e != nil {
+		return nil, e
+	}
 	o, e := h.Node.MakeOrder(MakeOrderParams{
 		Maker: maker, MakerSize: makerSize, MakerAddress: makerAddr,
 		Taker: taker, TakerSize: takerSize, TakerAddress: takerAddr,
@@ -233,7 +242,10 @@ func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 	fromAddr, _ := strParam(params, 1)
 	toAddr, _ := strParam(params, 2)
 	amount, _ := strParam(params, 3)
-	dryRun, _ := boolParam(params, 4, false)
+	dryRun, e := mustBool(params, 4, false, "dxTakeOrder")
+	if e != nil {
+		return nil, e
+	}
 	o, e := h.Node.TakeOrder(TakeOrderParams{ID: id, FromAddress: fromAddr, ToAddress: toAddr, Amount: amount, DryRun: dryRun})
 	if e != nil {
 		return nil, e
@@ -274,7 +286,10 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpcError) {
-	detail, _ := intParam(params, 0, 1)
+	detail, e := mustInt(params, 0, 1, "dxGetOrderBook")
+	if e != nil {
+		return nil, e
+	}
 	maker, ok := strParam(params, 1)
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail) (maker) (taker) (max_orders, default=50)[optional]")
@@ -283,7 +298,10 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail) (maker) (taker) (max_orders, default=50)[optional]")
 	}
-	maxOrders, _ := intParam(params, 3, 50)
+	maxOrders, e := mustInt(params, 3, 50, "dxGetOrderBook")
+	if e != nil {
+		return nil, e
+	}
 
 	asks := [][]interface{}{}
 	bids := [][]interface{}{}
@@ -448,7 +466,10 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface{}, *rpcError) {
-	ageMillis, _ := intParam(params, 0, 0)
+	ageMillis, e := mustInt(params, 0, 0, "dxFlushCancelledOrders")
+	if e != nil {
+		return nil, e
+	}
 	start := NowMicro()
 	flushed := []map[string]interface{}{}
 	for _, c := range h.Store.cancelled {
@@ -488,9 +509,18 @@ func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpc
 	ticker, _ := strParam(params, 0)
 	splitAmt, _ := strParam(params, 1)
 	address, _ := strParam(params, 2)
-	includeFees, _ := boolParam(params, 3, true)
-	showRawTx, _ := boolParam(params, 4, false)
-	submit, _ := boolParam(params, 5, true)
+	includeFees, e := mustBool(params, 3, true, "dxSplitAddress")
+	if e != nil {
+		return nil, e
+	}
+	showRawTx, e := mustBool(params, 4, false, "dxSplitAddress")
+	if e != nil {
+		return nil, e
+	}
+	submit, e := mustBool(params, 5, true, "dxSplitAddress")
+	if e != nil {
+		return nil, e
+	}
 	return h.splitTx(ticker, splitAmt, address, includeFees, showRawTx, submit, nil)
 }
 
@@ -501,9 +531,18 @@ func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcE
 	ticker, _ := strParam(params, 0)
 	splitAmt, _ := strParam(params, 1)
 	address, _ := strParam(params, 2)
-	includeFees, _ := boolParam(params, 3, true)
-	showRawTx, _ := boolParam(params, 4, false)
-	submit, _ := boolParam(params, 5, true)
+	includeFees, e := mustBool(params, 3, true, "dxSplitInputs")
+	if e != nil {
+		return nil, e
+	}
+	showRawTx, e := mustBool(params, 4, false, "dxSplitInputs")
+	if e != nil {
+		return nil, e
+	}
+	submit, e := mustBool(params, 5, true, "dxSplitInputs")
+	if e != nil {
+		return nil, e
+	}
 
 	var utxos []wallet.Utxo
 	if len(params) > 6 {
@@ -645,8 +684,11 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 // outputs, using the connector's estimate when available and conf FeePerByte
 // otherwise.
 func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
-	// Rough virtual-size estimate (legacy inputs/outputs).
-	vsize := nIn*148 + nOut*34 + 10
+	// Virtual-size estimate matches C++ xbridgewalletconnectorbtc.cpp:1948
+	// (192 bytes per legacy input, 34 per output). Modeling inputs at 192 keeps
+	// Go-built deposits inside C++'s counterpartyFees >= fee*0.95 acceptance band,
+	// so a C++ counterparty accepts our orders.
+	vsize := 192*nIn + 34*nOut
 	if cc == nil || cc.FeePerByte == 0 {
 		// 2 sat/vB default.
 		return uint64(vsize * 2)

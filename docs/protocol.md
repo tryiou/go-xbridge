@@ -178,6 +178,10 @@ From the order/accept/hold/init/create/confirm sequence documented in
 ```
 trNew -> trJoined -> trHold -> trInitialized -> trCreated -> trSigned
      -> trCommited -> trFinished   (or trCancelled / trDropped)
+
+(`trSigned` / `trCommited` are vestigial — C++ never assigns them during the
+two-confirmation gate; the progression walks trJoined → trHold → trInitialized
+→ trCreated → trFinished via `IncreaseStateCounter`. See `docs/swap.md` §2.)
 ```
 
 High-level flow (hub = the order maker / "exchange"; clients A and B are the
@@ -299,8 +303,10 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
      were deliberately NOT followed where they disagree with the real writers
      (see the note at the top of `body_types.go`). `xbcTransaction` is decoded
      end-to-end from a live captured packet in `proto/body_test.go`.
-5. **Wallet connector RPC** — `src/xbridge/bitcoinrpcconnector*` exposes
-   Blocknet core RPC; the connected SPV wallet (incl. BLOCK) signs + pays the
-   service-node fee. Implement the connector interface in `wallet/`.
-6. **API surface** — `src/xbridge/rpcxbridge.cpp` (`dx*` commands) as Go
-   library calls in `api/`.
+5. **Wallet connector RPC** — ✅ DONE. `wallet/` implements the `Connector`
+   interface with `RPCConnector` (JSON-RPC to a Blocknet-core-compatible wallet,
+   incl. `signmessage`/`getrawtransaction` for BIP137 proofs and `OnConfirm*`
+   refund/payment) and `LocalConnector` (local signing). See `docs/wallet.md`.
+6. **API surface** — ✅ DONE. All 23 `dx*` commands from `rpcxbridge.cpp` are
+   ported 1:1 in `api/`; the three-party client driver (`api/swap.go`) runs the
+   Maker ⇄ Hub ⇄ Taker handshake. See `docs/api.md`.

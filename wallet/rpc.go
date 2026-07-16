@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"xbridge-go/coins"
 )
@@ -46,17 +48,24 @@ type rpcResponse struct {
 	ID     string          `json:"id"`
 }
 
+// defaultRPCTimeout bounds each JSON-RPC call when a chain sets no explicit
+// timeout, so a hung wallet/node cannot wedge the caller indefinitely.
+const defaultRPCTimeout = 30 * time.Second
+
 // NewRPCClient builds a client for the given endpoint + basic-auth credentials.
 // jsonVersion and contentType honor the wallet's xbridge.conf (defaults applied
-// by the caller if empty).
-func NewRPCClient(url, user, pass, jsonVersion, contentType string) *RPCClient {
+// by the caller if empty). A zero timeout applies defaultRPCTimeout.
+func NewRPCClient(url, user, pass, jsonVersion, contentType string, timeout time.Duration) *RPCClient {
 	if jsonVersion == "" {
 		jsonVersion = "1.0"
 	}
 	if contentType == "" {
 		contentType = "application/json"
 	}
-	return &RPCClient{url: url, user: user, pass: pass, jsonVersion: jsonVersion, contentType: contentType, http: &http.Client{}}
+	if timeout <= 0 {
+		timeout = defaultRPCTimeout
+	}
+	return &RPCClient{url: url, user: user, pass: pass, jsonVersion: jsonVersion, contentType: contentType, http: &http.Client{Timeout: timeout}}
 }
 
 // Call invokes method with params and unmarshals the result into out.
@@ -109,10 +118,13 @@ type RPCConnector struct {
 
 // NewRPCConnector builds a Connector for the given chain endpoint.
 func NewRPCConnector(chain Chain) *RPCConnector {
-	return &RPCConnector{chain: chain, cli: NewRPCClient(chain.Endpoint, chain.User, chain.Pass, chain.JSONVersion, chain.ContentType)}
+	return &RPCConnector{chain: chain, cli: NewRPCClient(chain.Endpoint, chain.User, chain.Pass, chain.JSONVersion, chain.ContentType, chain.Timeout)}
 }
 
 func (c *RPCConnector) Ticker() string { return c.chain.Ticker }
+
+// Endpoint returns the configured wallet RPC endpoint (e.g. http://host:port).
+func (c *RPCConnector) Endpoint() string { return c.chain.Endpoint }
 
 // GetNewAddress returns a fresh receive address (native segwit when the chain
 // supports it, otherwise the wallet default P2PKH).
@@ -274,6 +286,29 @@ func (c *RPCConnector) GetRawTransaction(txid string) (string, error) {
 		return "", err
 	}
 	return hexStr, nil
+}
+
+// SignMessage produces a BIP137 ownership proof. Bitcoin Core's signmessage
+// returns the compact signature base64-encoded; XBridge carries it raw (65
+// bytes: 1 recovery byte + 64), so we decode it. The address must be one this
+// wallet owns (the UTXO's address).
+func (c *RPCConnector) SignMessage(address, message string) ([]byte, error) {
+	var b64 string
+	if err := c.cli.Call("signmessage", []interface{}{address, message}, &b64); err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(b64)
+}
+
+// VerifyMessage checks a BIP137 proof via Bitcoin Core's verifymessage, which
+// expects the signature base64-encoded.
+func (c *RPCConnector) VerifyMessage(address string, sig []byte, message string) (bool, error) {
+	var ok bool
+	b64 := base64.StdEncoding.EncodeToString(sig)
+	if err := c.cli.Call("verifymessage", []interface{}{address, b64, message}, &ok); err != nil {
+		return false, err
+	}
+	return ok, nil
 }
 
 // amountFloatToBase converts a wallet float amount (coin units) to base units

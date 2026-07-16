@@ -78,10 +78,7 @@ an error — the deposit flow supplies inputs and `prevTxs` explicitly instead.
 
 ## Not yet here
 
-- **Composing with `swap/`** — a `Session`/deposit driver that uses `coins` to
-  build the deposit/refund/payment transactions and `wallet.Connector` to fund,
-  sign (`trSigned`/`trCommited`), and broadcast them. This is the next layer.
 - **Non-UTXO adapters** (Decred, Particl) — need their own `Connector` shapes.
-- **Segwit BIP143 sighash** — `coins` currently implements legacy SIGHASH_ALL
-  only; `RPCConnector` already passes full `prevTxs` so a BIP143 signer can drop
-  in.
+- **Live-network execution** — the deposit/refund/payment driver is built and
+  unit-tested against mocks (see `swap.md` §6–7); end-to-end execution against a
+  real C++ service node still needs a live wallet and is the remaining gap.

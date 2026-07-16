@@ -6,6 +6,19 @@ import (
 	"xbridge-go/config"
 )
 
+// FamilyKind identifies a chain's transaction/address family so connectors can
+// branch on per-chain quirks. BTC/LTC/DGB share the base58check + bech32 family;
+// Bitcoin Cash uses CashAddr; others may follow. Mirrors C++'s per-connector
+// class selection (xbridgewalletconnector{btc,bch,...}.cpp).
+type FamilyKind string
+
+const (
+	// FamilyUTXOBTC is the BTC-family (base58check P2PKH/P2SH + optional bech32).
+	FamilyUTXOBTC FamilyKind = "utxo-btc"
+	// FamilyUTXOBCH is Bitcoin Cash (CashAddr encoding, "bitcoincash:" prefix).
+	FamilyUTXOBCH FamilyKind = "utxo-bch"
+)
+
 // Coin describes a UTXO-based blockchain traded over XBridge. The address
 // parameters are the version bytes / HRP the connected wallet uses; they drive
 // address decoding/encoding in address.go. NO coin values are hardcoded: every
@@ -20,7 +33,17 @@ type Coin struct {
 	P2SH      byte   // base58check version byte for P2SH addresses
 	Bech32HRP string // HRP for native segwit addresses ("", if none)
 	SegWit    bool   // whether native segwit (bech32/bech32m) addresses exist
+
+	// family is the chain family (see FamilyKind). It selects the address codec
+	// and any per-chain RPC quirks. Derived from CreateTxMethod.
+	family FamilyKind
+	// CashAddrPrefix is the CashAddr HRP (e.g. "bitcoincash") used when family ==
+	// FamilyUTXOBCH. Empty for other families.
+	CashAddrPrefix string
 }
+
+// Family returns the chain family.
+func (c Coin) Family() FamilyKind { return c.family }
 
 // Coins is the runtime registry, populated entirely from xbridge.conf by
 // InitFromConf. It starts empty — there is no baked-in set.
@@ -47,14 +70,40 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 		return Coin{}, fmt.Errorf("coins: %s: COIN not set in xbridge.conf", c.Ticker)
 	}
 	return Coin{
-		Ticker:    c.Ticker,
-		Name:      c.Title,
-		Decimals:  decimalsFromCoin(c.Coin),
-		P2PKH:     byte(c.AddressPrefix),
-		P2SH:      byte(c.ScriptPrefix),
-		Bech32HRP: bech32HRPFromMethod(c.CreateTxMethod),
-		SegWit:    segWitFromMethod(c.CreateTxMethod),
+		Ticker:         c.Ticker,
+		Name:           c.Title,
+		Decimals:       decimalsFromCoin(c.Coin),
+		P2PKH:          byte(c.AddressPrefix),
+		P2SH:           byte(c.ScriptPrefix),
+		Bech32HRP:      bech32HRPFromMethod(c.CreateTxMethod),
+		SegWit:         segWitFromMethod(c.CreateTxMethod),
+		family:         familyFromMethod(c.CreateTxMethod),
+		CashAddrPrefix: cashAddrPrefixFromMethod(c.CreateTxMethod),
 	}, nil
+}
+
+// familyFromMethod maps a CreateTxMethod to its chain family. Unmapped methods
+// default to the BTC family (the generic base58check + bech32 codec), matching
+// C++'s default connector behavior.
+func familyFromMethod(m string) FamilyKind {
+	switch normalizeTicker(m) {
+	case "BCH":
+		return FamilyUTXOBCH
+	default:
+		return FamilyUTXOBTC
+	}
+}
+
+// cashAddrPrefixFromMethod returns the CashAddr HRP for the BCH family. Empty
+// for other families. Mirrors C++'s cashaddr prefix constants; the method string
+// comes from conf so nothing is hardcoded in the registry itself.
+func cashAddrPrefixFromMethod(m string) string {
+	switch normalizeTicker(m) {
+	case "BCH":
+		return "bitcoincash"
+	default:
+		return ""
+	}
 }
 
 // decimalsFromCoin returns the number of decimal places implied by the base-unit

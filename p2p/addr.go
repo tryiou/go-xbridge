@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"encoding/binary"
-	"math/rand"
 	"net"
 )
 
@@ -12,7 +11,6 @@ const (
 	CmdAddr    = "addr"
 	CmdPing    = "ping"
 	CmdPong    = "pong"
-	CmdAddrV2  = "addrv2"
 )
 
 // AddrEntry is one decoded record from an `addr` message: a Unix timestamp, the
@@ -82,10 +80,4 @@ func MarshalAddr(addrs []AddrEntry) []byte {
 		buf = append(buf, p[:]...)
 	}
 	return buf
-}
-
-// shuffleEntries randomizes entry order in place (Fisher-Yates via math/rand),
-// used when sampling addrs to advertise in response to getaddr.
-func shuffleEntries(in []AddrEntry) {
-	rand.Shuffle(len(in), func(i, j int) { in[i], in[j] = in[j], in[i] })
 }

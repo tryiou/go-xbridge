@@ -14,21 +14,31 @@ dependency-light. It covers the three things every chain interaction needs:
 
 ## Coin registry
 
-Initial mainnet set (`Coins` in `coin.go`):
+Example mainnet parameters (the registry is **conf-driven**, not hardcoded —
+`InitFromConf` builds `Coins` from the `[TICKER]` sections of `xbridge.conf`,
+and there is no baked-in set):
 
-| Ticker | P2PKH | P2SH | bech32 HRP | segwit | decimals |
-|--------|-------|------|------------|--------|----------|
-| BTC    | 0x00  | 0x05 | `bc`       | yes    | 8 |
-| LTC    | 0x30  | 0x32 | `ltc`      | yes    | 8 |
-| DOGE   | 0x1e  | 0x16 | —          | no     | 8 |
-| DGB    | 0x1e  | 0x3f | `dgb`      | yes    | 8 | **[VERIFY]**
-| BLOCK  | 0x1a  | 0x1c | —          | no     | 8 |
+| Ticker | P2PKH | P2SH | bech32 HRP / address scheme | segwit | decimals |
+|--------|-------|------|------------------------------|--------|----------|
+| BTC    | 0x00  | 0x05 | `bc` (bech32)                | yes    | 8 |
+| LTC    | 0x30  | 0x32 | `ltc` (bech32)               | yes    | 8 |
+| DOGE   | 0x1e  | 0x16 | —                            | no     | 8 |
+| DGB    | 0x1e  | 0x3f | `dgb` (bech32)               | yes    | 8 |
+| BCH    | 0x00  | 0x05 | `bitcoincash` (CashAddr)     | no\*   | 8 |
+| BLOCK  | 0x1a  | 0x1c | —                            | no     | 8 |
+
+\*BCH uses **CashAddr** (`cashaddr.go`), a bech32-family format with its own
+checksum; its legacy base58 version byte collides with BTC's, so BCH addresses
+decode **only** via `cashaddrDecode`. The BCH family is selected by
+`CreateTxMethod` (e.g. `"BCH"` → `FamilyUTXOBCH`) and round-trips P2KH/P2SH
+CashAddr addresses (`TestCashAddrRoundTripP2KH`/`P2SH`).
 
 BLOCK values are from `src/chainparams.cpp` (mainnet: `PUBKEY_ADDRESS = 26`,
 `SCRIPT_ADDRESS = 28`; no `BECH32_PREFIX`, so no native segwit). BTC/LTC/DOGE
-are standard. **DGB is marked `[VERIFY]`** — confirm against Digibyte's
-chainparams before relying on it. Extend `Coins` for the rest of XBridge's
-supported set (BCH, BCD, BTG, PART, DCR, DeVault, Stealth) as needed.
+are standard. **DGB's chainparams are verified** (`TestDGBCoinConf`:
+`FamilyUTXOBTC`, `SegWit = true`, `Bech32HRP = "dgb"`) against Digibyte's
+connector. Extend `Coins` for the rest of XBridge's supported set (BCD, BTG,
+PART, DCR, DeVault, Stealth) as needed.
 
 ## Address model
 

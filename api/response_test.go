@@ -47,6 +47,45 @@ func TestParseXAmount(t *testing.T) {
 	}
 }
 
+// TestParseXAmountPrecision confirms the big.Int parser is exact for values
+// past float64's 2^53 precision cliff and rejects overflow/negative/garbage.
+func TestParseXAmountPrecision(t *testing.T) {
+	cases := []struct {
+		s    string
+		want uint64
+		ok   bool
+	}{
+		// "10000000000.123456" = 1e10 coins → 1e16 base units, above 2^53, where
+		// float64 silently drops the trailing 456. big.Int must keep it exact.
+		{"10000000000.123456", 10000000000123456, true},
+		// Sub-base-unit (7th-decimal) input is truncated to 6-decimal precision.
+		{"1.5000009", 1500000, true},
+		// Large but in-range: round-trips exactly.
+		{"18446744073709.000000", 18446744073709000000, true}, // < maxUint64
+		// Overflow beyond uint64 is rejected.
+		{"18446744073709551616", 0, false}, // 2^64
+		// Negative input is rejected (amounts are unsigned).
+		{"-1.5", 0, false},
+		// Multiple dots / garbage rejected.
+		{"1.2.3", 0, false},
+		{"abc", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		got, err := parseXAmount(c.s)
+		if c.ok {
+			if err != nil {
+				t.Fatalf("parseXAmount(%q) unexpected error: %v", c.s, err)
+			}
+			if got != c.want {
+				t.Errorf("parseXAmount(%q) = %d, want %d", c.s, got, c.want)
+			}
+		} else if err == nil {
+			t.Errorf("parseXAmount(%q) expected error, got %d", c.s, got)
+		}
+	}
+}
+
 func TestISO8601(t *testing.T) {
 	if got := iso8601(0); got != "1970-01-01T00:00:00.000Z" {
 		t.Errorf("iso8601(0) = %q", got)

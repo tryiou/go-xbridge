@@ -256,7 +256,10 @@ func TestBIP143NativeP2WPKH(t *testing.T) {
 	scriptCode := P2WPKHScriptCode(keyHash[:])
 
 	const amount = 600000000
-	got := tx.HashForSigningSegwit(1, scriptCode, amount)
+	got, err := tx.HashForSigningSegwit(1, scriptCode, amount)
+	if err != nil {
+		t.Fatalf("HashForSigningSegwit: %v", err)
+	}
 	want := "c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670"
 	if hex.EncodeToString(got[:]) != want {
 		t.Errorf("BIP143 native P2WPKH sigHash\n got %s\nwant %s", hex.EncodeToString(got[:]), want)
@@ -298,7 +301,10 @@ func TestBIP143NestedP2SHP2WPKH(t *testing.T) {
 	// Witness key hash from the vector's redeemScript 0014{keyhash}.
 	scriptCode := P2WPKHScriptCode(mustDecode(t, "79091972186c449eb1ded22b78e40d009bdf0089"))
 	const amount = 1000000000
-	got := tx.HashForSigningSegwit(0, scriptCode, amount)
+	got, err := tx.HashForSigningSegwit(0, scriptCode, amount)
+	if err != nil {
+		t.Fatalf("HashForSigningSegwit: %v", err)
+	}
 	want := "64f3b0f4dd2bb3aa1ce8566d220cc74dda9df97d8490cc81d89d735c92e59fb6"
 	if hex.EncodeToString(got[:]) != want {
 		t.Errorf("BIP143 P2SH-P2WPKH sigHash\n got %s\nwant %s", hex.EncodeToString(got[:]), want)

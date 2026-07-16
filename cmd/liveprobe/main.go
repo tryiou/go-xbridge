@@ -170,10 +170,3 @@ func rawDiag(addr string, magic [4]byte) {
 func fatal(format string, args ...interface{}) {
 	fmt.Printf(format+"\n", args...)
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

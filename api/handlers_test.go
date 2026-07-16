@@ -255,6 +255,26 @@ func TestDxWriteCommandsNoSession(t *testing.T) {
 	}
 }
 
+// TestDxSplitInputsBadBoolParam verifies a malformed (non-boolean) flag errors
+// out via errInvalidParameters instead of silently defaulting to true (Module F).
+func TestDxSplitInputsBadBoolParam(t *testing.T) {
+	ctx := newWalletTestCtx()
+	// 6 params: ticker, splitamount, address, include_fees(123!), show_rawtx, submit.
+	params := []json.RawMessage{
+		jstr("BTC"), jstr("1000000"), jstr(btcAddr),
+		json.RawMessage("123"), // not a boolean -> must error
+		json.RawMessage("false"),
+		json.RawMessage("true"),
+	}
+	res, err := ctx.dxSplitInputs(params)
+	if err == nil {
+		t.Fatalf("expected errInvalidParameters for non-boolean include_fees, got res=%v", res)
+	}
+	if err.Code != errInvalidParameters {
+		t.Errorf("err.Code = %d, want %d", err.Code, errInvalidParameters)
+	}
+}
+
 func TestGetNetworkInfo(t *testing.T) {
 	// Defaults when Config leaves the version blank (fall back to 4.4.1).
 	ctx := &HandlerCtx{Store: NewStore(), Node: &Node{}, Config: &Config{}}

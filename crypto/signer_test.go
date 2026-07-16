@@ -115,3 +115,48 @@ func TestSignWrongKeyLength(t *testing.T) {
 		t.Fatal("expected error for non-32-byte key")
 	}
 }
+
+// TestSignDeterministicKAT pins the signing output for a known key + digest.
+// The C++ XBridge wire relies on two implementations agreeing byte-for-byte on
+// a signature; that agreement is only possible because both use RFC6979
+// deterministic ECDSA. We cannot fetch an external C++ vector from this sandbox,
+// so this test pins the property that matters for interop: the same key and
+// same digest always produce the identical 64-byte compact signature (a
+// tampered/flaky signer would diverge and fail here). TODO(audit): validate
+// this exact signature against a captured C++ node to close the [VERIFY] item.
+func TestSignDeterministicKAT(t *testing.T) {
+	signer := NewBtcSigner()
+
+	// Fixed private key ("1") and a fixed digest.
+	priv := make([]byte, 32)
+	priv[31] = 1
+	var digest [32]byte
+	copy(digest[:], []byte("0123456789abcdef0123456789abcdef")) // ascii digest, fixed
+
+	p1 := proto.NewPacket(proto.XbcTransaction, digest[:])
+	p2 := proto.NewPacket(proto.XbcTransaction, digest[:])
+	if err := signer.Sign(p1, priv); err != nil {
+		t.Fatalf("sign 1: %v", err)
+	}
+	if err := signer.Sign(p2, priv); err != nil {
+		t.Fatalf("sign 2: %v", err)
+	}
+
+	// Identical key+digest must yield identical 64-byte compact signatures.
+	if p1.Signature != p2.Signature {
+		t.Fatalf("signature not deterministic:\n  sig1=%x\n  sig2=%x", p1.Signature, p2.Signature)
+	}
+	var zero [64]byte
+	if p1.Signature == zero {
+		t.Fatal("signature is all zeros")
+	}
+
+	// And the deterministic signature must verify against the published pubkey.
+	ok, err := signer.Verify(p1)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("deterministic signature failed verification")
+	}
+}

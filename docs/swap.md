@@ -137,7 +137,9 @@ gating level:
   from the role: maker locks SourceAmount/SourceCurrency, taker locks
   DestAmount/DestCurrency). `AdoptCounterparty` records the revealed `Hash` +
   lockTime. `ConfirmLocalDeposit`/`ConfirmOtherDeposit` advance the progression
-  gate (trJoined → trHold) once both sides' deposits confirm.
+  through every gate (trJoined → trHold → trInitialized → trCreated →
+  trFinished) once both sides' deposits confirm (see §2 and
+  `swap/session_test.go`).
 
 **Fidelity note:** C++ never assigns `trSigned`/`trCommited` to the transaction
 state (grep `xbridgetransaction.cpp` / `xbridgesession.cpp` — only trHold /

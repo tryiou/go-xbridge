@@ -222,7 +222,11 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	if err != nil {
 		return 0, nil, err
 	}
-	payTxID, err := s.n.cfg.Connectors[cur].SendRawTransaction(payHex)
+	conn, e := s.n.connector(cur)
+	if e != nil {
+		return 0, nil, e
+	}
+	payTxID, err := conn.SendRawTransaction(payHex)
 	if err != nil {
 		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
 	}
@@ -257,7 +261,11 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if err != nil {
 		return 0, nil, err
 	}
-	payTxID, err := s.n.cfg.Connectors[cur].SendRawTransaction(payHex2)
+	conn, e := s.n.connector(cur)
+	if e != nil {
+		return 0, nil, e
+	}
+	payTxID, err := conn.SendRawTransaction(payHex2)
 	if err != nil {
 		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
 	}

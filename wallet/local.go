@@ -100,3 +100,15 @@ func (l *LocalConnector) GetBlockHash(height int64) ([32]byte, error) {
 func (l *LocalConnector) GetRawTransaction(txid string) (string, error) {
 	return "", errors.New("wallet: LocalConnector has no block source")
 }
+
+// SignMessage is unsupported for LocalConnector: BIP137 signing over locally
+// held keys (the Blockchain Message magic-prefixed double-SHA256) is a
+// follow-up. The RPCConnector path covers live wallets.
+func (l *LocalConnector) SignMessage(address, message string) ([]byte, error) {
+	return nil, errors.New("wallet: LocalConnector does not support signmessage")
+}
+
+// VerifyMessage is unsupported for LocalConnector (see SignMessage).
+func (l *LocalConnector) VerifyMessage(address string, sig []byte, message string) (bool, error) {
+	return false, errors.New("wallet: LocalConnector does not support verifymessage")
+}

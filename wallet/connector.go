@@ -15,6 +15,8 @@
 // the coins package; wallet only signs and moves bytes.
 package wallet
 
+import "time"
+
 // Chain identifies a coin wallet endpoint: the connected SPV wallet (or full
 // node) exposing Blocknet-core-compatible RPC for that ticker. Every field is
 // derived from the coin's [TICKER] section in xbridge.conf (nothing hardcoded).
@@ -36,6 +38,10 @@ type Chain struct {
 	ContentType string
 	// Confirmations is the min confirmations for spendable UTXOs (from conf).
 	Confirmations int
+	// Timeout bounds each JSON-RPC call to the wallet/node. A hung wallet must
+	// not wedge the swap feed goroutine indefinitely. Zero applies the client's
+	// default (30s).
+	Timeout time.Duration
 }
 
 // Utxo is a spendable output usable to fund a deposit transaction.
@@ -85,4 +91,13 @@ type Connector interface {
 	// The taker uses it to read the maker's payTx and recover the HTLC secret
 	// preimage (C++ getSecretFromPaymentTransaction → getrawtransaction).
 	GetRawTransaction(txid string) (string, error)
+	// SignMessage produces a BIP137 ownership proof (compact 65-byte signature)
+	// over message for the given address. XBridge embeds a SignMessage proof for
+	// each order UTXO so counterparties can verify the order creator owns the
+	// coins (src/xbridge/xbridgeapp.cpp createOrder →
+	// CXBridgeWalletConnector::signMessage(address, txid:vout)).
+	SignMessage(address, message string) ([]byte, error)
+	// VerifyMessage checks a BIP137 proof (address, sig, message) against this
+	// wallet's chain. Used by the taker to validate the maker's UTXO proofs.
+	VerifyMessage(address string, sig []byte, message string) (bool, error)
 }

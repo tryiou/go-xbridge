@@ -47,6 +47,17 @@ func (a Address) ID() ([20]byte, bool) {
 func (a Address) String() string {
 	switch a.Kind {
 	case P2PKH, P2SH:
+		if a.Coin.Family() == FamilyUTXOBCH {
+			typ := 0
+			if a.Kind == P2SH {
+				typ = 1
+			}
+			s, err := cashaddrEncode(a.Coin.CashAddrPrefix, typ, a.Hash)
+			if err != nil {
+				return ""
+			}
+			return s
+		}
 		return base58CheckEncode(a.Prefix, a.Hash)
 	case P2WPKH, P2WSH, P2TR:
 		s, err := bech32Encode(a.Coin.Bech32HRP, a.WitnessVersion, a.Hash)
@@ -60,10 +71,25 @@ func (a Address) String() string {
 }
 
 // DecodeAddress decodes an address string for coin c, detecting legacy
-// base58check (P2PKH/P2SH) and, when supported, native segwit (bech32/bech32m).
+// base58check (P2PKH/P2SH), native segwit (bech32/bech32m), and — for the
+// Bitcoin Cash family — CashAddr.
 func (c Coin) DecodeAddress(s string) (Address, error) {
 	if s == "" {
 		return Address{}, errors.New("coins: empty address")
+	}
+	// Bitcoin Cash uses CashAddr exclusively; its legacy base58check version
+	// byte collides with BTC's, so we decode CashAddr first and reject anything
+	// else for that family.
+	if c.Family() == FamilyUTXOBCH {
+		typ, h, err := cashaddrDecode(s, c.CashAddrPrefix)
+		if err != nil {
+			return Address{}, err
+		}
+		kind := P2PKH
+		if typ == 1 {
+			kind = P2SH
+		}
+		return Address{Coin: c, Kind: kind, Hash: h}, nil
 	}
 	// Try legacy base58check first.
 	if prefix, payload, err := base58CheckDecode(s); err == nil {

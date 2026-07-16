@@ -22,6 +22,12 @@ const (
 	SigOffset    = 53 // C++: signatureField() = &m_body[53]
 	BodyOffset   = HeaderSize
 
+	// MaxBodySize bounds the declared body length of an XBridge packet. Peer-
+	// supplied sizes are untrusted; this cap prevents a huge p.Size from
+	// allocating an enormous Body (and avoids uint32 overflow in the length
+	// check). 1 MiB is far beyond any real XBridge body.
+	MaxBodySize = 1 << 20
+
 	// uint32 header field byte offsets (each field is 4 bytes, little-endian).
 	offVersion   = 0
 	offCommand   = 4
@@ -98,7 +104,13 @@ func Unmarshal(data []byte) (*Packet, error) {
 	}
 	copy(p.Pubkey[:], data[PubkeyOffset:PubkeyOffset+PubkeySize])
 	copy(p.Signature[:], data[SigOffset:SigOffset+SigSize])
-	if uint32(len(data)) < HeaderSize+p.Size {
+	// p.Size is untrusted. Reject absurd sizes up front (cheap), then verify it
+	// fits the buffer using uint64 math so a near-max uint32 cannot wrap the
+	// comparison and slip a truncated/oversized body through.
+	if p.Size > MaxBodySize {
+		return nil, errors.New("xbridge: declared body size too large")
+	}
+	if uint64(len(data)) < uint64(HeaderSize)+uint64(p.Size) {
 		return nil, errors.New("xbridge: declared body size exceeds data")
 	}
 	p.Body = make([]byte, p.Size)

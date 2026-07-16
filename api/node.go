@@ -157,6 +157,83 @@ func (n *Node) blockConnector() wallet.Connector {
 	return n.cfg.Connectors["BLOCK"]
 }
 
+// connector returns the wallet connector for ticker, or an *rpcError when none
+// is configured. This centralizes the nil/lookup check so swap handlers never
+// index n.cfg.Connectors[t] unguarded — an absent connector must surface as an
+// error, not as a nil-interface panic on the feed goroutine.
+func (n *Node) connector(t string) (wallet.Connector, error) {
+	if n.cfg == nil || n.cfg.Connectors == nil {
+		return nil, fmt.Errorf("dx: no wallet configured")
+	}
+	conn, ok := n.cfg.Connectors[t]
+	if !ok || conn == nil {
+		return nil, fmt.Errorf("dx: no wallet configured for %s", t)
+	}
+	return conn, nil
+}
+
+// blockContext returns the best block height and the first 8 bytes of the block
+// hash for ticker, mirroring C++ xbridgeapp.cpp:2420 (the chain tip stamped on
+// AcceptingBody). A missing/unreachable connector yields zeros — the order is
+// still accepted; only the anti-replay context is absent.
+func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte) {
+	conn, err := n.connector(ticker)
+	if err != nil {
+		return 0, [8]byte{}
+	}
+	h, err := conn.GetBlockCount()
+	if err != nil || h < 1 {
+		return 0, [8]byte{}
+	}
+	if h <= int64(^uint32(0)) {
+		height = uint32(h)
+	}
+	bh, err := conn.GetBlockHash(h)
+	if err != nil {
+		return height, [8]byte{}
+	}
+	copy(hash[:], bh[:8])
+	return height, hash
+}
+
+// utxoChallenge builds the BIP137 message an order UTXO is signed over,
+// matching C++ CXBridgeWalletConnector::signMessage: "<display-txid>:<vout>".
+// VERIFY: confirm the exact challenge string against a live C++ hub before
+// relying on cross-implementation acceptance of the proof.
+func utxoChallenge(txid string, vout uint32) string {
+	return fmt.Sprintf("%s:%d", txid, vout)
+}
+
+// buildUtxoProofs attaches a BIP137 ownership proof to each spendable UTXO,
+// producing the UtxoEntry list carried in order/pending/accepting bodies. Each
+// proof is signmessage(address, "<txid>:<vout>"); the counterparty verifies it
+// against the UTXO's address via VerifyMessage.
+func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) ([]proto.UtxoEntry, error) {
+	out := make([]proto.UtxoEntry, 0, len(utxos))
+	for _, u := range utxos {
+		id, err := reverseTxidHex(u.TxID)
+		if err != nil {
+			return nil, err
+		}
+		a, err := c.DecodeAddress(u.Address)
+		if err != nil {
+			return nil, err
+		}
+		raw, ok := a.ID()
+		if !ok {
+			return nil, fmt.Errorf("api: utxo address %s has no id", u.Address)
+		}
+		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout))
+		if err != nil {
+			return nil, err
+		}
+		var s [65]byte
+		copy(s[:], sig)
+		out = append(out, proto.UtxoEntry{TxID: id, Vout: u.Vout, RawAddress: raw, Signature: s})
+	}
+	return out, nil
+}
+
 // refreshBlock fetches the BLOCK best-block hash (tip-1, mirroring C++) and
 // caches it for stamping on outgoing orders. No-op without a BLOCK connector.
 func (n *Node) refreshBlock() {
@@ -293,6 +370,14 @@ func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, fn func(*SwapSession) (pr
 	if hub != ([20]byte{}) {
 		s.hub = hub
 	}
+	// Defense in depth: a malformed/inbound packet must never crash the feed
+	// goroutine (which would terminate the whole process). Recover from any
+	// panic in the handler and log it; the swap is simply not progressed.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("xbridge-go: recovered panic dispatching swap %s: %v", hexEncode(id[:]), r)
+		}
+	}()
 	cmd, body, err := fn(s)
 	if err != nil {
 		return
@@ -411,6 +496,21 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		MinFromAmount:  minFrom,
 	}
 
+	// Attach BIP137 ownership proofs for the maker's spendable UTXOs so a C++
+	// counterparty can verify we own the coins (best-effort: a wallet that
+	// cannot sign leaves Utxos empty rather than failing the order broadcast).
+	if c, e := n.connector(p.Maker); e == nil {
+		if cc := n.cfg.Confs[p.Maker]; cc != nil {
+			if utxos, e := c.ListUnspent(cc.Confirmations); e == nil && len(utxos) > 0 {
+				if coin, ok := coins.Get(p.Maker); ok {
+					if proofs, e := buildUtxoProofs(c, utxos, coin); e == nil {
+						body.Utxos = proofs
+					}
+				}
+			}
+		}
+	}
+
 	pkt := proto.NewPacket(proto.XbcTransaction, body.Marshal())
 	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
 		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
@@ -476,16 +576,20 @@ func (n *Node) TakeOrder(p TakeOrderParams) (*Order, *rpcError) {
 		}
 	}
 
+	fromH, fromHash := n.blockContext(o.ToCurrency)
+	toH, toHash := n.blockContext(o.FromCurrency)
 	acc := &proto.AcceptingBody{
 		ID:              o.ID,
 		From:            fromID,
 		FromCurrency:    o.ToCurrency,
 		FromAmount:      takeAmt,
+		FromBlockHeight: fromH,
+		FromBlockHash:   fromHash,
 		To:              toID,
 		ToCurrency:      o.FromCurrency,
 		ToAmount:        o.FromAmount,
-		FromBlockHeight: 0,
-		ToBlockHeight:   0,
+		ToBlockHeight:   toH,
+		ToBlockHash:     toHash,
 	}
 	pkt := proto.NewPacket(proto.XbcTransactionAccepting, acc.Marshal())
 	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -114,6 +115,27 @@ func intParam(params []json.RawMessage, i int, def int) (int, bool) {
 		return def, false
 	}
 	return n, true
+}
+
+// mustBool is boolParam with error propagation: a present-but-unparseable
+// param is a caller error (errInvalidParameters), not a silent default. A
+// missing param still yields def (ok=true).
+func mustBool(params []json.RawMessage, i int, def bool, method string) (bool, *rpcError) {
+	v, ok := boolParam(params, i, def)
+	if !ok {
+		return def, makeError(errInvalidParameters, method, fmt.Sprintf("param %d is not a boolean", i))
+	}
+	return v, nil
+}
+
+// mustInt is intParam with error propagation: a present-but-unparseable param
+// is a caller error, not a silent default. A missing param still yields def.
+func mustInt(params []json.RawMessage, i, def int, method string) (int, *rpcError) {
+	v, ok := intParam(params, i, def)
+	if !ok {
+		return def, makeError(errInvalidParameters, method, fmt.Sprintf("param %d is not an integer", i))
+	}
+	return v, nil
 }
 
 func strArrayParam(params []json.RawMessage, i int) ([]string, bool) {

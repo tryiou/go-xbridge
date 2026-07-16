@@ -1,11 +1,25 @@
 package wallet
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
+
+// mockMsgSigB64 is a fixed base64 BIP137 signature (65 raw bytes) the mock
+// signmessage handler returns, so SignMessage's decode path is exercised.
+var mockMsgSigB64 = func() string {
+	b := make([]byte, 65)
+	for i := range b {
+		b[i] = byte(i + 1)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}()
 
 // mockRPC returns a test server that answers the RPC methods the connector
 // calls with canned responses, checking basic auth.
@@ -43,6 +57,10 @@ func mockRPC(t *testing.T) *httptest.Server {
 			// (little-endian) order by revHashHex, so the internal form has
 			// 0xff in its last byte.
 			res(`"ff00000000000000000000000000000000000000000000000000000000000000"`)
+		case "signmessage":
+			res(`"` + mockMsgSigB64 + `"`)
+		case "verifymessage":
+			res(`true`)
 		default:
 			res(`null`)
 		}
@@ -151,5 +169,65 @@ func TestRPCConnectorUnauthorized(t *testing.T) {
 	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "bad", Pass: "bad", Decimals: 8})
 	if _, err := c.GetNewAddress(); err == nil {
 		t.Fatal("expected auth error")
+	}
+}
+
+// slowRPC returns a test server whose every handler blocks longer than the
+// client timeout, to exercise the timeout path.
+func slowRPC(delay time.Duration) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay)
+		enc := json.NewEncoder(w)
+		enc.Encode(rpcResponse{Result: json.RawMessage(`"ok"`), ID: "1"})
+	}))
+}
+
+// TestRPCClientTimeout confirms a hung wallet RPC surfaces an error instead of
+// blocking the caller (which would wedge the swap feed goroutine) forever.
+func TestRPCClientTimeout(t *testing.T) {
+	srv := slowRPC(300 * time.Millisecond)
+	defer srv.Close()
+	c := NewRPCClient(srv.URL, "u", "p", "", "", 50*time.Millisecond)
+	var out string
+	err := c.Call("getblockcount", nil, &out)
+	if err == nil {
+		t.Fatal("expected timeout error for a slow RPC")
+	}
+	if !strings.Contains(err.Error(), "Client.Timeout") && !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("expected a timeout error, got: %v", err)
+	}
+}
+
+// TestRPCClientDefaultTimeout confirms NewRPCClient applies the 30s default
+// when no explicit timeout is given (zero value), so callers relying on the
+// constructor always get a bounded client.
+func TestRPCClientDefaultTimeout(t *testing.T) {
+	c := NewRPCClient("http://example.invalid", "u", "p", "", "", 0)
+	if c.http.Timeout != defaultRPCTimeout {
+		t.Fatalf("expected default timeout %v, got %v", defaultRPCTimeout, c.http.Timeout)
+	}
+}
+
+// TestRPCConnectorSignMessage exercises the BIP137 proof plumbing: signmessage
+// returns a base64 compact sig that SignMessage decodes to 65 raw bytes, and
+// verifymessage round-trips true.
+func TestRPCConnectorSignMessage(t *testing.T) {
+	srv := mockRPC(t)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	sig, err := c.SignMessage("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", "msg")
+	if err != nil {
+		t.Fatalf("SignMessage: %v", err)
+	}
+	if len(sig) != 65 {
+		t.Fatalf("SignMessage sig len = %d, want 65", len(sig))
+	}
+	want, _ := base64.StdEncoding.DecodeString(mockMsgSigB64)
+	if !bytes.Equal(sig, want) {
+		t.Fatalf("SignMessage sig = %x, want %x", sig, want)
+	}
+	ok, err := c.VerifyMessage("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", sig, "msg")
+	if err != nil || !ok {
+		t.Fatalf("VerifyMessage ok=%v err=%v", ok, err)
 	}
 }

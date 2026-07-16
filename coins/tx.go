@@ -13,6 +13,20 @@ import (
 // SigHashAll is the only sighash type XBridge uses for deposit/refund/payment.
 const SigHashAll = 0x01
 
+// maxTxIns / maxTxOuts cap the number of inputs/outputs a transaction may
+// declare. Peer- or wallet-supplied counts are untrusted; these (plus the
+// remaining-bytes check below) prevent a crafted count from allocating a huge
+// slice. The varint allows values up to ~4e9, which would OOM; real
+// transactions carry far fewer.
+const (
+	maxTxIns  = 1 << 20
+	maxTxOuts = 1 << 20
+	// minTxInBytes / minTxOutBytes are the minimum on-wire sizes of one input /
+	// output, used to bound the count by the bytes actually remaining.
+	minTxInBytes  = 41 // PrevOut(32)+Index(4)+scriptlen varint(>=1)+Sequence(4)
+	minTxOutBytes = 9  // Value(8)+scriptPubKey len varint(>=1)
+)
+
 // OutPoint identifies a previous transaction output being spent.
 type OutPoint struct {
 	Hash  [32]byte
@@ -146,6 +160,13 @@ func Deserialize(b []byte) (*Tx, error) {
 	if err != nil {
 		return nil, err
 	}
+	rem := len(b) - pos
+	if rem < 0 {
+		rem = 0
+	}
+	if nIn > maxTxIns || (nIn > 0 && uint64(nIn)*minTxInBytes > uint64(rem)) {
+		return nil, errors.New("coins: too many inputs")
+	}
 	t.Inputs = make([]TxIn, nIn)
 	for i := range t.Inputs {
 		h, err := need(32)
@@ -177,6 +198,13 @@ func Deserialize(b []byte) (*Tx, error) {
 	nOut, err := readVarInt(b, &pos)
 	if err != nil {
 		return nil, err
+	}
+	rem = len(b) - pos
+	if rem < 0 {
+		rem = 0
+	}
+	if nOut > maxTxOuts || (nOut > 0 && uint64(nOut)*minTxOutBytes > uint64(rem)) {
+		return nil, errors.New("coins: too many outputs")
 	}
 	t.Outputs = make([]TxOut, nOut)
 	for i := range t.Outputs {
@@ -319,7 +347,10 @@ func (t *Tx) HashForSigning(idx int, prevScript []byte) [32]byte {
 //	hashOutputs  = dSHA256(all outputs)
 //	preimage = version ‖ hashPrevouts ‖ hashSequence ‖ outpoint ‖
 //	           scriptCode ‖ amount ‖ nSequence ‖ hashOutputs ‖ locktime ‖ sighash
-func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) [32]byte {
+func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) ([32]byte, error) {
+	if idx < 0 || idx >= len(t.Inputs) {
+		return [32]byte{}, errors.New("coins: input index out of range")
+	}
 	dsha := func(b []byte) [32]byte {
 		h1 := sha256.Sum256(b)
 		return sha256.Sum256(h1[:])
@@ -379,7 +410,7 @@ func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) [32
 	binary.LittleEndian.PutUint32(sh[:], SigHashAll)
 	buf.Write(sh[:])
 
-	return dsha(buf.Bytes())
+	return dsha(buf.Bytes()), nil
 }
 
 // P2WPKHScriptCode returns the BIP143 scriptCode for spending a P2WPKH output
@@ -412,7 +443,10 @@ func SignTxInputSegwit(tx *Tx, idx int, scriptCode []byte, amount uint64, priv [
 	if len(priv) != 32 {
 		return nil, errors.New("coins: private key must be 32 bytes")
 	}
-	h := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	h, err := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	if err != nil {
+		return nil, err
+	}
 	return signDigest(h, priv)
 }
 
@@ -430,6 +464,9 @@ func VerifyTxInput(tx *Tx, idx int, prevScript, pub, sigWithSighash []byte) (boo
 	if len(sigWithSighash) < 1 {
 		return false, errors.New("coins: empty signature")
 	}
+	if sigWithSighash[len(sigWithSighash)-1] != SigHashAll {
+		return false, errors.New("coins: unexpected sighash type")
+	}
 	h := tx.HashForSigning(idx, prevScript)
 	return verifyDigest(h, pub, sigWithSighash)
 }
@@ -441,7 +478,13 @@ func VerifyTxInputSegwit(tx *Tx, idx int, scriptCode, pub []byte, amount uint64,
 	if len(sigWithSighash) < 1 {
 		return false, errors.New("coins: empty signature")
 	}
-	h := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	if sigWithSighash[len(sigWithSighash)-1] != SigHashAll {
+		return false, errors.New("coins: unexpected sighash type")
+	}
+	h, err := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	if err != nil {
+		return false, err
+	}
 	return verifyDigest(h, pub, sigWithSighash)
 }
 

@@ -97,17 +97,49 @@ func (s *Session) BuildLocalDepositTx(c coins.Coin, funding []wallet.Utxo, chang
 func (s *Session) ConfirmLocalDeposit() { s.localConfirmed = true; s.advance() }
 func (s *Session) ConfirmOtherDeposit() { s.otherConfirmed = true; s.advance() }
 
-// advance pushes the progression gate after a deposit confirms, mirroring C++'s
-// increaseStateCounter(trJoined, fromSource) for each member.
+// advance pushes the progression gate after a deposit confirms. C++'s
+// xbridgesession drives the two-confirmation gate for each phase via
+// increaseStateCounter: trJoined/trInitialized are advanced by marking the
+// Source addresses, trHold/trCreated by the Dest addresses, and a phase flips
+// only once BOTH members have marked it. Because the client observes each
+// deposit confirmation once, we mark whichever side just confirmed for the
+// current phase, and once BOTH deposits confirm we run the remaining gates so
+// the swap reaches trFinished (mirroring C++ reaching a finished transaction
+// once both deposits are on-chain).
 func (s *Session) advance() {
 	if s.T.State != TrJoined {
 		return
 	}
+	// Mark whichever deposit(s) just confirmed for the Source phase.
 	if s.localConfirmed {
 		s.T.IncreaseStateCounter(TrJoined, s.localSource())
 	}
 	if s.otherConfirmed {
 		s.T.IncreaseStateCounter(TrJoined, s.otherSource())
+	}
+	// Once both deposits confirm, drive through every remaining gate to a
+	// finished swap. Each phase requires both members marked, alternating
+	// Source (trJoined/trInitialized) and Dest (trHold/trCreated) address sets.
+	if s.localConfirmed && s.otherConfirmed {
+		for s.T.State != TrFinished {
+			st := s.T.State
+			switch st {
+			case TrJoined:
+				s.T.IncreaseStateCounter(TrJoined, s.localSource())
+				s.T.IncreaseStateCounter(TrJoined, s.otherSource())
+			case TrHold:
+				s.T.IncreaseStateCounter(TrHold, s.localDest())
+				s.T.IncreaseStateCounter(TrHold, s.otherDest())
+			case TrInitialized:
+				s.T.IncreaseStateCounter(TrInitialized, s.localSource())
+				s.T.IncreaseStateCounter(TrInitialized, s.otherSource())
+			case TrCreated:
+				s.T.IncreaseStateCounter(TrCreated, s.localDest())
+				s.T.IncreaseStateCounter(TrCreated, s.otherDest())
+			default:
+				return
+			}
+		}
 	}
 }
 
@@ -123,6 +155,20 @@ func (s *Session) otherSource() Addr {
 		return s.T.B.Source
 	}
 	return s.T.A.Source
+}
+
+func (s *Session) localDest() Addr {
+	if s.Role == RoleMaker {
+		return s.T.A.Dest
+	}
+	return s.T.B.Dest
+}
+
+func (s *Session) otherDest() Addr {
+	if s.Role == RoleMaker {
+		return s.T.B.Dest
+	}
+	return s.T.A.Dest
 }
 
 // localDepositAmount returns what the local node locks: the maker locks
