@@ -19,15 +19,19 @@ every command diverged in at least one dapp-visible way, with the damage
 concentrated in (a) two **universal** substrate breaks and (b) the
 order-lifecycle + wallet/split commands.
 
-**Status (2026-07-16):** all 24 commands have been remediated against the C++
-wire contract — universal substrate (C1 6-decimals, C2/C3 error codes, C4/C5
-param/JSON-RPC), order lifecycle, wallet/split, and the final three history /
-trading / network-token commands. The only remaining deltas are documented
-thin-client backing limitations (per-UTXO lock tracking for `dxGetUtxos`/
-`dxGetTokenBalances`, live refund-tx value for `dxCancelOrder`, and the fact
-that `dxGetOrderHistory`/`dxGetTradingData` reflect local trade history only,
-not network-wide XSeries / on-chain BLOCK history). See the remediation-progress
-sections below.
+**Status (2026-07-17):** all 24 commands have been remediated against the C++
+wire contract. The **Tier 1** code bugs (`stateOrdinal` enum, `dxPartialOrderChainDetails`
+aggregation / empty-chain / id-validation, `dxTakeOrder` amount=0 full take,
+`FlushCancelled` uint64 underflow, `dxGetLockedUtxos` nil-guard) and **Tier 2**
+achievable backing gaps (per-`(txid:vout)` locked-UTXO tracking, `dxCancelOrder`
+`refund_tx`, `p2sh_deposits` / `_counterparty` fields, `dxGetTokenBalances`
+`Wallet` key) are **fixed** in this pass. The only remaining deltas are
+**Tier 3 — documented thin-client architectural limits** that require a BLOCK
+block index / `blocknetd` to fully resolve: `dxGetOrderHistory` / `dxGetTradingData`
+reflect session-local fills only (`fee_txid` / `nodepubkey` empty), and
+`dxGetNetworkTokens` completeness is bounded by P2P servicenode-ping coverage.
+These are documented (not silently divergent) under "Tier 3 — architectural
+limits" in `docs/api.md`. See the remediation-progress sections below.
 
 ## Equivalence matrix
 
@@ -39,19 +43,19 @@ sections below.
 | dxGetOrderBook | DIVERGED | high | **inverted price**; detail 1/2/4 unimplemented |
 | dxGetOrderFills | DIVERGED | high | only 6 of 12 fields emitted |
 | dxGetMyPartialOrderChain | PARTIAL-GAP | med | walks ancestors only (C++ adds descendants) |
-| dxPartialOrderChainDetails | DIVERGED | high | stub: order objects not hex-id array; totals hardcoded 0 |
-| dxGetLockedUtxos | DIVERGED | high | wrong schema: returns orders, not UTXO lists |
-| dxFlushCancelledOrders | DIVERGED | high | never prunes store; `ageMillis` ignored |
+| dxPartialOrderChainDetails | DONE | — | totals via `stateOrdinal<=trPending`; empty `{}` for unknown chain; id validated; `p2sh_deposits` emitted |
+| dxGetLockedUtxos | DONE | — | per-UTXO `txid:vout` locked set from active orders; nil-guarded |
+| dxFlushCancelledOrders | DONE | — | `FlushCancelled` prunes by age; uint64 underflow clamped |
 | dxGetLocalTokens | PARTIAL-GAP | low | static conf set vs live connector map |
 | dxGetNetworkTokens | DONE | med | live servicenode union via XbcServicesPing (was static conf) |
 | dxMakeOrder | DIVERGED | high | `dryrun` string **broadcasts**; missing validations |
 | dxMakePartialOrder | DIVERGED | high | misreports partial as `order_type="exact"`; trailing params ignored |
 | dxTakeOrder | DIVERGED | high | **maker/taker swapped**; `dryrun` broadcasts; no self-trade guard |
-| dxCancelOrder | DIVERGED | med | cancels in-progress orders; `refund_tx` never set |
+| dxCancelOrder | DONE | — | cancel guard `stateOrdinal>=trCreated`; `refund_tx` from swap refund |
 | dxLoadXBridgeConf | PARTIAL-GAP | low | returns `true` unconditionally (no reload) |
 | dxGetNewTokenAddress | DIVERGED | med | `[]` vs error on no-wallet; segwit addr type |
-| dxGetTokenBalances | DIVERGED | med | missing `Wallet` key; includes locked UTXOs |
-| dxGetUtxos | DIVERGED | med | missing `orderid` field; includes locked UTXOs |
+| dxGetTokenBalances | DONE | — | `Wallet` key from BLOCK connector; locked UTXOs subtracted |
+| dxGetUtxos | DONE | — | `orderid` field; locked UTXOs excluded (`include_used`) |
 | dxSplitAddress | PARTIAL-GAP | high | wrong response fields + wrong UTXO/change/fee model |
 | dxSplitInputs | PARTIAL-GAP | high | same as above + param-count divergence |
 | dxGetOrderHistory | DONE | med | OHLCV buckets from local fills; schema matches C++ (zero-filled empties) |
@@ -363,4 +367,57 @@ on-chain BLOCK history, because a thin client without blocknetd has no block
 index. The wire *schema* matches C++ exactly; `fee_txid`/`nodepubkey` in trading
 data are `""` (on-chain BLOCK data unavailable locally). `dxGetNetworkTokens`
 falls back to the config list when no servicenodes are connected.
+
+**Tier 1 + Tier 2 backing wiring (applied 2026-07-17):** closes the "not yet
+wired" gaps flagged above and fixes the remaining code bugs in the `dx*`
+surface. No `blocknetd` dependency is introduced (the thin-client design is
+preserved).
+
+- **T1.1 `stateOrdinal` enum** (`api/response.go`): added the two missing
+  `TransactionDescr::State` values — `trRollback=10`, `trRollbackFailed=11` —
+  and renumbered `trDropped=12`, `trCancelled=13`, `trInvalid=14`. Previously
+  these fell through to `0`, which broke `dxCancelOrder`'s `stateOrdinal >=
+  trCreated(6)` guard (a rolled-back order was wrongly cancellable). Verified by
+  `TestStateOrdinal`.
+- **T1.2 `dxPartialOrderChainDetails`** (`api/handlers.go`): `total_orders_open`
+  now counts `stateOrdinal(t.Status) <= 2` (C++ `state <= trPending`) instead of
+  only `status == "open"`; an unknown/empty chain returns an empty object `{}`
+  (not an error); the order id is validated as 64-hex and rejected with
+  `INVALID_PARAMETERS` otherwise. `p2sh_deposits` / `p2sh_deposits_counterparty`
+  are now populated from each order's `BinTxId` / `OBinTxId` (T2.3).
+- **T1.3 `dxTakeOrder` amount=0** (`api/node.go`): an omitted or zero `amount`
+  is now a **full-order** take (sizes equal the order's maker/taker sizes),
+  matching C++. Only a positive amount engages the partial recompute. Verified
+  by `TestDxTakeOrderFullTake`.
+- **T1.4 `Store.FlushCancelled` underflow** (`api/store.go`): the `uint64`
+  subtraction `now - minAgeMillis*1000` is clamped so a huge `minAgeMillis`
+  prunes every entry instead of wrapping around. Verified by
+  `TestFlushCancelledUnderflow`.
+- **T1.5 `dxGetLockedUtxos` nil-guard** (`api/handlers.go`): returns
+  `NOT_EXCHANGE_NODE` instead of panicking when `Node` / `Config` / exchange
+  wallets are absent.
+- **T2.1 per-UTXO locked tracking** (`api/store.go`, `api/handlers.go`): added
+  `Store.LockedUtxoInfo()` which derives the locked `txid:vout` set from each
+  *active* (non-terminal) order's `Utxos`. `dxGetLockedUtxos` now emits those
+  reserved UTXOs, `dxGetUtxos` excludes them when `include_used=false` (and sets
+  `orderid` when `true`), and `dxGetTokenBalances` subtracts each currency's
+  locked total from the wallet balance. Verified by `TestDxLockedUtxoExclusion`.
+- **T2.2 `dxCancelOrder` `refund_tx`** (`api/swap.go`): the swap layer now ties
+  its pre-signed refund hex to the order (`o.RefundTx`), so `dxCancelOrder`
+  surfaces a real `refund_tx` once a swap has reached the deposit step. Orders
+  cancelled before any deposit still return `""` (matches C++).
+- **T2.3 `p2sh_deposits`** (`api/order.go`, `api/swap.go`): added `BinTxId` /
+  `OBinTxId` to `Order`; the maker/taker deposit broadcasts populate them
+  (`buildDeposit` / `OnCreateB` / `OnConfirmA`), and `dxPartialOrderChainDetails`
+  emits them per order.
+- **T2.4 `dxGetTokenBalances` `Wallet` key** (`api/handlers.go`): the `Wallet`
+  key is now derived from the BLOCK connector (fallback: the first configured
+  exchange wallet), matching C++'s native-wallet balance label.
+
+**Tier 3 — documented, not fixed (thin-client architectural limits):** see the
+"Tier 3 — architectural limits" section in `docs/api.md`. These require a BLOCK
+block index / `blocknetd` and are intentionally out of scope for this pass:
+`dxGetOrderHistory` / `dxGetTradingData` reflect session-local fills only
+(`fee_txid` / `nodepubkey` empty), and `dxGetNetworkTokens` completeness is
+bounded by P2P servicenode-ping coverage.
 

@@ -195,6 +195,11 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	}
 	s.theirPub = b.APubKey
 	s.theirDepositTxID = b.ADepositTxID
+	// Record the counterparty (maker) deposit txid on the order so
+	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.OBinTxId = b.ADepositTxID
+	}
 	s.theirSecretHash = b.HashedSecret
 	s.theirLockTime = b.ALockTime
 	txid, refundHex, err := s.buildDeposit(false)
@@ -216,6 +221,11 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", hexEncode(s.id[:]))
 	}
 	s.theirDepositTxID = b.BDepositTxID
+	// Record the counterparty (taker) deposit txid on the order so
+	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.OBinTxId = b.BDepositTxID
+	}
 	s.theirLockTime = b.BLockTime
 
 	payHex, cur, err := s.redeemCounterparty(true)
@@ -383,12 +393,24 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	}
 	s.ourDepositTxID = txid
 	s.ourLockTime = lockTime
+	// Record our own deposit txid on the order so dxPartialOrderChainDetails can
+	// emit p2sh_deposits.
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.BinTxId = txid
+	}
 
 	refundHex, err = s.buildRefundTx(spec, cur)
 	if err != nil {
 		return "", "", err
 	}
 	s.refundHex = refundHex
+	// Tie the pre-signed refund to the order so dxCancelOrder can surface
+	// `refund_tx` for an order whose deposit has been broadcast (C++ returns the
+	// empty string for orders cancelled before any deposit — which is still the
+	// case here, since buildDeposit only runs once a swap reaches the deposit step).
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.RefundTx = refundHex
+	}
 	return txid, refundHex, nil
 }
 

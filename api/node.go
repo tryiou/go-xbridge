@@ -682,10 +682,14 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		if err != nil {
 			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
 		}
-		if a == 0 {
-			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+p.Amount)
-		}
-		if o.PartialAllowed {
+		// C++ treats a take amount of 0 (and an omitted amount) as a FULL-ORDER
+		// take: fromSize/toSize stay at the full order size. Only a positive amount
+		// (on a partial order) engages the partial recompute via
+		// xBridgeSourceAmountFromPrice.
+		if a > 0 {
+			if !o.PartialAllowed {
+				return orderListResult{}, makeError(errInvalidPartialOrder, "dxTakeOrder", "")
+			}
 			if a < o.MinFromAmount {
 				return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The minimum amount for this order is: "+formatXAmount(o.MinFromAmount))
 			}
@@ -696,8 +700,6 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 				toSize = a
 				fromSize = xBridgeSourceAmountFromPrice(toSize, o.ToAmount, o.FromAmount)
 			}
-		} else if a > 0 {
-			return orderListResult{}, makeError(errInvalidPartialOrder, "dxTakeOrder", "")
 		}
 	}
 

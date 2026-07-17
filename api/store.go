@@ -1,8 +1,11 @@
 package api
 
 import (
+	"strconv"
 	"sync"
 	"time"
+
+	"xbridge-go/proto"
 )
 
 // Store is the in-memory XBridge order book. It is populated by the P2P feed
@@ -133,6 +136,52 @@ func (s *Store) Locked() []*Order {
 		out = append(out, o)
 	}
 	return out
+}
+
+// isOrderTerminal reports whether an order's reserved UTXOs have been released
+// (the swap has ended / the order was dropped). Mirrors C++'s lock release once
+// a Transaction reaches a terminal state — only non-terminal orders still hold
+// their maker UTXOs, so only those contribute to the locked set.
+func isOrderTerminal(status string) bool {
+	switch statusString(status) {
+	case "finished", "canceled", "dropped", "invalid":
+		return true
+	}
+	return false
+}
+
+// utxoEntryKey returns the "txid:vout" lock key (display order) for a UTXO entry
+// carried in an order body. proto.UtxoEntry.TxID is stored little-endian, so it
+// is reversed to display order before hex-encoding (matching wallet UTXO keys).
+func utxoEntryKey(e proto.UtxoEntry) string {
+	var rev [32]byte
+	for i := 0; i < 32; i++ {
+		rev[i] = e.TxID[31-i]
+	}
+	return hexEncode(rev[:]) + ":" + strconv.FormatUint(uint64(e.Vout), 10)
+}
+
+// LockedUtxoInfo returns the set of "txid:vout" (display order) reserved by
+// active orders, plus a map from each key to the hex id of the order locking it.
+// dxGetLockedUtxos / dxGetUtxos / dxGetTokenBalances consume this so locked
+// coins are reported and excluded from available balances, matching C++.
+func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys = map[string]bool{}
+	byOrder = map[string]string{}
+	for _, o := range s.orders {
+		if isOrderTerminal(o.Status) {
+			continue
+		}
+		oid := hexEncode(o.ID[:])
+		for _, u := range o.Utxos {
+			k := utxoEntryKey(u)
+			keys[k] = true
+			byOrder[k] = oid
+		}
+	}
+	return keys, byOrder
 }
 
 // RecordCancelled records a flushed cancelled order (dxFlushCancelledOrders).
