@@ -2,7 +2,10 @@ package swap
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
+
+	xlog "xbridge-go/log"
 
 	"xbridge-go/coins"
 	"xbridge-go/wallet"
@@ -65,6 +68,9 @@ func (s *Session) CreateLocalDeposit(lockTime uint32) (*DepositSpec, error) {
 		LockTime:        lockTime,
 	}
 	s.localDeposited = true
+	sh := coins.KeyID(secret[:])
+	xlog.Debug("CreateLocalDeposit", "role", s.Role.String(), "cur", cur, "amount", amt,
+		"lockTime", lockTime, "secretHash", hex.EncodeToString(sh[:]))
 	return s.Local, nil
 }
 
@@ -82,6 +88,8 @@ func (s *Session) AdoptCounterparty(secretHash [20]byte, lockTime uint32) {
 		LockTime:        lockTime,
 	}
 	s.otherDeposited = true
+	xlog.Debug("AdoptCounterparty", "role", s.Role.String(), "cur", cur, "amount", amt,
+		"lockTime", lockTime, "secretHash", hex.EncodeToString(secretHash[:]))
 }
 
 // BuildLocalDepositTx constructs the unsigned local deposit tx from funding UTXOs.
@@ -94,8 +102,16 @@ func (s *Session) BuildLocalDepositTx(c coins.Coin, funding []wallet.Utxo, chang
 
 // ConfirmLocalDeposit / ConfirmOtherDeposit record on-chain confirmation of each
 // side's deposit and advance the progression gate once both are confirmed.
-func (s *Session) ConfirmLocalDeposit() { s.localConfirmed = true; s.advance() }
-func (s *Session) ConfirmOtherDeposit() { s.otherConfirmed = true; s.advance() }
+func (s *Session) ConfirmLocalDeposit() {
+	xlog.Debug("ConfirmLocalDeposit", "role", s.Role.String(), "state", s.T.State.String())
+	s.localConfirmed = true
+	s.advance()
+}
+func (s *Session) ConfirmOtherDeposit() {
+	xlog.Debug("ConfirmOtherDeposit", "role", s.Role.String(), "state", s.T.State.String())
+	s.otherConfirmed = true
+	s.advance()
+}
 
 // advance pushes the progression gate after a deposit confirms. C++'s
 // xbridgesession drives the two-confirmation gate for each phase via
@@ -121,6 +137,7 @@ func (s *Session) advance() {
 	// finished swap. Each phase requires both members marked, alternating
 	// Source (trJoined/trInitialized) and Dest (trHold/trCreated) address sets.
 	if s.localConfirmed && s.otherConfirmed {
+		xlog.Debug("advance: both deposits confirmed, driving to finished", "role", s.Role.String(), "state", s.T.State.String())
 		for s.T.State != TrFinished {
 			st := s.T.State
 			switch st {

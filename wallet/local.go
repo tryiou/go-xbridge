@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	xlog "xbridge-go/log"
+
 	"xbridge-go/coins"
 )
 
@@ -72,6 +74,7 @@ func (l *LocalConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (str
 		}
 		tx.Inputs[i].ScriptSig = sig
 	}
+	xlog.Debug("local sign", "ticker", l.ticker, "inputs", len(tx.Inputs), "complete", true)
 	return hex.EncodeToString(tx.Serialize()), true, nil
 }
 
@@ -80,6 +83,7 @@ func (l *LocalConnector) SendRawTransaction(txHex string) (string, error) {
 	if l.broadcast == nil {
 		return "", errors.New("wallet: LocalConnector has no Broadcaster")
 	}
+	xlog.Debug("local broadcast", "ticker", l.ticker, "txHexLen", len(txHex))
 	return l.broadcast(txHex)
 }
 

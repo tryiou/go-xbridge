@@ -7,6 +7,8 @@ import (
 
 	"golang.org/x/crypto/ripemd160"
 
+	xlog "xbridge-go/log"
+
 	"xbridge-go/coins"
 	"xbridge-go/wallet"
 )
@@ -18,6 +20,18 @@ const (
 	RoleMaker Role = iota // A — created the order
 	RoleTaker             // B — joined it
 )
+
+// String renders the swap role for logs.
+func (r Role) String() string {
+	switch r {
+	case RoleMaker:
+		return "maker"
+	case RoleTaker:
+		return "taker"
+	default:
+		return "role?"
+	}
+}
 
 // DepositSpec describes one participant's HTLC deposit, ported from the C++
 // deposit blob carried on xbcTransactionInit (command 8) and built by
@@ -93,6 +107,8 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 	if ver <= 0 {
 		ver = 1
 	}
+	xlog.Debug("BuildDepositTx", "cur", d.Currency, "amount", d.Amount, "lockTime", d.LockTime,
+		"txVersion", ver, "funding", len(funding), "total", total, "fee", fee, "change", total-d.Amount-fee)
 	tx := &coins.Tx{Version: int32(ver), LockTime: 0}
 	for _, u := range funding {
 		h, err := reverseHashHex(u.TxID)

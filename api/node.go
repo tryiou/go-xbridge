@@ -5,10 +5,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
 	"sync"
 	"time"
+
+	xlog "xbridge-go/log"
 
 	"xbridge-go/coins"
 	"xbridge-go/config"
@@ -122,7 +123,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 			return nil, fmt.Errorf("api: dial service node: %w", err)
 		}
 		n.conn = conn
-		log.Printf("xbridge-go: connected to explicit service node %s", cfg.NodeAddr)
+		xlog.Info("connected to explicit service node", "addr", cfg.NodeAddr)
 	} else {
 		// No explicit node: discover the Blocknet P2P network like a core
 		// wallet would — pick seeds, connect, then gossip to learn peers.
@@ -136,7 +137,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		})
 		pm.Start(context.Background())
 		n.conn = pm
-		log.Printf("xbridge-go: network discovery started on %q (target %d peers)", network, 8)
+		xlog.Info("network discovery started", "network", network, "targetPeers", 8)
 	}
 	go n.feed()
 	go n.blockLoop()
@@ -314,9 +315,11 @@ func (n *Node) feed() {
 		}
 		body, err := proto.DecodeBody(pkt.Command, pkt.Body)
 		if err != nil {
+			xlog.Debug("packet body decode skipped", "command", pkt.Command.String(), "err", err)
 			continue
 		}
 		maker := hexEncode(pkt.Pubkey[:])
+		xlog.Debug("packet received", "command", pkt.Command.String(), "from", maker)
 		switch b := body.(type) {
 		case *proto.OrderBody:
 			o := normalizeFromOrderBody(b, maker)
@@ -327,31 +330,31 @@ func (n *Node) feed() {
 
 		// --- swap handshake (client side, hub-driven) ---
 		case *proto.HoldBody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnHold(b)
 			})
 		case *proto.InitBody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnInit(b)
 			})
 		case *proto.CreateABody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnCreateA(b)
 			})
 		case *proto.CreateBBody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnCreateB(b)
 			})
 		case *proto.ConfirmABody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnConfirmA(b)
 			})
 		case *proto.ConfirmBBody:
-			n.dispatchSwap(b.ID, b.HubAddress, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnConfirmB(b)
 			})
 		case *proto.FinishedBody:
-			n.dispatchSwap(b.ID, [20]byte{}, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnFinished(b)
 			})
 
@@ -415,32 +418,41 @@ type responseBody interface {
 // signs and broadcasts it. Packets for order ids we are not a party to are
 // ignored. The optional hub address is recorded on the session so responses are
 // addressed correctly.
-func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
+func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
 	n.sessMu.Lock()
 	s := n.sessions[hexEncode(id[:])]
 	n.sessMu.Unlock()
 	if s == nil {
+		xlog.Debug("swap packet for unknown order", "order", hexEncode(id[:]))
 		return
 	}
 	if hub != ([20]byte{}) {
 		s.hub = hub
 	}
+	orderID := hexEncode(id[:])
+	xlog.Info("swap packet received", "order", orderID, "command", cmdName, "state", s.state.String())
 	// Defense in depth: a malformed/inbound packet must never crash the feed
 	// goroutine (which would terminate the whole process). Recover from any
 	// panic in the handler and log it; the swap is simply not progressed.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("xbridge-go: recovered panic dispatching swap %s: %v", hexEncode(id[:]), r)
+			xlog.Error("recovered panic dispatching swap", "order", orderID, "panic", r)
 		}
 	}()
 	cmd, body, err := fn(s)
 	if err != nil {
+		xlog.Error("swap handler error", "order", orderID, "err", err)
 		return
 	}
 	if body == nil {
+		xlog.Debug("swap handler produced no response", "order", orderID)
 		return
 	}
-	_ = n.send(cmd, body)
+	if err := n.send(cmd, body); err != nil {
+		xlog.Error("swap response send failed", "order", orderID, "command", cmd.String(), "err", err)
+	} else {
+		xlog.Info("swap response sent", "order", orderID, "command", cmd.String())
+	}
 }
 
 // send signs and broadcasts a handshake response packet.
@@ -613,6 +625,9 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
 		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
 	}
+	if p.DryRun {
+		xlog.Warn("MakeOrder dry run — order not broadcast", "maker", p.Maker, "taker", p.Taker, "makerSize", p.MakerSize, "takerSize", p.TakerSize)
+	}
 	if !p.DryRun {
 		if err := n.conn.WritePacket(pkt); err != nil {
 			return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
@@ -729,6 +744,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	if p.DryRun {
 		// C++ renders the dryrun result BEFORE the swap and does not broadcast.
+		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
 		return o.toTakeDryrunResult(fromSize, toSize), nil
 	}
 	if err := n.conn.WritePacket(pkt); err != nil {

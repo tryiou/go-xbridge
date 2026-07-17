@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	xlog "xbridge-go/log"
+
 	"xbridge-go/coins"
 )
 
@@ -72,6 +74,7 @@ func NewRPCClient(url, user, pass, jsonVersion, contentType string, timeout time
 func (c *RPCClient) Call(method string, params []interface{}, out interface{}) error {
 	id := fmt.Sprintf("xbg-%d", c.nextID)
 	c.nextID++
+	xlog.Debug("rpc call", "method", method, "url", c.url)
 	body, err := json.Marshal(rpcRequest{JSONRPC: c.jsonVersion, ID: id, Method: method, Params: params})
 	if err != nil {
 		return err
@@ -85,11 +88,13 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		xlog.Error("rpc transport failed", "method", method, "url", c.url, "err", err)
 		return err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
+		xlog.Error("rpc read failed", "method", method, "err", err)
 		return err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -97,13 +102,16 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 	}
 	var r rpcResponse
 	if err := json.Unmarshal(data, &r); err != nil {
+		xlog.Error("rpc decode failed", "method", method, "err", err, "body", string(data))
 		return fmt.Errorf("wallet: rpc decode: %w (body %q)", err, string(data))
 	}
 	if r.Error != nil {
+		xlog.Error("rpc error", "method", method, "code", r.Error.Code, "msg", r.Error.Message)
 		return fmt.Errorf("wallet: rpc error %d: %s", r.Error.Code, r.Error.Message)
 	}
 	if out != nil && len(r.Result) > 0 && string(r.Result) != "null" {
 		if err := json.Unmarshal(r.Result, out); err != nil {
+			xlog.Error("rpc result decode failed", "method", method, "err", err, "body", string(r.Result))
 			return fmt.Errorf("wallet: rpc result decode: %w (body %q)", err, string(r.Result))
 		}
 	}

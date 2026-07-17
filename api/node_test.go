@@ -147,7 +147,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	n.conn = cc
 
 	// OnHold drives the maker's response to a hub xbcTransactionHold.
-	n.dispatchSwap(id, hub, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	n.dispatchSwap(id, hub, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		return s.OnHold(&proto.HoldBody{})
 	})
 

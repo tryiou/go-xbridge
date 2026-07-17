@@ -72,7 +72,7 @@ func TestDispatchSwapRecoversFromPanic(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		node.dispatchSwap(id, [20]byte{}, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		node.dispatchSwap(id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			panic("boom")
 		})
 		close(done)

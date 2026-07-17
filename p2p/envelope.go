@@ -2,8 +2,11 @@ package p2p
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"time"
+
+	xlog "xbridge-go/log"
 )
 
 // XBridge transport envelope (src/xbridge/xbridgeapp.cpp App::Impl::onSend and
@@ -34,6 +37,7 @@ func encodeXBridgePayload(packet []byte) []byte {
 	env = append(env, ts[:]...)
 	env = append(env, packet...)
 	out := writeVarInt(len(env))
+	xlog.Debug("encode xbridge payload", "packetLen", len(packet), "envLen", len(out))
 	return append(out, env...)
 }
 
@@ -43,6 +47,7 @@ func encodeXBridgePayload(packet []byte) []byte {
 func DecodeXBridgePayload(payload []byte) ([]byte, error) {
 	n, off, err := readVarInt(payload, 0)
 	if err != nil {
+		xlog.Debug("decode xbridge payload failed", "err", err, "len", len(payload))
 		return nil, err
 	}
 	if off+n != len(payload) {
@@ -51,7 +56,9 @@ func DecodeXBridgePayload(payload []byte) ([]byte, error) {
 	if n < xbridgeEnvelopeSize {
 		return nil, errors.New("p2p: xbridge envelope too small")
 	}
-	return payload[off+xbridgeEnvelopeSize : off+n], nil
+	packet := payload[off+xbridgeEnvelopeSize : off+n]
+	xlog.Debug("decode xbridge payload", "len", len(payload), "packetLen", len(packet), "hex", hex.EncodeToString(packet))
+	return packet, nil
 }
 
 // writeVarInt encodes a Bitcoin CompactSize (varint) integer.

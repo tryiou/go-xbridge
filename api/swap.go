@@ -8,6 +8,7 @@ import (
 	"xbridge-go/coins"
 	"xbridge-go/config"
 	"xbridge-go/crypto"
+	xlog "xbridge-go/log"
 	"xbridge-go/proto"
 	"xbridge-go/swap"
 	"xbridge-go/wallet"
@@ -45,6 +46,35 @@ const (
 	csConfirmedB
 	csFinished
 )
+
+// String renders the client state for logs (the hub owns the authoritative
+// Transaction state; this is only our local view).
+func (c clientState) String() string {
+	switch c {
+	case csIdle:
+		return "idle"
+	case csMaker:
+		return "maker"
+	case csTaker:
+		return "taker"
+	case csHoldApplied:
+		return "holdApplied"
+	case csInitialized:
+		return "initialized"
+	case csCreatedA:
+		return "createdA"
+	case csCreatedB:
+		return "createdB"
+	case csConfirmedA:
+		return "confirmedA"
+	case csConfirmedB:
+		return "confirmedB"
+	case csFinished:
+		return "finished"
+	default:
+		return fmt.Sprintf("clientState(%d)", int(c))
+	}
+}
 
 // SwapSession is the XBridge CLIENT side of one order's swap. XBridge is a
 // three-party protocol: the service-node HUB holds the authoritative Transaction
@@ -111,6 +141,8 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams) {
 	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
 	n.sessMu.Unlock()
+	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "maker",
+		"srcCur", o.FromCurrency, "srcAmt", o.FromAmount, "dstCur", o.ToCurrency, "dstAmt", o.ToAmount)
 }
 
 // newTakerSession registers the client-side taker for a taken order. The secret
@@ -135,6 +167,8 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams) {
 	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
 	n.sessMu.Unlock()
+	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "taker",
+		"srcCur", o.ToCurrency, "srcAmt", o.ToAmount, "dstCur", o.FromCurrency, "dstAmt", o.FromAmount)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +190,7 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 	src := [20]byte{}
 	copy(src[:], a.Hash)
 	s.state = csHoldApplied
+	xlog.Info("hold applied", "order", hexEncode(s.id[:]), "state", s.state.String())
 	return proto.XbcTransactionHoldApply, &proto.HoldApplyBody{
 		HubAddress: s.hub, ClientAddress: src, ID: s.id,
 	}, nil
@@ -164,6 +199,7 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 // OnInit (hub→each) → Initialized (9): echo back our destination address.
 func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseBody, error) {
 	s.state = csInitialized
+	xlog.Info("initialized", "order", hexEncode(s.id[:]), "state", s.state.String())
 	return proto.XbcTransactionInitialized, &proto.InitializedBody{
 		HubAddress: s.hub, ClientAddress: b.ClientAddress, ID: s.id,
 	}, nil
@@ -178,11 +214,15 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 		return 0, nil, fmt.Errorf("api: CreateA missing B pubkey")
 	}
 	s.theirPub = b.BPubKey
+	xlog.Info("CreateA: building deposit A", "order", hexEncode(s.id[:]), "counterparty", hexEncode(b.BPubKey[:]))
 	txid, refundHex, err := s.buildDeposit(true)
 	if err != nil {
 		return 0, nil, err
 	}
 	s.state = csCreatedA
+	xlog.Info("deposit A broadcast", "order", hexEncode(s.id[:]), "txid", txid,
+		"lockTime", s.ourLockTime, "secretHash", hexEncode(s.secretHash[:]))
+	xlog.Debug("deposit A refund pre-signed", "order", hexEncode(s.id[:]), "refundHex", refundHex)
 	return proto.XbcTransactionCreatedA, &proto.CreatedABody{
 		HubAddress: s.hub, ID: s.id,
 		ADepositTxID: txid, HashedSecret: s.secretHash, ALockTime: s.ourLockTime,
@@ -207,11 +247,16 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	}
 	s.theirSecretHash = b.HashedSecret
 	s.theirLockTime = b.ALockTime
+	xlog.Info("CreateB: learned maker deposit", "order", hexEncode(s.id[:]),
+		"makerDeposit", b.ADepositTxID, "makerLockTime", b.ALockTime, "secretHash", hexEncode(b.HashedSecret[:]))
 	txid, refundHex, err := s.buildDeposit(false)
 	if err != nil {
 		return 0, nil, err
 	}
 	s.state = csCreatedB
+	xlog.Info("deposit B broadcast", "order", hexEncode(s.id[:]), "txid", txid,
+		"lockTime", s.ourLockTime, "makerDeposit", b.ADepositTxID)
+	xlog.Debug("deposit B refund pre-signed", "order", hexEncode(s.id[:]), "refundHex", refundHex)
 	return proto.XbcTransactionCreatedB, &proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
 		BDepositTxID: txid, BLockTime: s.ourLockTime,
@@ -233,10 +278,12 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	}
 	s.theirLockTime = b.BLockTime
 
+	xlog.Info("ConfirmA: redeeming taker deposit", "order", hexEncode(s.id[:]), "takerDeposit", b.BDepositTxID)
 	payHex, cur, err := s.redeemCounterparty(true)
 	if err != nil {
 		return 0, nil, err
 	}
+	xlog.Debug("ConfirmA: claim tx built", "order", hexEncode(s.id[:]), "cur", cur, "payHex", payHex)
 	conn, e := s.n.connector(cur)
 	if e != nil {
 		return 0, nil, e
@@ -246,6 +293,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
 	}
 	s.state = csConfirmedA
+	xlog.Info("ConfirmA: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
 	return proto.XbcTransactionConfirmedA, &proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
 	}, nil
@@ -271,11 +319,14 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: could not recover secret from payTx %s", b.APayTxID)
 	}
 	s.secret = secret
+	xlog.Info("ConfirmB: secret recovered from maker payTx", "order", hexEncode(s.id[:]),
+		"makerPayTx", b.APayTxID, "secretHash", hexEncode(s.secretHash[:]))
 
 	payHex2, cur, err := s.redeemCounterparty(false)
 	if err != nil {
 		return 0, nil, err
 	}
+	xlog.Debug("ConfirmB: claim tx built", "order", hexEncode(s.id[:]), "cur", cur, "payHex", payHex2)
 	conn, e := s.n.connector(cur)
 	if e != nil {
 		return 0, nil, e
@@ -285,6 +336,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: broadcast payTx: %w", err)
 	}
 	s.state = csConfirmedB
+	xlog.Info("ConfirmB: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
 	return proto.XbcTransactionConfirmedB, &proto.ConfirmedBBody{
 		HubAddress: s.hub, ID: s.id, BPayTxID: payTxID,
 	}, nil
@@ -297,6 +349,7 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 		o.Updated = NowMicro()
 	}
 	s.state = csFinished
+	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
 	return 0, nil, nil
 }
 
@@ -372,6 +425,9 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	}
 	fee := estimateFee(cc, len(funding), 2)
 	lockTime := s.computeLockTime(isMaker)
+	xlog.Debug("buildDeposit: plan", "order", hexEncode(s.id[:]), "isMaker", isMaker,
+		"cur", cur, "amount", amt, "lockTime", lockTime, "txVersion", s.txVersion(cur),
+		"utxos", len(funding), "fee", fee)
 
 	hash := s.secretHash
 	if !isMaker {
@@ -390,6 +446,7 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	if err != nil {
 		return "", "", err
 	}
+	xlog.Debug("buildDeposit: unsigned tx built", "order", hexEncode(s.id[:]), "txVersion", tx.Version, "outputs", len(tx.Outputs))
 	prevTxs := make([]wallet.PrevTx, 0, len(funding))
 	for _, u := range funding {
 		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
@@ -445,6 +502,8 @@ func (s *SwapSession) buildRefundTx(spec *swap.DepositSpec, cur string) (string,
 		return "", err
 	}
 	tx := &coins.Tx{Version: int32(s.txVersion(cur)), LockTime: spec.LockTime}
+	xlog.Debug("buildRefundTx: plan", "order", hexEncode(s.id[:]), "cur", cur,
+		"deposit", s.ourDepositTxID, "lockTime", spec.LockTime, "amount", spec.Amount, "fee", fee, "txVersion", s.txVersion(cur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
@@ -493,6 +552,8 @@ func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur strin
 		return "", "", err
 	}
 	tx := &coins.Tx{Version: int32(s.txVersion(depositCur)), LockTime: 0} // ELSE branch, no CLTV
+	xlog.Debug("redeemCounterparty: plan", "order", hexEncode(s.id[:]), "isMaker", isMaker,
+		"depositCur", depositCur, "deposit", s.theirDepositTxID, "amount", theirSpec.Amount, "fee", fee, "txVersion", s.txVersion(depositCur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xffffffff,
@@ -558,13 +619,17 @@ func (s *SwapSession) minConf(cc *config.CoinConf) int {
 func secretFromPayTx(payHex string) ([33]byte, bool) {
 	raw, err := hex.DecodeString(payHex)
 	if err != nil {
+		xlog.Debug("secretFromPayTx: bad hex", "err", err)
 		return [33]byte{}, false
 	}
 	tx, err := coins.Deserialize(raw)
 	if err != nil || len(tx.Inputs) == 0 {
+		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
 		return [33]byte{}, false
 	}
-	return secretFromScriptSig(tx.Inputs[0].ScriptSig)
+	secret, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig)
+	xlog.Debug("secretFromPayTx", "ok", ok)
+	return secret, ok
 }
 
 // secretFromScriptSig parses a payment scriptSig (<secret 33> <sig> <myPubKey>
