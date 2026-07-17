@@ -518,7 +518,7 @@ func decodeScriptPushes(t *testing.T, b []byte) (pushes [][]byte, ops []byte) {
 
 // setupSwapPair builds a maker-only swap fixture on BTC so individual maker-side
 // paths (refund tx, etc.) can be exercised without a full taker exchange.
-func setupSwapPair(t *testing.T) (*SwapSession, *fakeConnector) {
+func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 	t.Helper()
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", Title: "Bitcoin", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
@@ -548,7 +548,7 @@ func setupSwapPair(t *testing.T) (*SwapSession, *fakeConnector) {
 	s := n.sessions[hexEncode(orderID[:])]
 	hub := hash20("hub")
 	s.hub = hub
-	return s, btcConn
+	return n, s, btcConn
 }
 
 // TestRefundTx exercises the pre-signed CLTV refund produced when the maker
@@ -557,7 +557,7 @@ func setupSwapPair(t *testing.T) (*SwapSession, *fakeConnector) {
 // <sig> <depositorPub> OP_1 <redeemScript> whose inner push equals the deposit's
 // HTLC redeem script.
 func TestRefundTx(t *testing.T) {
-	s, conn := setupSwapPair(t)
+	_, s, conn := setupSwapPair(t)
 
 	_, bodyA, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])})
 	if err != nil {
@@ -639,5 +639,62 @@ func TestComputeLockTime(t *testing.T) {
 	}
 	if got := s.computeLockTime(false); got != 1006 {
 		t.Errorf("taker lockTime (clamped) = %d, want 1006", got)
+	}
+}
+
+// TestRefundWatcher drives the fund-safety safety net: before the deposit's
+// lockTime the watcher must not broadcast; once the chain advances past the
+// lockTime, checkRefunds must auto-broadcast the pre-signed refund exactly once
+// (guarded by refundDone).
+func TestRefundWatcher(t *testing.T) {
+	n, s, conn := setupSwapPair(t)
+	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])}); err != nil {
+		t.Fatalf("OnCreateA: %v", err)
+	}
+	if s.refundHex == "" {
+		t.Fatal("refund not pre-signed at deposit time")
+	}
+	// Maker lockTime = 1000 (blockHeight) + 7200/60 = 1120. Before expiry, the
+	// watcher must leave the deposit untouched.
+	before := len(conn.broadcasts)
+	n.checkRefunds()
+	if len(conn.broadcasts) != before {
+		t.Errorf("refund broadcast before lockTime expiry (broadcasts %d)", len(conn.broadcasts))
+	}
+	// Advance the chain past the deposit lockTime and re-run the check.
+	conn.blockHeight = 1200
+	n.checkRefunds()
+	if len(conn.broadcasts) != before+1 {
+		t.Fatalf("refund not auto-broadcast at lockTime (broadcasts %d, want %d)", len(conn.broadcasts), before+1)
+	}
+	if !s.refundDone {
+		t.Error("refundDone not set after auto-broadcast")
+	}
+	// A second pass must NOT double-broadcast.
+	after := len(conn.broadcasts)
+	n.checkRefunds()
+	if len(conn.broadcasts) != after {
+		t.Errorf("refund auto-broadcast twice (broadcasts %d, want %d)", len(conn.broadcasts), after)
+	}
+}
+
+// TestRefundEscapeHatch exercises the manual escape hatch: BroadcastRefund
+// force-broadcasts the stored refund and records it on the connector.
+func TestRefundEscapeHatch(t *testing.T) {
+	_, s, conn := setupSwapPair(t)
+	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])}); err != nil {
+		t.Fatalf("OnCreateA: %v", err)
+	}
+	orderIDHex := hexEncode(s.id[:])
+	before := len(conn.broadcasts)
+	txid, err := s.n.BroadcastRefund(orderIDHex)
+	if err != nil {
+		t.Fatalf("BroadcastRefund: %v", err)
+	}
+	if txid == "" {
+		t.Fatal("BroadcastRefund returned empty txid")
+	}
+	if len(conn.broadcasts) != before+1 {
+		t.Errorf("escape-hatch refund not broadcast (broadcasts %d, want %d)", len(conn.broadcasts), before+1)
 	}
 }

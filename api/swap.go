@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"xbridge-go/coins"
 	"xbridge-go/config"
@@ -27,6 +28,10 @@ const (
 	xMinLockTimeBlocks    = 6    // XMIN_LOCKTIME_BLOCKS
 	xSlowTakerLockTimeSec = 3600 // XSLOW_TAKER_LOCKTIME_TARGET_SECONDS
 	xSlowBlockTimeSec     = 600  // XSLOW_BLOCKTIME_SECONDS
+
+	// refundCheckInterval is how often the background watcher scans live sessions
+	// for refunds whose deposit lockTime has passed. Overridable in tests.
+	refundCheckInterval = 60 * time.Second
 )
 
 // clientState tracks the local client's progress through the hub-driven swap.
@@ -100,6 +105,7 @@ type SwapSession struct {
 	ourLockTime    uint32
 	ourDepositTxID string
 	refundHex      string // pre-signed IF-branch refund, for cancel/expiry
+	refundDone     bool   // guard so the watcher broadcasts the refund at most once
 
 	theirDepositTxID string // counterparty's deposit txid (from ConfirmA/CreateB)
 	theirLockTime    uint32
@@ -351,6 +357,97 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 	s.state = csFinished
 	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
 	return 0, nil, nil
+}
+
+// broadcastRefund sends this session's pre-signed CLTV refund to its source
+// chain, returning the refund txid. The refund spends the deposit back to our
+// source address and is only valid after the deposit's lockTime, so calling it
+// is always fund-safe: it can never claim the counterparty's funds or double-
+// spend a legitimately claimed deposit. Caller must not hold n.sessMu (this does
+// wallet I/O, not session-state access).
+func (n *Node) broadcastRefund(s *SwapSession) (string, error) {
+	cur := s.srcCur
+	conn := n.cfg.Connectors[cur]
+	if conn == nil {
+		return "", fmt.Errorf("api: no connector for %s", cur)
+	}
+	if s.refundHex == "" {
+		return "", fmt.Errorf("api: no refund available for order %s", hexEncode(s.id[:]))
+	}
+	txid, err := conn.SendRawTransaction(s.refundHex)
+	if err != nil {
+		xlog.Error("refund broadcast failed", "order", hexEncode(s.id[:]), "err", err)
+		return "", err
+	}
+	xlog.Info("refund broadcast", "order", hexEncode(s.id[:]), "txid", txid)
+	return txid, nil
+}
+
+// BroadcastRefund is the manual escape hatch: it force-broadcasts the pre-signed
+// CLTV refund for an order (e.g. a swap has stalled and the deposit's lockTime
+// has passed), returning the deposit to the source address without waiting for
+// the background watcher. If a live session exists it uses that; otherwise it
+// falls back to the order's stored refund hex (trying both the maker and taker
+// deposit chains).
+func (n *Node) BroadcastRefund(orderID string) (string, error) {
+	n.sessMu.Lock()
+	s := n.sessions[orderID]
+	n.sessMu.Unlock()
+	if s != nil && s.refundHex != "" {
+		txid, err := n.broadcastRefund(s)
+		if err == nil {
+			s.refundDone = true
+		}
+		return txid, err
+	}
+	if o := n.store.Get(orderID); o != nil && o.RefundTx != "" {
+		for _, cur := range []string{o.FromCurrency, o.ToCurrency} {
+			conn := n.cfg.Connectors[cur]
+			if conn == nil {
+				continue
+			}
+			txid, err := conn.SendRawTransaction(o.RefundTx)
+			if err != nil {
+				xlog.Warn("escape-hatch refund broadcast failed", "order", orderID, "cur", cur, "err", err)
+				continue
+			}
+			xlog.Info("escape-hatch refund broadcast", "order", orderID, "txid", txid)
+			return txid, nil
+		}
+		return "", fmt.Errorf("api: could not broadcast stored refund for %s", orderID)
+	}
+	return "", fmt.Errorf("api: no refund available for order %s", orderID)
+}
+
+// checkRefunds scans all live sessions and auto-broadcasts any pre-signed
+// refund whose deposit lockTime has passed (the fund-safety safety net). It is
+// invoked by the background refundWatcher and can be called directly (e.g. in
+// tests) to drive the check on demand. Caller must not hold n.sessMu.
+func (n *Node) checkRefunds() {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+	for id, s := range n.sessions {
+		if s.refundDone || s.refundHex == "" || s.state == csFinished || s.state < csCreatedA {
+			continue
+		}
+		conn := n.cfg.Connectors[s.srcCur]
+		if conn == nil {
+			continue
+		}
+		h, err := conn.GetBlockCount()
+		if err != nil || h < 1 {
+			continue
+		}
+		if uint32(h) >= s.ourLockTime {
+			txid, berr := n.broadcastRefund(s)
+			if berr != nil {
+				xlog.Error("refund auto-broadcast failed", "order", id, "err", berr)
+				continue
+			}
+			s.refundDone = true
+			xlog.Info("refund auto-broadcast on lockTime expiry", "order", id, "txid", txid)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

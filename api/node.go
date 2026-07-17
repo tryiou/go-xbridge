@@ -141,6 +141,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 	}
 	go n.feed()
 	go n.blockLoop()
+	go n.refundWatcher()
 	return n, nil
 }
 
@@ -292,6 +293,24 @@ func (n *Node) blockLoop() {
 			return
 		case <-t.C:
 			n.refreshBlock()
+		}
+	}
+}
+
+// refundWatcher is the fund-safety safety net: it periodically scans live swap
+// sessions and auto-broadcasts any pre-signed CLTV refund whose deposit lockTime
+// has passed, so a stalled swap never leaves the local deposit permanently locked
+// at the hub. Each refund is broadcast at most once (guarded by SwapSession.
+// refundDone); the emergency escape hatch is Node.BroadcastRefund.
+func (n *Node) refundWatcher() {
+	t := time.NewTicker(refundCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.stop:
+			return
+		case <-t.C:
+			n.checkRefunds()
 		}
 	}
 }
@@ -784,5 +803,12 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	o.Status = "canceled"
 	o.Updated = NowMicro()
 	n.store.RecordCancelled(p.ID, o.Created)
+	// Best-effort fund recovery: if a deposit was already broadcast, return it
+	// via the pre-signed CLTV refund rather than leaving it locked at the hub.
+	if o.RefundTx != "" {
+		if _, rerr := n.BroadcastRefund(p.ID); rerr != nil {
+			xlog.Warn("dxCancelOrder refund broadcast failed", "order", p.ID, "err", rerr)
+		}
+	}
 	return o, nil
 }
