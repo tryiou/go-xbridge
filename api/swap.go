@@ -21,6 +21,11 @@ import (
 const (
 	makerLockTimeSec = 7200
 	takerLockTimeSec = 1800
+
+	// C++ xbridgewallet.h constexprs (not conf-driven; faithfully mirrored):
+	xMinLockTimeBlocks    = 6    // XMIN_LOCKTIME_BLOCKS
+	xSlowTakerLockTimeSec = 3600 // XSLOW_TAKER_LOCKTIME_TARGET_SECONDS
+	xSlowBlockTimeSec     = 600  // XSLOW_BLOCKTIME_SECONDS
 )
 
 // clientState tracks the local client's progress through the hub-driven swap.
@@ -319,8 +324,17 @@ func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
 	target := makerLockTimeSec
 	if !isMaker {
 		target = takerLockTimeSec
+		// C++ xbridgewalletconnectorbtc.cpp lockTime(role 'B'): on slow chains
+		// (blockTime >= XSLOW_BLOCKTIME_SECONDS) use the longer taker target.
+		if bt >= xSlowBlockTimeSec {
+			target = xSlowTakerLockTimeSec
+		}
 	}
-	return uint32(n) + uint32(target/bt)
+	blocks := target / bt
+	if blocks < xMinLockTimeBlocks { // XMIN_LOCKTIME_BLOCKS clamp (C++)
+		blocks = xMinLockTimeBlocks
+	}
+	return uint32(n) + uint32(blocks)
 }
 
 // buildDeposit builds the local participant's HTLC deposit, funds it from the
@@ -370,6 +384,7 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 		CounterpartyPub: s.theirPub,
 		Hash:            hash,
 		LockTime:        lockTime,
+		TxVersion:       s.txVersion(cur),
 	}
 	tx, err := spec.BuildDepositTx(c, funding, change, fee)
 	if err != nil {
@@ -429,7 +444,7 @@ func (s *SwapSession) buildRefundTx(spec *swap.DepositSpec, cur string) (string,
 	if err != nil {
 		return "", err
 	}
-	tx := &coins.Tx{Version: 1, LockTime: spec.LockTime}
+	tx := &coins.Tx{Version: int32(s.txVersion(cur)), LockTime: spec.LockTime}
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
@@ -477,7 +492,7 @@ func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur strin
 	if err != nil {
 		return "", "", err
 	}
-	tx := &coins.Tx{Version: 1, LockTime: 0} // ELSE branch, no CLTV
+	tx := &coins.Tx{Version: int32(s.txVersion(depositCur)), LockTime: 0} // ELSE branch, no CLTV
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xffffffff,
@@ -515,6 +530,17 @@ func (s *SwapSession) conf(cur string) *config.CoinConf {
 		return s.n.cfg.Confs[cur]
 	}
 	return nil
+}
+
+// txVersion returns the per-coin transaction version to stamp on the deposit,
+// refund, and claim txs. C++ reads <COIN>.TxVersion from xbridge.conf (default
+// 1); we mirror that, falling back to 1 when unset. Never hardcode this.
+func (s *SwapSession) txVersion(cur string) int {
+	cc := s.conf(cur)
+	if cc == nil || cc.TxVersion <= 0 {
+		return 1
+	}
+	return cc.TxVersion
 }
 
 // minConf returns the connector's minimum confirmations for spendable UTXOs,

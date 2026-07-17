@@ -232,7 +232,7 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		SecretPrefix:              s.intp("SecretPrefix", 0),
 		Coin:                      s.uintp("COIN", 0),
 		MinimumAmount:             s.uintp("MinimumAmount", 0),
-		TxVersion:                 s.intp("TxVersion", 0),
+		TxVersion:                 s.intp("TxVersion", 1), // C++ xbridgeapp.cpp: s.get<uint32_t>(*i+".TxVersion", 1)
 		DustAmount:                s.uintp("DustAmount", 0),
 		MinTxFee:                  s.uintp("MinTxFee", 0),
 		BlockTime:                 s.intp("BlockTime", 0),
