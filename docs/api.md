@@ -62,14 +62,62 @@ returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
   exact shape (no `partial_*` fields, per C++).
 
 **Shaped / partial (correct object shape, backing not yet wired):**
-- `dxGetOrderFills`, `dxGetMyPartialOrderChain`, `dxPartialOrderChainDetails`,
-  `dxGetLockedUtxos`, `dxFlushCancelledOrders` — correct shapes from the store.
+- `dxGetOrderFills`, `dxGetMyPartialOrderChain` — correct shapes from the store.
 - `dxGetLocalTokens` / `dxGetNetworkTokens` — coin registry keys.
-- `dxGetTokenBalances`, `dxGetUtxos`, `dxGetNewTokenAddress`, `dxSplitAddress`,
-  `dxSplitInputs` — require a wallet connector (the `wallet` package exists);
-  currently return empty/error shapes.
-- `dxGetOrderHistory`, `dxGetTradingData` / `gettradingdata` — require
-  historical blockchain data a thin client lacks; return empty arrays.
+- `dxGetNewTokenAddress`, `dxSplitAddress`, `dxSplitInputs` — require a wallet
+  connector (the `wallet` package exists); currently return empty/error shapes.
+
+**Fully functional after the C++ parity pass (Tier 1 + Tier 2):**
+- `dxPartialOrderChainDetails` — counts `total_orders_open` as
+  `stateOrdinal(status) <= trPending(2)` (matches C++); returns an empty `{}`
+  for an unknown chain instead of an error; validates the order id (64-hex,
+  `INVALID_PARAMETERS` otherwise); emits `p2sh_deposits` /
+  `p2sh_deposits_counterparty` from each order's `BinTxId` / `OBinTxId`.
+- `dxTakeOrder` — an omitted or zero `amount` is a **full-order** take
+  (sizes equal the order's maker/taker sizes), matching C++.
+- `dxGetLockedUtxos` — nil-guarded; derives the locked set from each active
+  order's reserved `Utxos` (`Store.LockedUtxoInfo`), keyed `txid:vout`.
+- `dxGetUtxos` — excludes UTXOs reserved by active orders (`include_used=false`),
+  returns them with `orderid` set when `include_used=true`.
+- `dxGetTokenBalances` — subtracts each currency's locked UTXOs from the wallet
+  total; the `Wallet` key is derived from the BLOCK connector (fallback: the
+  first configured exchange wallet).
+- `dxFlushCancelledOrders` — `Store.FlushCancelled` clamps the `uint64`
+  subtraction so a huge `minAgeMillis` prunes everything instead of wrapping
+  around.
+
+## Tier 3 — architectural limits (thin-client, cannot fully match C++)
+
+These divergences are inherent to the **no `blocknetd`** design: xbridge-go is a
+client that speaks the XBridge wire protocol to live service nodes but holds no
+BLOCK block index and replays no historical chain. They are **documented, not
+silently divergent**.
+
+- **`dxGetOrderHistory` / `dxGetTradingData` (`gettradingdata`)** — reflect
+  *session-local* fills only (the `Store.fills` recorded by this client).
+  `fee_txid` and `nodepubkey` are empty. C++ derives these from the BLOCK chain
+  index across all servicenode-confirmed trades.
+  - *Why:* no local block index; the client never replays historical BLOCK data.
+  - *What parity would require:* embedding `blocknetd` (or a BLOCK block
+    indexer + XSeries trade-history RPC) so fills can be fetched from chain
+    rather than only from this session's memory.
+- **`dxGetNetworkTokens`** — completeness is bounded by the P2P servicenode-ping
+  coverage the client currently sees; it cannot enumerate every token C++
+  learns from the full servicenode network.
+  - *Why:* P2P discovery is incremental and depends on which servicenodes the
+    client has connected to.
+  - *What parity would require:* a fuller servicenode handshake / network-state
+    sync, or a trusted token-list source, to match C++'s network-wide view.
+- **`dxGetLockedUtxos` / `dxGetUtxos` locked set** — the locked set is derived
+  from orders *this client knows about* (its `Store`). A UTXO locked by an order
+  the client has not seen is not subtracted from balances.
+  - *Why:* the client only learns of orders it has observed on the P2P feed.
+  - *What parity would require:* tracking every in-flight order network-wide
+    (same root cause as `dxGetNetworkTokens`).
+
+The Tier 1 (code bugs) and Tier 2 (achievable backing gaps) items above are
+**fixed**; see `audit-dx-equivalence.md` for the divergence register and the
+fixes applied per method.
 
 ## Known deviations / VERIFY
 
