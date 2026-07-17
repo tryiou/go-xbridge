@@ -38,6 +38,11 @@ type DepositSpec struct {
 	Secret          [33]byte // depositor-chosen 33-byte preimage (local side only)
 	Hash            [20]byte // HASH160(Secret); set directly for the counterparty (whose Secret is unknown)
 	LockTime        uint32
+	// TxVersion is the transaction version to stamp on the deposit (and, by
+	// extension, its refund/claim spends). In C++ this is the per-coin
+	// <COIN>.TxVersion read from xbridge.conf (default 1), NOT a hardcoded
+	// constant — so it must come from the coin config, not be fixed here.
+	TxVersion int
 }
 
 // SecretHash returns the HTLC hashlock target. The depositor computes it from
@@ -82,7 +87,13 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 	if total < d.Amount+fee {
 		return nil, errors.New("swap: funding insufficient for deposit + fee")
 	}
-	tx := &coins.Tx{Version: 1, LockTime: 0}
+	// Transaction version is the per-coin <COIN>.TxVersion (C++ default 1). A
+	// zero/unset value falls back to 1 to match C++'s config default.
+	ver := d.TxVersion
+	if ver <= 0 {
+		ver = 1
+	}
+	tx := &coins.Tx{Version: int32(ver), LockTime: 0}
 	for _, u := range funding {
 		h, err := reverseHashHex(u.TxID)
 		if err != nil {
