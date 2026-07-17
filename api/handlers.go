@@ -709,12 +709,39 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
 		return out, nil
 	}
-	// C++ dxGetTokenBalances always emits a "Wallet" key (availableBalance()/COIN,
-	// rendered in fixed-6 XBridge scale). We approximate it with the first
-	// configured exchange wallet's balance (the thin client has no single native
-	// wallet balance to draw on).
-	var walletTicker string
-	var walletBalance string
+	// UTXOs locked by active orders (keyed "txid:vout") are subtracted from each
+	// balance so the figure mirrors C++'s spendable (non-locked) funds.
+	keys, _ := h.Store.LockedUtxoInfo()
+	lockedOf := func(utxos []wallet.Utxo) uint64 {
+		var l uint64
+		for _, u := range utxos {
+			k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+			if keys[k] {
+				l += u.Amount
+			}
+		}
+		return l
+	}
+	// C++ dxGetTokenBalances always emits a "Wallet" key: the available balance of
+	// the native BLOCK coin used to pay service-node fees (availableBalance()/COIN,
+	// fixed-6 XBridge scale). Derive it from the BLOCK connector when loaded;
+	// otherwise fall back to the first configured exchange wallet so the key stays
+	// present.
+	var walletTicker, walletBalance string
+	if c, ok := coins.Get("BLOCK"); ok {
+		if conn, ok := h.Node.cfg.Connectors["BLOCK"]; ok && conn != nil {
+			if utxos, err := conn.ListUnspent(0); err == nil {
+				var total uint64
+				for _, u := range utxos {
+					total += u.Amount
+				}
+				if l := lockedOf(utxos); l < total {
+					total -= l
+				}
+				walletTicker, walletBalance = "BLOCK", formatXAmount(toXBridgeAmt(c, total))
+			}
+		}
+	}
 	for _, ticker := range h.Node.cfg.ExchangeWallets {
 		conn, ok := h.Node.cfg.Connectors[ticker]
 		if !ok || conn == nil {
@@ -731,8 +758,13 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 		if c, ok := coins.Get(ticker); ok {
 			// C++ renders per-connector balances in fixed-6 XBridge scale
 			// (xBridgeStringValueFromPrice on the COIN-divided wallet balance),
-			// not native per-coin decimals.
-			bal := formatXAmount(toXBridgeAmt(c, total))
+			// not native per-coin decimals, and subtracts UTXOs locked by pending
+			// orders so the figure reflects spendable funds.
+			avail := total
+			if l := lockedOf(utxos); l < avail {
+				avail -= l
+			}
+			bal := formatXAmount(toXBridgeAmt(c, avail))
 			out[ticker] = bal
 			if walletTicker == "" {
 				walletTicker = ticker
@@ -846,9 +878,15 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "(order_id)")
 	}
+	// C++ validates the order id up front (uint256S(sid).IsNull()).
+	if _, err := hex.DecodeString(id); err != nil || len(id) != 64 {
+		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "Invalid order id ["+id+"]")
+	}
+	id = strings.ToLower(id)
 	chain := h.partialOrderChain(id)
+	// C++ returns an empty object `{}` for an unknown / empty chain (not an error).
 	if len(chain) == 0 {
-		return nil, makeError(errTxNotFound, "dxPartialOrderChainDetails", id)
+		return map[string]interface{}{}, nil
 	}
 	first := chain[0]
 	last := chain[len(chain)-1]
@@ -856,6 +894,8 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 	var totalSent, totalReceived, totalNotSent, totalNotReceived uint64
 	totalOpen, totalFinished, totalCanceled := 0, 0, 0
 	orderIDs := make([]string, 0, len(chain))
+	deposits := make([]string, 0, len(chain))
+	counter := make([]string, 0, len(chain))
 	for _, t := range chain {
 		switch t.Status {
 		case "finished":
@@ -869,11 +909,21 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		default:
 			totalNotSent += t.FromAmount
 			totalNotReceived += t.ToAmount
-			if t.Status == "open" {
+			// C++ counts state <= trPending (expired/new/offline/pending) as open;
+			// matching that here rather than only the literal "open" string.
+			if stateOrdinal(t.Status) <= 2 {
 				totalOpen++
 			}
 		}
 		orderIDs = append(orderIDs, hexEncode(t.ID[:]))
+		// C++ pushes each order's deposit txids (binTxId / oBinTxId) into these
+		// arrays so a caller can see the on-chain HTLC deposits for the chain.
+		if t.BinTxId != "" {
+			deposits = append(deposits, t.BinTxId)
+		}
+		if t.OBinTxId != "" {
+			counter = append(counter, t.OBinTxId)
+		}
 	}
 	details := map[string]interface{}{
 		"first_order_id":             hexEncode(first.ID[:]),
@@ -894,8 +944,8 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		"total_orders_finished":      totalFinished,
 		"total_orders_canceled":      totalCanceled,
 		"orders":                     orderIDs,
-		"p2sh_deposits":              []string{},
-		"p2sh_deposits_counterparty": []string{},
+		"p2sh_deposits":              deposits,
+		"p2sh_deposits_counterparty": counter,
 	}
 	return details, nil
 }
@@ -909,25 +959,70 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		return nil, makeError(errInvalidParameters, "dxGetLockedUtxos", "Too many parameters.")
 	}
 	// C++ gates on the Exchange (Service Node) being started; a thin client with
-	// no configured exchange wallets cannot serve locked-utxo data.
-	if len(h.Node.cfg.ExchangeWallets) == 0 {
+	// no configured exchange wallets cannot serve locked-utxo data. Guard the nil
+	// Node/Config so an unconfigured handler returns the business error instead of
+	// panicking.
+	if h.Node == nil || h.Node.cfg == nil || len(h.Node.cfg.ExchangeWallets) == 0 {
 		return nil, makeError(errNotExchangeNode, "dxGetLockedUtxos", "not an exchange node")
 	}
+	keys, byOrder := h.Store.LockedUtxoInfo()
 	id, _ := strParam(params, 0)
 	if id == "" {
-		// No id -> all locked utxos (colon-delimited "txid:vout:amount:address"
-		// strings, per C++ Exchange::getUtxoItems). Backing not wired yet.
-		return map[string]interface{}{"all_locked_utxo": []string{}}, nil
+		// No id -> all locked utxos across the configured exchange wallets,
+		// rendered as C++ Exchange::getUtxoItems "txid:vout:amount:address" strings
+		// in fixed-6 XBridge scale.
+		all := make([]string, 0)
+		for _, ticker := range h.Node.cfg.ExchangeWallets {
+			conn, e := h.connector(ticker)
+			if e != nil {
+				continue
+			}
+			utxos, err := conn.ListUnspent(0)
+			if err != nil {
+				continue
+			}
+			c, cok := coins.Get(ticker)
+			for _, u := range utxos {
+				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+				if !keys[k] {
+					continue
+				}
+				amt := u.Amount
+				if cok {
+					amt = toXBridgeAmt(c, u.Amount)
+				}
+				all = append(all, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+formatXAmount(amt)+":"+u.Address)
+			}
+		}
+		return map[string]interface{}{"all_locked_utxo": all}, nil
 	}
 	o := h.Store.Get(id)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", id)
 	}
-	// C++ keys the utxo array by the order's currency (a_currency for the pending
-	// tx, or a_and_b for the accepted tx). We key by the order's maker currency.
+	// Per-order locked utxos, keyed by the order's maker currency and restricted to
+	// UTXOs locked by THIS order (C++ keys the array by the order's currency).
+	entries := make([]string, 0)
+	if conn, e := h.connector(o.FromCurrency); e == nil {
+		utxos, err := conn.ListUnspent(0)
+		if err == nil {
+			c, cok := coins.Get(o.FromCurrency)
+			for _, u := range utxos {
+				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+				if byOrder[k] != id {
+					continue
+				}
+				amt := u.Amount
+				if cok {
+					amt = toXBridgeAmt(c, u.Amount)
+				}
+				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+formatXAmount(amt)+":"+u.Address)
+			}
+		}
+	}
 	return map[string]interface{}{
 		"id":           id,
-		o.FromCurrency: []string{},
+		o.FromCurrency: entries,
 	}, nil
 }
 
@@ -1365,13 +1460,21 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 		return nil, makeError(errUnknown, "dxGetUtxos", err.Error())
 	}
 	c, _ := coins.Get(ticker)
+	keys, byOrder := h.Store.LockedUtxoInfo()
 	out := make([]map[string]interface{}, 0, len(utxos))
 	for _, u := range utxos {
-		// C++ always emits "orderid" (empty when the UTXO is not locked in an
-		// order). The thin client does not yet track per-UTXO order locks, so the
-		// value is always "" (the locked-UTXO exclusion on include_used=false is
-		// likewise not yet wired).
-		_ = includeUsed
+		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+		// C++ excludes UTXOs locked by pending orders unless include_used=true,
+		// and always emits "orderid" — the id of the order locking the UTXO, or ""
+		// when it is unused. LockedUtxoInfo provides both the reserved set and the
+		// per-UTXO order-id map.
+		if !includeUsed && keys[k] {
+			continue
+		}
+		orderid := ""
+		if byOrder[k] != "" {
+			orderid = byOrder[k]
+		}
 		out = append(out, map[string]interface{}{
 			"txid":          u.TxID,
 			"vout":          u.Vout,
@@ -1379,7 +1482,7 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 			"amount":        coins.FormatAmount(c, u.Amount),
 			"scriptPubKey":  u.ScriptPubKey,
 			"confirmations": u.Confirmations,
-			"orderid":       "",
+			"orderid":       orderid,
 		})
 	}
 	return out, nil

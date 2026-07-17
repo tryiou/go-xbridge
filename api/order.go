@@ -43,7 +43,9 @@ type Order struct {
 	MakerAddress   string   // decoded address string (may be "")
 	TakerAddress   string   // decoded address string (may be "")
 	BlockID        string   // hex block hash, for dxMakeOrder/dxCancelOrder
-	RefundTx       string   // refund txid, for dxCancelOrder
+	RefundTx       string   // refund txid, for dxCancelOrder ("" when no deposit)
+	BinTxId        string   // our HTLC deposit txid (dxPartialOrderChainDetails p2sh_deposits)
+	OBinTxId       string   // counterparty HTLC deposit txid (p2sh_deposits_counterparty)
 	Utxos          []proto.UtxoEntry
 	Mine           bool // true if created locally by this node
 }
