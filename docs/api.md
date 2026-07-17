@@ -12,7 +12,7 @@ dapp's RPC URL at `xbridged` and it reaches the XBridge API unchanged.
 - **Method names** (24, exact — including the lowercase `gettradingdata`
   alias): see `dispatch.go`.
 - **Response object field names and JSON value types match C++ exactly:**
-  - amounts are **strings** (`"100.0000000"`) to preserve precision;
+  - amounts are **strings** (`"100.000000"`) to preserve precision;
   - dates are **ISO-8601 strings with millisecond precision**
     (`"2018-01-15T18:15:30.123Z"`) — see `iso8601`;
   - `partial_repost` is a **bool**;
@@ -25,9 +25,10 @@ dapp's RPC URL at `xbridged` and it reaches the XBridge API unchanged.
 
 XBridge order amounts are stored in base units of `COIN = 1_000_000`
 (`xbridgetransactiondescr.h`). `formatXAmount` mirrors C++
-`xBridgeStringValueFromAmount`: `(amt/1e6 + 1e-8)` rendered with
-`std::fixed` `setprecision(7)` → **7 decimal places**. `parseXAmount` mirrors
-`xBridgeAmountFromString`: `floor(val*1e6 + 1e-8)`.
+`xBridgeStringValueFromAmount` rendered with `std::fixed`
+`setprecision(xBridgeSignificantDigits(COIN))` == `setprecision(6)` → **6
+decimal places**. `formatXPrice` uses the same precision. `parseXAmount`
+mirrors `xBridgeAmountFromString` (`floor(val*COIN)`, truncating to 6 decimals).
 
 ## Timestamps
 
@@ -51,7 +52,10 @@ returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
   `xbcTransaction` broadcasts).
 - `dxMakeOrder` / `dxMakePartialOrder` — build, sign (secp256k1 compact ECDSA
   via `crypto.BtcSigner`), and broadcast a real `xbcTransaction` packet; return
-  the exact `makeOrderResult` (`partial_*` = `"0"`, `status` = `"created"`).
+  the exact `makeOrderResult`. `dxMakeOrder` (exact) emits `partial_*` =
+  `"0.000000"` and `status` = `"created"`; `dxMakePartialOrder` emits
+  `order_type` = `"partial"` with the real `partial_minimum` /
+  `partial_orig_*_size` and `partial_repost`, `status` = `"created"`.
 - `dxTakeOrder` — broadcasts an `xbcTransactionAccepting` packet, returns the
   exact order-list shape.
 - `dxCancelOrder` — broadcasts an `xbcTransactionCancel` packet, returns the
@@ -75,11 +79,21 @@ returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
    first, while we emit `id`, `maker`, `maker_size`, ... then addresses). JSON
    object key order is not semantically significant and dapps parse by key;
    content is identical. Flagged for awareness.
-2. **Amount decimal count (7 vs 6).** `setprecision(
-   xBridgeSignificantDigits(1_000_000))` = `setprecision(7)`. The C++ help-text
-   examples show 6 decimals, but the code uses 7. If real blocknetd is observed
-   emitting 6, change `formatXAmount`/`formatXPrice` to 6.
-3. **Take-order handshake.** `dxTakeOrder` broadcasts the accepting packet and
+2. **Amount decimal count (now 6).** C++ `setprecision(
+   xBridgeSignificantDigits(1_000_000))` == `setprecision(6)` (the loop in
+   `xBridgeSignificantDigits` returns 6). `formatXAmount`/`formatXPrice` render
+   **6 decimals**. This is now fixed (audit C1); the old "7 decimals" claim in
+   this doc and in CLAUDE.md was wrong and has been corrected.
+3. **Error `code`/`error` (now C++-faithful).** Error `code` values are the C++
+   1000-range enum (`xbridgeerror.h`: `INVALID_PARAMETERS=1025`,
+   `NO_SESSION=1018`, `TRANSACTION_NOT_FOUND=1021`, `INVALID_ADDRESS=1026`,
+   `INSUFFICIENT_FUNDS=1019`, `INVALID_STATE=1028`, `BAD_REQUEST=1004`,
+   `NOT_EXCHANGE_NODE=1029`, `UNKNOWN=1002`, …). The `error` string is built by
+   `xbridgeErrorText(code, arg)` which prepends the per-code text (audit C2/C3).
+4. **JSON-RPC envelope (now 1.0).** Responses are JSON-RPC 1.0 — compact, with
+   only `result`/`error`/`id` (no `jsonrpc` field). Business errors live in the
+   `result` object; the envelope `error` stays null (audit C5).
+5. **Take-order handshake.** `dxTakeOrder` broadcasts the accepting packet and
    registers a client-side `SwapSession`; the hold→init→create→confirm deposit
    handshake **is now wired** — `dxMakeOrder`/`dxTakeOrder` spawn sessions
    (`newMakerSession`/`newTakerSession`) and `Node.feed` dispatches the

@@ -111,9 +111,14 @@ func TestDxGetNewTokenAddress(t *testing.T) {
 
 func TestDxGetNewTokenAddressNoConnector(t *testing.T) {
 	ctx := newWalletTestCtx()
-	_, err := ctx.dxGetNewTokenAddress([]json.RawMessage{json.RawMessage(`"DOGE"`)})
-	if err == nil {
-		t.Fatal("expected no-session error for unconfigured coin")
+	// C++ dxGetNewTokenAddress returns an empty array (not an error) when no
+	// wallet is loaded for the requested coin.
+	res, err := ctx.dxGetNewTokenAddress([]json.RawMessage{json.RawMessage(`"DOGE"`)})
+	if err != nil {
+		t.Fatalf("dxGetNewTokenAddress(no connector) should not error: %v", err)
+	}
+	if arr, ok := res.([]string); !ok || len(arr) != 0 {
+		t.Fatalf("dxGetNewTokenAddress(no connector) = %v (%T), want []", res, res)
 	}
 }
 
@@ -133,6 +138,16 @@ func TestDxGetUtxos(t *testing.T) {
 	if arr[0]["txid"] == "" || arr[0]["scriptPubKey"] == "" {
 		t.Errorf("missing utxo fields: %v", arr[0])
 	}
+	// C++ dxGetUtxos always emits the orderid key (empty when not locked).
+	if arr[0]["orderid"] != "" {
+		t.Errorf("orderid = %v, want \"\"", arr[0]["orderid"])
+	}
+	// Too many params -> error.
+	if _, err := ctx.dxGetUtxos([]json.RawMessage{
+		json.RawMessage(`"BTC"`), json.RawMessage("true"), json.RawMessage("x"),
+	}); err == nil {
+		t.Error("dxGetUtxos(3 params) should error")
+	}
 }
 
 func TestDxGetTokenBalances(t *testing.T) {
@@ -142,8 +157,16 @@ func TestDxGetTokenBalances(t *testing.T) {
 		t.Fatalf("dxGetTokenBalances: %v", err)
 	}
 	m, ok := res.(map[string]string)
-	if !ok || m["BTC"] != "1" {
+	if !ok {
 		t.Fatalf("result = %v (%T)", res, res)
+	}
+	// C++ renders per-coin balances in fixed-6 XBridge scale, not native decimals.
+	if m["BTC"] != "1.000000" {
+		t.Errorf("BTC balance = %v, want 1.000000", m["BTC"])
+	}
+	// C++ always emits a "Wallet" key.
+	if m["Wallet"] != "1.000000" {
+		t.Errorf("Wallet balance = %v, want 1.000000", m["Wallet"])
 	}
 }
 
@@ -158,8 +181,24 @@ func TestDxSplitAddress(t *testing.T) {
 		t.Fatalf("dxSplitAddress: %v", err)
 	}
 	m, ok := res.(map[string]interface{})
-	if !ok || m["txid"] != "txid123" {
+	if !ok {
 		t.Fatalf("result = %v (%T)", res, res)
+	}
+	// C++ derives txid from the signed tx (double-SHA256, byte-reversed); it is
+	// always present, even before submission.
+	txid, _ := m["txid"].(string)
+	if len(txid) != 64 {
+		t.Errorf("txid should be a 64-char hash, got %q", txid)
+	}
+	// show_rawtx defaults to false, so rawtx is empty.
+	if m["rawtx"] != "" {
+		t.Errorf("rawtx should be empty when show_rawtx=false, got %v", m["rawtx"])
+	}
+	if m["token"] != "BTC" || m["include_fees"] != true {
+		t.Errorf("unexpected token/include_fees: %v / %v", m["token"], m["include_fees"])
+	}
+	if m["split_amount_requested"] != "0.500000" || m["split_total"] != "1.000000" {
+		t.Errorf("unexpected amounts: requested=%v total=%v", m["split_amount_requested"], m["split_total"])
 	}
 }
 
@@ -190,5 +229,32 @@ func TestDxTokenListsFromConf(t *testing.T) {
 	}
 	if ns, _ := net.([]string); len(ns) != 1 || ns[0] != "BTC" {
 		t.Errorf("network tokens = %v", net)
+	}
+}
+
+// TestDxGetNetworkTokensLive verifies the live servicenode union: advertised
+// ServicesPing token lists from connected servicenodes are unioned (plus the
+// config's local tokens).
+func TestDxGetNetworkTokensLive(t *testing.T) {
+	ctx := newWalletTestCtx()
+	// Simulate two servicenodes advertising their supported tokens.
+	ctx.Node.recordServices("sn1", []string{"BTC", "LTC", "SYS"})
+	ctx.Node.recordServices("sn2", []string{"LTC", "DOGE"})
+	net, err := ctx.dxGetNetworkTokens(nil)
+	if err != nil {
+		t.Fatalf("dxGetNetworkTokens: %v", err)
+	}
+	ns, ok := net.([]string)
+	if !ok {
+		t.Fatalf("dxGetNetworkTokens = %v (%T)", net, net)
+	}
+	want := map[string]bool{"BTC": true, "LTC": true, "SYS": true, "DOGE": true}
+	if len(ns) != len(want) {
+		t.Fatalf("network tokens = %v, want union %v", ns, want)
+	}
+	for _, tk := range ns {
+		if !want[tk] {
+			t.Errorf("unexpected token %q in %v", tk, ns)
+		}
 	}
 }

@@ -96,25 +96,109 @@ type rpcError struct {
 	Name  string `json:"name"`
 }
 
-func makeError(code int, name, msg string) *rpcError {
-	return &rpcError{Error: msg, Code: code, Name: name}
+// xbridgeErrorText mirrors util/xbridgeerror.cpp::xbridgeErrorText(code, arg):
+// each case wraps the argument in the per-code message Blocknet emits. The
+// `name` (C++ __FUNCTION__) is carried separately in rpcError.Name; this only
+// builds the `error` string. arg is typically the currency/order-id/param the
+// caller passes as makeError's third argument.
+func xbridgeErrorText(code int, arg string) string {
+	switch code {
+	case errSuccess:
+		return ""
+	case errUnauthorized:
+		return "Unauthorized " + arg
+	case errUnknown:
+		return "Internal Server Error"
+	case errBadRequest:
+		return "Bad Request " + arg
+	case errInvalidMakeSymbol:
+		return "Invalid maker symbol " + arg
+	case errInvalidTakeSymbol:
+		return "Invalid taker symbol " + arg
+	case errInvalidDetailLevel:
+		return "Invalid detail level, possible values: 1 - 3"
+	case errInvalidTime:
+		return "Invalid time format, ISO 8601 date format required"
+	case errInvalidCurrency:
+		return "Invalid coin " + arg
+	case errNoSession:
+		return "No session for currency " + arg
+	case errInsufficientFunds:
+		return "Insufficient funds for " + arg
+	case errFundsNotSigned:
+		return "Funds not signed for " + arg
+	case errTxNotFound:
+		return "Transaction " + arg + " not found"
+	case errUnknownSession:
+		return "Unknown session for " + arg
+	case errRevertTxFailed:
+		return "Revert tx failed for " + arg
+	case errInvalidAmount:
+		return "Invalid amount " + arg
+	case errInvalidParameters:
+		return "Invalid parameters: " + arg
+	case errInvalidAddress:
+		return "Bad address " + arg
+	case errInvalidSignature:
+		return "Invalid signature " + arg
+	case errInvalidState:
+		return "invalid transaction state " + arg
+	case errNotExchangeNode:
+		return "Blocknet is not running as an exchange node"
+	case errDust:
+		return "Amount is dust (very small)"
+	case errInsufficientFundsDX:
+		return "Blocknet wallet amount is too small to cover the fee payment"
+	case errNoServiceNode:
+		return "Could not find a service node with required services: " + arg
+	case errInvalidOnchainHist:
+		return "The order information could not be written to the blockchain"
+	case errInvalidPartialOrder:
+		return "Partial orders not allowed for this transaction"
+	}
+	return "invalid error value"
 }
 
-// errInvalidAmount is returned by parseXAmount on a malformed amount string.
-var errInvalidAmount = errors.New("api: invalid amount")
+func makeError(code int, name, msg string) *rpcError {
+	return &rpcError{Error: xbridgeErrorText(code, msg), Code: code, Name: name}
+}
 
-// C++ xbridge error codes (src/xbridge/util/xbridgeerror.h subset referenced by
-// rpcxbridge.cpp makeError calls).
+// errBadAmount is returned by parseXAmount on a malformed amount string.
+var errBadAmount = errors.New("api: invalid amount")
+
+// C++ xbridge error codes — verbatim from src/xbridge/util/xbridgeerror.h.
+// These are the wire contract for dx* errors: the JSON-RPC `result` object
+// `{error, code, name}` carries `code` set to exactly one of these. The Go
+// constants from before (1,2,3,...) were wrong; Blocknet uses the 1000-range
+// enum. rpcxbridge.cpp::makeError forwards (statusCode, __FUNCTION__, msg) to
+// util/xbridgeerror.cpp::xbridgeErrorText, which prepends the per-code text.
 const (
-	errInvalidParameters = 1
-	errNoSession         = 2
-	errTxNotFound        = 3
-	errInvalidAddress    = 4
-	errInsufficientFunds = 5
-	errInvalidState      = 6
-	errBadRequest        = 7
-	errNotExchangeNode   = 8
-	errUnknown           = 100
+	errSuccess             = 0
+	errUnauthorized        = 1001
+	errUnknown             = 1002
+	errBadRequest          = 1004
+	errInvalidMakeSymbol   = 1011
+	errInvalidTakeSymbol   = 1012
+	errInvalidDetailLevel  = 1015
+	errInvalidTime         = 1016
+	errInvalidCurrency     = 1017
+	errNoSession           = 1018
+	errInsufficientFunds   = 1019
+	errFundsNotSigned      = 1020
+	errTxNotFound          = 1021
+	errUnknownSession      = 1022
+	errRevertTxFailed      = 1023
+	errInvalidAmount       = 1024
+	errInvalidParameters   = 1025
+	errInvalidAddress      = 1026
+	errInvalidSignature    = 1027
+	errInvalidState        = 1028
+	errNotExchangeNode     = 1029
+	errDust                = 1030
+	errInsufficientFundsDX = 1031
+	errNoServiceNode       = 1032
+	errInvalidOnchainHist  = 1033
+	errInvalidPartialOrder = 1034
 )
 
 // ---------------------------------------------------------------------------
@@ -123,28 +207,33 @@ const (
 // XBridge stores order amounts in base units of COIN = 1_000_000 (6 decimal
 // places of coin value). Display uses C++ xBridgeValueFromAmount
 // (amt/COIN + 1/::COIN) rendered with std::fixed setprecision(
-// xBridgeSignificantDigits(COIN)) = setprecision(7). So amounts are rendered as
-// fixed 7-decimal-place strings. (The help-text examples showing 6 decimals are
-// misleading; the code uses 7.)
+// xBridgeSignificantDigits(COIN)). xBridgeSignificantDigits(1000000) loops
+// `do { n++; i/=10 } while (i>1)` and returns 6, so amounts are rendered as
+// fixed 6-decimal-place strings. The RPC help-text examples showing 7 decimals
+// are misleading; the code uses 6. (Verified against util/xutil.cpp:202-274.)
 // ---------------------------------------------------------------------------
 
 // coinScale is the XBridge base-unit factor: COIN = 1e6 (6 decimal places of
 // coin value). Amounts are carried on the wire as uint64 base units.
 const coinScale = 1_000_000
 
+// maxXSize is the largest order size Blocknet accepts (C++ TransactionDescr::
+// MAX_COIN = 100000000 whole coins, expressed in COIN base units).
+const maxXSize = uint64(100000000) * coinScale
+
 // maxXAmount is the largest base-unit value parseXAmount will accept
 // (math.MaxUint64); larger inputs overflow uint64 and are rejected.
 var maxXAmount = new(big.Int).SetUint64(^uint64(0))
 
-// formatXAmount renders a base-unit (COIN=1e6) amount as the fixed 7-decimal
+// formatXAmount renders a base-unit (COIN=1e6) amount as the fixed 6-decimal
 // string Blocknet returns. Mirrors xBridgeStringValueFromAmount: integer base
-// units scaled to coin value and rendered with C++ setprecision(7). Base units
-// carry 6 decimals, so the 7th digit is always 0. Computed with integer
-// division to avoid float drift.
+// units scaled to coin value and rendered with C++ setprecision(6) (since
+// xBridgeSignificantDigits(COIN)==6). Computed with integer division to avoid
+// float drift.
 func formatXAmount(amt uint64) string {
 	q := amt / coinScale
 	r := amt % coinScale
-	return strconv.FormatUint(q, 10) + "." + fmt.Sprintf("%06d", r) + "0"
+	return strconv.FormatUint(q, 10) + "." + fmt.Sprintf("%06d", r)
 }
 
 // parseXAmount converts a user-supplied decimal amount string (e.g. "1.5") into
@@ -156,10 +245,10 @@ func formatXAmount(amt uint64) string {
 func parseXAmount(s string) (uint64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0, errInvalidAmount
+		return 0, errBadAmount
 	}
 	if s[0] == '-' {
-		return 0, errInvalidAmount
+		return 0, errBadAmount
 	}
 	dot := strings.IndexByte(s, '.')
 	intStr := s
@@ -170,12 +259,12 @@ func parseXAmount(s string) (uint64, error) {
 	}
 	for _, c := range intStr {
 		if c < '0' || c > '9' {
-			return 0, errInvalidAmount
+			return 0, errBadAmount
 		}
 	}
 	for _, c := range fracStr {
 		if c < '0' || c > '9' {
-			return 0, errInvalidAmount
+			return 0, errBadAmount
 		}
 	}
 	if intStr == "" {
@@ -192,18 +281,83 @@ func parseXAmount(s string) (uint64, error) {
 	}
 	combined := new(big.Int)
 	if _, ok := combined.SetString(intStr+frac, 10); !ok {
-		return 0, errInvalidAmount
+		return 0, errBadAmount
 	}
 	if combined.Sign() < 0 || combined.Cmp(maxXAmount) > 0 {
-		return 0, errInvalidAmount
+		return 0, errBadAmount
 	}
 	return combined.Uint64(), nil
 }
 
-// formatXPrice renders a price ratio (double) as the fixed 7-decimal string
-// Blocknet returns (mirrors xBridgeStringValueFromPrice).
+// formatXPrice renders a price ratio (double) as the fixed 6-decimal string
+// Blocknet returns. Mirrors xBridgeStringValueFromPrice
+// (util/xutil.cpp:209) which uses setprecision(xBridgeSignificantDigits(COIN))
+// == setprecision(6).
 func formatXPrice(p float64) string {
-	return strconv.FormatFloat(p, 'f', 7, 64)
+	return strconv.FormatFloat(p, 'f', 6, 64)
+}
+
+// xBridgeSourceAmountFromPrice mirrors util/xutil.cpp
+// xBridgeSourceAmountFromPrice(counterpartyDestAmount, sourceAmount, destAmount):
+// scales the three base-unit amounts by COIN, computes counterpartyDestAmount *
+// (sourceAmount/destAmount) in double precision, adds 1 scaled unit (1/COIN),
+// then scales back down and truncates — producing the taker-sent amount implied
+// by a partial take. Used by dxTakeOrder to recompute the swap sizes.
+func xBridgeSourceAmountFromPrice(counterpartyDestAmount, sourceAmount, destAmount uint64) uint64 {
+	const c = coinScale
+	if destAmount == 0 {
+		return 0
+	}
+	cda := float64(counterpartyDestAmount * c)
+	sa := float64(sourceAmount * c)
+	da := float64(destAmount * c)
+	v := cda*(sa/da) + 1.0 // +1 scaled unit (C++ adds 1 before the /c normalize)
+	v /= float64(c)
+	out := uint64(v) // truncation toward zero (v >= 0)
+	if out < 1 {
+		return 1
+	}
+	return out
+}
+
+// xBridgeValidCoin mirrors util/xutil.cpp xBridgeValidCoin: counts the decimal
+// precision of an amount string (ignoring trailing zeros) and returns whether
+// it is within the 6-digit limit Blocknet enforces. "25.000000" → ok;
+// "25.1234567" → too precise.
+func xBridgeValidCoin(amountStr string) bool {
+	f := false
+	n := 0
+	trailingZeros := 0
+	for i := 0; i < len(amountStr); i++ {
+		c := amountStr[i]
+		if !f && c == '.' {
+			f = true
+		} else if f {
+			n++
+			if c == '0' {
+				trailingZeros++
+			} else {
+				trailingZeros = 0
+			}
+		}
+	}
+	return n-trailingZeros <= xBridgeSignificantDigits(coinScale)
+}
+
+// xBridgeSignificantDigits mirrors util/xutil.cpp xBridgeSignificantDigits:
+// the number of significant base-unit digits for the given COIN factor. For
+// COIN=1_000_000 it loops `do { n++; i/=10 } while (i>1)` → 6.
+func xBridgeSignificantDigits(coin int64) int {
+	n := 0
+	i := coin
+	for {
+		n++
+		i /= 10
+		if i <= 1 {
+			break
+		}
+	}
+	return n
 }
 
 // iso8601 renders a microsecond-resolution unix timestamp as the ISO-8601
@@ -276,6 +430,48 @@ func statusString(s string) string {
 		return "invalid"
 	default:
 		return "unknown"
+	}
+}
+
+// stateOrdinal maps a status string to its xbridge::TransactionDescr::State
+// integer, mirroring the C++ enum order. Used by guards such as dxCancelOrder's
+// "cannot cancel once state >= trCreated".
+func stateOrdinal(s string) int {
+	switch statusString(s) {
+	case "expired":
+		return -1
+	case "new":
+		return 0
+	case "offline":
+		return 1
+	case "open":
+		return 2
+	case "accepting":
+		return 3
+	case "hold":
+		return 4
+	case "initialized":
+		return 5
+	case "created":
+		return 6
+	case "signed":
+		return 7
+	case "commited":
+		return 8
+	case "finished":
+		return 9
+	case "rolled back":
+		return 10
+	case "rollback failed":
+		return 11
+	case "dropped":
+		return 12
+	case "canceled":
+		return 13
+	case "invalid":
+		return 14
+	default:
+		return 0
 	}
 }
 

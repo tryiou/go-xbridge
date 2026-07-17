@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -88,16 +89,23 @@ type Node struct {
 	blockMu sync.RWMutex
 	block   [32]byte
 	blockAt time.Time
+
+	// svcMu guards svcByPeer, the per-servicenode set of advertised token
+	// services learned from XbcServicesPing packets. dxGetNetworkTokens unions
+	// these to report the live network token set (C++ walletServices()).
+	svcMu     sync.RWMutex
+	svcByPeer map[string][]string
 }
 
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		cfg:      cfg,
-		store:    store,
-		signer:   crypto.NewBtcSigner(),
-		stop:     make(chan struct{}),
-		sessions: map[string]*SwapSession{},
+		cfg:       cfg,
+		store:     store,
+		signer:    crypto.NewBtcSigner(),
+		stop:      make(chan struct{}),
+		sessions:  map[string]*SwapSession{},
+		svcByPeer: map[string][]string{},
 	}
 	if len(cfg.PrivKey) == 32 {
 		pk, err := crypto.CompressedPubKey(cfg.PrivKey)
@@ -346,8 +354,55 @@ func (n *Node) feed() {
 			n.dispatchSwap(b.ID, [20]byte{}, func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnFinished(b)
 			})
+
+		// --- servicenode service advertisement (network token discovery) ---
+		case *proto.ServicesPingBody:
+			n.recordServices(maker, b.Services)
 		}
 	}
+}
+
+// recordServices stores the token-service list a servicenode advertised via an
+// XbcServicesPing packet. Thread-safe; called from the feed goroutine.
+func (n *Node) recordServices(pubkey string, svcs []string) {
+	n.svcMu.Lock()
+	defer n.svcMu.Unlock()
+	if n.svcByPeer == nil {
+		n.svcByPeer = map[string][]string{}
+	}
+	n.svcByPeer[pubkey] = svcs
+}
+
+// NetworkTokens returns the union of tokens advertised by connected
+// servicenodes (C++ walletServices()), always including the locally-known
+// tokens from config. When no servicenodes are connected it reduces to the
+// config list (static fallback).
+func (n *Node) NetworkTokens() []string {
+	n.svcMu.RLock()
+	set := map[string]bool{}
+	for _, svcs := range n.svcByPeer {
+		for _, s := range svcs {
+			if s != "" {
+				set[s] = true
+			}
+		}
+	}
+	n.svcMu.RUnlock()
+	for _, t := range n.cfg.NetworkTokens {
+		set[t] = true
+	}
+	for _, t := range n.cfg.ExchangeWallets {
+		set[t] = true
+	}
+	if len(set) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // responseBody is implemented by every proto body the swap driver returns.
@@ -414,6 +469,8 @@ type MakeOrderParams struct {
 	Type         string // "exact" or "partial"
 	MinSize      string // partial minimum (partial orders only)
 	UseAllFunds  bool
+	AutoSplit    bool // partial orders only; repost remainder splitting
+	Repost       bool // partial orders only; repost remainder after a take
 	DryRun       bool
 }
 
@@ -435,10 +492,10 @@ func decodeAddr(currency, addrStr string) ([20]byte, *rpcError) {
 
 func (n *Node) requireWrite() *rpcError {
 	if n.conn == nil {
-		return makeError(errNoSession, "dxMakeOrder", "not connected to a service node")
+		return makeError(errNoServiceNode, "dx", "")
 	}
 	if len(n.cfg.PrivKey) != 32 {
-		return makeError(errBadRequest, "dxMakeOrder", "no private key configured")
+		return makeError(errBadRequest, "dx", "no private key configured")
 	}
 	return nil
 }
@@ -448,6 +505,15 @@ func (n *Node) requireWrite() *rpcError {
 func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if e := n.requireWrite(); e != nil {
 		return nil, e
+	}
+	// Reject amounts that are more precise than Blocknet allows (C++
+	// xBridgeValidCoin): trailing zeros are ignored, so "25.000000" is ok but
+	// "25.1234567" is not.
+	if !xBridgeValidCoin(p.MakerSize) {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The maker_size is too precise. The maximum precision supported is 6 digits.")
+	}
+	if !xBridgeValidCoin(p.TakerSize) {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The taker_size is too precise. The maximum precision supported is 6 digits.")
 	}
 	fromAmt, err := parseXAmount(p.MakerSize)
 	if err != nil {
@@ -465,15 +531,47 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if e != nil {
 		return nil, e
 	}
+	// C++ dxMakeOrder: maker_address and taker_address must differ.
+	if p.MakerAddress == p.TakerAddress {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The maker_address and taker_address cannot be the same: "+p.MakerAddress)
+	}
+	// C++ upper/lower size limits (MAX_COIN = 100000000 whole coins; min size =
+	// 1/COIN, rendered as xBridgeStringValueFromPrice(1.0/COIN) = 0.000001).
+	if fromAmt > maxXSize || toAmt > maxXSize {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The maximum supported size is 100000000")
+	}
+	if fromAmt == 0 || toAmt == 0 {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The minimum supported size is "+formatXPrice(1.0/float64(coinScale)))
+	}
+	// Per-currency connector (NO_SESSION) gate.
+	if _, e := n.connector(p.Maker); e != nil {
+		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
+	}
+	if _, e := n.connector(p.Taker); e != nil {
+		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
+	}
 
 	partial := false
 	minFrom := fromAmt
 	if p.Type == "partial" {
 		partial = true
-		if p.MinSize != "" {
-			if m, err := parseXAmount(p.MinSize); err == nil {
-				minFrom = m
-			}
+		// C++ reads minimum_size at params[6] (required for partials). A
+		// non-parseable value errors, exceeding maker_size errors, and a
+		// dust-level minimum errors.
+		if p.MinSize == "" {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "minimum_size is required for partial orders")
+		}
+		m, err := parseXAmount(p.MinSize)
+		if err != nil {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "invalid minimum_size")
+		}
+		minFrom = m
+		if minFrom > fromAmt {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
+		}
+		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
+		if cc := n.cfg.Confs[p.Maker]; cc != nil && cc.DustAmount > 0 && minFrom < cc.DustAmount {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
 
@@ -525,6 +623,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.MakerAddress = p.MakerAddress
 	o.TakerAddress = p.TakerAddress
 	o.BlockID = hexEncode(body.BlockHash[:])
+	o.PartialRepost = p.Repost
 	o.Mine = true
 	if p.Type == "partial" {
 		o.Status = "open"
@@ -549,31 +648,62 @@ type TakeOrderParams struct {
 }
 
 // TakeOrder broadcasts an xbcTransactionAccepting packet for the given order and
-// returns the dxTakeOrder response shape. (Full deposit/refund handshake is the
-// swap layer, wired in a later phase; this drives the accepting broadcast and
-// the exact response object dapps consume.)
-func (n *Node) TakeOrder(p TakeOrderParams) (*Order, *rpcError) {
+// returns the dxTakeOrder response shape. C++ swaps maker/taker before rendering
+// the real take (so maker = order's toCurrency), keeps the PRE-swap frame for
+// the dryrun result, and recomputes the swap sizes for partial takes via
+// xBridgeSourceAmountFromPrice.
+func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if e := n.requireWrite(); e != nil {
-		return nil, e
+		return orderListResult{}, e
+	}
+	// C++ dxTakeOrder: from_address and to_address must differ.
+	if p.FromAddress == p.ToAddress {
+		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The from_address and to_address cannot be the same: "+p.FromAddress)
 	}
 	o := n.store.Get(p.ID)
 	if o == nil {
-		return nil, makeError(errTxNotFound, "dxTakeOrder", p.ID)
+		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
 	}
 	fromID, e := decodeAddr(o.ToCurrency, p.FromAddress)
 	if e != nil {
-		return nil, e
+		return orderListResult{}, e
 	}
 	toID, e := decodeAddr(o.FromCurrency, p.ToAddress)
 	if e != nil {
-		return nil, e
+		return orderListResult{}, e
 	}
 
-	takeAmt := o.ToAmount
+	// C++ pre-swap orientation: fromSize = toAmount (taker sends), toSize =
+	// fromAmount (taker receives).
+	fromSize := o.ToAmount
+	toSize := o.FromAmount
 	if p.Amount != "" {
-		if a, err := parseXAmount(p.Amount); err == nil {
-			takeAmt = a
+		a, err := parseXAmount(p.Amount)
+		if err != nil {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
 		}
+		if a == 0 {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+p.Amount)
+		}
+		if o.PartialAllowed {
+			if a < o.MinFromAmount {
+				return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The minimum amount for this order is: "+formatXAmount(o.MinFromAmount))
+			}
+			if a > o.FromAmount {
+				return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The maximum amount for this order is: "+formatXAmount(o.FromAmount))
+			}
+			if a < toSize {
+				toSize = a
+				fromSize = xBridgeSourceAmountFromPrice(toSize, o.ToAmount, o.FromAmount)
+			}
+		} else if a > 0 {
+			return orderListResult{}, makeError(errInvalidPartialOrder, "dxTakeOrder", "")
+		}
+	}
+
+	// No self-trades.
+	if o.Mine {
+		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "Unable to accept your own order.")
 	}
 
 	fromH, fromHash := n.blockContext(o.ToCurrency)
@@ -582,29 +712,31 @@ func (n *Node) TakeOrder(p TakeOrderParams) (*Order, *rpcError) {
 		ID:              o.ID,
 		From:            fromID,
 		FromCurrency:    o.ToCurrency,
-		FromAmount:      takeAmt,
+		FromAmount:      fromSize,
 		FromBlockHeight: fromH,
 		FromBlockHash:   fromHash,
 		To:              toID,
 		ToCurrency:      o.FromCurrency,
-		ToAmount:        o.FromAmount,
+		ToAmount:        toSize,
 		ToBlockHeight:   toH,
 		ToBlockHash:     toHash,
 	}
 	pkt := proto.NewPacket(proto.XbcTransactionAccepting, acc.Marshal())
 	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
-		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
+		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
-	if !p.DryRun {
-		if err := n.conn.WritePacket(pkt); err != nil {
-			return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
-		}
+	if p.DryRun {
+		// C++ renders the dryrun result BEFORE the swap and does not broadcast.
+		return o.toTakeDryrunResult(fromSize, toSize), nil
+	}
+	if err := n.conn.WritePacket(pkt); err != nil {
+		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	o.Updated = NowMicro()
 	o.Status = "accepting"
 	// Begin driving the client-side deposit handshake for this taken order.
 	n.newTakerSession(o, p)
-	return o, nil
+	return o.toTakeResult(fromSize, toSize), nil
 }
 
 // CancelOrderParams are the parsed dxCancelOrder arguments.

@@ -14,13 +14,14 @@ type rpcRequest struct {
 	ID     json.RawMessage   `json:"id"`
 }
 
-// rpcResponse is the JSON-RPC envelope. The `error` field stays null even for
-// business errors — those are returned as the `result` object (see rpcError).
+// rpcResponse is the JSON-RPC 1.0 envelope, matching blocknetd's dx* surface
+// (C++ is JSON-RPC 1.0: only result/error/id, no "jsonrpc" version field, and
+// compact — not pretty-printed). Business errors live in the `result` object
+// (see rpcError); the `error` field stays null for them.
 type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	Result  interface{}     `json:"result"`
-	Error   interface{}     `json:"error"`
-	ID      json.RawMessage `json:"id"`
+	Result interface{}     `json:"result"`
+	Error  interface{}     `json:"error"`
+	ID     json.RawMessage `json:"id"`
 }
 
 // envelopeError is used only for transport-level failures (parse error, unknown
@@ -73,13 +74,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
-	// Stamp the JSON-RPC 2.0 version on every response. BLOCK-DX expects the
-	// field on the getnetworkinfo handshake; it is harmless for the dx* calls.
-	if r, ok := v.(rpcResponse); ok {
-		r.JSONRPC = "2.0"
-		v = r
-	}
+	// blocknetd emits JSON-RPC 1.0: compact JSON, no "jsonrpc" field.
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
 }

@@ -129,6 +129,34 @@ func (o *Order) toListResult() orderListResult {
 	return orderListResult{o.toOrderBase()}
 }
 
+// toTakeResult renders the dxTakeOrder SUCCESS response. C++ swaps
+// fromCurrency<->toCurrency before rendering the real (non-dryrun) take, so
+// maker becomes the order's toCurrency and taker the order's fromCurrency.
+// fromSize is the (partial-adjusted) amount of toCurrency the taker sends;
+// toSize is the (partial-adjusted) amount of fromCurrency the taker receives.
+func (o *Order) toTakeResult(fromSize, toSize uint64) orderListResult {
+	base := o.toOrderBase()
+	base.Maker = o.ToCurrency
+	base.MakerSize = formatXAmount(fromSize)
+	base.Taker = o.FromCurrency
+	base.TakerSize = formatXAmount(toSize)
+	return orderListResult{base}
+}
+
+// toTakeDryrunResult renders the dxTakeOrder dryrun response. C++ renders the
+// dryrun BEFORE the swap (maker=fromCurrency, taker=toCurrency), with the id set
+// to the zero uint256 and status "filled".
+func (o *Order) toTakeDryrunResult(fromSize, toSize uint64) orderListResult {
+	base := o.toOrderBase()
+	base.Maker = o.FromCurrency
+	base.MakerSize = formatXAmount(fromSize)
+	base.Taker = o.ToCurrency
+	base.TakerSize = formatXAmount(toSize)
+	base.Status = "filled"
+	base.ID = "0000000000000000000000000000000000000000000000000000000000000000"
+	return orderListResult{base}
+}
+
 func (o *Order) toDetailResult() orderDetailResult {
 	return orderDetailResult{
 		orderBase:    o.toOrderBase(),
@@ -138,14 +166,31 @@ func (o *Order) toDetailResult() orderDetailResult {
 }
 
 // makeOrderResponse renders the dxMakeOrder result. Mirrors rpcxbridge.cpp
-// dxMakeOrder SUCCESS branch: the partial_* fields are the literal string "0",
-// order_type is "exact", and status is "created".
+// dxMakeOrder SUCCESS branch: the partial_* fields are "0.000000" (formatXAmount
+// of zero), order_type is "exact", and status is "created".
 func (o *Order) makeOrderResponse() makeOrderResult {
 	base := o.toOrderBase()
-	base.PartialMinimum = "0"
-	base.PartialOrigMakerSize = "0"
-	base.PartialOrigTakerSize = "0"
+	base.PartialMinimum = formatXAmount(0)
+	base.PartialOrigMakerSize = formatXAmount(0)
+	base.PartialOrigTakerSize = formatXAmount(0)
 	base.OrderType = "exact"
+	base.Status = "created"
+	return makeOrderResult{
+		orderBase:    base,
+		MakerAddress: o.MakerAddress,
+		TakerAddress: o.TakerAddress,
+		BlockID:      o.BlockID,
+	}
+}
+
+// makePartialOrderResponse renders the dxMakePartialOrder result. Mirrors
+// rpcxbridge.cpp dxMakePartialOrder SUCCESS branch: order_type is "partial",
+// the partial_* fields carry the real values (toOrderBase already does this
+// when PartialAllowed is true), order_type stays "partial", partial_repost is
+// the caller-supplied repost flag, and status is "created".
+func (o *Order) makePartialOrderResponse(repost bool) makeOrderResult {
+	base := o.toOrderBase()
+	base.PartialRepost = repost
 	base.Status = "created"
 	return makeOrderResult{
 		orderBase:    base,

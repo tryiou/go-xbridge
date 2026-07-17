@@ -26,6 +26,13 @@ type fillEntry struct {
 	TakerSize string
 	ParentID  string
 	PartialID string
+	// Partial-order fields, carried so dxGetOrderFills can echo C++'s full
+	// 12-field fill object.
+	OrderType            string
+	PartialMinimum       string
+	PartialOrigMakerSize string
+	PartialOrigTakerSize string
+	PartialRepost        bool
 }
 
 type cancelledEntry struct {
@@ -133,6 +140,35 @@ func (s *Store) RecordCancelled(id string, txtime uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancelled = append(s.cancelled, cancelledEntry{ID: id, Txtime: txtime, UseCount: 1})
+}
+
+// FlushCancelled prunes cancelled orders whose txtime is older than
+// minAgeMillis, mirroring C++ dxFlushCancelledOrders. keepTime = now -
+// minAgeMillis(ms); entries with Txtime < keepTime are removed and returned in
+// the flushed subset (the rest are kept). A minAgeMillis of 0 prunes everything
+// regardless of age.
+func (s *Store) FlushCancelled(minAgeMillis uint64) []cancelledEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// keepTime = now - minAgeMillis(ms). A very large age would make the
+	// subtrahend overflow uint64 and wrap; clamp so every entry is pruned.
+	now := NowMicro()
+	sub := uint64(minAgeMillis) * 1000
+	keepTime := uint64(0)
+	if sub <= now {
+		keepTime = now - sub
+	}
+	flushed := make([]cancelledEntry, 0)
+	kept := make([]cancelledEntry, 0, len(s.cancelled))
+	for _, c := range s.cancelled {
+		if c.Txtime < keepTime {
+			flushed = append(flushed, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.cancelled = kept
+	return flushed
 }
 
 // NowMicro returns the current time in microseconds since epoch (mirrors C++

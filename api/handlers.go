@@ -1,10 +1,13 @@
 package api
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	"xbridge-go/coins"
 	"xbridge-go/config"
@@ -12,14 +15,23 @@ import (
 	"xbridge-go/wallet"
 )
 
-// fillOut is one entry of dxGetOrderFills' recent-fills list.
+// fillOut is one entry of dxGetOrderFills' recent-fills list. Mirrors C++'s
+// 12-field object (id, time, maker, maker_size, taker, taker_size, order_type,
+// partial_minimum, partial_orig_maker_size, partial_orig_taker_size,
+// partial_repost, partial_parent_id).
 type fillOut struct {
-	ID        string `json:"id"`
-	Time      string `json:"time"`
-	Maker     string `json:"maker"`
-	MakerSize string `json:"maker_size"`
-	Taker     string `json:"taker"`
-	TakerSize string `json:"taker_size"`
+	ID                   string `json:"id"`
+	Time                 string `json:"time"`
+	Maker                string `json:"maker"`
+	MakerSize            string `json:"maker_size"`
+	Taker                string `json:"taker"`
+	TakerSize            string `json:"taker_size"`
+	OrderType            string `json:"order_type"`
+	PartialMinimum       string `json:"partial_minimum"`
+	PartialOrigMakerSize string `json:"partial_orig_maker_size"`
+	PartialOrigTakerSize string `json:"partial_orig_taker_size"`
+	PartialRepost        bool   `json:"partial_repost"`
+	PartialParentID      string `json:"partial_parent_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -50,12 +62,18 @@ func (h *HandlerCtx) dxGetOrderFills(params []json.RawMessage) (interface{}, *rp
 			continue
 		}
 		out = append(out, fillOut{
-			ID:        f.ID,
-			Time:      iso8601(f.Time),
-			Maker:     f.Maker,
-			MakerSize: f.MakerSize,
-			Taker:     f.Taker,
-			TakerSize: f.TakerSize,
+			ID:                   f.ID,
+			Time:                 iso8601(f.Time),
+			Maker:                f.Maker,
+			MakerSize:            f.MakerSize,
+			Taker:                f.Taker,
+			TakerSize:            f.TakerSize,
+			OrderType:            f.OrderType,
+			PartialMinimum:       f.PartialMinimum,
+			PartialOrigMakerSize: f.PartialOrigMakerSize,
+			PartialOrigTakerSize: f.PartialOrigTakerSize,
+			PartialRepost:        f.PartialRepost,
+			PartialParentID:      f.ParentID,
 		})
 	}
 	return out, nil
@@ -100,9 +118,19 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetOrder", "(id)")
 	}
+	// C++ normalizes the id via uint256S (case-insensitive); Store keys are
+	// lowercased hex, so lowercase the input before lookup.
+	id = strings.ToLower(id)
 	o := h.Store.Get(id)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetOrder", id)
+	}
+	// C++ requires a wallet session for both order currencies.
+	if _, e := h.connector(o.FromCurrency); e != nil {
+		return nil, e
+	}
+	if _, e := h.connector(o.ToCurrency); e != nil {
+		return nil, e
 	}
 	return o.toListResult(), nil
 }
@@ -116,7 +144,14 @@ func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *r
 }
 
 func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, *rpcError) {
-	return knownTokens(h.Config.NetworkTokens), nil
+	// C++ returns the live union of tokens servicenodes advertise
+	// (walletServices()); we derive that from the connected servicenodes'
+	// XbcServicesPing advertisements, falling back to config when none are
+	// connected.
+	if h.Node == nil {
+		return knownTokens(h.Config.NetworkTokens), nil
+	}
+	return h.Node.NetworkTokens(), nil
 }
 
 func knownTokens(tickers []string) []string {
@@ -130,11 +165,11 @@ func knownTokens(tickers []string) []string {
 // business error (mirroring C++ when no wallet is loaded for that coin).
 func (h *HandlerCtx) connector(ticker string) (wallet.Connector, *rpcError) {
 	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
-		return nil, makeError(errNoSession, "dx", "no wallet configured")
+		return nil, makeError(errNoSession, "dx", ticker)
 	}
 	conn, ok := h.Node.cfg.Connectors[ticker]
 	if !ok || conn == nil {
-		return nil, makeError(errNoSession, "dx", "no wallet configured for "+ticker)
+		return nil, makeError(errNoSession, "dx", ticker)
 	}
 	return conn, nil
 }
@@ -162,7 +197,9 @@ func (h *HandlerCtx) dxGetNewTokenAddress(params []json.RawMessage) (interface{}
 	}
 	conn, e := h.connector(ticker)
 	if e != nil {
-		return nil, e
+		// C++ dxGetNewTokenAddress returns an empty array (not an error) when
+		// no wallet is loaded for the requested coin; mirror that here.
+		return []string{}, nil
 	}
 	addr, err := conn.GetNewAddress()
 	if err != nil {
@@ -187,13 +224,35 @@ func (h *HandlerCtx) dxMakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 	takerSize, _ := strParam(params, 4)
 	takerAddr, _ := strParam(params, 5)
 	typ, _ := strParam(params, 6)
-	useAll, e := mustBool(params, 7, true, "dxMakeOrder")
-	if e != nil {
-		return nil, e
+	// use_all_funds is read at index 7 only when present (C++ reads it when
+	// params.size() >= 8); a present-but-unparseable value is an error.
+	useAll := true
+	if len(params) >= 8 {
+		b, ok := boolParam(params, 7, true)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxMakeOrder", "invalid use_all_funds")
+		}
+		useAll = b
 	}
-	dryRun, e := mustBool(params, 8, false, "dxMakeOrder")
-	if e != nil {
-		return nil, e
+	// dryrun is read as the literal string "dryrun" at index 8 only when there
+	// are exactly 9 params (C++: if params.size()==9). Any other value is an
+	// error, so a misspelled dryrun does not broadcast an order.
+	dryRun := false
+	if len(params) == 9 {
+		d, ok := strParam(params, 8)
+		if !ok || d != "dryrun" {
+			arg := d
+			if !ok {
+				arg = "<invalid>"
+			}
+			return nil, makeError(errInvalidParameters, "dxMakeOrder", arg)
+		}
+		dryRun = true
+	}
+	// C++ only supports the "exact" type for dxMakeOrder; dxMakePartialOrder
+	// handles partials.
+	if typ != "exact" {
+		return nil, makeError(errInvalidParameters, "dxMakeOrder", "Only the exact type is supported at this time.")
 	}
 	o, e := h.Node.MakeOrder(MakeOrderParams{
 		Maker: maker, MakerSize: makerSize, MakerAddress: makerAddr,
@@ -218,15 +277,55 @@ func (h *HandlerCtx) dxMakePartialOrder(params []json.RawMessage) (interface{}, 
 	takerSize, _ := strParam(params, 4)
 	takerAddr, _ := strParam(params, 5)
 	minSize, _ := strParam(params, 6)
+	// C++ reads repost/use_all_funds/auto_split at indices 7/8/9 (defaults true)
+	// only when present, and dryrun at index 10 only when there are exactly 11
+	// params (a misspelled dryrun is an error, never a silent broadcast).
+	repost := true
+	if len(params) >= 8 {
+		b, ok := boolParam(params, 7, true)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "invalid repost")
+		}
+		repost = b
+	}
+	useAll := true
+	if len(params) >= 9 {
+		b, ok := boolParam(params, 8, true)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "invalid use_all_funds")
+		}
+		useAll = b
+	}
+	autoSplit := true
+	if len(params) >= 10 {
+		b, ok := boolParam(params, 9, true)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "invalid auto_split")
+		}
+		autoSplit = b
+	}
+	dryRun := false
+	if len(params) == 11 {
+		d, ok := strParam(params, 10)
+		if !ok || d != "dryrun" {
+			arg := d
+			if !ok {
+				arg = "<invalid>"
+			}
+			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", arg)
+		}
+		dryRun = true
+	}
 	o, e := h.Node.MakeOrder(MakeOrderParams{
 		Maker: maker, MakerSize: makerSize, MakerAddress: makerAddr,
 		Taker: taker, TakerSize: takerSize, TakerAddress: takerAddr,
-		Type: "partial", MinSize: minSize, DryRun: false,
+		Type: "partial", MinSize: minSize,
+		UseAllFunds: useAll, AutoSplit: autoSplit, Repost: repost, DryRun: dryRun,
 	})
 	if e != nil {
 		return nil, e
 	}
-	return o.makeOrderResponse(), nil
+	return o.makePartialOrderResponse(repost), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -242,15 +341,26 @@ func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 	fromAddr, _ := strParam(params, 1)
 	toAddr, _ := strParam(params, 2)
 	amount, _ := strParam(params, 3)
-	dryRun, e := mustBool(params, 4, false, "dxTakeOrder")
+	// dryrun is read as the literal string "dryrun" at index 4 only when there
+	// are exactly 5 params (C++: if params.size()==5). Any other value is an
+	// error, so a misspelled dryrun does not broadcast a take.
+	dryRun := false
+	if len(params) == 5 {
+		d, ok := strParam(params, 4)
+		if !ok || d != "dryrun" {
+			arg := d
+			if !ok {
+				arg = "<invalid>"
+			}
+			return nil, makeError(errInvalidParameters, "dxTakeOrder", arg)
+		}
+		dryRun = true
+	}
+	res, e := h.Node.TakeOrder(TakeOrderParams{ID: id, FromAddress: fromAddr, ToAddress: toAddr, Amount: amount, DryRun: dryRun})
 	if e != nil {
 		return nil, e
 	}
-	o, e := h.Node.TakeOrder(TakeOrderParams{ID: id, FromAddress: fromAddr, ToAddress: toAddr, Amount: amount, DryRun: dryRun})
-	if e != nil {
-		return nil, e
-	}
-	return o.toListResult(), nil
+	return res, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +372,32 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 		return nil, makeError(errInvalidParameters, "dxCancelOrder", "(id)")
 	}
 	id, _ := strParam(params, 0)
-	o, e := h.Node.CancelOrder(CancelOrderParams{ID: id})
+	// C++ validates the id format up front (uint256S(sid).IsNull()).
+	if _, err := hex.DecodeString(id); err != nil || len(id) != 64 {
+		return nil, makeError(errInvalidParameters, "dxCancelOrder", "Invalid order id ["+id+"]")
+	}
+	id = strings.ToLower(id)
+	o := h.Store.Get(id)
+	if o == nil {
+		return nil, makeError(errTxNotFound, "dxCancelOrder", id)
+	}
+	// C++ refuses to cancel once the swap has progressed to trCreated or beyond
+	// (the order is already committed / in process).
+	if stateOrdinal(o.Status) >= 6 {
+		return nil, makeError(errInvalidState, "dxCancelOrder", "The order is already "+statusString(o.Status))
+	}
+	// C++ requires a wallet session for both currencies to build the result.
+	if _, e := h.connector(o.FromCurrency); e != nil {
+		return nil, e
+	}
+	if _, e := h.connector(o.ToCurrency); e != nil {
+		return nil, e
+	}
+	res, e := h.Node.CancelOrder(CancelOrderParams{ID: id})
 	if e != nil {
 		return nil, e
 	}
-	return o.toCancelResult(), nil
+	return res.toCancelResult(), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -278,59 +409,295 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	if len(params) < 5 || len(params) > 8 {
 		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "(maker) (taker) (start time) (end time) (granularity) (order_ids, default=false)[optional] (with_inverse, default=false)[optional] (limit)[optional]")
 	}
-	return []interface{}{}, nil
+	maker, _ := strParam(params, 0)
+	taker, _ := strParam(params, 1)
+	start, ok := int64Param(params, 2)
+	if !ok {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid start time")
+	}
+	end, ok := int64Param(params, 3)
+	if !ok {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid end time")
+	}
+	granularity, ok := int64Param(params, 4)
+	if !ok || granularity <= 0 {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid granularity")
+	}
+	orderIDs := false
+	if len(params) > 5 {
+		b, ok := boolParam(params, 5, false)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid order_ids")
+		}
+		orderIDs = b
+	}
+	withInverse := false
+	if len(params) > 6 {
+		b, ok := boolParam(params, 6, false)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid with_inverse")
+		}
+		withInverse = b
+	}
+
+	if end <= start {
+		return []interface{}{}, nil
+	}
+	numBuckets := (end - start) / granularity
+
+	// C++ walk of the XSeries cache is replaced here by the thin client's local
+	// trade history (Store.Fills): OHLCV is aggregated from the fills this node
+	// has actually seen. Network-wide XSeries history (requiring a blocknetd
+	// block index) is not available to the thin client, so the data reflects
+	// this node's local trades only. The wire *schema* matches C++ exactly.
+	type bucket struct {
+		fills []*fillEntry
+	}
+	buckets := make([]bucket, numBuckets)
+	for i := range buckets {
+		buckets[i].fills = make([]*fillEntry, 0)
+	}
+	allFills := h.Store.Fills()
+	for i := range allFills {
+		f := &allFills[i]
+		match := (f.Maker == maker && f.Taker == taker)
+		if !match && withInverse {
+			match = (f.Maker == taker && f.Taker == maker)
+		}
+		if !match {
+			continue
+		}
+		ft := int64(f.Time / 1e6)
+		if ft < start || ft >= end {
+			continue
+		}
+		bi := (ft - start) / granularity
+		if bi < 0 || bi >= numBuckets {
+			continue
+		}
+		buckets[bi].fills = append(buckets[bi].fills, f)
+	}
+
+	out := make([]interface{}, 0, numBuckets)
+	for i := int64(0); i < numBuckets; i++ {
+		bucketStart := start + i*granularity
+		bf := buckets[i].fills
+		// Chronological order so open=first, close=last.
+		sort.SliceStable(bf, func(i, j int) bool { return bf[i].Time < bf[j].Time })
+		var open, high, low, close, volume float64
+		ids := make([]string, 0, len(bf))
+		for _, f := range bf {
+			makerNum, e1 := strconv.ParseFloat(f.MakerSize, 64)
+			takerNum, e2 := strconv.ParseFloat(f.TakerSize, 64)
+			if e1 != nil || e2 != nil || makerNum == 0 {
+				continue
+			}
+			price := takerNum / makerNum
+			if len(ids) == 0 {
+				open = price
+			}
+			if price > high || high == 0 {
+				high = price
+			}
+			if price < low || low == 0 {
+				low = price
+			}
+			close = price
+			volume += takerNum
+			ids = append(ids, f.ID)
+		}
+		row := []interface{}{iso8601(uint64(bucketStart) * 1e6), low, high, open, close, volume}
+		if orderIDs {
+			row = append(row, ids)
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
 // dxGetOrderBook.
 // ---------------------------------------------------------------------------
 
+// obEntry is one matched order-book entry (ask or bid) with its computed price.
+type obEntry struct {
+	price    float64 // numeric price for sorting (ask=to/from, bid=from/to)
+	priceStr string  // 6-decimal rendered price
+	amount   uint64  // base-unit amount to render (ask=fromAmount, bid=toAmount)
+	id       string  // hex order id
+}
+
+// obPriceGroup is one aggregated price level (detail 2): an aggregated size and
+// the count of orders at that level across the full order book.
+type obPriceGroup struct {
+	priceStr string
+	sum      uint64
+	count    int
+}
+
+// groupByPrice aggregates a price-sorted (descending) entry list into best-first
+// price levels. reverse=true (asks) yields lowest-price-first; reverse=false
+// (bids) yields highest-price-first. Prices are grouped by their 6-decimal
+// rendered string, matching C++'s floatCompare equality.
+func groupByPrice(list []obEntry, reverse bool) []obPriceGroup {
+	groups := []obPriceGroup{}
+	var cur *obPriceGroup
+	add := func(e obEntry) {
+		if cur == nil || cur.priceStr != e.priceStr {
+			if cur != nil {
+				groups = append(groups, *cur)
+			}
+			g := obPriceGroup{priceStr: e.priceStr, sum: e.amount, count: 1}
+			cur = &g
+		} else {
+			cur.sum += e.amount
+			cur.count++
+		}
+	}
+	if reverse {
+		for i := len(list) - 1; i >= 0; i-- {
+			add(list[i])
+		}
+	} else {
+		for i := 0; i < len(list); i++ {
+			add(list[i])
+		}
+	}
+	if cur != nil {
+		groups = append(groups, *cur)
+	}
+	return groups
+}
+
+func countAtPrice(list []obEntry, priceStr string) int {
+	n := 0
+	for _, e := range list {
+		if e.priceStr == priceStr {
+			n++
+		}
+	}
+	return n
+}
+
+func idsAtPrice(list []obEntry, priceStr string) []string {
+	seen := map[string]bool{}
+	ids := []string{}
+	for _, e := range list {
+		if e.priceStr == priceStr && !seen[e.id] {
+			seen[e.id] = true
+			ids = append(ids, e.id)
+		}
+	}
+	return ids
+}
+
 func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpcError) {
+	if len(params) < 3 || len(params) > 4 {
+		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]")
+	}
 	detail, e := mustInt(params, 0, 1, "dxGetOrderBook")
 	if e != nil {
 		return nil, e
 	}
+	if detail < 1 || detail > 4 {
+		return nil, makeError(errInvalidDetailLevel, "dxGetOrderBook", "")
+	}
 	maker, ok := strParam(params, 1)
 	if !ok {
-		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail) (maker) (taker) (max_orders, default=50)[optional]")
+		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]")
 	}
 	taker, ok := strParam(params, 2)
 	if !ok {
-		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail) (maker) (taker) (max_orders, default=50)[optional]")
+		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]")
 	}
-	maxOrders, e := mustInt(params, 3, 50, "dxGetOrderBook")
-	if e != nil {
-		return nil, e
+	maxOrders := 50
+	if len(params) == 4 {
+		maxOrders, e = mustInt(params, 3, 50, "dxGetOrderBook")
+		if e != nil {
+			return nil, e
+		}
+	}
+	if maxOrders < 1 {
+		maxOrders = 1
 	}
 
-	asks := [][]interface{}{}
-	bids := [][]interface{}{}
-	count := 1
+	// Collect matching asks/bids. C++ runs two independent filter passes (an
+	// order can land in both when maker==taker currency), so use two ifs.
+	asks := []obEntry{}
+	bids := []obEntry{}
 	for _, o := range h.Store.List() {
 		if o.Status != "open" {
 			continue
 		}
-		if o.FromCurrency == maker && o.ToCurrency == taker {
-			price := formatXPrice(float64(o.FromAmount) / float64(o.ToAmount))
-			size := formatXAmount(o.FromAmount)
-			asks = append(asks, bookEntry(detail, price, size, o.ID, count))
-		} else if o.FromCurrency == taker && o.ToCurrency == maker {
-			price := formatXPrice(float64(o.ToAmount) / float64(o.FromAmount))
-			size := formatXAmount(o.ToAmount)
-			bids = append(bids, bookEntry(detail, price, size, o.ID, count))
+		if o.FromAmount <= 0 || o.ToAmount <= 0 {
+			continue
 		}
-		if maxOrders > 0 && (len(asks)+len(bids)) >= maxOrders {
-			break
+		if strings.EqualFold(o.FromCurrency, maker) && strings.EqualFold(o.ToCurrency, taker) {
+			// ask: from=maker (sold), to=taker; price = to/from (taker per maker)
+			p := float64(o.ToAmount) / float64(o.FromAmount)
+			asks = append(asks, obEntry{price: p, priceStr: formatXPrice(p), amount: o.FromAmount, id: hexEncode(o.ID[:])})
+		}
+		if strings.EqualFold(o.FromCurrency, taker) && strings.EqualFold(o.ToCurrency, maker) {
+			// bid: from=taker, to=maker; priceBid = from/to (taker per maker)
+			p := float64(o.FromAmount) / float64(o.ToAmount)
+			bids = append(bids, obEntry{price: p, priceStr: formatXPrice(p), amount: o.ToAmount, id: hexEncode(o.ID[:])})
 		}
 	}
-	return orderBookResult{Detail: detail, Maker: maker, Taker: taker, Asks: asks, Bids: bids}, nil
-}
 
-func bookEntry(detail int, price, size string, id [32]byte, count int) []interface{} {
-	if detail == 3 {
-		return []interface{}{price, size, hexEncode(id[:])}
+	// Sort both sides descending by price: best bid is at the front (highest),
+	// best ask is at the back (lowest).
+	sort.Slice(asks, func(i, j int) bool { return asks[i].price > asks[j].price })
+	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price })
+
+	res := orderBookResult{Detail: detail, Maker: maker, Taker: taker}
+
+	switch detail {
+	case 1:
+		// Best bid and ask only, with the count of orders at that best price.
+		if len(asks) > 0 {
+			best := asks[len(asks)-1] // lowest-price ask
+			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(asks, best.priceStr)})
+		}
+		if len(bids) > 0 {
+			best := bids[0] // highest-price bid
+			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(bids, best.priceStr)})
+		}
+	case 2:
+		// Aggregated top levels (per side), best-first, capped at maxOrders.
+		for _, g := range groupByPrice(asks, true) {
+			if len(res.Asks) >= maxOrders {
+				break
+			}
+			res.Asks = append(res.Asks, []interface{}{g.priceStr, formatXAmount(g.sum), g.count})
+		}
+		for _, g := range groupByPrice(bids, false) {
+			if len(res.Bids) >= maxOrders {
+				break
+			}
+			res.Bids = append(res.Bids, []interface{}{g.priceStr, formatXAmount(g.sum), g.count})
+		}
+	case 3:
+		// Full, non-aggregated, per side, capped at maxOrders, with order ids.
+		for i := len(asks) - 1; i >= 0 && len(res.Asks) < maxOrders; i-- {
+			e := asks[i]
+			res.Asks = append(res.Asks, []interface{}{e.priceStr, formatXAmount(e.amount), e.id})
+		}
+		for i := 0; i < len(bids) && len(res.Bids) < maxOrders; i++ {
+			e := bids[i]
+			res.Bids = append(res.Bids, []interface{}{e.priceStr, formatXAmount(e.amount), e.id})
+		}
+	case 4:
+		// Best bid and ask only, with the array of order ids at that price.
+		if len(asks) > 0 {
+			best := asks[len(asks)-1]
+			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(asks, best.priceStr)})
+		}
+		if len(bids) > 0 {
+			best := bids[0]
+			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(bids, best.priceStr)})
+		}
 	}
-	return []interface{}{price, size, count}
+	return res, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +709,12 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
 		return out, nil
 	}
+	// C++ dxGetTokenBalances always emits a "Wallet" key (availableBalance()/COIN,
+	// rendered in fixed-6 XBridge scale). We approximate it with the first
+	// configured exchange wallet's balance (the thin client has no single native
+	// wallet balance to draw on).
+	var walletTicker string
+	var walletBalance string
 	for _, ticker := range h.Node.cfg.ExchangeWallets {
 		conn, ok := h.Node.cfg.Connectors[ticker]
 		if !ok || conn == nil {
@@ -356,8 +729,19 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			total += u.Amount
 		}
 		if c, ok := coins.Get(ticker); ok {
-			out[ticker] = coins.FormatAmount(c, total)
+			// C++ renders per-connector balances in fixed-6 XBridge scale
+			// (xBridgeStringValueFromPrice on the COIN-divided wallet balance),
+			// not native per-coin decimals.
+			bal := formatXAmount(toXBridgeAmt(c, total))
+			out[ticker] = bal
+			if walletTicker == "" {
+				walletTicker = ticker
+				walletBalance = bal
+			}
 		}
+	}
+	if walletTicker != "" {
+		out["Wallet"] = walletBalance
 	}
 	return out, nil
 }
@@ -371,6 +755,10 @@ func (h *HandlerCtx) dxGetMyOrders(params []json.RawMessage) (interface{}, *rpcE
 	for _, o := range h.Store.Mine() {
 		out = append(out, o.toDetailResult())
 	}
+	// C++ dxGetMyOrders sorts ascending by txtime (updated time).
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].UpdatedAt < out[j].UpdatedAt
+	})
 	return out, nil
 }
 
@@ -383,24 +771,13 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetMyPartialOrderChain", "(order_id)")
 	}
-	o := h.Store.Get(id)
-	if o == nil {
+	// C++ getPartialOrderChain resolves both ancestors and descendants; reuse the
+	// shared chain walker so this matches dxPartialOrderChainDetails.
+	chain := h.partialOrderChain(id)
+	if len(chain) == 0 {
 		return nil, makeError(errTxNotFound, "dxGetMyPartialOrderChain", id)
 	}
-	// Follow parent links to assemble the chain (oldest -> newest).
-	chain := []*Order{o}
-	seen := map[string]bool{id: true}
-	cur := o
-	for !isZeroID(cur.ParentID) {
-		p := h.Store.Get(hexEncode(cur.ParentID[:]))
-		if p == nil || seen[hexEncode(p.ID[:])] {
-			break
-		}
-		chain = append([]*Order{p}, chain...)
-		seen[hexEncode(p.ID[:])] = true
-		cur = p
-	}
-	out := []orderDetailResult{}
+	out := make([]orderDetailResult, 0, len(chain))
 	for _, c := range chain {
 		out = append(out, c.toDetailResult())
 	}
@@ -411,36 +788,114 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 // dxPartialOrderChainDetails — aggregate details for a partial chain.
 // ---------------------------------------------------------------------------
 
+// partialOrderChain returns the full partial order chain for id — the root
+// (oldest ancestor) first, then the queried order, then all descendants,
+// matching C++ xbridge::App::getPartialOrderChain.
+func (h *HandlerCtx) partialOrderChain(id string) []*Order {
+	cur := h.Store.Get(id)
+	if cur == nil {
+		return nil
+	}
+	chain := []*Order{cur}
+	seen := map[string]bool{id: true}
+	// Walk up to the root via ParentID.
+	for !isZeroID(cur.ParentID) {
+		pid := hexEncode(cur.ParentID[:])
+		p := h.Store.Get(pid)
+		if p == nil || seen[pid] {
+			break
+		}
+		chain = append([]*Order{p}, chain...)
+		seen[pid] = true
+		cur = p
+	}
+	// Index parent -> children and walk down to descendants.
+	children := map[string][]string{}
+	for _, o := range h.Store.List() {
+		oid := hexEncode(o.ID[:])
+		if isZeroID(o.ParentID) {
+			continue
+		}
+		children[hexEncode(o.ParentID[:])] = append(children[hexEncode(o.ParentID[:])], oid)
+	}
+	var descend func(pid string)
+	descend = func(pid string) {
+		for _, cid := range children[pid] {
+			if seen[cid] {
+				continue
+			}
+			c := h.Store.Get(cid)
+			if c == nil {
+				continue
+			}
+			chain = append(chain, c)
+			seen[cid] = true
+			descend(cid)
+		}
+	}
+	// Descend from every node already in the chain (the queried order sits
+	// between its ancestors and descendants, so both directions must be walked).
+	for _, c := range chain {
+		descend(hexEncode(c.ID[:]))
+	}
+	return chain
+}
+
 func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (interface{}, *rpcError) {
 	id, ok := strParam(params, 0)
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "(order_id)")
 	}
-	o := h.Store.Get(id)
-	if o == nil {
+	chain := h.partialOrderChain(id)
+	if len(chain) == 0 {
 		return nil, makeError(errTxNotFound, "dxPartialOrderChainDetails", id)
 	}
+	first := chain[0]
+	last := chain[len(chain)-1]
+
+	var totalSent, totalReceived, totalNotSent, totalNotReceived uint64
+	totalOpen, totalFinished, totalCanceled := 0, 0, 0
+	orderIDs := make([]string, 0, len(chain))
+	for _, t := range chain {
+		switch t.Status {
+		case "finished":
+			totalSent += t.FromAmount
+			totalReceived += t.ToAmount
+			totalFinished++
+		case "canceled":
+			totalNotSent += t.FromAmount
+			totalNotReceived += t.ToAmount
+			totalCanceled++
+		default:
+			totalNotSent += t.FromAmount
+			totalNotReceived += t.ToAmount
+			if t.Status == "open" {
+				totalOpen++
+			}
+		}
+		orderIDs = append(orderIDs, hexEncode(t.ID[:]))
+	}
 	details := map[string]interface{}{
-		"first_order_id":             id,
-		"maker":                      o.FromCurrency,
-		"maker_address":              o.MakerAddress,
-		"taker":                      o.ToCurrency,
-		"taker_address":              o.TakerAddress,
-		"partial_minimum":            formatXAmount(o.MinFromAmount),
-		"partial_orig_maker_size":    formatXAmount(o.OrigFromAmount),
-		"partial_orig_taker_size":    formatXAmount(o.OrigToAmount),
-		"first_order_time":           iso8601(o.Created),
-		"last_order_time":            iso8601(o.Updated),
-		"total_reported_sent":        "0",
-		"total_reported_received":    "0",
-		"total_reported_notsent":     "0",
-		"total_reported_notreceived": "0",
-		"total_orders_open":          0,
-		"total_orders_finished":      0,
-		"total_orders_canceled":      0,
-		"orders":                     []orderDetailResult{},
-		"p2sh_deposits":              []interface{}{},
-		"p2sh_deposits_counterparty": []interface{}{},
+		"first_order_id":             hexEncode(first.ID[:]),
+		"maker":                      first.FromCurrency,
+		"maker_address":              first.MakerAddress,
+		"taker":                      first.ToCurrency,
+		"taker_address":              first.TakerAddress,
+		"partial_minimum":            formatXAmount(first.MinFromAmount),
+		"partial_orig_maker_size":    formatXAmount(first.OrigFromAmount),
+		"partial_orig_taker_size":    formatXAmount(first.OrigToAmount),
+		"first_order_time":           iso8601(first.Created),
+		"last_order_time":            iso8601(last.Updated),
+		"total_reported_sent":        formatXAmount(totalSent),
+		"total_reported_received":    formatXAmount(totalReceived),
+		"total_reported_notsent":     formatXAmount(totalNotSent),
+		"total_reported_notreceived": formatXAmount(totalNotReceived),
+		"total_orders_open":          totalOpen,
+		"total_orders_finished":      totalFinished,
+		"total_orders_canceled":      totalCanceled,
+		"orders":                     orderIDs,
+		"p2sh_deposits":              []string{},
+		"p2sh_deposits_counterparty": []string{},
 	}
 	return details, nil
 }
@@ -450,15 +905,30 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *rpcError) {
-	id, _ := strParam(params, 0)
-	out := []orderDetailResult{}
-	for _, o := range h.Store.Locked() {
-		if id != "" && hexEncode(o.ID[:]) != id {
-			continue
-		}
-		out = append(out, o.toDetailResult())
+	if len(params) > 1 {
+		return nil, makeError(errInvalidParameters, "dxGetLockedUtxos", "Too many parameters.")
 	}
-	return out, nil
+	// C++ gates on the Exchange (Service Node) being started; a thin client with
+	// no configured exchange wallets cannot serve locked-utxo data.
+	if len(h.Node.cfg.ExchangeWallets) == 0 {
+		return nil, makeError(errNotExchangeNode, "dxGetLockedUtxos", "not an exchange node")
+	}
+	id, _ := strParam(params, 0)
+	if id == "" {
+		// No id -> all locked utxos (colon-delimited "txid:vout:amount:address"
+		// strings, per C++ Exchange::getUtxoItems). Backing not wired yet.
+		return map[string]interface{}{"all_locked_utxo": []string{}}, nil
+	}
+	o := h.Store.Get(id)
+	if o == nil {
+		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", id)
+	}
+	// C++ keys the utxo array by the order's currency (a_currency for the pending
+	// tx, or a_and_b for the accepted tx). We key by the order's maker currency.
+	return map[string]interface{}{
+		"id":           id,
+		o.FromCurrency: []string{},
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -466,25 +936,40 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface{}, *rpcError) {
-	ageMillis, e := mustInt(params, 0, 0, "dxFlushCancelledOrders")
-	if e != nil {
-		return nil, e
+	// C++ dxFlushCancelledOrders: ageMillis is optional (default 0, must be >= 0).
+	// params.size() == 0 -> 0; == 1 -> params[0]; > 1 -> -1 -> error.
+	var ageMillis int
+	switch {
+	case len(params) == 0:
+		ageMillis = 0
+	case len(params) == 1:
+		v, ok := intParam(params, 0, 0)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxFlushCancelledOrders", "ageMillis must be an integer >= 0")
+		}
+		ageMillis = v
+	default:
+		return nil, makeError(errInvalidParameters, "dxFlushCancelledOrders", "ageMillis must be an integer >= 0")
 	}
-	start := NowMicro()
-	flushed := []map[string]interface{}{}
-	for _, c := range h.Store.cancelled {
-		flushed = append(flushed, map[string]interface{}{
+	if ageMillis < 0 {
+		return nil, makeError(errInvalidParameters, "dxFlushCancelledOrders", "ageMillis must be an integer >= 0")
+	}
+	now := NowMicro()
+	flushed := h.Store.FlushCancelled(uint64(ageMillis))
+	dur := NowMicro() - now
+	orders := make([]map[string]interface{}, 0, len(flushed))
+	for _, c := range flushed {
+		orders = append(orders, map[string]interface{}{
 			"id":        c.ID,
 			"txtime":    iso8601(c.Txtime),
 			"use_count": c.UseCount,
 		})
 	}
-	dur := NowMicro() - start
 	return map[string]interface{}{
 		"ageMillis":        ageMillis,
-		"now":              iso8601(start),
+		"now":              iso8601(now),
 		"durationMicrosec": int64(dur),
-		"flushedOrders":    flushed,
+		"flushedOrders":    orders,
 	}, nil
 }
 
@@ -493,9 +978,30 @@ func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetTradingData(params []json.RawMessage) (interface{}, *rpcError) {
-	// (blocks, default=43200) (errors, default=false)
-	_ = params
-	return []interface{}{}, nil
+	// (blocks, default=43200) (errors, default=false). C++ reads BLOCK blockchain
+	// blocks and parses on-chain trade-fee transactions; a thin client has no
+	// blocknetd block index, so we surface the same 8-field record schema built
+	// from the local fills this node has seen. `blocks`/`errors` are accepted for
+	// contract compatibility but cannot bound a BLOCK block scan here.
+	if len(params) > 2 {
+		return nil, makeError(errInvalidParameters, "dxGetTradingData", "(blocks, default=43200)[optional] (errors, default=false)[optional]")
+	}
+	out := make([]interface{}, 0)
+	for _, f := range h.Store.Fills() {
+		takerSize, _ := strconv.ParseFloat(f.TakerSize, 64)
+		makerSize, _ := strconv.ParseFloat(f.MakerSize, 64)
+		out = append(out, map[string]interface{}{
+			"timestamp":  int64(f.Time / 1e6),
+			"fee_txid":   "",
+			"nodepubkey": "",
+			"id":         f.ID,
+			"taker":      f.Taker,
+			"taker_size": takerSize,
+			"maker":      f.Maker,
+			"maker_size": makerSize,
+		})
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +1009,8 @@ func (h *HandlerCtx) dxGetTradingData(params []json.RawMessage) (interface{}, *r
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) < 3 {
+	// (token, splitamount, address, include_fees[default=true], show_rawtx[default=false], submit[default=true])
+	if len(params) < 3 || len(params) > 6 {
 		return nil, makeError(errInvalidParameters, "dxSplitAddress", "(token) (splitamount) (address) (include_fees, default=true)[optional] (show_rawtx, default=false)[optional] (submit, default=true)[optional]")
 	}
 	ticker, _ := strParam(params, 0)
@@ -525,13 +1032,14 @@ func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpc
 }
 
 func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) < 6 {
-		return nil, makeError(errInvalidParameters, "dxSplitInputs", "(token) (splitamount) (address) (include_fees) (show_rawtx) (submit) (utxos)[optional]")
+	// C++ requires exactly 7 params: (token, splitamount, address, include_fees, show_rawtx, submit, utxos)
+	if len(params) != 7 {
+		return nil, makeError(errInvalidParameters, "dxSplitInputs", "(token) (splitamount) (address) (include_fees) (show_rawtx) (submit) (utxos)")
 	}
 	ticker, _ := strParam(params, 0)
 	splitAmt, _ := strParam(params, 1)
 	address, _ := strParam(params, 2)
-	includeFees, e := mustBool(params, 3, true, "dxSplitInputs")
+	includeFees, e := mustBool(params, 3, false, "dxSplitInputs")
 	if e != nil {
 		return nil, e
 	}
@@ -539,32 +1047,35 @@ func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcE
 	if e != nil {
 		return nil, e
 	}
-	submit, e := mustBool(params, 5, true, "dxSplitInputs")
+	submit, e := mustBool(params, 5, false, "dxSplitInputs")
 	if e != nil {
 		return nil, e
 	}
-
-	var utxos []wallet.Utxo
-	if len(params) > 6 {
-		c, ok := coins.Get(ticker)
-		if !ok {
-			return nil, makeError(errInvalidParameters, "dxSplitInputs", "unknown coin: "+ticker)
-		}
-		u, e := parseUtxoParam(c, params[6])
-		if e != nil {
-			return nil, e
-		}
-		utxos = u
+	c, ok := coins.Get(ticker)
+	if !ok {
+		return nil, makeError(errInvalidParameters, "dxSplitInputs", "unknown coin: "+ticker)
+	}
+	utxos, e := parseUtxoParam(c, params[6])
+	if e != nil {
+		return nil, e
+	}
+	if len(utxos) == 0 {
+		return nil, makeError(errBadRequest, "dxSplitInputs", "No utxos were specified")
 	}
 	return h.splitTx(ticker, splitAmt, address, includeFees, showRawTx, submit, utxos)
 }
 
 // splitTx builds, signs and optionally submits a UTXO-split transaction for the
-// given coin: it sends `splitAmount` (base units) to `address` across as many
-// outputs as the selected inputs allow, returning change to a fresh address.
-// Legacy P2PKH/P2SH outputs only (native segwit split is a follow-up). VERIFY:
-// exact C++ return shape/semantics (include_fees handling, rawtx/txid, utxos
-// field names).
+// given coin, mirroring C++ dxSplitAddress/dxSplitInputs:
+//   - each split output sends `splitAmount` (and +fee when include_fees) to address;
+//   - change returns to a fresh address;
+//   - the result echoes C++'s 8-field object
+//     {token, include_fees, split_amount_requested, split_amount_with_fees,
+//     split_utxo_count, split_total, txid, rawtx}.
+//
+// Amounts are rendered in XBridge 1e6 scale (formatXAmount); the tx itself is
+// built in the coin's native scale. txid is the double-SHA256 of the signed
+// transaction, byte-reversed — always computed, even when submit=false.
 func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees, showRawTx, submit bool, utxos []wallet.Utxo) (interface{}, *rpcError) {
 	conn, e := h.connector(ticker)
 	if e != nil {
@@ -574,11 +1085,19 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxSplit", "unknown coin: "+ticker)
 	}
-	target, err := coins.ParseAmount(c, splitAmountStr)
+	// C++ parses splitamount via xBridgeAmountFromString (1e6 scale); the real tx
+	// output values are converted to the coin's native scale.
+	targetXB, err := parseXAmount(splitAmountStr)
 	if err != nil {
 		return nil, makeError(errInvalidParameters, "dxSplit", "invalid split amount")
 	}
+	target := fromXBridgeAmt(c, targetXB)
 	cc, _ := h.Node.cfg.Confs[ticker]
+
+	// C++ dust gate on the minimum split amount.
+	if cc != nil && cc.DustAmount > 0 && targetXB < cc.DustAmount {
+		return nil, makeError(errBadRequest, "dxSplit", "split amount is dust ["+formatXAmount(targetXB)+"]")
+	}
 
 	if len(utxos) == 0 {
 		minConf := 0
@@ -616,21 +1135,27 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 
 	// Fee estimate (fallback to conf FeePerByte when estimatesmartfee is absent).
 	fee := estimateFee(cc, len(utxos), 2)
-	nSplits := total / target
-	for nSplits > 0 && total < nSplits*target+fee {
-		nSplits--
+
+	// Per-output size matches C++: splitAmount, plus fee when include_fees.
+	splitSize := target
+	if includeFees {
+		splitSize += fee
+	}
+	nSplits := total / splitSize
+	if nSplits > 100 {
+		nSplits = 100
 	}
 	if nSplits == 0 {
 		return nil, makeError(errInsufficientFunds, "dxSplit", "insufficient funds for split amount")
 	}
 
-	spent := nSplits*target + fee
+	spent := nSplits * splitSize
 	change := uint64(0)
 	if total > spent {
 		change = total - spent
 	}
+	// Dust change is dropped (C++ claws it back into fees); keeps the tx relayable.
 	if cc != nil && change < cc.DustAmount {
-		fee += change
 		change = 0
 	}
 
@@ -649,7 +1174,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		})
 	}
 	for i := uint64(0); i < nSplits; i++ {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: target, ScriptPubKey: destScript})
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: splitSize, ScriptPubKey: destScript})
 	}
 	if change > 0 {
 		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: change, ScriptPubKey: changeScript})
@@ -664,20 +1189,31 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		return nil, makeError(errUnknown, "dxSplit", "signing incomplete (wallet missing keys?)")
 	}
 
-	res := map[string]interface{}{"address": address}
+	txid, e := txidOfRawTx(signedHex)
+	if e != nil {
+		return nil, e
+	}
+
+	rawtx := ""
+	if showRawTx {
+		rawtx = signedHex
+	}
 	if submit {
-		txid, err := conn.SendRawTransaction(signedHex)
-		if err != nil {
+		if _, err := conn.SendRawTransaction(signedHex); err != nil {
 			return nil, makeError(errUnknown, "dxSplit", err.Error())
 		}
-		res["txid"] = txid
-		if showRawTx {
-			res["rawtx"] = signedHex
-		}
-	} else {
-		res["rawtx"] = signedHex
 	}
-	return res, nil
+
+	return map[string]interface{}{
+		"token":                  ticker,
+		"include_fees":           includeFees,
+		"split_amount_requested": formatXAmount(targetXB),
+		"split_amount_with_fees": formatXAmount(toXBridgeAmt(c, splitSize)),
+		"split_utxo_count":       int(nSplits),
+		"split_total":            formatXAmount(toXBridgeAmt(c, total)),
+		"txid":                   txid,
+		"rawtx":                  rawtx,
+	}, nil
 }
 
 // estimateFee returns a rough satoshi fee for a tx with nIn inputs and nOut
@@ -729,6 +1265,49 @@ func reverseTxidHex(s string) ([32]byte, error) {
 	return out, nil
 }
 
+// txidOfRawTx computes a transaction id from serialized (signed) raw tx hex:
+// double-SHA256 then byte-reversed (Bitcoin display order). This is identical
+// to how C++ derives txid from a signed tx.
+func txidOfRawTx(rawHex string) (string, *rpcError) {
+	b, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return "", makeError(errInvalidParameters, "dxSplit", "bad signed transaction")
+	}
+	h := sha256.Sum256(b)
+	h = sha256.Sum256(h[:])
+	for i, j := 0, len(h)-1; i < j; i, j = i+1, j-1 {
+		h[i], h[j] = h[j], h[i]
+	}
+	return hex.EncodeToString(h[:]), nil
+}
+
+// toXBridgeAmt converts a native-chain amount (coins.Coin.Decimals base units)
+// into XBridge 1e6-scale base units for display. Raw tx output values stay in
+// native scale; only response amount strings use this conversion.
+func toXBridgeAmt(c coins.Coin, native uint64) uint64 {
+	nc := uint64(1)
+	for i := 0; i < c.Decimals; i++ {
+		nc *= 10
+	}
+	if nc == 0 {
+		nc = 1
+	}
+	return native * coinScale / nc
+}
+
+// fromXBridgeAmt converts an XBridge 1e6-scale amount into the coin's native
+// base units for use as a real on-chain output value.
+func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {
+	nc := uint64(1)
+	for i := 0; i < c.Decimals; i++ {
+		nc *= 10
+	}
+	if nc == 0 {
+		nc = 1
+	}
+	return xb * nc / coinScale
+}
+
 // parseUtxoParam parses the explicit-utxos array argument of dxSplitInputs.
 func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError) {
 	var arr []struct {
@@ -757,9 +1336,21 @@ func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcError) {
+	if len(params) < 1 || len(params) > 2 {
+		return nil, makeError(errInvalidParameters, "dxGetUtxos", "(token) (include_used, default=false)[optional]")
+	}
 	ticker, ok := strParam(params, 0)
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetUtxos", "(token) (include_used, default=false)[optional]")
+	}
+	// include_used defaults to false (C++: excluded locked UTXOs unless true).
+	includeUsed := false
+	if len(params) >= 2 {
+		b, ok := boolParam(params, 1, false)
+		if !ok {
+			return nil, makeError(errInvalidParameters, "dxGetUtxos", "invalid include_used")
+		}
+		includeUsed = b
 	}
 	conn, e := h.connector(ticker)
 	if e != nil {
@@ -776,6 +1367,11 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 	c, _ := coins.Get(ticker)
 	out := make([]map[string]interface{}, 0, len(utxos))
 	for _, u := range utxos {
+		// C++ always emits "orderid" (empty when the UTXO is not locked in an
+		// order). The thin client does not yet track per-UTXO order locks, so the
+		// value is always "" (the locked-UTXO exclusion on include_used=false is
+		// likewise not yet wired).
+		_ = includeUsed
 		out = append(out, map[string]interface{}{
 			"txid":          u.TxID,
 			"vout":          u.Vout,
@@ -783,6 +1379,7 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 			"amount":        coins.FormatAmount(c, u.Amount),
 			"scriptPubKey":  u.ScriptPubKey,
 			"confirmations": u.Confirmations,
+			"orderid":       "",
 		})
 	}
 	return out, nil

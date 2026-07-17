@@ -117,6 +117,25 @@ func intParam(params []json.RawMessage, i int, def int) (int, bool) {
 	return n, true
 }
 
+// int64Param extracts an int64 from a param that may be a JSON number or a
+// decimal string (dapps send unix timestamps/seconds either way).
+func int64Param(params []json.RawMessage, i int) (int64, bool) {
+	if i >= len(params) {
+		return 0, false
+	}
+	var n int64
+	if err := json.Unmarshal(params[i], &n); err == nil {
+		return n, true
+	}
+	var s string
+	if err := json.Unmarshal(params[i], &s); err == nil {
+		if v, e := strconv.ParseInt(strings.TrimSpace(s), 10, 64); e == nil {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
 // mustBool is boolParam with error propagation: a present-but-unparseable
 // param is a caller error (errInvalidParameters), not a silent default. A
 // missing param still yields def (ok=true).
