@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"math/big"
 	"strings"
@@ -317,6 +319,26 @@ func TestSwapHandshake(t *testing.T) {
 	assertDepositHTLC(t, btcConn, makerDepositTxID, makerSession.pubkey(), to33(tkPub), createdA.HashedSecret, createdA.ALockTime)
 	assertDepositHTLC(t, ltcConn, takerDepositTxID, to33(tkPub), makerSession.pubkey(), createdA.HashedSecret, createdB.BLockTime)
 
+	// Refund-path coverage (must be covered per the fund-safety requirement):
+	// the maker's pre-signed CLTV refund, produced at deposit time, must be
+	// broadcastable on abort. Task #5 automates this; here we exercise the path
+	// end-to-end by broadcasting the stored refund hex and asserting the
+	// connector recorded it.
+	if createdA.RefTx == "" {
+		t.Fatal("maker refund hex not produced at deposit time")
+	}
+	before := len(btcConn.broadcasts)
+	refundTxID, err := btcConn.SendRawTransaction(createdA.RefTx)
+	if err != nil {
+		t.Fatalf("abort refund broadcast: %v", err)
+	}
+	if refundTxID == "" {
+		t.Fatal("refund broadcast returned empty txid")
+	}
+	if len(btcConn.broadcasts) != before+1 {
+		t.Errorf("refund broadcast not recorded by connector (got %d, want %d)", len(btcConn.broadcasts), before+1)
+	}
+
 	// 5) ConfirmA (hub→maker's dest): maker redeems taker's deposit B, revealing
 	// its secret on-chain.
 	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: takerDepositTxID, BLockTime: createdB.BLockTime})
@@ -433,4 +455,189 @@ func mustHex(s string) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// decodeScriptPushes splits a Bitcoin scriptSig into its data pushes plus the
+// trailing opcodes (e.g. OP_1/OP_0 between pushes). btcd/txscript is not a
+// dependency, so we validate scriptSig structure byte-for-byte rather than via
+// a VM.
+func decodeScriptPushes(t *testing.T, b []byte) (pushes [][]byte, ops []byte) {
+	t.Helper()
+	i := 0
+	for i < len(b) {
+		c := b[i]
+		switch {
+		case c >= 1 && c <= 75:
+			n := int(c)
+			i++
+			if i+n > len(b) {
+				t.Fatalf("script push runs past end (len %d, need %d)", len(b), i+n)
+			}
+			pushes = append(pushes, b[i:i+n])
+			i += n
+		case c == coins.OpPushData1:
+			if i+2 > len(b) {
+				t.Fatalf("OP_PUSHDATA1 truncated")
+			}
+			n := int(b[i+1])
+			i += 2
+			if i+n > len(b) {
+				t.Fatalf("OP_PUSHDATA1 data runs past end")
+			}
+			pushes = append(pushes, b[i:i+n])
+			i += n
+		case c == coins.OpPushData2:
+			if i+3 > len(b) {
+				t.Fatalf("OP_PUSHDATA2 truncated")
+			}
+			n := int(binary.LittleEndian.Uint16(b[i+1 : i+3]))
+			i += 3
+			if i+n > len(b) {
+				t.Fatalf("OP_PUSHDATA2 data runs past end")
+			}
+			pushes = append(pushes, b[i:i+n])
+			i += n
+		case c == coins.OpPushData4:
+			if i+5 > len(b) {
+				t.Fatalf("OP_PUSHDATA4 truncated")
+			}
+			n := int(binary.LittleEndian.Uint32(b[i+1 : i+5]))
+			i += 5
+			if i+n > len(b) {
+				t.Fatalf("OP_PUSHDATA4 data runs past end")
+			}
+			pushes = append(pushes, b[i:i+n])
+			i += n
+		default:
+			ops = append(ops, c)
+			i++
+		}
+	}
+	return pushes, ops
+}
+
+// setupSwapPair builds a maker-only swap fixture on BTC so individual maker-side
+// paths (refund tx, etc.) can be exercised without a full taker exchange.
+func setupSwapPair(t *testing.T) (*SwapSession, *fakeConnector) {
+	t.Helper()
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Title: "Bitcoin", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	priv, _ := newKey(t)
+	btcFundingPriv, btcFundingPub := newKey(t)
+	btcFunding := wallet.Utxo{
+		TxID:         strings.Repeat("aa", 32),
+		Vout:         0,
+		Amount:       5e8,
+		ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(btcFundingPub))),
+	}
+	btcConn := &fakeConnector{
+		ticker: "BTC", funding: btcFunding, fundingPriv: btcFundingPriv, fundingPub: btcFundingPub,
+		changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	conns := map[string]wallet.Connector{"BTC": btcConn}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, priv, confs, conns)
+	var orderID [32]byte
+	oid := hash20("order-id")
+	copy(orderID[:], oid[:])
+	mkAddr := addrFor(0, "maker-btc-dest")
+	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr})
+	s := n.sessions[hexEncode(orderID[:])]
+	hub := hash20("hub")
+	s.hub = hub
+	return s, btcConn
+}
+
+// TestRefundTx exercises the pre-signed CLTV refund produced when the maker
+// deposits: it must carry the deposit's lockTime, set the input sequence to
+// 0xfffffffe (CLTV enabled), and assemble the IF-branch scriptSig
+// <sig> <depositorPub> OP_1 <redeemScript> whose inner push equals the deposit's
+// HTLC redeem script.
+func TestRefundTx(t *testing.T) {
+	s, conn := setupSwapPair(t)
+
+	_, bodyA, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])})
+	if err != nil {
+		t.Fatalf("OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+	if _, ok := conn.rawTx[createdA.ADepositTxID]; !ok {
+		t.Fatal("maker deposit not broadcast")
+	}
+	if createdA.RefTx == "" {
+		t.Fatal("empty refund hex")
+	}
+	raw, err := hex.DecodeString(createdA.RefTx)
+	if err != nil {
+		t.Fatalf("decode refund: %v", err)
+	}
+	tx, err := coins.Deserialize(raw)
+	if err != nil {
+		t.Fatalf("deserialize refund: %v", err)
+	}
+	if tx.LockTime != createdA.ALockTime {
+		t.Errorf("refund LockTime %d != deposit lockTime %d", tx.LockTime, createdA.ALockTime)
+	}
+	if len(tx.Inputs) != 1 {
+		t.Fatalf("refund wants 1 input, got %d", len(tx.Inputs))
+	}
+	if tx.Inputs[0].Sequence != 0xfffffffe {
+		t.Errorf("refund input sequence %#x != 0xfffffffe (CLTV not enabled)", tx.Inputs[0].Sequence)
+	}
+	pushes, ops := decodeScriptPushes(t, tx.Inputs[0].ScriptSig)
+	if len(pushes) != 3 || len(ops) != 1 || ops[0] != coins.Op1 {
+		t.Fatalf("refund scriptSig wrong: pushes=%d ops=%v", len(pushes), ops)
+	}
+	wantInner := coins.BuildDepositUnlockScript(s.n.pubkey[:], s.theirPub[:], s.secretHash[:], createdA.ALockTime)
+	if !bytes.Equal(pushes[2], wantInner) {
+		t.Error("refund scriptSig inner push != expected HTLC redeem script")
+	}
+}
+
+// TestComputeLockTime checks the C++ locktime formula (xbridgewallet.h:96-101):
+// target = MAKER/TAKER seconds; taker target becomes XSLOW_TAKER when blockTime
+// >= 600; blocks = target/blockTime clamped to XMIN_LOCKTIME_BLOCKS=6; result =
+// current block + blocks. The computed values here are BTC-like (blockTime 60)
+// plus a few edge blockTimes; the clamp/mask behavior is identical to C++.
+func TestComputeLockTime(t *testing.T) {
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", BlockTime: 60},
+	}
+	conn := &fakeConnector{ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{}}
+	conns := map[string]wallet.Connector{"BTC": conn}
+	priv, _ := newKey(t)
+	n := newTestNode(t, priv, confs, conns)
+	s := &SwapSession{n: n, isMaker: true, id: [32]byte{}, srcCur: "BTC", dstCur: "BTC"}
+	n.sessions["x"] = s
+
+	// blockTime 60: maker 7200/60=120 → 1120; taker 1800/60=30 → 1030.
+	if got := s.computeLockTime(true); got != 1120 {
+		t.Errorf("maker lockTime (bt60) = %d, want 1120", got)
+	}
+	if got := s.computeLockTime(false); got != 1030 {
+		t.Errorf("taker lockTime (bt60) = %d, want 1030", got)
+	}
+
+	// blockTime 100 (no clamp): maker 7200/100=72 → 1072; taker 1800/100=18 → 1018.
+	confs["BTC"].BlockTime = 100
+	if got := s.computeLockTime(true); got != 1072 {
+		t.Errorf("maker lockTime (bt100) = %d, want 1072", got)
+	}
+	if got := s.computeLockTime(false); got != 1018 {
+		t.Errorf("taker lockTime (bt100) = %d, want 1018", got)
+	}
+
+	// blockTime 7200: maker 7200/7200=1, taker 1800/7200=0 → both clamped to
+	// XMIN_LOCKTIME_BLOCKS=6 → 1006. (The XSLOW_TAKER branch is also applied for
+	// bt>=600 but the 6-block clamp dominates the result, matching C++.)
+	confs["BTC"].BlockTime = 7200
+	if got := s.computeLockTime(true); got != 1006 {
+		t.Errorf("maker lockTime (clamped) = %d, want 1006", got)
+	}
+	if got := s.computeLockTime(false); got != 1006 {
+		t.Errorf("taker lockTime (clamped) = %d, want 1006", got)
+	}
 }
