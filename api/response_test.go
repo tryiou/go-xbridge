@@ -11,11 +11,11 @@ func TestFormatXAmount(t *testing.T) {
 		amt  uint64
 		want string
 	}{
-		{0, "0.0000000"},
-		{100000000, "100.0000000"}, // 100 * COIN
-		{1500000, "1.5000000"},     // 1.5
-		{1531409, "1.5314090"},     // live-packet DOGE amount
-		{24500001, "24.5000010"},   // live-packet BLOCK amount
+		{0, "0.000000"},
+		{100000000, "100.000000"}, // 100 * COIN
+		{1500000, "1.500000"},     // 1.5
+		{1531409, "1.531409"},     // live-packet DOGE amount
+		{24500001, "24.500001"},   // live-packet BLOCK amount
 	}
 	for _, c := range cases {
 		if got := formatXAmount(c.amt); got != c.want {
@@ -128,7 +128,8 @@ func TestStatusString(t *testing.T) {
 }
 
 func TestMakeOrderResponseShapes(t *testing.T) {
-	// dxMakeOrder must report partial_* = "0" and status = "created".
+	// dxMakeOrder must report partial_* = "0.000000" (formatXAmount of zero) and
+	// status = "created".
 	o := &Order{
 		ID:             [32]byte{0x01},
 		FromCurrency:   "SYS",
@@ -144,8 +145,8 @@ func TestMakeOrderResponseShapes(t *testing.T) {
 		BlockID:        "blockhash",
 	}
 	r := o.makeOrderResponse()
-	if r.PartialMinimum != "0" || r.PartialOrigMakerSize != "0" || r.PartialOrigTakerSize != "0" {
-		t.Errorf("dxMakeOrder partial fields must be \"0\", got %q/%q/%q",
+	if r.PartialMinimum != "0.000000" || r.PartialOrigMakerSize != "0.000000" || r.PartialOrigTakerSize != "0.000000" {
+		t.Errorf("dxMakeOrder partial fields must be \"0.000000\", got %q/%q/%q",
 			r.PartialMinimum, r.PartialOrigMakerSize, r.PartialOrigTakerSize)
 	}
 	if r.Status != "created" || r.OrderType != "exact" {
@@ -158,7 +159,13 @@ func TestMakeOrderResponseShapes(t *testing.T) {
 
 func TestMakeErrorShape(t *testing.T) {
 	e := makeError(errInvalidParameters, "dxGetOrder", "boom")
-	if e.Code != errInvalidParameters || e.Name != "dxGetOrder" || e.Error != "boom" {
-		t.Errorf("makeError shape wrong: %+v", e)
+	want := "Invalid parameters: boom"
+	if e.Code != errInvalidParameters || e.Name != "dxGetOrder" || e.Error != want {
+		t.Errorf("makeError shape wrong: got %+v, want error=%q", e, want)
+	}
+	// Unknown errors ignore the argument.
+	u := makeError(errUnknown, "dx", "anything")
+	if u.Error != "Internal Server Error" {
+		t.Errorf("unknown error must ignore arg, got %q", u.Error)
 	}
 }
