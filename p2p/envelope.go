@@ -32,7 +32,12 @@ func encodeXBridgePayload(packet []byte) []byte {
 	env := make([]byte, 0, xbridgeEnvelopeSize+len(packet))
 	env = append(env, make([]byte, xbridgeAddrSize)...) // broadcast (zero dest addr)
 	var ts [xbridgeTimestampSize]byte
-	binary.LittleEndian.PutUint64(ts[:], uint64(time.Now().UnixMilli()))
+	// C++ stamps this 8-byte field in MICROSECONDS (timeToInt =
+	// total_microseconds(), xutil.cpp:280) and includes it in the SHA256-signed
+	// body (Hash(msg.begin(), msg.end()), xbridgeapp.cpp:576). A millisecond
+	// value here is a 1000x wire divergence that fails every counterparty
+	// signature check — must stay UnixMicro().
+	binary.LittleEndian.PutUint64(ts[:], uint64(time.Now().UnixMicro()))
 	env = append(env, ts[:]...)
 	env = append(env, packet...)
 	out := writeVarInt(len(env))
@@ -82,6 +87,11 @@ func writeVarInt(n int) []byte {
 		return b
 	}
 }
+
+// ReadVarInt is the exported entry point for parsing a Bitcoin CompactSize
+// (varint) integer. It is used by sibling packages (e.g. servicenode) that
+// parse raw P2P payloads sharing Bitcoin's varint encoding.
+func ReadVarInt(b []byte, pos int) (int, int, error) { return readVarInt(b, pos) }
 
 // readVarInt reads a Bitcoin CompactSize (varint) at *pos, advancing pos past
 // it and returning the decoded value.

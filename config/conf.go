@@ -52,6 +52,7 @@ type CoinConf struct {
 	MinimumAmount uint64
 	TxVersion     int
 	DustAmount    uint64
+	RelayFee      float64 // per-KB relay fee in coin units (C++ info.relayFee); drives dust
 	MinTxFee      uint64
 	BlockTime     int // seconds per block
 	FeePerByte    uint64
@@ -189,6 +190,18 @@ func (s section) uintp(key string, def uint64) uint64 {
 	return n
 }
 
+func (s section) floatp(key string, def float64) float64 {
+	v, ok := s.get(key)
+	if !ok || v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
 func (s section) boolp(key string) bool {
 	v, ok := s.get(key)
 	if !ok {
@@ -238,6 +251,7 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		MinimumAmount:             s.uintp("MinimumAmount", 0),
 		TxVersion:                 s.intp("TxVersion", 1), // C++ xbridgeapp.cpp: s.get<uint32_t>(*i+".TxVersion", 1)
 		DustAmount:                s.uintp("DustAmount", 0),
+		RelayFee:                  s.floatp("RelayFee", 0),
 		MinTxFee:                  s.uintp("MinTxFee", 0),
 		BlockTime:                 s.intp("BlockTime", 0),
 		FeePerByte:                s.uintp("FeePerByte", 0),

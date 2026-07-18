@@ -78,6 +78,11 @@ func marshalNetAddr(a NetAddr) []byte {
 	return buf
 }
 
+// MarshalVarStr is the exported entry point for serializing a length-prefixed
+// string using a Bitcoin VarInt. It is used by sibling packages that build raw
+// P2P payloads (e.g. servicenode tests/builders).
+func MarshalVarStr(s string) []byte { return marshalVarStr(s) }
+
 // marshalVarStr serializes a length-prefixed string using a Bitcoin VarInt.
 // User agents are short, so only the single-byte and 0xFD (uint16) encodings
 // are needed here.
@@ -233,6 +238,11 @@ func netIPFrom16(b [16]byte) net.IP {
 	}
 	return net.IP(b[:])
 }
+
+// UnmarshalVarStr is the exported entry point for parsing a Bitcoin
+// VarInt-prefixed string. It is used by sibling packages that parse raw P2P
+// payloads (e.g. servicenode).
+func UnmarshalVarStr(b []byte) (string, int, error) { return unmarshalVarStr(b) }
 
 // unmarshalVarStr parses a Bitcoin VarInt-prefixed string.
 func unmarshalVarStr(b []byte) (string, int, error) {

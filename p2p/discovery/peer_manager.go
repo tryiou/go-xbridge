@@ -10,6 +10,7 @@ import (
 
 	xlog "xbridge-go/log"
 	"xbridge-go/p2p"
+	"xbridge-go/p2p/servicenode"
 	"xbridge-go/proto"
 )
 
@@ -47,6 +48,11 @@ type PeerManager struct {
 	peers    map[string]*p2p.Conn // addr -> conn (nil while connecting)
 	rr       int                  // round-robin cursor over candidates
 	explicit []string
+
+	// snReg is the servicenode registry, populated from SNREGISTER / SNPING /
+	// SNLISTPING P2P messages (mirrors a core XBridge wallet learning the
+	// network token set). Exposed via ServiceNodes() for dxGetNetworkTokens.
+	snReg *servicenode.Registry
 }
 
 // peerPacket couples an XBridge packet with the TCP peer address it arrived
@@ -82,6 +88,7 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		xbridgeCh: make(chan peerPacket, 256),
 		done:      make(chan struct{}),
 		peers:     make(map[string]*p2p.Conn),
+		snReg:     servicenode.NewRegistry(),
 	}
 }
 
@@ -248,6 +255,24 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 			_ = conn.SendCommand(p2p.CmdAddr, p2p.MarshalAddr(sample))
 		case p2p.CmdPing:
 			_ = conn.SendCommand(p2p.CmdPong, msg.Payload)
+		case servicenode.CmdSNRegister:
+			sn, derr := servicenode.ParseServiceNode(msg.Payload)
+			if derr != nil {
+				xlog.Warn("servicenode: SNREGISTER parse error", "peer", addr, "err", derr)
+				break
+			}
+			m.snReg.AddRegistration(sn)
+		case servicenode.CmdSNPing, servicenode.CmdSNListPing:
+			sn, derr := servicenode.ParseServiceNodePing(msg.Payload)
+			if derr != nil {
+				xlog.Warn("servicenode: SNPING/SNLISTPING parse error", "peer", addr, "cmd", msg.Command, "err", derr)
+				break
+			}
+			m.snReg.AddPing(sn)
+		case servicenode.CmdSNList:
+			xlog.Debug("servicenode: ignoring SNLIST (stock client does not answer)", "peer", addr)
+			// A stock XBridge client does not answer SNLIST (only XRouter
+			// does); ignore it. We learn the SN set from relayed pings.
 		default:
 			// version/verack (handshake) and addrv2 are intentionally ignored.
 		}
@@ -309,6 +334,13 @@ func (m *PeerManager) Peers() []string {
 // address manager (useful for diagnostics and tests).
 func (m *PeerManager) AddrCount() int {
 	return m.addrMan.Count()
+}
+
+// ServiceNodes returns the live servicenode registry, populated from SNREGISTER /
+// SNPING / SNLISTPING messages. The api.Node uses it to derive the network
+// token set for dxGetNetworkTokens (mirroring C++ walletServices()).
+func (m *PeerManager) ServiceNodes() *servicenode.Registry {
+	return m.snReg
 }
 
 // liveCount returns the number of fully-connected peers.

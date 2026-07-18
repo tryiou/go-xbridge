@@ -22,6 +22,11 @@ type Conn struct {
 	magic       [4]byte
 	reader      *bufio.Reader
 	peerVersion *VersionMessage
+	// OnNonXBridge, if set, is invoked for every raw P2P message whose
+	// command is not the XBridge envelope command ("xbridge"). It lets callers
+	// observe raw servicenode messages (snr/snp/snlp) that would otherwise
+	// be skipped by ReadPacket. Optional; nil means skip as before.
+	OnNonXBridge func(cmd string, payload []byte)
 }
 
 // Dial connects to a Blocknet peer and completes the handshake.
@@ -120,6 +125,9 @@ func (c *Conn) ReadPacket() (*proto.Packet, string, error) {
 			return nil, "", err
 		}
 		if msg.Command != XBridgeNetCommand {
+			if c.OnNonXBridge != nil {
+				c.OnNonXBridge(msg.Command, msg.Payload)
+			}
 			continue
 		}
 		pktBytes, err := DecodeXBridgePayload(msg.Payload)

@@ -1017,9 +1017,6 @@ func DecodeBody(cmd XBridgeCommand, body []byte) (interface{}, error) {
 	case XbcXChatMessage:
 		var b XChatMessageBody
 		return &b, b.Unmarshal(body)
-	case XbcServicesPing:
-		var b ServicesPingBody
-		return &b, b.Unmarshal(body)
 	default:
 		return nil, errors.New("xbridge: no typed body for command " + cmd.String())
 	}
