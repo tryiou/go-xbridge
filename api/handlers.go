@@ -179,6 +179,12 @@ func (h *HandlerCtx) connector(ticker string) (wallet.Connector, *rpcError) {
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxLoadXBridgeConf(params []json.RawMessage) (interface{}, *rpcError) {
+	if h.Node == nil {
+		return true, nil
+	}
+	if err := h.Node.reloadConf(); err != nil {
+		return nil, makeError(errInvalidParameters, "dxLoadXBridgeConf", err.Error())
+	}
 	return true, nil
 }
 

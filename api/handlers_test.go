@@ -2,9 +2,17 @@ package api
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"xbridge-go/coins"
+	"xbridge-go/config"
+	"xbridge-go/crypto"
+	"xbridge-go/p2p/servicenode"
+	"xbridge-go/wallet"
 )
 
 // jstr wraps a Go string as a JSON-RawMessage param (a quoted
@@ -594,5 +602,72 @@ func TestGetNetworkInfo(t *testing.T) {
 	m2 := res2.(map[string]interface{})
 	if m2["version"] != 4120000 || m2["subversion"] != "/blocknet:4.12.0/" {
 		t.Errorf("override = %v / %v", m2["version"], m2["subversion"])
+	}
+}
+
+// TestDxLoadConfHotReload verifies dxLoadXBridgeConf re-reads xbridge.conf from
+// ConfPath and rebuilds the coin registry + connectors live (C++ reload-from-
+// the-same-conf behaviour), without the daemon needing a restart.
+func TestDxLoadConfHotReload(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "xbridge.conf")
+
+	const btcOnly = "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n"
+	const withDoge = "[Main]\nExchangeWallets=BTC,DOGE\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n\n[DOGE]\nTitle=Dogecoin\nCreateTxMethod=BTC\nAddressPrefix=30\nScriptPrefix=22\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=60\nFeePerByte=1\nConfirmations=2\n"
+
+	if err := os.WriteFile(confPath, []byte(btcOnly), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Build a node whose config mirrors what the daemon parsed from confPath.
+	cc, err := config.Load(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coins.InitFromConf(cc.Coins); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Confs:           cc.Coins,
+		Connectors:      map[string]wallet.Connector{},
+		ExchangeWallets: cc.Main.ExchangeWallets,
+		NetworkTokens:   []string{"BTC"},
+		ConfPath:        confPath,
+	}
+	node := &Node{config: cfg, store: NewStore(), signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
+	ctx := &HandlerCtx{Store: NewStore(), Node: node}
+
+	if !coins.Has("BTC") || coins.Has("DOGE") {
+		t.Fatalf("precondition: coins = BTC only, got BTC=%v DOGE=%v", coins.Has("BTC"), coins.Has("DOGE"))
+	}
+
+	// Swap the on-disk conf to include DOGE, then hot-reload.
+	if err := os.WriteFile(confPath, []byte(withDoge), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res, rerr := ctx.dxLoadXBridgeConf(nil); rerr != nil || res != true {
+		t.Fatalf("dxLoadXBridgeConf = %v %v", res, rerr)
+	}
+
+	// The live registry + config must now reflect DOGE, and BTC must persist.
+	if !coins.Has("BTC") || !coins.Has("DOGE") {
+		t.Errorf("after reload: coins.Has BTC=%v DOGE=%v", coins.Has("BTC"), coins.Has("DOGE"))
+	}
+	nt, _ := ctx.dxGetNetworkTokens(nil)
+	got := map[string]bool{}
+	for _, tk := range nt.([]string) {
+		got[tk] = true
+	}
+	if !got["BTC"] || !got["DOGE"] {
+		t.Errorf("dxGetNetworkTokens after reload = %v", nt)
+	}
+}
+
+// TestDxLoadConfHotReloadMissingPath verifies that a node started without a
+// conf path (ConfPath empty) reports a clean error instead of reloading.
+func TestDxLoadConfHotReloadMissingPath(t *testing.T) {
+	node := &Node{config: &Config{}, store: NewStore(), signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
+	ctx := &HandlerCtx{Store: NewStore(), Node: node}
+	if res, rerr := ctx.dxLoadXBridgeConf(nil); rerr == nil {
+		t.Fatalf("expected error for empty ConfPath, got res=%v", res)
 	}
 }

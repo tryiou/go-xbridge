@@ -166,6 +166,7 @@ func main() {
 		WalletVersion:    *walletVersion,
 		WalletVersionStr: *walletVersionStr,
 		DataDir:          dataDir,
+		ConfPath:         *confPath,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {

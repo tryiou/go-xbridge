@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"xbridge-go/coins"
@@ -96,6 +98,18 @@ func newWalletTestCtx() *HandlerCtx {
 	if err := coins.InitFromConf(cfg.Confs); err != nil {
 		panic(err)
 	}
+	// Write the conf the context was built from so dxLoadXBridgeConf can
+	// hot-reload from it (mirrors the daemon, which sets Config.ConfPath).
+	td, err := os.MkdirTemp("", "xbridge-conf-*")
+	if err != nil {
+		panic(err)
+	}
+	confPath := filepath.Join(td, "xbridge.conf")
+	confBody := "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n"
+	if err := os.WriteFile(confPath, []byte(confBody), 0o600); err != nil {
+		panic(err)
+	}
+	cfg.ConfPath = confPath
 	store := NewStore()
 	node := &Node{config: cfg, store: store, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
 	return &HandlerCtx{Store: store, Node: node}

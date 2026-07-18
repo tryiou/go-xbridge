@@ -54,6 +54,10 @@ type Config struct {
 	// (<UserConfigDir>/xbridged), so persistence is ON by default — matching
 	// C++'s always-on orders.dat. Set via xbridged's -datadir flag.
 	DataDir string
+	// ConfPath is the path the daemon loaded xbridge.conf from. dxLoadXBridgeConf
+	// hot-reloads from this path, mirroring C++'s reload-from-the-same-conf
+	// behaviour. Empty disables hot-reload (the call returns an error).
+	ConfPath string
 }
 
 // XConn is the connection surface the Node needs. Both *p2p.Conn (a single
@@ -217,6 +221,61 @@ func (n *Node) cfg() *Config {
 	n.cfgMu.RLock()
 	defer n.cfgMu.RUnlock()
 	return n.config
+}
+
+// reloadConf hot-reloads xbridge.conf from ConfPath, mirroring C++'s
+// dxLoadXBridgeConf (re-read the same conf the daemon started with and rebuild
+// the coin registry + wallet connectors). The fresh *Config is swapped under
+// the cfgMu write lock, so concurrent handlers keep seeing a consistent config
+// and never a half-built one. On any load/parse failure the previous config is
+// left untouched and the error is returned (the daemon keeps running, as C++
+// does on a bad reload).
+func (n *Node) reloadConf() error {
+	path := n.cfg().ConfPath
+	if path == "" {
+		return fmt.Errorf("dxLoadXBridgeConf: no conf path configured (daemon started without -conf)")
+	}
+	conf, err := config.Load(path)
+	if err != nil {
+		return fmt.Errorf("dxLoadXBridgeConf: load %s: %w", path, err)
+	}
+	if err := coins.InitFromConf(conf.Coins); err != nil {
+		return fmt.Errorf("dxLoadXBridgeConf: coin registry: %w", err)
+	}
+	connectors := map[string]wallet.Connector{}
+	for ticker, cc := range conf.Coins {
+		conn, cerr := wallet.NewConnectorFromConf(cc)
+		if cerr != nil {
+			xlog.Warn("connector not configured after reload", "coin", ticker, "err", cerr)
+			continue
+		}
+		connectors[ticker] = conn
+	}
+	networkTokens := make([]string, 0, len(conf.Coins))
+	for t := range conf.Coins {
+		networkTokens = append(networkTokens, t)
+	}
+	sort.Strings(networkTokens)
+
+	fresh := &Config{
+		NodeAddr:         n.cfg().NodeAddr,
+		Magic:            n.cfg().Magic,
+		Confs:            conf.Coins,
+		Connectors:       connectors,
+		ExchangeWallets:  conf.Main.ExchangeWallets,
+		NetworkTokens:    networkTokens,
+		Network:          n.cfg().Network,
+		AddNodes:         n.cfg().AddNodes,
+		WalletVersion:    n.cfg().WalletVersion,
+		WalletVersionStr: n.cfg().WalletVersionStr,
+		DataDir:          n.cfg().DataDir,
+		ConfPath:         path,
+	}
+	n.cfgMu.Lock()
+	n.config = fresh
+	n.cfgMu.Unlock()
+	xlog.Info("reloaded xbridge.conf", "path", path, "coins", len(conf.Coins))
+	return nil
 }
 
 // blockConnector returns the connector for the BLOCK chain, whose block height
