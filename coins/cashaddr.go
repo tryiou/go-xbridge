@@ -10,12 +10,17 @@ import (
 // byte. It lets xbridge-go decode/encode BCH addresses the way a C++ BCH
 // connector expects. Implementation mirrors the CashAddr spec.
 
-// cashaddrGenerator is the CashAddr checksum polynomial (distinct from bech32's).
+// cashaddrGenerator holds the five 40-bit generator constants Bitcoin ABC's
+// cashaddr PolyMod XORs in, one per set bit of c0 (cashaddr.cpp::PolyMod). The
+// previous port truncated these to their low byte, so its checksum validated
+// only against itself and rejected every genuine BCH address. These are the
+// authoritative values from Bitcoin ABC.
 var cashaddrGenerator = []uint64{
-	0x98, 0x79, 0x05, 0x97, 0x2d, 0x25, 0x66, 0x0d, 0xed, 0x27, 0x31, 0x31,
-	0x69, 0x22, 0x55, 0x19, 0x89, 0x8e, 0x80, 0x1e, 0x6b, 0xcb, 0x3d, 0x40,
-	0x88, 0x2a, 0x2c, 0x0c, 0xb9, 0x48, 0xb4, 0xca, 0x4b, 0x4f, 0x6f, 0x3d,
-	0xb2, 0xe8, 0x8a, 0x96,
+	0x98f2bc8e61, // c0 & 0x01
+	0x79b76d99e2, // c0 & 0x02
+	0xf33e5fb3c4, // c0 & 0x04
+	0xae2eabe2a8, // c0 & 0x08
+	0x1e4f43e470, // c0 & 0x10
 }
 
 // cashaddrPolymod computes the CashAddr checksum over the data (5-bit groups).
@@ -33,8 +38,10 @@ func cashaddrPolymod(values []int) uint64 {
 	return c
 }
 
-// cashaddrHRPExpand expands the HRP for checksumming: each char's low 5 bits,
-// then a single zero separator. (Differs from bech32's two-part expansion.)
+// cashaddrHRPExpand expands the HRP for checksumming. It mirrors Bitcoin ABC's
+// cashaddr ExpandPrefix exactly: each char's low 5 bits (prefix[i] & 0x1f),
+// followed by a single zero separator. (Do NOT split into high+low 5-bit pairs
+// as bech32 does — CashAddr only takes the low 5 bits per char.)
 func cashaddrHRPExpand(hrp string) []int {
 	out := make([]int, 0, len(hrp)+1)
 	for i := 0; i < len(hrp); i++ {
@@ -65,19 +72,57 @@ func cashaddrVerifyChecksum(prefix string, full []int) bool {
 	return cashaddrPolymod(data) == 1
 }
 
-// cashaddrEncode encodes a 20-byte hash as a CashAddr string of the given prefix
-// and type (hashType: 0=P2KH, 1=P2SH). The version byte packs the type into the
-// top 3 bits and the hash length (in bytes >> 2) into the bottom 5 bits, matching
-// the Bitcoin Cash CashAddr spec (so P2KH addresses begin with 'q' and P2SH with
-// 'p' for the "bitcoincash" prefix).
-func cashaddrEncode(prefix string, hashType int, hash []byte) (string, error) {
-	if len(hash) != 20 {
-		return "", fmt.Errorf("coins: cashaddr requires a 20-byte hash")
+// cashaddrSizeIndex maps a hash length in bytes to the 2-bit size field that
+// Bitcoin Cash's cashaddrenc.cpp::PackAddrData stores in the low bits of the
+// version byte. Mirrors the C++ switch (20→0, 24→1, 28→2, 32→3).
+func cashaddrSizeIndex(n int) (int, error) {
+	switch n {
+	case 20:
+		return 0, nil
+	case 24:
+		return 1, nil
+	case 28:
+		return 2, nil
+	case 32:
+		return 3, nil
+	default:
+		return 0, fmt.Errorf("coins: cashaddr unsupported hash length %d bytes", n)
 	}
+}
+
+// cashaddrLenFromIndex is the inverse of cashaddrSizeIndex: the 2-bit size field
+// back to a hash length in bytes.
+func cashaddrLenFromIndex(i int) (int, bool) {
+	switch i {
+	case 0:
+		return 20, true
+	case 1:
+		return 24, true
+	case 2:
+		return 28, true
+	case 3:
+		return 32, true
+	default:
+		return 0, false
+	}
+}
+
+// cashaddrEncode encodes a 20/24/28/32-byte hash as a CashAddr string of the
+// given prefix and type (hashType: 0=P2KH, 1=P2SH). The version byte packs the
+// type into the top 3 bits and the hash size index (0/1/2/3) into the bottom 2
+// bits, matching Bitcoin Cash CashAddr (Bitcoin ABC cashaddrenc.cpp::PackAddrData)
+// — so 20-byte P2KH addresses begin with 'q' and P2SH with 'p' for the
+// "bitcoincash" prefix. The previous Go port packed (len>>2) into the low bits,
+// which is byte-incompatible with real BCH addresses and cannot decode them.
+func cashaddrEncode(prefix string, hashType int, hash []byte) (string, error) {
 	if hashType != 0 && hashType != 1 {
 		return "", fmt.Errorf("coins: cashaddr invalid hash type %d", hashType)
 	}
-	version := (hashType << 3) | (len(hash) >> 2)
+	sizeIdx, err := cashaddrSizeIndex(len(hash))
+	if err != nil {
+		return "", err
+	}
+	version := (hashType << 3) | sizeIdx
 	payload, err := convertBits(append([]int{version}, bytesToInts(hash)...), 8, 5, true)
 	if err != nil {
 		return "", err
@@ -128,17 +173,18 @@ func cashaddrDecode(addr, wantPrefix string) (hashType int, hash []byte, err err
 	if err != nil {
 		return 0, nil, err
 	}
-	if len(decoded) != 21 {
-		return 0, nil, fmt.Errorf("coins: cashaddr unexpected payload length")
-	}
 	version := decoded[0]
 	hashType = version >> 3
-	hashLenBytes := (version & 0x07) << 2
+	sizeIdx := version & 0x07
+	hashLenBytes, ok := cashaddrLenFromIndex(sizeIdx)
+	if !ok {
+		return 0, nil, fmt.Errorf("coins: cashaddr invalid hash size index %d", sizeIdx)
+	}
 	if hashType != 0 && hashType != 1 {
 		return 0, nil, fmt.Errorf("coins: cashaddr invalid hash type %d", hashType)
 	}
-	if hashLenBytes != 20 {
-		return 0, nil, fmt.Errorf("coins: cashaddr unsupported hash length %d bytes", hashLenBytes)
+	if len(decoded) != 1+hashLenBytes {
+		return 0, nil, fmt.Errorf("coins: cashaddr unexpected payload length %d", len(decoded))
 	}
-	return hashType, intsToBytes(decoded[1:]), nil
+	return hashType, intsToBytes(decoded[1 : 1+hashLenBytes]), nil
 }
