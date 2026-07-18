@@ -18,6 +18,15 @@ type Store struct {
 	fills     []fillEntry // recent completed fills (session-scoped, like C++)
 	locked    map[string]*Order
 	cancelled []cancelledEntry
+	history   []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
+}
+
+// historyEntry is a removed order's terminal record (C++ moveTransactionToHistory).
+type historyEntry struct {
+	ID      string
+	Status  string // e.g. "canceled"
+	Reason  uint32
+	Updated uint64
 }
 
 type fillEntry struct {
@@ -86,6 +95,40 @@ func (s *Store) Remove(idHex string) {
 	defer s.mu.Unlock()
 	delete(s.orders, idHex)
 }
+
+// MoveToHistory deletes the live order and appends a terminal history record,
+// mirroring C++ App::moveTransactionToHistory (xbridgesession.cpp:3385). Used
+// by the remote-cancel path when an order has no deposit yet.
+func (s *Store) MoveToHistory(idHex, status string, reason, updated uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.orders, idHex)
+	s.history = append(s.history, historyEntry{
+		ID:      idHex,
+		Status:  status,
+		Reason:  uint32(reason),
+		Updated: updated,
+	})
+}
+
+// MoveToHistoryU32 is MoveToHistory with a uint32 reason (C++ TxCancelReason).
+func (s *Store) MoveToHistoryU32(idHex, status string, reason uint32, updated uint64) {
+	s.MoveToHistory(idHex, status, uint64(reason), updated)
+}
+
+// History returns the removed/cancelled order records.
+func (s *Store) History() []historyEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]historyEntry, len(s.history))
+	copy(out, s.history)
+	return out
+}
+
+// RemovePendingPackets is the thin-client equivalent of C++
+// xapp.removePackets: xbridge-go holds no pending-packet queue, so there is
+// nothing to drop. It exists to mirror the call site verbatim.
+func (s *Store) RemovePendingPackets(idHex string) {}
 
 // Mine returns orders created locally by this node.
 func (s *Store) Mine() []*Order {

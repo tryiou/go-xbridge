@@ -214,3 +214,352 @@ func TestDecodeAddr(t *testing.T) {
 		t.Fatal("expected rpcError for unknown coin")
 	}
 }
+
+// --- processTransactionCancel / processTransactionReject port tests ---
+
+// signBodyPacket signs a body with priv and returns the packet whose Pubkey is
+// the compressed pubkey of priv (matching the C++ wire contract).
+func signBodyPacket(t *testing.T, cmd proto.XBridgeCommand, body []byte, priv []byte) *proto.Packet {
+	t.Helper()
+	pkt := proto.NewPacket(cmd, body)
+	if err := crypto.NewBtcSigner().Sign(pkt, priv); err != nil {
+		t.Fatalf("sign packet: %v", err)
+	}
+	return pkt
+}
+
+func newCancelTestNode(conn XConn) *Node {
+	return &Node{
+		cfg:      &Config{Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}}},
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		store:    NewStore(),
+		sessions: map[string]*SwapSession{},
+		conn:     conn,
+	}
+}
+
+func mustID(t *testing.T) (id [32]byte, idHex string) {
+	t.Helper()
+	copy(id[:], []byte("cancel-test-order-id-000000000")) // 32 bytes
+	return id, hexEncode(id[:])
+}
+
+// TestRemoteCancelObservedOpen moves an observed (non-local) open order with a
+// valid snode-signed cancel into history as "canceled".
+func TestRemoteCancelObservedOpen(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x11
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "open", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if n.store.Get(idHex) != nil {
+		t.Fatal("observed open order should have been removed from live store")
+	}
+	h := n.store.History()
+	if len(h) != 1 || h[0].Status != "canceled" {
+		t.Fatalf("history = %+v, want one 'canceled' entry", h)
+	}
+}
+
+// TestRemoteCancelLocalOpenRebroadcast: a local open order cancelled by the
+// counterparty (not by us) must NOT be cancelled — it is marked stale for
+// rebroadcast instead.
+func TestRemoteCancelLocalOpenRebroadcast(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x22
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "open", Mine: true, SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	got := n.store.Get(idHex)
+	if got == nil {
+		t.Fatal("local open order must stay in the live store (rebroadcast branch)")
+	}
+	if got.Status != "open" {
+		t.Fatalf("local open order status = %q, want 'open'", got.Status)
+	}
+	if got.Updated > NowMicro()-240_000_000 {
+		t.Fatal("local open order should have been marked stale (~241s in the past)")
+	}
+}
+
+// TestRemoteCancelCreatedDepositSent rolls a created order with a sent deposit
+// back to "rolled back".
+func TestRemoteCancelCreatedDepositSent(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x33
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "created", DepositSent: true, RefundTx: "refundhex", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 2}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 2})
+
+	got := n.store.Get(idHex)
+	if got == nil {
+		t.Fatal("created order must remain in the live store (rollback)")
+	}
+	if got.Status != "rolled back" {
+		t.Fatalf("status = %q, want 'rolled back'", got.Status)
+	}
+	if got.Reason != 2 {
+		t.Fatalf("reason = %d, want 2", got.Reason)
+	}
+}
+
+// TestRemoteCancelAlreadyCanceled leaves an already-cancelled order unchanged.
+func TestRemoteCancelAlreadyCanceled(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x44
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "canceled", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+	before := len(n.store.History())
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if len(n.store.History()) != before {
+		t.Fatal("already-cancelled order must not produce a new history entry")
+	}
+	if got := n.store.Get(idHex); got == nil || got.Status != "canceled" {
+		t.Fatal("already-cancelled order must stay 'canceled'")
+	}
+}
+
+// TestRemoteCancelCreatedNoDeposit cancels a created order whose deposit was
+// never sent.
+func TestRemoteCancelCreatedNoDeposit(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x55
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "created", DepositSent: false, SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	got := n.store.Get(idHex)
+	if got == nil || got.Status != "canceled" {
+		t.Fatal("created+no-deposit order must become 'canceled' in the live store")
+	}
+}
+
+// TestRemoteCancelCounterpartyRedeemed ignores the cancel.
+func TestRemoteCancelCounterpartyRedeemed(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x66
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "created", DepositSent: true, CounterpartyRedeemed: true,
+		SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if got := n.store.Get(idHex); got == nil || got.Status != "created" {
+		t.Fatal("counterparty-redeemed order must ignore cancel (stay 'created')")
+	}
+}
+
+// TestRemoteCancelCreatedNoRefund cancels when no refund tx is available.
+func TestRemoteCancelCreatedNoRefund(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x77
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "created", DepositSent: true, RefundTx: "", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if got := n.store.Get(idHex); got == nil || got.Status != "canceled" {
+		t.Fatal("created+no-refund order must become 'canceled'")
+	}
+}
+
+// TestRemoteCancelExchangeBranch verifies the Exchange::instance().isStarted()
+// branch: a cancel signed by one of the session's member keys triggers
+// sendCancelTransaction (a broadcast xbcTransactionCancel).
+func TestRemoteCancelExchangeBranch(t *testing.T) {
+	coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
+	})
+	mPriv := make([]byte, 32)
+	mPriv[0] = 0x88
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, idHex := mustID(t)
+
+	n := newCancelTestNode(&captureXConn{})
+	n.SetExchangeStarted(true)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "open", SNodePubkey: "snodehex"}
+	o.ID = decodeID(t, idHex)
+	n.store.Add(o)
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 3}).Marshal(), mPriv)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 3})
+
+	pkts := n.conn.(*captureXConn).snapshot()
+	if len(pkts) != 1 {
+		t.Fatalf("exchange branch wrote %d packets, want 1", len(pkts))
+	}
+	if pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("command = %d, want XbcTransactionCancel", pkts[0].Command)
+	}
+}
+
+// TestRemoteRejectRestoresToPending: a role-'B' accepting order rejected with a
+// valid snode signature is restored to "open", role cleared, never cancelled.
+func TestRemoteRejectRestoresToPending(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x99
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "LTC", ToCurrency: "BTC", FromAmount: 2e6, ToAmount: 1e6,
+		OrigFromCurrency: "BTC", OrigToCurrency: "LTC", OrigFromAmount: 1e6, OrigToAmount: 2e6,
+		Status: "accepting", Role: 'B', MakerKey: "ourMkey", OtherPubkey: "theirOkey",
+		SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 4}).Marshal(), snodePriv)
+	n.onRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 4})
+
+	got := n.store.Get(idHex)
+	if got == nil {
+		t.Fatal("rejected order must remain in the live store")
+	}
+	if got.Status != "open" {
+		t.Fatalf("status = %q, want 'open'", got.Status)
+	}
+	if got.Role != 0 {
+		t.Fatalf("role = %d, want 0", got.Role)
+	}
+	if got.MakerKey != "" || got.OtherPubkey != "" {
+		t.Fatal("MakerKey/OtherPubkey must be cleared on reject")
+	}
+	if got.Reason != 0 {
+		t.Fatalf("reason = %d, want 0", got.Reason)
+	}
+	if got.FromCurrency != "BTC" || got.ToCurrency != "LTC" {
+		t.Fatalf("currencies not restored to orig: %s/%s", got.FromCurrency, got.ToCurrency)
+	}
+}
+
+// TestRemoteRejectIgnoredForMaker: a role-'A' order ignores the reject.
+func TestRemoteRejectIgnoredForMaker(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0xaa
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "accepting", Role: 'A', SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.onRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 1})
+
+	got := n.store.Get(idHex)
+	if got == nil || got.Status != "accepting" || got.Role != 'A' {
+		t.Fatal("role-'A' order must ignore reject")
+	}
+}
+
+// TestRemoteCancelBadSignature is a negative test: a cancel whose packet key
+// matches neither SNodePubkey, OtherPubkey, nor MakerKey must not change state.
+func TestRemoteCancelBadSignature(t *testing.T) {
+	goodSnode := make([]byte, 32)
+	goodSnode[0] = 0xbb
+	// attacker signs with a different key
+	bad := make([]byte, 32)
+	bad[0] = 0xcc
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "open", SNodePubkey: hexPub(t, goodSnode), MakerKey: "makerkey", OtherPubkey: "otherkey"}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+	before := len(n.store.History())
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), bad)
+	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if len(n.store.History()) != before {
+		t.Fatal("bad-signature cancel must not produce a history entry")
+	}
+	got := n.store.Get(idHex)
+	if got == nil || got.Status != "open" {
+		t.Fatal("bad-signature cancel must not change status")
+	}
+}
+
+// decodeID parses a 64-hex-char id into a [32]byte.
+func decodeID(t *testing.T, idHex string) [32]byte {
+	t.Helper()
+	var id [32]byte
+	if _, err := hex.Decode(id[:], []byte(idHex)); err != nil {
+		t.Fatalf("decode id: %v", err)
+	}
+	return id
+}
+
+func mustPub(t *testing.T, priv []byte) [33]byte {
+	t.Helper()
+	pub, err := crypto.CompressedPubKey(priv)
+	if err != nil {
+		t.Fatalf("compressed pubkey: %v", err)
+	}
+	return pub
+}
+
+// hexPub returns the hex encoding of the compressed pubkey for priv.
+func hexPub(t *testing.T, priv []byte) string {
+	t.Helper()
+	pub := mustPub(t, priv)
+	return hexEncode(pub[:])
+}

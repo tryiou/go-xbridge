@@ -8,7 +8,9 @@ package crypto
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -25,6 +27,10 @@ type Signer interface {
 	Sign(p *proto.Packet, priv []byte) error
 	// Verify checks p's signature against p.Pubkey.
 	Verify(p *proto.Packet) (bool, error)
+	// VerifyAgainst checks p's signature against an explicit 33-byte hex
+	// pubkey (C++ packet->verify(pubkey) with a non-header key, e.g. the
+	// order's mPubKey/oPubKey/sPubKey rather than pkt.Pubkey).
+	VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error)
 }
 
 // BtcSigner signs XBridge packets with a secp256k1 ECDSA key using
@@ -86,6 +92,29 @@ func (BtcSigner) Sign(p *proto.Packet, priv []byte) error {
 // either low-S or high-S forms, matching the C++ secp256k1_ecdsa_verify check.)
 func (BtcSigner) Verify(p *proto.Packet) (bool, error) {
 	pub, err := btcec.ParsePubKey(p.Pubkey[:])
+	if err != nil {
+		return false, err
+	}
+	sig, err := compactParse(p.Signature[:])
+	if err != nil {
+		return false, err
+	}
+	d := p.Digest()
+	return sig.Verify(d[:], pub), nil
+}
+
+// VerifyAgainst returns true iff p.Signature is a valid compact ECDSA signature
+// over the packet digest, produced by the holder of the given 33-byte hex
+// compressed pubkey. It mirrors C++ packet->verify(pubkey), which checks
+// against an arbitrary key rather than the packet header's pubkey. A malformed
+// or wrong-length hex yields (false, err); callers that wish to treat an
+// absent key as "not verified" should ignore the error.
+func (BtcSigner) VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error) {
+	raw, err := hex.DecodeString(pubkeyHex)
+	if err != nil || len(raw) != 33 {
+		return false, fmt.Errorf("crypto: bad pubkey hex %q", pubkeyHex)
+	}
+	pub, err := btcec.ParsePubKey(raw)
 	if err != nil {
 		return false, err
 	}

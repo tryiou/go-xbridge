@@ -16,6 +16,7 @@ import (
 	"xbridge-go/crypto"
 	"xbridge-go/p2p"
 	discovery "xbridge-go/p2p/discovery"
+	"xbridge-go/p2p/servicenode"
 	"xbridge-go/proto"
 	"xbridge-go/wallet"
 )
@@ -99,22 +100,29 @@ type Node struct {
 	block   [32]byte
 	blockAt time.Time
 
-	// svcMu guards svcByPeer, the per-servicenode set of advertised token
-	// services learned from XbcServicesPing packets. dxGetNetworkTokens unions
-	// these to report the live network token set (C++ walletServices()).
-	svcMu     sync.RWMutex
-	svcByPeer map[string][]string
+	// snReg is the servicenode registry learned from SNREGISTER / SNPING /
+	// SNLISTPING P2P messages (the same wire source a core XBridge wallet
+	// uses). dxGetNetworkTokens unions snReg.WalletServices() (the live network
+	// token set, C++ walletServices()) with the local config tokens.
+	snReg *servicenode.Registry
+
+	// exchangeStarted mirrors C++ Exchange::instance().isStarted(). It is true
+	// only when this node runs the exchange/hub role. This thin client never
+	// does, so it defaults false; the cancel handler's exchange branch is
+	// therefore dead in production but ported verbatim for fidelity (and
+	// exercisable in tests via SetExchangeStarted).
+	exchangeStarted bool
 }
 
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		cfg:       cfg,
-		store:     store,
-		signer:    crypto.NewBtcSigner(),
-		stop:      make(chan struct{}),
-		sessions:  map[string]*SwapSession{},
-		svcByPeer: map[string][]string{},
+		cfg:      cfg,
+		store:    store,
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		sessions: map[string]*SwapSession{},
+		snReg:    servicenode.NewRegistry(),
 	}
 
 	// Restore local swaps persisted to DataDir (mirrors C++ loadOrders). This
@@ -140,6 +148,25 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		if err != nil {
 			return n, fmt.Errorf("api: dial service node: %w", err)
 		}
+		// Route raw servicenode P2P messages (snr/snp/snlp) into the
+		// registry; Conn.ReadPacket would otherwise skip them. This mirrors
+		// how a core XBridge wallet learns the network token set.
+		conn.OnNonXBridge = func(cmd string, payload []byte) {
+			switch cmd {
+			case servicenode.CmdSNRegister:
+				if sn, derr := servicenode.ParseServiceNode(payload); derr == nil {
+					n.snReg.AddRegistration(sn)
+				} else {
+					xlog.Warn("servicenode: SNREGISTER parse error", "err", derr)
+				}
+			case servicenode.CmdSNPing, servicenode.CmdSNListPing:
+				if sn, derr := servicenode.ParseServiceNodePing(payload); derr == nil {
+					n.snReg.AddPing(sn)
+				} else {
+					xlog.Warn("servicenode: SNPING/SNLISTPING parse error", "err", derr)
+				}
+			}
+		}
 		n.conn = conn
 		xlog.Info("connected to explicit service node", "addr", cfg.NodeAddr)
 	} else {
@@ -154,6 +181,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 			TargetPeers:   8,
 		})
 		pm.Start(context.Background())
+		n.snReg = pm.ServiceNodes()
 		n.conn = pm
 		xlog.Info("network discovery started", "network", network, "targetPeers", 8)
 	}
@@ -361,14 +389,23 @@ func (n *Node) feed() {
 			xlog.Debug("packet body decode skipped", "command", pkt.Command.String(), "err", err)
 			continue
 		}
-		maker := hexEncode(pkt.Pubkey[:])
-		xlog.Debug("packet received", "command", pkt.Command.String(), "from", maker, "peer", peer)
+		// All traders verify the snode's packet signature against the pubkey
+		// in the packet header (C++ xbridgesession.cpp:736, verbatim). A
+		// bad signature means the packet was not signed by the claiming
+		// servicenode, so it is dropped regardless of command.
+		if ok, _ := n.signer.Verify(pkt); !ok {
+			snode := hexEncode(pkt.Pubkey[:])
+			xlog.Warn("bad snode packet signature", "command", pkt.Command.String(), "snode", snode, "peer", peer)
+			continue
+		}
+		snode := hexEncode(pkt.Pubkey[:])
+		xlog.Debug("packet received", "command", pkt.Command.String(), "snode", snode, "peer", peer)
 		switch b := body.(type) {
 		case *proto.OrderBody:
-			o := normalizeFromOrderBody(b, maker)
+			o := normalizeFromOrderBody(b, snode)
 			n.store.Add(o)
 		case *proto.PendingTransactionBody:
-			o := normalizeFromPendingBody(b, maker)
+			o := normalizeFromPendingBody(b, snode)
 			n.store.Add(o)
 
 		// --- swap handshake (client side, hub-driven) ---
@@ -400,40 +437,33 @@ func (n *Node) feed() {
 			n.dispatchSwap(b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnFinished(b)
 			})
-
-		// --- servicenode service advertisement (network token discovery) ---
-		case *proto.ServicesPingBody:
-			n.recordServices(maker, b.Services)
+		case *proto.CancelBody:
+			// Remote cancel (C++ processTransactionCancel). No session/hub
+			// needed; handled directly against the store.
+			n.onRemoteCancel(pkt, b)
+		case *proto.RejectBody:
+			// Remote reject (C++ processTransactionReject).
+			n.onRemoteReject(pkt, b)
 		}
 	}
 }
 
-// recordServices stores the token-service list a servicenode advertised via an
-// XbcServicesPing packet. Thread-safe; called from the feed goroutine.
-func (n *Node) recordServices(pubkey string, svcs []string) {
-	n.svcMu.Lock()
-	defer n.svcMu.Unlock()
-	if n.svcByPeer == nil {
-		n.svcByPeer = map[string][]string{}
-	}
-	n.svcByPeer[pubkey] = svcs
-}
-
-// NetworkTokens returns the union of tokens advertised by connected
-// servicenodes (C++ walletServices()), always including the locally-known
-// tokens from config. When no servicenodes are connected it reduces to the
-// config list (static fallback).
+// NetworkTokens returns the union of tokens advertised by servicenodes on the
+// P2P network (C++ walletServices(), xbridgeapp.cpp:2758) with the locally
+// known tokens from xbridge.conf. The servicenode set is learned from
+// SNREGISTER / SNPING / SNLISTPING messages via the registry; only SPV-tier
+// xbridge tokens matching ^[^:]+$ (excluding xr/xrs) from servicenodes
+// pinged within the 5-minute running window are included. When no servicenodes
+// are seen it reduces to the config list (static fallback).
 func (n *Node) NetworkTokens() []string {
-	n.svcMu.RLock()
 	set := map[string]bool{}
-	for _, svcs := range n.svcByPeer {
-		for _, s := range svcs {
-			if s != "" {
-				set[s] = true
+	if reg := n.snReg; reg != nil {
+		if ws := reg.WalletServices(); ws != nil {
+			for _, t := range ws {
+				set[t] = true
 			}
 		}
 	}
-	n.svcMu.RUnlock()
 	for _, t := range n.cfg.NetworkTokens {
 		set[t] = true
 	}
@@ -623,7 +653,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
 		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
-		if cc := n.cfg.Confs[p.Maker]; cc != nil && cc.DustAmount > 0 && minFrom < cc.DustAmount {
+		if cc := n.cfg.Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
@@ -695,6 +725,13 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.BlockID = hexEncode(body.BlockHash[:])
 	o.PartialRepost = p.Repost
 	o.Mine = true
+	// Local maker: set our per-trade M key and original currencies (C++
+	// xbridgeapp.cpp:1751,2380). MakerKey is OUR mPubKey (not the snode
+	// header); Orig* currencies are the maker-facing pair, restored on reject.
+	o.Role = 'A'
+	o.MakerKey = hexEncode(mPub[:])
+	o.OrigFromCurrency = p.Maker
+	o.OrigToCurrency = p.Taker
 	if p.Type == "partial" {
 		o.Status = "open"
 	} else {
@@ -821,6 +858,14 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	o.Updated = NowMicro()
 	o.Status = "accepting"
+	// Local taker: set our per-trade M key and capture the original
+	// (maker-facing) currencies BEFORE the take reorients the order
+	// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
+	// On a reject these Orig* values restore the order to pending.
+	o.Role = 'B'
+	o.MakerKey = hexEncode(tPub[:])
+	o.OrigFromCurrency = o.FromCurrency
+	o.OrigToCurrency = o.ToCurrency
 	// Begin driving the client-side deposit handshake for this taken order.
 	n.newTakerSession(o, p, tPrivArr, tPub)
 	// Persist the new local swap (incl. its per-trade M keypair) to disk.
@@ -844,22 +889,11 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 		return nil, makeError(errTxNotFound, "dxCancelOrder", p.ID)
 	}
 	var reason uint32 = 0
-	body := (&proto.CancelBody{ID: o.ID, Reason: reason}).Marshal()
-	pkt := proto.NewPacket(proto.XbcTransactionCancel, body)
 	// Cancel is signed with the trade's per-trade M keypair (C++ session
 	// sendCancelTransaction uses ptr->mPrivKey). Use the live session if we
 	// have one; otherwise there is no key to sign with.
-	n.sessMu.Lock()
-	s := n.sessions[p.ID]
-	n.sessMu.Unlock()
-	if s == nil {
-		return nil, makeError(errBadRequest, "dxCancelOrder", "no active session for order")
-	}
-	if err := n.signer.Sign(pkt, s.privKey[:]); err != nil {
-		return nil, makeError(errUnknown, "dxCancelOrder", err.Error())
-	}
-	if err := n.conn.WritePacket(pkt); err != nil {
-		return nil, makeError(errUnknown, "dxCancelOrder", err.Error())
+	if err := n.sendCancelTransaction(p.ID, reason); err != nil {
+		return nil, err
 	}
 	o.Status = "canceled"
 	o.Updated = NowMicro()
@@ -876,4 +910,210 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	// captured.
 	n.persist()
 	return o, nil
+}
+
+// ---------------------------------------------------------------------------
+// Cancel/reject plumbing (ports of C++ Session::Impl::processTransactionCancel /
+// processTransactionReject and their helpers).
+// ---------------------------------------------------------------------------
+
+// SetExchangeStarted toggles the exchange/hub role flag (C++ Exchange::instance()
+// .isStarted()). It exists so tests can exercise the cancel handler's exchange
+// branch; production never sets it (this is a thin client).
+func (n *Node) SetExchangeStarted(v bool) { n.exchangeStarted = v }
+
+// exchangeStarted mirrors C++ Exchange::instance().isStarted().
+func (n *Node) ExchangeStarted() bool { return n.exchangeStarted }
+
+// sessionFor returns the live swap session for idHex, or nil. It mirrors C++
+// processTransactionCancel's pendingTransaction() then transaction() lookup: in
+// Go a single sessions map holds both, so a nil result means "no valid
+// transaction".
+func (n *Node) sessionFor(idHex string) *SwapSession {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+	return n.sessions[idHex]
+}
+
+// sendCancelTransaction builds, signs (with the order's per-trade M keypair) and
+// broadcasts an xbcTransactionCancel packet. It is the shared wire primitive
+// behind both the local dxCancelOrder RPC and the remote-cancel handler (C++
+// sendCancelTransaction). The caller is responsible for any local state changes
+// (status, history, refund broadcast) — this only performs the packet I/O.
+func (n *Node) sendCancelTransaction(idHex string, reason uint32) *rpcError {
+	if n.conn == nil {
+		return makeError(errNoServiceNode, "dxCancelOrder", "")
+	}
+	n.sessMu.Lock()
+	s := n.sessions[idHex]
+	n.sessMu.Unlock()
+	if s == nil {
+		return makeError(errBadRequest, "dxCancelOrder", "no active session for order")
+	}
+	body := (&proto.CancelBody{ID: s.id, Reason: reason}).Marshal()
+	pkt := proto.NewPacket(proto.XbcTransactionCancel, body)
+	if err := n.signer.Sign(pkt, s.privKey[:]); err != nil {
+		return makeError(errUnknown, "dxCancelOrder", err.Error())
+	}
+	if err := n.conn.WritePacket(pkt); err != nil {
+		return makeError(errUnknown, "dxCancelOrder", err.Error())
+	}
+	return nil
+}
+
+// markStale sets o.Updated ~241 seconds in the past so the servicenode treats
+// the order as stale and rebroadcasts it (C++ setUpdateTime(now - 241s),
+// xbridgesession.cpp:3380-3381). Used by the local-rebroadcast cancel branch.
+func (n *Node) markStale(o *Order) {
+	o.Updated = NowMicro() - 241_000_000
+}
+
+// onUnlockCoins / onUnlockFeeUtxos are the thin-client equivalents of C++
+// xapp.unlockCoins / unlockFeeUtxos. xbridge-go holds no locked-coin registry
+// (the locks live in the connected wallet connector), so these are no-op stubs
+// kept to mirror the reject call site verbatim.
+func (n *Node) onUnlockCoins(o *Order)    {}
+func (n *Node) onUnlockFeeUtxos(o *Order) {}
+
+// onRemoteCancel ports C++ Session::Impl::processTransactionCancel
+// (xbridgesession.cpp:3288-3429) verbatim, including the Exchange branch and
+// the state-machine switch.
+func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
+	idHex := hexEncode(b.ID[:])
+	o := n.store.Get(idHex)
+	if o == nil {
+		xlog.Info("cancel: unknown order", "order", idHex)
+		return
+	}
+
+	// --- Exchange branch (C++ :3316-3341) ---
+	if n.exchangeStarted {
+		s := n.sessionFor(idHex)
+		if s == nil {
+			xlog.Info("cancel: order not valid", "order", idHex)
+			return
+		}
+		if ok, _ := n.signer.VerifyAgainst(pkt, hexEncode(s.pubKey[:])); !ok {
+			if ok2, _ := n.signer.VerifyAgainst(pkt, hexEncode(s.theirPub[:])); !ok2 {
+				xlog.Info("cancel: invalid packet signature", "order", idHex)
+				return
+			}
+		}
+		if err := n.sendCancelTransaction(idHex, b.Reason); err != nil {
+			xlog.Error("cancel: send failed", "order", idHex, "err", err)
+			return
+		}
+		xlog.Info("cancel: counterparty requested cancel", "order", idHex)
+		return
+	}
+
+	// --- Non-exchange branch (C++ :3343-3428) ---
+	if o = n.store.Get(idHex); o == nil {
+		xlog.Info("cancel: unknown order", "order", idHex)
+		return
+	}
+
+	// Only Maker, Taker, or Servicenode can cancel (C++ :3351-3357).
+	iCanceled := false
+	if o.MakerKey != "" {
+		if ok, _ := n.signer.VerifyAgainst(pkt, o.MakerKey); ok {
+			iCanceled = true
+		}
+	}
+	snOK, _ := n.signer.VerifyAgainst(pkt, o.SNodePubkey)
+	othOK, _ := n.signer.VerifyAgainst(pkt, o.OtherPubkey)
+	if !snOK && !othOK && !iCanceled {
+		xlog.Info("cancel: bad packet signature for cancelation request on order, not canceling", "order", idHex)
+		return
+	}
+
+	// Connector gate (C++ :3359-3364). Thin client: if the from-currency has
+	// no configured connector we cannot proceed, mirroring the C++ bail-out.
+	if _, e := n.connector(o.FromCurrency); e != nil {
+		xlog.Warn("cancel: no connector for currency, not canceling", "order", idHex, "currency", o.FromCurrency)
+		return
+	}
+
+	// If local order is still open/pending and WE didn't initiate the cancel,
+	// mark stale so it rebroadcasts on another servicenode (C++ :3379-3383).
+	if o.Mine && stateOrdinal(o.Status) <= 2 && !iCanceled {
+		n.markStale(o)
+		xlog.Info("cancel: cancel received, rebroadcasting order on another service node", "order", idHex)
+		return
+	} else if stateOrdinal(o.Status) < 6 { // no deposits yet (C++ :3384-3388)
+		n.store.MoveToHistoryU32(idHex, "canceled", b.Reason, NowMicro())
+		xlog.Info("cancel: counterparty cancel request", "order", idHex)
+		return
+	} else if o.Status == "canceled" { // already canceled (C++ :3389-3391)
+		xlog.Info("cancel: already canceled", "order", idHex)
+		return
+	} else if !o.DepositSent { // cancel if deposit not sent (C++ :3392-3394)
+		o.Status = "canceled"
+		o.Reason = b.Reason
+		o.Updated = NowMicro()
+		xlog.Info("cancel: counterparty cancel request", "order", idHex)
+		n.persist()
+		return
+	} else if o.CounterpartyRedeemed { // ignore if counterparty already redeemed (C++ :3395-3397)
+		xlog.Info("cancel: counterparty already redeemed, ignore cancel", "order", idHex)
+		return
+	}
+
+	// If no refund tx is defined, we cannot roll back (C++ :3400-3404).
+	if o.RefundTx == "" {
+		o.Status = "canceled"
+		o.Reason = b.Reason
+		o.Updated = NowMicro()
+		xlog.Info("cancel: could not find a refund transaction for order", "order", idHex)
+		n.persist()
+		return
+	}
+
+	// Rollback path (C++ :3406-3428).
+	n.store.RemovePendingPackets(idHex)
+	o.Status = "rolled back"
+	o.Reason = b.Reason
+	o.Updated = NowMicro()
+	if o.RefundTx != "" {
+		if _, rerr := n.BroadcastRefund(idHex); rerr != nil {
+			xlog.Warn("cancel: rollback refund broadcast failed", "order", idHex, "err", rerr)
+			// C++ processLater; the background refundWatcher retries on locktime.
+		}
+	}
+	xlog.Info("cancel: rollback initiated", "order", idHex)
+	n.persist()
+}
+
+// onRemoteReject ports C++ Session::Impl::processTransactionReject
+// (xbridgesession.cpp:3432-3485) verbatim. It restores the order to pending
+// (trPending / "open") and NEVER cancels it.
+func (n *Node) onRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
+	idHex := hexEncode(b.ID[:])
+	o := n.store.Get(idHex)
+	if o == nil {
+		return
+	}
+
+	// Only the taker (role 'B') in the accepting phase may be rejected
+	// (C++ :3452).
+	if o.Role != 'B' || stateOrdinal(o.Status) > 3 {
+		return
+	}
+
+	// Only the servicenode can reject an order (C++ :3456).
+	if ok, _ := n.signer.VerifyAgainst(pkt, o.SNodePubkey); !ok {
+		return
+	}
+
+	o.Reason = b.Reason
+	xlog.Info("reject: order rejected by servicenode", "order", idHex)
+
+	// Restore state on rejection (C++ :3463-3482).
+	o.Status = "open" // trPending
+	n.onUnlockCoins(o)
+	n.onUnlockFeeUtxos(o)
+	o.clearUsedCoins()
+	n.store.RemovePendingPackets(idHex)
+	xlog.Info("reject: order restored to pending", "order", idHex)
+	n.persist()
 }

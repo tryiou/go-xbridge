@@ -48,6 +48,33 @@ type Order struct {
 	OBinTxId       string   // counterparty HTLC deposit txid (p2sh_deposits_counterparty)
 	Utxos          []proto.UtxoEntry
 	Mine           bool // true if created locally by this node
+
+	// --- cancel/reject + fidelity fields (mirror xbridge::TransactionDescr) ---
+	// SNodePubkey is C++ sPubKey: the servicenode pubkey carried in the
+	// packet header (pkt.Pubkey) of the SN that originated/broadcast the order
+	// (xbridgesession.cpp:722,811). For observed orders it is also the maker
+	// display key (MakerPubkey). It is set for every order we ingest.
+	SNodePubkey string
+	// OtherPubkey is C++ oPubKey: the counterparty's per-trade M pubkey,
+	// learned from the CreateA/B body during the swap handshake.
+	OtherPubkey string
+	// MakerKey is C++ mPubKey: OUR per-trade M pubkey. It is populated
+	// ONLY for locally-created orders (make/take); for observed orders it
+	// stays "" (C++ never sets mPubKey from the snode header).
+	MakerKey string
+	// Reason is C++ xtx->reason (the TxCancelReason from a cancel/reject).
+	Reason uint32
+	// Role is the 'A'/'B'/0 maker/taker role (xbridgeapp.cpp:1751/2380).
+	Role byte
+	// DepositSent proxies C++ didSendDeposit() (xbridgetransactiondescr.h:491).
+	DepositSent bool
+	// CounterpartyRedeemed proxies C++ hasRedeemedCounterpartyDeposit()
+	// (xbridgetransactiondescr.h:496).
+	CounterpartyRedeemed bool
+	// OrigFromCurrency/OrigToCurrency mirror C++ origFromCurrency/origToCurrency
+	// (xbridgetransactiondescr.h:247/249); restored on a reject.
+	OrigFromCurrency string
+	OrigToCurrency   string
 }
 
 // OrderType distinguishes how an order entered our local view.
@@ -79,7 +106,8 @@ func normalizeFromOrderBody(b *proto.OrderBody, maker string) *Order {
 		OrigToAmount:   b.ToAmount,
 		PartialRepost:  false,
 		Status:         "open",
-		MakerPubkey:    maker,
+		MakerPubkey:    maker, // display key = snode header for observed orders
+		SNodePubkey:    maker, // C++ sPubKey = pkt.Pubkey
 		Utxos:          b.Utxos,
 	}
 }
@@ -103,7 +131,8 @@ func normalizeFromPendingBody(b *proto.PendingTransactionBody, maker string) *Or
 		OrigToAmount:   b.ToAmount,
 		PartialRepost:  false,
 		Status:         "open",
-		MakerPubkey:    maker,
+		MakerPubkey:    maker, // display key = snode header for observed orders
+		SNodePubkey:    maker, // C++ sPubKey = pkt.Pubkey
 	}
 }
 
@@ -216,4 +245,20 @@ func (o *Order) toCancelResult() cancelOrderResult {
 		CreatedAt:    iso8601(o.Created),
 		Status:       statusString(o.Status),
 	}
+}
+
+// clearUsedCoins mirrors C++ TransactionDescr::clearUsedCoins() (called on a
+// reject, xbridgesession.cpp:3467): it resets the swap-role state so the order
+// drops back to a fresh pending order. The Orig* currencies are preserved so the
+// order still renders correctly; the wallet-side coin/fee unlocking is delegated
+// to the connected wallet connector (out of xbridge-go's scope as a thin client).
+func (o *Order) clearUsedCoins() {
+	o.Role = 0
+	o.MakerKey = ""
+	o.OtherPubkey = ""
+	o.Reason = 0
+	o.FromCurrency = o.OrigFromCurrency
+	o.ToCurrency = o.OrigToCurrency
+	o.FromAmount = o.OrigFromAmount
+	o.ToAmount = o.OrigToAmount
 }
