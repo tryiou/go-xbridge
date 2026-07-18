@@ -655,7 +655,12 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 	sort.Slice(asks, func(i, j int) bool { return asks[i].price > asks[j].price })
 	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price })
 
-	res := orderBookResult{Detail: detail, Maker: maker, Taker: taker}
+	// Initialize the side arrays to empty (non-nil) slices so they serialize
+	// as "[]" rather than "null", matching C++ dxGetOrderBook which emits
+	// default-constructed Array objects for an empty book
+	// (rpcxbridge.cpp:1568-1576).
+	res := orderBookResult{Detail: detail, Maker: maker, Taker: taker,
+		Asks: [][]interface{}{}, Bids: [][]interface{}{}}
 
 	switch detail {
 	case 1:
@@ -1196,7 +1201,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	cc, _ := h.Node.cfg.Confs[ticker]
 
 	// C++ dust gate on the minimum split amount.
-	if cc != nil && cc.DustAmount > 0 && targetXB < cc.DustAmount {
+	if cc != nil && targetXB < effectiveDust(cc) {
 		return nil, makeError(errBadRequest, "dxSplit", "split amount is dust ["+formatXAmount(targetXB)+"]")
 	}
 
@@ -1256,7 +1261,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		change = total - spent
 	}
 	// Dust change is dropped (C++ claws it back into fees); keeps the tx relayable.
-	if cc != nil && change < cc.DustAmount {
+	if cc != nil && change < effectiveDust(cc) {
 		change = 0
 	}
 
@@ -1317,6 +1322,24 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}, nil
 }
 
+// effectiveDust returns the minimum non-dust amount (base units) for a coin,
+// mirroring C++ xbridgewalletconnectorbtc.cpp:1526:
+//
+//	dustAmount = info.relayFee > 0 ? 0.546 * info.relayFee * COIN : 5460;
+//
+// Go has no live relayFee feed (thin client), so: prefer an explicit RelayFee
+// config; else an explicit DustAmount override; else the C++ default 5460.
+func effectiveDust(cc *config.CoinConf) uint64 {
+	const coin = 1_000_000 // COIN (xbridge-go base units, 6 decimals)
+	if cc != nil && cc.RelayFee > 0 {
+		return uint64(0.546 * cc.RelayFee * coin)
+	}
+	if cc != nil && cc.DustAmount > 0 {
+		return cc.DustAmount
+	}
+	return 5460
+}
+
 // estimateFee returns a rough satoshi fee for a tx with nIn inputs and nOut
 // outputs, using the connector's estimate when available and conf FeePerByte
 // otherwise.
@@ -1326,11 +1349,19 @@ func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
 	// Go-built deposits inside C++'s counterpartyFees >= fee*0.95 acceptance band,
 	// so a C++ counterparty accepts our orders.
 	vsize := 192*nIn + 34*nOut
+	var fee uint64
 	if cc == nil || cc.FeePerByte == 0 {
-		// 2 sat/vB default.
-		return uint64(vsize * 2)
+		// 2 sat/vB default when the connector reports no fee rate.
+		fee = uint64(vsize * 2)
+	} else {
+		fee = cc.FeePerByte * uint64(vsize)
 	}
-	return cc.FeePerByte * uint64(vsize)
+	// C++ floors every fee at minTxFee in minTxFee1/minTxFee2
+	// (xbridgewalletconnectorbtc.cpp:1952,1968); apply the same floor.
+	if cc != nil && cc.MinTxFee > 0 && fee < cc.MinTxFee {
+		fee = cc.MinTxFee
+	}
+	return fee
 }
 
 // legacyOutputScript builds a P2PKH/P2SH output script for addr. Native segwit
