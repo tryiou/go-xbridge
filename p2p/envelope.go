@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"time"
 
@@ -57,7 +56,7 @@ func DecodeXBridgePayload(payload []byte) ([]byte, error) {
 		return nil, errors.New("p2p: xbridge envelope too small")
 	}
 	packet := payload[off+xbridgeEnvelopeSize : off+n]
-	xlog.Debug("decode xbridge payload", "len", len(payload), "packetLen", len(packet), "hex", hex.EncodeToString(packet))
+	xlog.Debug("decode xbridge payload", "len", len(payload), "packetLen", len(packet))
 	return packet, nil
 }
 

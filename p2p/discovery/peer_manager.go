@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
+	xlog "xbridge-go/log"
 	"xbridge-go/p2p"
 	"xbridge-go/proto"
 )
@@ -39,7 +39,7 @@ type PeerManager struct {
 	dial    func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
 
 	addrMan   *AddrMan
-	xbridgeCh chan *proto.Packet
+	xbridgeCh chan peerPacket
 	done      chan struct{}
 	once      sync.Once
 
@@ -47,6 +47,13 @@ type PeerManager struct {
 	peers    map[string]*p2p.Conn // addr -> conn (nil while connecting)
 	rr       int                  // round-robin cursor over candidates
 	explicit []string
+}
+
+// peerPacket couples an XBridge packet with the TCP peer address it arrived
+// from, so consumers can correlate received packets with connect/disconnect logs.
+type peerPacket struct {
+	peer string
+	pkt  *proto.Packet
 }
 
 // New constructs a PeerManager. It does not connect until Start is called.
@@ -72,7 +79,7 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		dial:      dial,
 		explicit:  explicit,
 		addrMan:   NewAddrMan(),
-		xbridgeCh: make(chan *proto.Packet, 256),
+		xbridgeCh: make(chan peerPacket, 256),
 		done:      make(chan struct{}),
 		peers:     make(map[string]*p2p.Conn),
 	}
@@ -182,7 +189,7 @@ func (m *PeerManager) connectOne(ctx context.Context, addr string) {
 	m.mu.Lock()
 	m.peers[addr] = conn
 	m.mu.Unlock()
-	log.Printf("xbridge-go: connected to peer %s", addr)
+	xlog.Info("peer connected", "peer", addr)
 
 	// Start reading from the peer first so its addr/XBridge traffic is consumed
 	// even if the getaddr write below is slow to be read by the peer.
@@ -191,7 +198,7 @@ func (m *PeerManager) connectOne(ctx context.Context, addr string) {
 	// Ask the peer for its known addresses (enables further discovery).
 	if err := conn.SendCommand(p2p.CmdGetAddr, nil); err != nil {
 		// Non-fatal; we can still relay XBridge from this peer.
-		log.Printf("xbridge-go: getaddr to %s: %v", addr, err)
+		xlog.Debug("getaddr failed", "peer", addr, "err", err)
 	}
 }
 
@@ -202,6 +209,7 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		m.mu.Lock()
 		delete(m.peers, addr)
 		m.mu.Unlock()
+		xlog.Info("peer disconnected", "peer", addr)
 	}()
 	for {
 		select {
@@ -211,6 +219,9 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		}
 		msg, err := conn.ReadMessage()
 		if err != nil {
+			if err != io.EOF {
+				xlog.Debug("peer read loop ended", "peer", addr, "err", err)
+			}
 			return
 		}
 		switch msg.Command {
@@ -224,7 +235,7 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 				continue
 			}
 			select {
-			case m.xbridgeCh <- pkt:
+			case m.xbridgeCh <- peerPacket{peer: addr, pkt: pkt}:
 			case <-m.done:
 				return
 			}
@@ -244,16 +255,17 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 }
 
 // ReadPacket blocks until an XBridge packet is available from any peer, or
-// returns io.EOF once Close has been called.
-func (m *PeerManager) ReadPacket() (*proto.Packet, error) {
+// returns io.EOF once Close has been called. The returned peer address is the
+// TCP endpoint the packet arrived from.
+func (m *PeerManager) ReadPacket() (pkt *proto.Packet, peer string, err error) {
 	select {
-	case pkt, ok := <-m.xbridgeCh:
+	case pp, ok := <-m.xbridgeCh:
 		if !ok {
-			return nil, io.EOF
+			return nil, "", io.EOF
 		}
-		return pkt, nil
+		return pp.pkt, pp.peer, nil
 	case <-m.done:
-		return nil, io.EOF
+		return nil, "", io.EOF
 	}
 }
 

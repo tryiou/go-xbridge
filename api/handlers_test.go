@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 )
 
@@ -222,8 +223,10 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// dxGetOrderHistory: a valid range with no fills still emits one zero-filled
 	// bucket per granularity slice (C++ emits N zero-filled OHLCV slices, not []).
+	// start must be >= XSeries earliest (2018-02-25 00:00:00 UTC = 1519516800) per C++ fidelity.
+	const xEarly = int64(1519516800)
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jstr("0"), jstr("180"), jstr("60"),
+		jstr("BTC"), jstr("LTC"), jstr(strconv.FormatInt(xEarly, 10)), jstr(strconv.FormatInt(xEarly+180, 10)), jstr("60"),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderHistory: %v", err)
@@ -273,16 +276,19 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 // order_ids=true.
 func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	ctx := newWalletTestCtx()
-	ctx.Store.AddFill(fillEntry{ID: "aaa", Time: 1030 * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
-	ctx.Store.AddFill(fillEntry{ID: "bbb", Time: 1040 * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "4.0"})
-	ctx.Store.AddFill(fillEntry{ID: "ccc", Time: 1090 * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "2.0", TakerSize: "2.0"})
+	const xEarly = int64(1519516800)
+	// Fill timestamps are relative to the XSeries earliest (1519516800); they
+	// must stay within the queried window [xEarly+1000, xEarly+1180).
+	ctx.Store.AddFill(fillEntry{ID: "aaa", Time: uint64(xEarly+1030) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
+	ctx.Store.AddFill(fillEntry{ID: "bbb", Time: uint64(xEarly+1040) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "4.0"})
+	ctx.Store.AddFill(fillEntry{ID: "ccc", Time: uint64(xEarly+1090) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "2.0", TakerSize: "2.0"})
 	// A fill outside the pair (should be ignored).
-	ctx.Store.AddFill(fillEntry{ID: "zzz", Time: 1035 * 1e6, Maker: "SYS", Taker: "LTC", MakerSize: "1.0", TakerSize: "1.0"})
+	ctx.Store.AddFill(fillEntry{ID: "zzz", Time: uint64(xEarly+1035) * 1e6, Maker: "SYS", Taker: "LTC", MakerSize: "1.0", TakerSize: "1.0"})
 
-	// range [1000,1180) granularity 60 -> 3 buckets; bucket0 has 2 fills,
-	// bucket1 has 1, bucket2 empty.
+	// range [xEarly+1000, xEarly+1180) granularity 60 -> 3 buckets; bucket0 has
+	// 2 fills, bucket1 has 1, bucket2 empty. Start >= XSeries earliest per C++.
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jstr("1000"), jstr("1180"), jstr("60"),
+		jstr("BTC"), jstr("LTC"), jstr(strconv.FormatInt(xEarly+1000, 10)), jstr(strconv.FormatInt(xEarly+1180, 10)), jstr("60"),
 		json.RawMessage("true"), jstr("false"),
 	})
 	if err != nil {

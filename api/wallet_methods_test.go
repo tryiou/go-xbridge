@@ -82,6 +82,9 @@ func newWalletTestCtx() *HandlerCtx {
 				ticker: "BTC",
 				addr:   btcAddr,
 				utxos: []wallet.Utxo{
+					// 1 BTC exact. C++ dxGetTokenBalances sums native satoshis as a double
+					// and renders printf("%.6f", 1.0) = "1.000000" (no +1/COIN; the value
+					// is already a whole-coin double). formatBalanceNative reproduces this.
 					{TxID: "0000000000000000000000000000000000000000000000000000000000000000", Vout: 0, Amount: 100000000, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 				},
 			},
@@ -160,11 +163,13 @@ func TestDxGetTokenBalances(t *testing.T) {
 	if !ok {
 		t.Fatalf("result = %v (%T)", res, res)
 	}
-	// C++ renders per-coin balances in fixed-6 XBridge scale, not native decimals.
+	// C++ renders per-coin balances in fixed-6 XBridge scale via
+	// xBridgeStringValueFromPrice (printf("%.6f", wholeCoinDouble)), so 1 BTC
+	// -> "1.000000". formatBalanceNative reproduces the C++ double path exactly.
 	if m["BTC"] != "1.000000" {
 		t.Errorf("BTC balance = %v, want 1.000000", m["BTC"])
 	}
-	// C++ always emits a "Wallet" key.
+	// C++ always emits a "Wallet" key (native BLOCK available balance).
 	if m["Wallet"] != "1.000000" {
 		t.Errorf("Wallet balance = %v, want 1.000000", m["Wallet"])
 	}

@@ -94,7 +94,9 @@ type captureXConn struct {
 	written []*proto.Packet
 }
 
-func (c *captureXConn) ReadPacket() (*proto.Packet, error) { return nil, io.EOF }
+func (c *captureXConn) ReadPacket() (*proto.Packet, string, error) {
+	return nil, "", io.EOF
+}
 func (c *captureXConn) WritePacket(p *proto.Packet) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

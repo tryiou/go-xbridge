@@ -111,21 +111,26 @@ func (c *Conn) writeVerack() error {
 // ReadPacket reads the next XBridge packet from the stream, skipping any
 // non-XBridge P2P messages (ping/pong, addr, etc.). The `xbridge` payload is
 // unwrapped from its transport envelope (varint length + 20-byte dest addr + 8-byte
-// timestamp) before being parsed as a proto.Packet.
-func (c *Conn) ReadPacket() (*proto.Packet, error) {
+// timestamp) before being parsed as a proto.Packet. The returned peer is the
+// TCP remote address of this connection.
+func (c *Conn) ReadPacket() (*proto.Packet, string, error) {
 	for {
 		msg, err := c.readMessage()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if msg.Command != XBridgeNetCommand {
 			continue
 		}
 		pktBytes, err := DecodeXBridgePayload(msg.Payload)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return proto.Unmarshal(pktBytes)
+		pkt, err := proto.Unmarshal(pktBytes)
+		if err != nil {
+			return nil, "", err
+		}
+		return pkt, c.netConn.RemoteAddr().String(), nil
 	}
 }
 

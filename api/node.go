@@ -58,7 +58,7 @@ type Config struct {
 // *discovery.PeerManager (an automatically-discovered pool, used when NodeAddr
 // is empty) satisfy it, so PeerManager is a drop-in replacement.
 type XConn interface {
-	ReadPacket() (*proto.Packet, error)
+	ReadPacket() (pkt *proto.Packet, peer string, err error)
 	WritePacket(*proto.Packet) error
 	Close() error
 }
@@ -323,7 +323,7 @@ func (n *Node) feed() {
 			return
 		default:
 		}
-		pkt, err := n.conn.ReadPacket()
+		pkt, peer, err := n.conn.ReadPacket()
 		if err != nil {
 			select {
 			case <-n.stop:
@@ -338,7 +338,7 @@ func (n *Node) feed() {
 			continue
 		}
 		maker := hexEncode(pkt.Pubkey[:])
-		xlog.Debug("packet received", "command", pkt.Command.String(), "from", maker)
+		xlog.Debug("packet received", "command", pkt.Command.String(), "from", maker, "peer", peer)
 		switch b := body.(type) {
 		case *proto.OrderBody:
 			o := normalizeFromOrderBody(b, maker)

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"xbridge-go/coins"
 )
 
 // ---------------------------------------------------------------------------
@@ -226,14 +228,37 @@ const maxXSize = uint64(100000000) * coinScale
 var maxXAmount = new(big.Int).SetUint64(^uint64(0))
 
 // formatXAmount renders a base-unit (COIN=1e6) amount as the fixed 6-decimal
-// string Blocknet returns. Mirrors xBridgeStringValueFromAmount: integer base
-// units scaled to coin value and rendered with C++ setprecision(6) (since
-// xBridgeSignificantDigits(COIN)==6). Computed with integer division to avoid
-// float drift.
+// string Blocknet returns. It TRUNCATES the sub-unit remainder (no rounding),
+// mirroring C++ xBridgeIntFromReal (util/xutil.cpp:236: "Does not round, but
+// truncates because a utxo cannot pay if it's rounded up"). This is the correct
+// rounding for order amounts/sizes, which must never be rounded up. Computed
+// with integer division to avoid float drift.
 func formatXAmount(amt uint64) string {
 	q := amt / coinScale
 	r := amt % coinScale
 	return strconv.FormatUint(q, 10) + "." + fmt.Sprintf("%06d", r)
+}
+
+// formatBalanceNative renders a wallet balance from its native base-unit amount
+// (e.g. BTC satoshis) as the fixed 6-decimal string Blocknet returns. It is
+// faithful to C++ dxGetTokenBalances, which sums native UTXO amounts as a double
+// and renders with xBridgeStringValueFromPrice -> std::fixed setprecision(6)
+// (i.e. printf("%.6f", wholeCoinValue)). The whole-coin value is native/nc where
+// nc = 10^Decimals; we reproduce that double and format with Go's equivalent
+// (FormatFloat 'f' 6), so sub-satoshi remainders round to the NEAREST 6th
+// decimal exactly as C++ does — unlike formatXAmount, which truncates. This is
+// why balances match core to the last digit for every coin (incl. PIVX/UNO,
+// where integer truncation in toXBridgeAmt otherwise loses the sub-satoshi).
+func formatBalanceNative(c coins.Coin, native uint64) string {
+	nc := uint64(1)
+	for i := 0; i < c.Decimals; i++ {
+		nc *= 10
+	}
+	if nc == 0 {
+		nc = 1
+	}
+	whole := float64(native) / float64(nc)
+	return strconv.FormatFloat(whole, 'f', 6, 64)
 }
 
 // parseXAmount converts a user-supplied decimal amount string (e.g. "1.5") into

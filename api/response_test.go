@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"testing"
 	"time"
+
+	"xbridge-go/coins"
 )
 
 func TestFormatXAmount(t *testing.T) {
@@ -20,6 +22,35 @@ func TestFormatXAmount(t *testing.T) {
 	for _, c := range cases {
 		if got := formatXAmount(c.amt); got != c.want {
 			t.Errorf("formatXAmount(%d) = %q, want %q", c.amt, got, c.want)
+		}
+	}
+}
+
+func TestFormatBalanceNative(t *testing.T) {
+	// Mirrors C++ dxGetTokenBalances: sum native UTXO amounts as a double, then
+	// xBridgeStringValueFromPrice -> printf("%.6f", wholeCoinValue) where
+	// wholeCoinValue = native / 10^Decimals. FormatFloat('f',6) is the Go
+	// equivalent. Crucially this rounds to the NEAREST 6th decimal (matching
+	// %.6f), so sub-satoshi remainders render correctly — unlike formatXAmount
+	// which truncates (the original PIVX/UNO 1-satoshi divergence).
+	btc8 := coins.Coin{Decimals: 8}
+	pivx6 := coins.Coin{Decimals: 6}
+	cases := []struct {
+		c    coins.Coin
+		nat  uint64
+		want string
+	}{
+		{btc8, 100000000, "1.000000"},  // 1 BTC exact
+		{btc8, 7669400, "0.076694"},    // DASH-style 0.076694
+		{btc8, 1476550, "0.014766"},    // DOGE-style
+		{pivx6, 14013258, "14.013258"}, // PIVX CORE value (sub-sat kept)
+		{pivx6, 492755, "0.492755"},    // UNO CORE value
+		{btc8, 0, "0.000000"},                         // zero
+		{btc8, 1, "0.000000"},                         // 1 sat < 6dp rounds to 0 (%.6f)
+	}
+	for _, c := range cases {
+		if got := formatBalanceNative(c.c, c.nat); got != c.want {
+			t.Errorf("formatBalanceNative(Decimals=%d, %d) = %q, want %q", c.c.Decimals, c.nat, got, c.want)
 		}
 	}
 }

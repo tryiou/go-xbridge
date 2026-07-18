@@ -171,13 +171,14 @@ func TestPeerManagerFakePeer(t *testing.T) {
 	defer pm.Close()
 
 	type res struct {
-		pkt *proto.Packet
-		err error
+		pkt  *proto.Packet
+		peer string
+		err  error
 	}
 	ch := make(chan res, 1)
 	go func() {
-		p, e := pm.ReadPacket()
-		ch <- res{p, e}
+		p, peer, e := pm.ReadPacket()
+		ch <- res{p, peer, e}
 	}()
 
 	select {

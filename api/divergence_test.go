@@ -13,9 +13,11 @@ import (
 // without a live service node.
 type fakeXConn struct{}
 
-func (fakeXConn) ReadPacket() (*proto.Packet, error) { return nil, io.EOF }
-func (fakeXConn) WritePacket(*proto.Packet) error    { return nil }
-func (fakeXConn) Close() error                       { return nil }
+func (fakeXConn) ReadPacket() (*proto.Packet, string, error) {
+	return nil, "", io.EOF
+}
+func (fakeXConn) WritePacket(*proto.Packet) error { return nil }
+func (fakeXConn) Close() error                    { return nil }
 
 // btcAddr2 is a second valid BTC P2PKH address, used as a distinct
 // from/to address so dxTakeOrder's "addresses must differ" check passes.

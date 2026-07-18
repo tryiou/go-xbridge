@@ -423,6 +423,12 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	if !ok || granularity <= 0 {
 		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid granularity")
 	}
+	// C++ XSeries::earliestTime() = 2018-02-25 00:00:00 UTC = 1519516800 (util/xseries.h:108).
+	// Requests starting before this are rejected with "Start time too early."
+	const xSeriesEarliest = int64(1519516800)
+	if start < xSeriesEarliest {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "Start time too early.")
+	}
 	orderIDs := false
 	if len(params) > 5 {
 		b, ok := boolParam(params, 5, false)
@@ -738,7 +744,7 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 				if l := lockedOf(utxos); l < total {
 					total -= l
 				}
-				walletTicker, walletBalance = "BLOCK", formatXAmount(toXBridgeAmt(c, total))
+				walletTicker, walletBalance = "BLOCK", formatBalanceNative(c, total)
 			}
 		}
 	}
@@ -764,7 +770,7 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			if l := lockedOf(utxos); l < avail {
 				avail -= l
 			}
-			bal := formatXAmount(toXBridgeAmt(c, avail))
+			bal := formatBalanceNative(c, avail)
 			out[ticker] = bal
 			if walletTicker == "" {
 				walletTicker = ticker
