@@ -53,12 +53,27 @@ type TxOut struct {
 
 // Tx is a Bitcoin-style transaction. SegWit selects the 0x0001 marker form on
 // serialization; the deposit/refund layer here uses legacy (P2SH) scripts.
+//
+// WithTime / TxTime carry the XBridge per-coin "serializeWithTimeField" quirk
+// (xbridge/xbitcointransaction.h:39-84). When a coin's connector sets the flag
+// (read from <COIN>.TxWithTimeField in xbridge.conf, xbridgeapp.cpp:993), the
+// CTransaction is serialized with an extra 4-byte nTime (unsigned int) written
+// immediately after nVersion and before the segwit marker / vin. Both peers
+// agree on the flag out-of-band from conf, so the decoder is *told* whether the
+// field is present (DeserializeWithTime) — it cannot be detected on the wire.
 type Tx struct {
 	Version  int32
 	LockTime uint32
 	Inputs   []TxIn
 	Outputs  []TxOut
 	SegWit   bool
+	// WithTime, when true, makes Serialize write the 4-byte TxTime field. Set by
+	// the deposit/refund/claim builders from the coin's TxWithTimeField flag.
+	WithTime bool
+	// TxTime is the nTime value (unix seconds) written when WithTime is set. Zero
+	// is a valid value but the C++ constructors default it to time(nullptr) when
+	// the flag is on (xbitcointransaction.h:92), so builders populate it.
+	TxTime uint32
 }
 
 // varInt encodes a Bitcoin variable-length integer.
@@ -85,12 +100,20 @@ func varInt(n int) []byte {
 }
 
 // Serialize produces the wire bytes (classic, or segwit-marker form when
-// SegWit is set). The scriptSig of each input is serialized verbatim.
+// SegWit is set). The scriptSig of each input is serialized verbatim. When
+// WithTime is set (per-coin serializeWithTimeField), a 4-byte nTime is written
+// immediately after nVersion and before the segwit marker / vin, mirroring
+// XBridge CTransaction::SerializationOp (xbitcointransaction.h:77-84).
 func (t *Tx) Serialize() []byte {
 	buf := make([]byte, 0, 256)
 	var v [4]byte
 	binary.LittleEndian.PutUint32(v[:], uint32(t.Version))
 	buf = append(buf, v[:]...)
+	if t.WithTime {
+		var tm [4]byte
+		binary.LittleEndian.PutUint32(tm[:], t.TxTime)
+		buf = append(buf, tm[:]...)
+	}
 	if t.SegWit {
 		buf = append(buf, 0x00, 0x01) // marker + flag
 	}
@@ -129,10 +152,25 @@ func (t *Tx) Serialize() []byte {
 	return buf
 }
 
-// Deserialize parses wire bytes (classic, or segwit-marker form) into a Tx.
-// It mirrors Serialize: legacy inputs carry only ScriptSig; segwit inputs
-// additionally carry their Witness stack.
+// Deserialize parses wire bytes (classic, or segwit-marker form) into a Tx,
+// assuming NO nTime field is present. Use DeserializeWithTime for coins whose
+// connector sets serializeWithTimeField. It mirrors Serialize: legacy inputs
+// carry only ScriptSig; segwit inputs additionally carry their Witness stack.
 func Deserialize(b []byte) (*Tx, error) {
+	return deserializeTx(b, false)
+}
+
+// DeserializeWithTime parses wire bytes into a Tx. When hasTime is true it reads
+// the 4-byte nTime field (unsigned int) immediately after nVersion and records
+// it on the returned Tx (WithTime=true, TxTime=read value) so a later
+// Serialize reproduces the same layout — matching C++ CTransaction::SerializationOp.
+// The flag is supplied by the caller because the wire format is ambiguous: both
+// peers agree on serializeWithTimeField out-of-band from xbridge.conf.
+func DeserializeWithTime(b []byte, hasTime bool) (*Tx, error) {
+	return deserializeTx(b, hasTime)
+}
+
+func deserializeTx(b []byte, hasTime bool) (*Tx, error) {
 	t := &Tx{}
 	pos := 0
 	need := func(n int) ([]byte, error) {
@@ -150,6 +188,15 @@ func Deserialize(b []byte) (*Tx, error) {
 		return nil, err
 	}
 	t.Version = int32(le32(ver))
+
+	if hasTime {
+		tm, err := need(4)
+		if err != nil {
+			return nil, err
+		}
+		t.TxTime = le32(tm)
+		t.WithTime = true
+	}
 
 	if len(b) >= pos+2 && b[pos] == 0x00 && b[pos+1] == 0x01 {
 		t.SegWit = true

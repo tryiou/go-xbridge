@@ -60,7 +60,15 @@ func (l *LocalConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (str
 	if err != nil {
 		return "", false, fmt.Errorf("wallet: bad tx hex: %w", err)
 	}
-	tx, err := coins.Deserialize(raw)
+	// Deserialize honoring the coin's serializeWithTimeField quirk: if the
+	// stored txHex carries the 4-byte nTime field (deposit/refund/claim for a
+	// TxWithTimeField coin), we must read it so the witness/script layout lines
+	// up and the re-emitted hex is byte-identical.
+	hasTime := false
+	if c, ok := coins.Get(l.ticker); ok {
+		hasTime = c.TxWithTimeField
+	}
+	tx, err := coins.DeserializeWithTime(raw, hasTime)
 	if err != nil {
 		return "", false, err
 	}

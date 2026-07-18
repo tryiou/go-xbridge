@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"golang.org/x/crypto/ripemd160"
 
@@ -110,6 +111,13 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 	xlog.Debug("BuildDepositTx", "cur", d.Currency, "amount", d.Amount, "lockTime", d.LockTime,
 		"txVersion", ver, "funding", len(funding), "total", total, "fee", fee, "change", total-d.Amount-fee)
 	tx := &coins.Tx{Version: int32(ver), LockTime: 0}
+	// Per-coin serializeWithTimeField quirk: stamp the 4-byte nTime after
+	// nVersion so the wire layout matches the counterparty's XBridge connector
+	// (xbitcointransaction.h:77-84). C++ defaults nTime to time(nullptr).
+	if c.TxWithTimeField {
+		tx.WithTime = true
+		tx.TxTime = uint32(time.Now().Unix())
+	}
 	for _, u := range funding {
 		h, err := reverseHashHex(u.TxID)
 		if err != nil {

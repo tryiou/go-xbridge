@@ -320,7 +320,13 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if err != nil {
 		return 0, nil, fmt.Errorf("api: getrawtransaction %s: %w", b.APayTxID, err)
 	}
-	secret, ok := secretFromPayTx(payHex, s.theirSecretHash)
+	// The maker's payTx was serialized by the maker's XBridge connector; if that
+	// coin sets serializeWithTimeField we must parse the nTime field accordingly.
+	hasTime := false
+	if cc := s.conf(s.srcCur); cc != nil {
+		hasTime = cc.TxWithTimeField
+	}
+	secret, ok := secretFromPayTx(payHex, s.theirSecretHash, hasTime)
 	if !ok {
 		return 0, nil, fmt.Errorf("api: could not recover secret from payTx %s", b.APayTxID)
 	}
@@ -599,6 +605,12 @@ func (s *SwapSession) buildRefundTx(spec *swap.DepositSpec, cur string) (string,
 		return "", err
 	}
 	tx := &coins.Tx{Version: int32(s.txVersion(cur)), LockTime: spec.LockTime}
+	// Per-coin serializeWithTimeField: stamp nTime after nVersion so the refund
+	// matches the counterparty's XBridge connector wire layout.
+	if cc := s.conf(cur); cc != nil && cc.TxWithTimeField {
+		tx.WithTime = true
+		tx.TxTime = uint32(time.Now().Unix())
+	}
 	xlog.Debug("buildRefundTx: plan", "order", hexEncode(s.id[:]), "cur", cur,
 		"deposit", s.ourDepositTxID, "lockTime", spec.LockTime, "amount", spec.Amount, "fee", fee, "txVersion", s.txVersion(cur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
@@ -649,6 +661,13 @@ func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur strin
 		return "", "", err
 	}
 	tx := &coins.Tx{Version: int32(s.txVersion(depositCur)), LockTime: 0} // ELSE branch, no CLTV
+	// Per-coin serializeWithTimeField: the claim (ELSE-branch) spend must carry
+	// the nTime field for coins whose connector sets it, matching the
+	// counterparty's XBridge serialization.
+	if cc := s.conf(depositCur); cc != nil && cc.TxWithTimeField {
+		tx.WithTime = true
+		tx.TxTime = uint32(time.Now().Unix())
+	}
 	xlog.Debug("redeemCounterparty: plan", "order", hexEncode(s.id[:]), "isMaker", isMaker,
 		"depositCur", depositCur, "deposit", s.theirDepositTxID, "amount", theirSpec.Amount, "fee", fee, "txVersion", s.txVersion(depositCur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
@@ -714,13 +733,13 @@ func (s *SwapSession) minConf(cc *config.CoinConf) int {
 // payTx, verifying it against the expected secretHash hx (the deposit's
 // HashedSecret). C++ does the same in getSecretFromPaymentTransaction, which only
 // adopts a push whose getKeyId(push) equals hx.
-func secretFromPayTx(payHex string, hx [20]byte) ([33]byte, bool) {
+func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) {
 	raw, err := hex.DecodeString(payHex)
 	if err != nil {
 		xlog.Debug("secretFromPayTx: bad hex", "err", err)
 		return [33]byte{}, false
 	}
-	tx, err := coins.Deserialize(raw)
+	tx, err := coins.DeserializeWithTime(raw, hasTime)
 	if err != nil || len(tx.Inputs) == 0 {
 		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
 		return [33]byte{}, false

@@ -64,6 +64,82 @@ func TestTxRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTxWithTimeField verifies the per-coin serializeWithTimeField quirk
+// (xbridge/xbitcointransaction.h:77-84): when WithTime is set, Serialize writes
+// exactly 4 extra bytes (the nTime uint32) immediately after nVersion, and
+// DeserializeWithTime(b, true) round-trips it. DeserializeWithTime(b, false)
+// does NOT read the field, so the flag must be supplied by the caller — it
+// cannot be detected on the wire. C4.
+func TestTxWithTimeField(t *testing.T) {
+	inner := BuildDepositUnlockScript(genPub, genPub, []byte("0123456789abcdef0123456789abcdef01234567"), 600)
+	p2sh := BuildP2SHScript(KeyID(inner))
+	tx := &Tx{
+		Version: 2,
+		Inputs: []TxIn{{
+			PrevOut:   OutPoint{Index: 3},
+			ScriptSig: []byte{0x01, 0x02, 0x03},
+			Sequence:  0xffffffff,
+		}},
+		Outputs:  []TxOut{{Value: 1_000_000, ScriptPubKey: p2sh}},
+		LockTime: 0,
+	}
+
+	rawNoTime := tx.Serialize()
+
+	// With WithTime, serialization must carry exactly 4 extra bytes (nTime).
+	tx.WithTime = true
+	tx.TxTime = 0x12345678
+	rawWithTime := tx.Serialize()
+	if len(rawWithTime) != len(rawNoTime)+4 {
+		t.Fatalf("with-time length %d, want %d (+4 nTime)", len(rawWithTime), len(rawNoTime)+4)
+	}
+	// nTime sits right after the 4-byte nVersion (LE uint32 of 0x12345678).
+	if string(rawWithTime[4:8]) != string([]byte{0x78, 0x56, 0x34, 0x12}) {
+		t.Errorf("nTime bytes = %x, want 78563412", rawWithTime[4:8])
+	}
+
+	// DeserializeWithTime(b, true) recovers the field.
+	back, err := DeserializeWithTime(rawWithTime, true)
+	if err != nil {
+		t.Fatalf("DeserializeWithTime(true): %v", err)
+	}
+	if !back.WithTime {
+		t.Error("WithTime not set after DeserializeWithTime(true)")
+	}
+	if back.TxTime != 0x12345678 {
+		t.Errorf("TxTime = %#x, want 0x12345678", back.TxTime)
+	}
+	if string(back.Serialize()) != string(rawWithTime) {
+		t.Error("re-serialize (with time) mismatch")
+	}
+
+	// DeserializeWithTime(b, false) ignores the time field entirely: a blob with
+	// NO nTime, parsed with the flag off, round-trips as a normal tx and leaves
+	// WithTime false. This is the contract the swap layer relies on for coins
+	// that do NOT set serializeWithTimeField.
+	plain, err := DeserializeWithTime(rawNoTime, false)
+	if err != nil {
+		t.Fatalf("DeserializeWithTime(false) on no-time blob: %v", err)
+	}
+	if plain.WithTime {
+		t.Error("WithTime should be false after DeserializeWithTime(false) on no-time blob")
+	}
+	if plain.TxTime != 0 {
+		t.Errorf("TxTime should be 0, got %#x", plain.TxTime)
+	}
+	if string(plain.Serialize()) != string(rawNoTime) {
+		t.Error("re-serialize (no-time blob, flag off) mismatch")
+	}
+
+	// The wire format is ambiguous: a time-bearing blob parsed with the flag OFF
+	// must NOT silently succeed with a wrong layout — it errors, proving the
+	// caller is responsible for passing the correct hasTime. This is why the
+	// swap layer threads the per-coin TxWithTimeField flag through.
+	if _, err := DeserializeWithTime(rawWithTime, false); err == nil {
+		t.Error("expected error deserializing time-bearing blob with hasTime=false")
+	}
+}
+
 func TestKeyID(t *testing.T) {
 	id := KeyID(genPub)
 	if len(id) != 20 {

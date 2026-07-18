@@ -40,6 +40,13 @@ type Coin struct {
 	// CashAddrPrefix is the CashAddr HRP (e.g. "bitcoincash") used when family ==
 	// FamilyUTXOBCH. Empty for other families.
 	CashAddrPrefix string
+
+	// TxWithTimeField mirrors <COIN>.TxWithTimeField in xbridge.conf
+	// (xbridgeapp.cpp:993). When true, deposit/refund/claim transactions for this
+	// coin carry the extra 4-byte nTime field after nVersion on the wire (the
+	// XBridge serializeWithTimeField quirk). Carried on Coin so the deposit/
+	// refund builders can stamp it without a conf round-trip.
+	TxWithTimeField bool
 }
 
 // Family returns the chain family.
@@ -70,15 +77,16 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 		return Coin{}, fmt.Errorf("coins: %s: COIN not set in xbridge.conf", c.Ticker)
 	}
 	return Coin{
-		Ticker:         c.Ticker,
-		Name:           c.Title,
-		Decimals:       decimalsFromCoin(c.Coin),
-		P2PKH:          byte(c.AddressPrefix),
-		P2SH:           byte(c.ScriptPrefix),
-		Bech32HRP:      bech32HRPFromMethod(c.CreateTxMethod),
-		SegWit:         segWitFromMethod(c.CreateTxMethod),
-		family:         familyFromMethod(c.CreateTxMethod),
-		CashAddrPrefix: cashAddrPrefixFromMethod(c.CreateTxMethod),
+		Ticker:          c.Ticker,
+		Name:            c.Title,
+		Decimals:        decimalsFromCoin(c.Coin),
+		P2PKH:           byte(c.AddressPrefix),
+		P2SH:            byte(c.ScriptPrefix),
+		Bech32HRP:       bech32HRPFromMethod(c.CreateTxMethod),
+		SegWit:          segWitFromMethod(c.CreateTxMethod),
+		family:          familyFromMethod(c.CreateTxMethod),
+		CashAddrPrefix:  cashAddrPrefixFromMethod(c.CreateTxMethod),
+		TxWithTimeField: c.TxWithTimeField,
 	}, nil
 }
 
