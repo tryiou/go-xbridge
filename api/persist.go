@@ -49,6 +49,16 @@ type persistedSwap struct {
 	Status         string            `json:"status"`
 	Utxos          []proto.UtxoEntry `json:"utxos"`
 
+	SNodePubkey          string `json:"sNodePubkey"`
+	OtherPubkey          string `json:"otherPubkey"`
+	MakerKey             string `json:"makerKey"`
+	Reason               uint32 `json:"reason"`
+	Role                 byte   `json:"role"`
+	DepositSent          bool   `json:"depositSent"`
+	CounterpartyRedeemed bool   `json:"counterpartyRedeemed"`
+	OrigFromCurrency     string `json:"origFromCurrency"`
+	OrigToCurrency       string `json:"origToCurrency"`
+
 	SrcCur        string `json:"srcCur"`
 	DstCur        string `json:"dstCur"`
 	SrcAmt        uint64 `json:"srcAmt"`
@@ -187,53 +197,63 @@ func (n *Node) persist() {
 // persistFromSession flattens a live session + its order into a persistedSwap.
 func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	return persistedSwap{
-		ID:               o.ID,
-		IsMaker:          s.isMaker,
-		Type:             o.Type,
-		From:             o.From,
-		To:               o.To,
-		FromCurrency:     o.FromCurrency,
-		ToCurrency:       o.ToCurrency,
-		FromAmount:       o.FromAmount,
-		ToAmount:         o.ToAmount,
-		OrigFromAmount:   o.OrigFromAmount,
-		OrigToAmount:     o.OrigToAmount,
-		MinFromAmount:    o.MinFromAmount,
-		PartialAllowed:   o.PartialAllowed,
-		PartialRepost:    o.PartialRepost,
-		ParentID:         o.ParentID,
-		Created:          o.Created,
-		Updated:          o.Updated,
-		BlockHash:        o.BlockHash,
-		MakerPubkey:      o.MakerPubkey,
-		MakerAddress:     o.MakerAddress,
-		TakerAddress:     o.TakerAddress,
-		BlockID:          o.BlockID,
-		RefundTx:         o.RefundTx,
-		BinTxId:          o.BinTxId,
-		OBinTxId:         o.OBinTxId,
-		Status:           o.Status,
-		Utxos:            o.Utxos,
-		SrcCur:           s.srcCur,
-		DstCur:           s.dstCur,
-		SrcAmt:           s.srcAmt,
-		DstAmt:           s.dstAmt,
-		OurSourceAddr:    s.ourSourceAddr,
-		OurDestAddr:      s.ourDestAddr,
-		TheirPub:         s.theirPub,
-		PrivKey:          s.privKey,
-		PubKey:           s.pubKey,
-		Secret:           s.secret,
-		SecretHash:       s.secretHash,
-		OurLockTime:      s.ourLockTime,
-		OurDepositTxID:   s.ourDepositTxID,
-		RefundHex:        s.refundHex,
-		RefundDone:       s.refundDone,
-		TheirDepositTxID: s.theirDepositTxID,
-		TheirLockTime:    s.theirLockTime,
-		TheirSecretHash:  s.theirSecretHash,
-		Hub:              s.hub,
-		State:            s.state,
+		ID:             o.ID,
+		IsMaker:        s.isMaker,
+		Type:           o.Type,
+		From:           o.From,
+		To:             o.To,
+		FromCurrency:   o.FromCurrency,
+		ToCurrency:     o.ToCurrency,
+		FromAmount:     o.FromAmount,
+		ToAmount:       o.ToAmount,
+		OrigFromAmount: o.OrigFromAmount,
+		OrigToAmount:   o.OrigToAmount,
+		MinFromAmount:  o.MinFromAmount,
+		PartialAllowed: o.PartialAllowed,
+		PartialRepost:  o.PartialRepost,
+		ParentID:       o.ParentID,
+		Created:        o.Created,
+		Updated:        o.Updated,
+		BlockHash:      o.BlockHash,
+		MakerPubkey:    o.MakerPubkey,
+		MakerAddress:   o.MakerAddress,
+		TakerAddress:   o.TakerAddress,
+		BlockID:        o.BlockID,
+		RefundTx:       o.RefundTx,
+		BinTxId:        o.BinTxId,
+		OBinTxId:       o.OBinTxId,
+		Status:         o.Status,
+		Utxos:          o.Utxos,
+
+		SNodePubkey:          o.SNodePubkey,
+		OtherPubkey:          o.OtherPubkey,
+		MakerKey:             o.MakerKey,
+		Reason:               o.Reason,
+		Role:                 o.Role,
+		DepositSent:          o.DepositSent,
+		CounterpartyRedeemed: o.CounterpartyRedeemed,
+		OrigFromCurrency:     o.OrigFromCurrency,
+		OrigToCurrency:       o.OrigToCurrency,
+		SrcCur:               s.srcCur,
+		DstCur:               s.dstCur,
+		SrcAmt:               s.srcAmt,
+		DstAmt:               s.dstAmt,
+		OurSourceAddr:        s.ourSourceAddr,
+		OurDestAddr:          s.ourDestAddr,
+		TheirPub:             s.theirPub,
+		PrivKey:              s.privKey,
+		PubKey:               s.pubKey,
+		Secret:               s.secret,
+		SecretHash:           s.secretHash,
+		OurLockTime:          s.ourLockTime,
+		OurDepositTxID:       s.ourDepositTxID,
+		RefundHex:            s.refundHex,
+		RefundDone:           s.refundDone,
+		TheirDepositTxID:     s.theirDepositTxID,
+		TheirLockTime:        s.theirLockTime,
+		TheirSecretHash:      s.theirSecretHash,
+		Hub:                  s.hub,
+		State:                s.state,
 	}
 }
 
@@ -270,6 +290,16 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		Status:         ps.Status,
 		Utxos:          ps.Utxos,
 		Mine:           true,
+
+		SNodePubkey:          ps.SNodePubkey,
+		OtherPubkey:          ps.OtherPubkey,
+		MakerKey:             ps.MakerKey,
+		Reason:               ps.Reason,
+		Role:                 ps.Role,
+		DepositSent:          ps.DepositSent,
+		CounterpartyRedeemed: ps.CounterpartyRedeemed,
+		OrigFromCurrency:     ps.OrigFromCurrency,
+		OrigToCurrency:       ps.OrigToCurrency,
 	}
 	n.store.Add(o)
 
