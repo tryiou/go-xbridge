@@ -45,7 +45,7 @@ bounded by the thin-client design. `GO-ONLY` = no C++ `dx*` counterpart.
 | dxMakePartialOrder | DONE | `order_type="partial"`; trailing params; min/dust checks |
 | dxTakeOrder | DONE | maker/taker correct; `dryrun` simulates; self-trade guard; full-take on amount=0 |
 | dxCancelOrder | DONE | `state>=trCreated` guard; `refund_tx` from swap refund |
-| dxLoadXBridgeConf | PARTIAL | returns `true` unconditionally (no live reload) |
+| dxLoadXBridgeConf | OK | hot-reloads xbridge.conf from the daemon's ConfPath (Load -> InitFromConf -> rebuild connectors) under cfgMu; keeps last-good config on failure |
 | dxGetNewTokenAddress | DONE | `[]` on no-wallet; segwit addr type |
 | dxGetTokenBalances | DONE | `Wallet` key from BLOCK connector; locked UTXOs subtracted |
 | dxGetUtxos | DONE | `orderid` field; locked UTXOs excluded (`include_used`) |

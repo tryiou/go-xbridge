@@ -1018,6 +1018,12 @@ func DecodeBody(cmd XBridgeCommand, body []byte) (interface{}, error) {
 		var b XChatMessageBody
 		return &b, b.Unmarshal(body)
 	default:
+		// XbcServicesPing (50) is intentionally not decoded here: a core
+		// XBridge wallet learns the network token set from the servicenode
+		// P2P messages (SNREGISTER/SNPING/SNLISTPING), which xbridge-go parses
+		// in p2p/servicenode rather than through this XBridge-path codec. The
+		// ServicesPingBody type exists for the standalone servicenode wire
+		// format, not for DecodeBody.
 		return nil, errors.New("xbridge: no typed body for command " + cmd.String())
 	}
 }
