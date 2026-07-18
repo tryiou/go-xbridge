@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	"xbridge-go/p2p/servicenode"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	"go-xbridge/p2p/servicenode"
+	"go-xbridge/wallet"
 )
 
 // stubErr is a trivial error type used by fake connectors.

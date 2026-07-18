@@ -9,8 +9,8 @@ import (
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 
-	"xbridge-go/coins"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/wallet"
 )
 
 // randKey returns a compressed 33-byte pubkey and its 32-byte priv scalar.

@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"xbridge-go/coins"
+	"go-xbridge/coins"
 )
 
 // TestBuildUtxoProofs confirms each spendable UTXO gets a 65-byte BIP137

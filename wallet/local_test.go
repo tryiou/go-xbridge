@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"xbridge-go/coins"
+	"go-xbridge/coins"
 )
 
 // testHTLCSigner signs the refund (IF) branch of an XBridge HTLC deposit,

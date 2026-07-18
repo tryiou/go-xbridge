@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Bitcoin P2P version message field values used by xbridge-go.
+// Bitcoin P2P version message field values used by go-xbridge.
 const (
 	// BitcoinProtocolVersion is Blocknet's PROTOCOL_VERSION (src/version.h:12).
 	// The node rejects peers advertising a lower version.
@@ -19,7 +19,7 @@ const (
 	ServiceNodeNone uint64 = 0
 
 	// UserAgent identifies this client in the version handshake.
-	UserAgent = "/xbridge-go:0.1.0/"
+	UserAgent = "/go-xbridge:0.1.0/"
 )
 
 // VersionMessage is a Bitcoin P2P `version` payload.

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"xbridge-go/crypto"
-	"xbridge-go/proto"
+	"go-xbridge/crypto"
+	"go-xbridge/proto"
 )
 
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an

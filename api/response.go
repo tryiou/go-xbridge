@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"xbridge-go/coins"
-	"xbridge-go/swap"
+	"go-xbridge/coins"
+	"go-xbridge/swap"
 )
 
 // ---------------------------------------------------------------------------

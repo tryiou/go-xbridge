@@ -1,4 +1,4 @@
-module xbridge-go
+module go-xbridge
 
 go 1.25.0
 

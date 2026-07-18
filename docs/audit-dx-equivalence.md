@@ -1,4 +1,4 @@
-# xbridge-go `dx*` RPC Equivalence Audit
+# go-xbridge `dx*` RPC Equivalence Audit
 
 **Source of truth:** the original C++ implementation in
 `blocknet_core/src/xbridge/` (mainly `rpcxbridge.cpp`, plus `xbridgeapp.cpp`,

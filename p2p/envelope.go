@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 )
 
 // XBridge transport envelope (src/xbridge/xbridgeapp.cpp App::Impl::onSend and

@@ -3,7 +3,7 @@ package coins
 import (
 	"fmt"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 // FamilyKind identifies a chain's transaction/address family so connectors can
@@ -24,7 +24,7 @@ const (
 // address decoding/encoding in address.go. NO coin values are hardcoded: every
 // Coin is built at startup from its [TICKER] section in xbridge.conf via
 // InitFromConf. The original core-wallet XBridge supplies these same values
-// through xbridge.conf, so xbridge-go simply mirrors that (read-only).
+// through xbridge.conf, so go-xbridge simply mirrors that (read-only).
 type Coin struct {
 	Ticker    string // wire ticker, e.g. "BTC"
 	Name      string

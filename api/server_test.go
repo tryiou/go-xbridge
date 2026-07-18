@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 func newTestCtx() *HandlerCtx {

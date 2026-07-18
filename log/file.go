@@ -13,7 +13,7 @@ import (
 // generations, then a fresh file is opened. It is safe for concurrent use.
 //
 // This is a deliberately minimal, dependency-free size-based rotator (no
-// time-based rotation) matching xbridge-go's stdlib-only convention.
+// time-based rotation) matching go-xbridge's stdlib-only convention.
 type rotatingWriter struct {
 	mu       sync.Mutex
 	f        *os.File

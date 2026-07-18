@@ -3,7 +3,7 @@ package coins
 import (
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 func init() {

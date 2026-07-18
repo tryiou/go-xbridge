@@ -1,4 +1,4 @@
-# xbridge-go — Implementation Status & Roadmap
+# go-xbridge — Implementation Status & Roadmap
 
 > **Contributor-facing.** This document tracks per-package implementation state
 > and the historical task log. End users should read [`docs/usage.md`](usage.md)

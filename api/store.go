@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 // Store is the in-memory XBridge order book. It is populated by the P2P feed
@@ -126,7 +126,7 @@ func (s *Store) History() []historyEntry {
 }
 
 // RemovePendingPackets is the thin-client equivalent of C++
-// xapp.removePackets: xbridge-go holds no pending-packet queue, so there is
+// xapp.removePackets: go-xbridge holds no pending-packet queue, so there is
 // nothing to drop. It exists to mirror the call site verbatim.
 func (s *Store) RemovePendingPackets(idHex string) {}
 

@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 // TestEstimateFeeMatchesCppVsize verifies the deposit fee uses C++'s virtual

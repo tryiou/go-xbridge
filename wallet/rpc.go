@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"time"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 
-	"xbridge-go/coins"
+	"go-xbridge/coins"
 )
 
 // RPCClient is a minimal Bitcoin-Core-style JSON-RPC client (HTTP + basic

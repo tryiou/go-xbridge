@@ -6,7 +6,7 @@ import (
 )
 
 // Network bootstrap seeds. These are NETWORK bootstrap constants — analogous to
-// Bitcoin's vSeeds — NOT coin definitions. They tell xbridge-go where the
+// Bitcoin's vSeeds — NOT coin definitions. They tell go-xbridge where the
 // Blocknet P2P network lives so it can connect "like a core wallet" without a
 // manually-supplied service-node URL. They do NOT violate the "nothing
 // hardcoded" rule, which governs coin [TICKER] connectors (read from

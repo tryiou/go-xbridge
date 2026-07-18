@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 )
 
 // rpcRequest is the bitcoind-style JSON-RPC 1.0 request envelope used by

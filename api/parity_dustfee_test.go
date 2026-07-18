@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 func TestEffectiveDust(t *testing.T) {

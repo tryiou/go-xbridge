@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	"xbridge-go/p2p/servicenode"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	"go-xbridge/p2p/servicenode"
+	"go-xbridge/wallet"
 )
 
 // jstr wraps a Go string as a JSON-RawMessage param (a quoted

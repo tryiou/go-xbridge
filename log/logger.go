@@ -1,4 +1,4 @@
-// Package log is xbridge-go's structured, level-based logging facade.
+// Package log is go-xbridge's structured, level-based logging facade.
 //
 // It wraps the standard library's log/slog with a package-level logger whose
 // level can be changed at runtime (via a slog.LevelVar) and whose handler can be

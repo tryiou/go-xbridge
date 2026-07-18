@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 const sampleConf = `

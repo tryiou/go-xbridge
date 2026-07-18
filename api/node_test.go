@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	"xbridge-go/proto"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // blockStub is a wallet.Connector that returns a fixed anti-replay block hash

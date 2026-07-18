@@ -1,5 +1,5 @@
 // Package discovery implements lightweight P2P network discovery for
-// xbridge-go: it maintains a small pool of outbound Blocknet peers, exchanges
+// go-xbridge: it maintains a small pool of outbound Blocknet peers, exchanges
 // getaddr/addr gossip to learn more peers, relays XBridge packets from any peer
 // into a single consumer channel, and broadcasts our own packets to the pool.
 //
@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"xbridge-go/p2p"
+	"go-xbridge/p2p"
 )
 
 // addrEntry is a discovered peer address tracked by AddrMan.

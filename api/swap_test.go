@@ -12,11 +12,11 @@ import (
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	"xbridge-go/proto"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // b58alphabet is the Bitcoin base58 alphabet used by base58check.

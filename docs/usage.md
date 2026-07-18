@@ -1,4 +1,4 @@
-# Using xbridge-go
+# Using go-xbridge
 
 This guide covers **how to install, configure, run, and trade with `xbridged`**.
 It is the user-facing counterpart to the wire contract in

@@ -3,7 +3,7 @@ package wallet
 import (
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 // TestNewConnectorFromConfMissingHost asserts that a [TICKER] section without

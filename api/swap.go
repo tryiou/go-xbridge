@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	xlog "xbridge-go/log"
-	"xbridge-go/proto"
-	"xbridge-go/swap"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	xlog "go-xbridge/log"
+	"go-xbridge/proto"
+	"go-xbridge/swap"
+	"go-xbridge/wallet"
 )
 
 // Locktime targets mirror xbridgewallet.h: the maker (role A) locks for 2h, the

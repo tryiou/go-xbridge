@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"xbridge-go/coins"
+	"go-xbridge/coins"
 )
 
 func TestFormatXAmount(t *testing.T) {

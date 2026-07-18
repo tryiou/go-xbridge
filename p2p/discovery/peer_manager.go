@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	xlog "xbridge-go/log"
-	"xbridge-go/p2p"
-	"xbridge-go/p2p/servicenode"
-	"xbridge-go/proto"
+	xlog "go-xbridge/log"
+	"go-xbridge/p2p"
+	"go-xbridge/p2p/servicenode"
+	"go-xbridge/proto"
 )
 
 // Options configures a PeerManager.

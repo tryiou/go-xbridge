@@ -9,16 +9,16 @@ import (
 	"sync"
 	"time"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	"xbridge-go/crypto"
-	"xbridge-go/p2p"
-	discovery "xbridge-go/p2p/discovery"
-	"xbridge-go/p2p/servicenode"
-	"xbridge-go/proto"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	"go-xbridge/crypto"
+	"go-xbridge/p2p"
+	discovery "go-xbridge/p2p/discovery"
+	"go-xbridge/p2p/servicenode"
+	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // Config tunes a Node.
@@ -30,7 +30,7 @@ type Config struct {
 	Magic [4]byte
 	// Confs holds the parsed [TICKER] sections from xbridge.conf.
 	Confs map[string]*config.CoinConf
-	// Connectors maps ticker -> the wallet connector xbridge-go drives for it
+	// Connectors maps ticker -> the wallet connector go-xbridge drives for it
 	// (built from xbridge.conf). Wallet-backed dx* methods use this.
 	Connectors map[string]wallet.Connector
 	// ExchangeWallets is the local-wallet list from [Main].ExchangeWallets.
@@ -1043,7 +1043,7 @@ func (n *Node) markStale(o *Order) {
 }
 
 // onUnlockCoins / onUnlockFeeUtxos are the thin-client equivalents of C++
-// xapp.unlockCoins / unlockFeeUtxos. xbridge-go holds no locked-coin registry
+// xapp.unlockCoins / unlockFeeUtxos. go-xbridge holds no locked-coin registry
 // (the locks live in the connected wallet connector), so these are no-op stubs
 // kept to mirror the reject call site verbatim.
 func (n *Node) onUnlockCoins(o *Order)    {}

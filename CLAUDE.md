@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`xbridge-go` is a **portable, standalone Go reimplementation** of the Blocknet
+`go-xbridge` is a **portable, standalone Go reimplementation** of the Blocknet
 **XBridge** atomic-swap engine. It is a **thin client**: it speaks the existing
 XBridge wire protocol to the live Blocknet service-node P2P network, so a user can
 trade by connecting their own (SPV) wallets — **without running `blocknetd`**.
@@ -16,7 +16,7 @@ header-comment enum values are frequently **stale** — trust the actual C++ wri
 under `src/xbridge/`, not the comments.
 
 Repo history: standalone git repo (branch `main`), extracted from `blocknet_core`
-via `git filter-branch --subdirectory-filter xbridge-go`. Commit subjects are
+via `git filter-branch --subdirectory-filter go-xbridge`. Commit subjects are
 unchanged but **SHA-1s differ from any pre-extraction references**.
 
 ## Layout
@@ -63,4 +63,4 @@ Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
   the user explicitly asks. To push later:
   `git remote add origin <url> && git push -u origin main`.
 - Verification of network behavior uses the **live** Blocknet service-node P2P port
-  (e.g. `coreproxy.airdns.org:42111`); HTTP-terminated proxies reject raw P2P.
+  (e.g. `coreproxy.airdns.org:42111`);

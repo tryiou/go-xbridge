@@ -8,10 +8,10 @@ import (
 
 	"golang.org/x/crypto/ripemd160"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 
-	"xbridge-go/coins"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/wallet"
 )
 
 // Role identifies which side of a swap the local node plays.

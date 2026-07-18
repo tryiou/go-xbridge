@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 
-	"xbridge-go/coins"
+	"go-xbridge/coins"
 )
 
 // LocalSigner signs individual inputs of an in-memory transaction, producing

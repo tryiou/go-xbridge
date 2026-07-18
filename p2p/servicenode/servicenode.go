@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	xlog "xbridge-go/log"
-	"xbridge-go/p2p"
+	xlog "go-xbridge/log"
+	"go-xbridge/p2p"
 )
 
 // P2P command names (src/protocol.cpp:45-49).

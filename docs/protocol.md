@@ -77,7 +77,7 @@ Field values (`p2p/version.go`):
 - `addr_recv` = the peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from`
   left zeroed. Port is **big-endian** in `net_addr` (network byte order).
 - `nonce` = random `uint64`.
-- `user_agent` = `"/xbridge-go:0.1.0/"`.
+- `user_agent` = `"/go-xbridge:0.1.0/"`.
 - `start_height` = `0` (thin client has no chain).
 - `relay` = `false`.
 

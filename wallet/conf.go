@@ -3,8 +3,8 @@ package wallet
 import (
 	"fmt"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
+	"go-xbridge/coins"
+	"go-xbridge/config"
 )
 
 // NewConnectorFromConf builds a Connector for a coin from its [TICKER] section

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"xbridge-go/p2p"
-	"xbridge-go/proto"
+	"go-xbridge/p2p"
+	"go-xbridge/proto"
 )
 
 // fakePeer is a minimal hand-rolled XBridge peer on one end of an in-memory

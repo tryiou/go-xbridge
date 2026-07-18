@@ -8,7 +8,7 @@ import (
 	"net"
 	"time"
 
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 // handshakeTimeout bounds the version/verack exchange so a misbehaving peer

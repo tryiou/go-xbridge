@@ -23,8 +23,8 @@ import (
 	"os"
 	"time"
 
-	"xbridge-go/p2p"
-	"xbridge-go/proto"
+	"go-xbridge/p2p"
+	"go-xbridge/proto"
 )
 
 func main() {

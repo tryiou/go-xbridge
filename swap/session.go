@@ -5,10 +5,10 @@ import (
 	"encoding/hex"
 	"errors"
 
-	xlog "xbridge-go/log"
+	xlog "go-xbridge/log"
 
-	"xbridge-go/coins"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/wallet"
 )
 
 // Session drives the deposit/refund (xbridgesession*) layer for a joined

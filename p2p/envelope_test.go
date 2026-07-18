@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 // liveXBridgePacket is a real `xbridge` P2P message payload captured from a

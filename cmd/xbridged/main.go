@@ -1,9 +1,9 @@
-// Command xbridged is the xbridge-go JSON-RPC server — a drop-in replacement
+// Command xbridged is the go-xbridge JSON-RPC server — a drop-in replacement
 // for blocknetd's dx* RPC surface. Point a dapp's RPC URL at it to reach the
 // XBridge API over the live Blocknet service-node P2P network.
 //
 // Coin connectors are read from xbridge.conf (the same file core-wallet XBridge
-// uses) — xbridge-go never creates or modifies it. Every coin, including BLOCK
+// uses) — go-xbridge never creates or modifies it. Every coin, including BLOCK
 // and BTC, is defined entirely by its [TICKER] section there.
 package main
 
@@ -16,12 +16,12 @@ import (
 	"sort"
 	"strings"
 
-	"xbridge-go/api"
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	xlog "xbridge-go/log"
-	"xbridge-go/p2p"
-	"xbridge-go/wallet"
+	"go-xbridge/api"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	xlog "go-xbridge/log"
+	"go-xbridge/p2p"
+	"go-xbridge/wallet"
 )
 
 // fatalf logs an error at ERROR level with the given structured fields and

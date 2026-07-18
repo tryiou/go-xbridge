@@ -1,5 +1,5 @@
 // Package config reads Blocknet's xbridge.conf — the same INI file the original
-// core-wallet XBridge reads. xbridge-go only READS this file (it never generates
+// core-wallet XBridge reads. go-xbridge only READS this file (it never generates
 // or mutates it); every coin connector, including BLOCK and BTC, is defined
 // entirely by its [TICKER] section here. There is no hardcoded coin data anywhere
 // in the library — the schema below is a faithful mirror of
@@ -17,7 +17,7 @@ import (
 // Main holds the [Main] section of xbridge.conf.
 type Main struct {
 	// ExchangeWallets is the comma-separated list of tickers that have a local
-	// wallet configured (the connectors xbridge-go drives).
+	// wallet configured (the connectors go-xbridge drives).
 	ExchangeWallets []string
 	ShowAllOrders   bool
 	FullLog         bool
@@ -36,7 +36,7 @@ type CoinConf struct {
 
 	// CreateTxMethod selects the transaction-construction path (e.g. "BTC").
 	// The original derives segwit/bech32 support from this inside the connector
-	// class; xbridge-go reproduces that mapping (see coins package) so the
+	// class; go-xbridge reproduces that mapping (see coins package) so the
 	// method string — supplied by conf — is the only input.
 	CreateTxMethod string
 

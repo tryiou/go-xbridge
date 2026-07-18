@@ -1,4 +1,4 @@
-// Package api is the xbridge-go JSON-RPC surface. It is a 1:1 port of
+// Package api is the go-xbridge JSON-RPC surface. It is a 1:1 port of
 // blocknetd's XBridge RPC: the same method names, the same positional
 // parameters, and the same response object schemas (down to field names and
 // JSON value types — notably string amounts to preserve precision, ISO-8601
@@ -10,7 +10,7 @@
 // live Blocknet service-node P2P network. See docs/protocol.md.
 package api
 
-import "xbridge-go/proto"
+import "go-xbridge/proto"
 
 // Order is the internal normalized model of a live XBridge order. It carries
 // everything required to render every dx* order response (dxGetOrders,
@@ -251,7 +251,7 @@ func (o *Order) toCancelResult() cancelOrderResult {
 // reject, xbridgesession.cpp:3467): it resets the swap-role state so the order
 // drops back to a fresh pending order. The Orig* currencies are preserved so the
 // order still renders correctly; the wallet-side coin/fee unlocking is delegated
-// to the connected wallet connector (out of xbridge-go's scope as a thin client).
+// to the connected wallet connector (out of go-xbridge's scope as a thin client).
 func (o *Order) clearUsedCoins() {
 	o.Role = 0
 	o.MakerKey = ""

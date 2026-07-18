@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 // fakeXConn is a no-op XConn so dxTakeOrder can pass requireWrite and "broadcast"

@@ -7,7 +7,7 @@ import (
 
 // CashAddr encoding (Bitcoin Cash, BIP-CashAddr) is a bech32-family format with
 // a different separator (':'), HRP expansion, checksum polynomial, and version
-// byte. It lets xbridge-go decode/encode BCH addresses the way a C++ BCH
+// byte. It lets go-xbridge decode/encode BCH addresses the way a C++ BCH
 // connector expects. Implementation mirrors the CashAddr spec.
 
 // cashaddrGenerator holds the five 40-bit generator constants Bitcoin ABC's

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 // TestMain seeds the coin registry from a fixture xbridge.conf so the existing

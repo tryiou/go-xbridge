@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"xbridge-go/crypto"
+	"go-xbridge/crypto"
 )
 
 // newPersistNode builds a minimal Node wired for persistence tests: a temp

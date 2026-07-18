@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	"xbridge-go/coins"
-	"xbridge-go/config"
-	discovery "xbridge-go/p2p/discovery"
-	"xbridge-go/wallet"
+	"go-xbridge/coins"
+	"go-xbridge/config"
+	discovery "go-xbridge/p2p/discovery"
+	"go-xbridge/wallet"
 )
 
 // fillOut is one entry of dxGetOrderFills' recent-fills list. Mirrors C++'s
@@ -1336,7 +1336,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 // Go has no live relayFee feed (thin client), so: prefer an explicit RelayFee
 // config; else an explicit DustAmount override; else the C++ default 5460.
 func effectiveDust(cc *config.CoinConf) uint64 {
-	const coin = 1_000_000 // COIN (xbridge-go base units, 6 decimals)
+	const coin = 1_000_000 // COIN (go-xbridge base units, 6 decimals)
 	if cc != nil && cc.RelayFee > 0 {
 		return uint64(0.546 * cc.RelayFee * coin)
 	}

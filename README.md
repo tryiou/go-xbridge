@@ -1,4 +1,4 @@
-# xbridge-go
+# go-xbridge
 
 A portable, standalone **Go** reimplementation of the Blocknet **XBridge**
 atomic-swap engine. It is a **thin client**: it speaks the existing XBridge

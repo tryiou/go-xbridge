@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"xbridge-go/p2p"
+	"go-xbridge/p2p"
 )
 
 // buildPing marshals a ServiceNodePing payload following the EXACT C++

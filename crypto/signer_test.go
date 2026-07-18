@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"xbridge-go/proto"
+	"go-xbridge/proto"
 )
 
 func TestSignVerifyRoundTrip(t *testing.T) {

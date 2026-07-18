@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"xbridge-go/config"
+	"go-xbridge/config"
 )
 
 // TestCashAddrRoundTripP2KH encodes a 20-byte hash as a P2KH CashAddr and

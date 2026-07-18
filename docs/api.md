@@ -1,6 +1,6 @@
 # XBridge JSON-RPC API (`api` package)
 
-`xbridge-go/api` is a **1:1 port of blocknetd's XBridge `dx*` JSON-RPC surface**
+`go-xbridge/api` is a **1:1 port of blocknetd's XBridge `dx*` JSON-RPC surface**
 (`src/xbridge/rpcxbridge.cpp`). The goal is a drop-in replacement: point a
 dapp's RPC URL at `xbridged` and it reaches the XBridge API unchanged.
 
@@ -54,7 +54,7 @@ status log.
 
 ## Tier 3 — architectural limits (thin-client, cannot fully match C++)
 
-These divergences are inherent to the **no `blocknetd`** design: xbridge-go is a
+These divergences are inherent to the **no `blocknetd`** design: go-xbridge is a
 client that speaks the XBridge wire protocol to live service nodes but holds no
 BLOCK block index and replays no historical chain. They are **documented, not
 silently divergent**.

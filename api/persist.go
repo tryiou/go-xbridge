@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	xlog "xbridge-go/log"
-	"xbridge-go/proto"
+	xlog "go-xbridge/log"
+	"go-xbridge/proto"
 )
 
 // persistedSwap is the on-disk record of one local (Mine) swap, merging the
