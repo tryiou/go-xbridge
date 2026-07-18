@@ -178,7 +178,7 @@ func main() {
 		}
 	}()
 
-	ctx := &api.HandlerCtx{Store: store, Node: node, Config: cfg}
+	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
 
 	if *nodeAddr != "" {

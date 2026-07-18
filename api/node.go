@@ -74,7 +74,7 @@ type XConn interface {
 // responds to hub-originated packets and builds /broadcasts the HTLC deposits
 // and their claim/refund spends.
 type Node struct {
-	cfg    *Config
+	config *Config
 	conn   XConn
 	store  *Store
 	signer crypto.Signer
@@ -100,6 +100,12 @@ type Node struct {
 	block   [32]byte
 	blockAt time.Time
 
+	// cfgMu guards the live configuration. dxLoadXBridgeConf hot-reloads it
+	// (write lock) while handlers and the feed read it (read lock) via cfg().
+	// This keeps a single mutable config slot so a reload never leaves a
+	// handler reading a stale copy.
+	cfgMu sync.RWMutex
+
 	// snReg is the servicenode registry learned from SNREGISTER / SNPING /
 	// SNLISTPING P2P messages (the same wire source a core XBridge wallet
 	// uses). dxGetNetworkTokens unions snReg.WalletServices() (the live network
@@ -117,7 +123,7 @@ type Node struct {
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		cfg:      cfg,
+		config:   cfg,
 		store:    store,
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
@@ -204,24 +210,33 @@ func (n *Node) Close() error {
 	return nil
 }
 
+// cfg returns the live configuration under a read lock. All config reads must
+// go through this accessor so dxLoadXBridgeConf's hot-reload (which swaps the
+// pointer under the write lock) is safe against concurrent handler access.
+func (n *Node) cfg() *Config {
+	n.cfgMu.RLock()
+	defer n.cfgMu.RUnlock()
+	return n.config
+}
+
 // blockConnector returns the connector for the BLOCK chain, whose block height
 // backs XBridge order anti-replay (C++ stamps chainActive.Tip()->pprev).
 func (n *Node) blockConnector() wallet.Connector {
-	if n.cfg == nil || n.cfg.Connectors == nil {
+	if n.cfg() == nil || n.cfg().Connectors == nil {
 		return nil
 	}
-	return n.cfg.Connectors["BLOCK"]
+	return n.cfg().Connectors["BLOCK"]
 }
 
 // connector returns the wallet connector for ticker, or an *rpcError when none
 // is configured. This centralizes the nil/lookup check so swap handlers never
-// index n.cfg.Connectors[t] unguarded — an absent connector must surface as an
+// index n.cfg().Connectors[t] unguarded — an absent connector must surface as an
 // error, not as a nil-interface panic on the feed goroutine.
 func (n *Node) connector(t string) (wallet.Connector, error) {
-	if n.cfg == nil || n.cfg.Connectors == nil {
+	if n.cfg() == nil || n.cfg().Connectors == nil {
 		return nil, fmt.Errorf("dx: no wallet configured")
 	}
-	conn, ok := n.cfg.Connectors[t]
+	conn, ok := n.cfg().Connectors[t]
 	if !ok || conn == nil {
 		return nil, fmt.Errorf("dx: no wallet configured for %s", t)
 	}
@@ -464,10 +479,10 @@ func (n *Node) NetworkTokens() []string {
 			}
 		}
 	}
-	for _, t := range n.cfg.NetworkTokens {
+	for _, t := range n.cfg().NetworkTokens {
 		set[t] = true
 	}
-	for _, t := range n.cfg.ExchangeWallets {
+	for _, t := range n.cfg().ExchangeWallets {
 		set[t] = true
 	}
 	if len(set) == 0 {
@@ -653,7 +668,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
 		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
-		if cc := n.cfg.Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc) {
+		if cc := n.cfg().Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
@@ -695,7 +710,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	// counterparty can verify we own the coins (best-effort: a wallet that
 	// cannot sign leaves Utxos empty rather than failing the order broadcast).
 	if c, e := n.connector(p.Maker); e == nil {
-		if cc := n.cfg.Confs[p.Maker]; cc != nil {
+		if cc := n.cfg().Confs[p.Maker]; cc != nil {
 			if utxos, e := c.ListUnspent(cc.Confirmations); e == nil && len(utxos) > 0 {
 				if coin, ok := coins.Get(p.Maker); ok {
 					if proofs, e := buildUtxoProofs(c, utxos, coin); e == nil {

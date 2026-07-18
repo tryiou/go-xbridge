@@ -29,7 +29,7 @@ func (b *blockStub) GetBlockHash(height int64) ([32]byte, error) {
 
 func newBlockNode(bs wallet.Connector) *Node {
 	cfg := &Config{Connectors: map[string]wallet.Connector{"BLOCK": bs}}
-	return &Node{cfg: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{})}
+	return &Node{config: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{})}
 }
 
 func TestNodeRefreshBlock(t *testing.T) {
@@ -137,7 +137,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	cfg := &Config{
 		Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}},
 	}
-	n := &Node{cfg: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), sessions: map[string]*SwapSession{}}
+	n := &Node{config: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), sessions: map[string]*SwapSession{}}
 
 	o := &Order{
 		ID:           id,
@@ -230,7 +230,7 @@ func signBodyPacket(t *testing.T, cmd proto.XBridgeCommand, body []byte, priv []
 
 func newCancelTestNode(conn XConn) *Node {
 	return &Node{
-		cfg:      &Config{Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}}},
+		config:   &Config{Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}}},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),

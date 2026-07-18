@@ -184,13 +184,13 @@ func loadSwaps(path string) ([]persistedSwap, error) {
 // previous behaviour). Safe to call from any goroutine; serializes against
 // concurrent persist() calls via persistMu.
 func (n *Node) persist() {
-	if n.cfg == nil || n.cfg.DataDir == "" {
+	if n.cfg() == nil || n.cfg().DataDir == "" {
 		return
 	}
 	n.persistMu.Lock()
 	defer n.persistMu.Unlock()
-	if err := saveSwaps(swapStatePath(n.cfg.DataDir), n); err != nil {
-		xlog.Warn("swap persist failed", "dir", n.cfg.DataDir, "err", err)
+	if err := saveSwaps(swapStatePath(n.cfg().DataDir), n); err != nil {
+		xlog.Warn("swap persist failed", "dir", n.cfg().DataDir, "err", err)
 	}
 }
 

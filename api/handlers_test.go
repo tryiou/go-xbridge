@@ -565,7 +565,7 @@ func TestDxSplitInputsBadBoolParam(t *testing.T) {
 
 func TestGetNetworkInfo(t *testing.T) {
 	// Defaults when Config leaves the version blank (fall back to 4.4.1).
-	ctx := &HandlerCtx{Store: NewStore(), Node: &Node{}, Config: &Config{}}
+	ctx := &HandlerCtx{Store: NewStore(), Node: &Node{}}
 	res, err := ctx.getNetworkInfo(nil)
 	if err != nil {
 		t.Fatalf("getNetworkInfo: %v", err)
@@ -589,7 +589,7 @@ func TestGetNetworkInfo(t *testing.T) {
 	}
 
 	// Explicit Config overrides the defaults.
-	ctx2 := &HandlerCtx{Store: NewStore(), Node: &Node{}, Config: &Config{WalletVersion: 4120000, WalletVersionStr: "/blocknet:4.12.0/"}}
+	ctx2 := &HandlerCtx{Store: NewStore(), Node: &Node{config: &Config{WalletVersion: 4120000, WalletVersionStr: "/blocknet:4.12.0/"}}}
 	res2, _ := ctx2.getNetworkInfo(nil)
 	m2 := res2.(map[string]interface{})
 	if m2["version"] != 4120000 || m2["subversion"] != "/blocknet:4.12.0/" {

@@ -341,7 +341,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", hexEncode(s.id[:]))
 	}
 	// Recover the 33-byte secret preimage from the maker's payTx.
-	conn := s.n.cfg.Connectors[s.srcCur]
+	conn := s.n.cfg().Connectors[s.srcCur]
 	if conn == nil {
 		return 0, nil, fmt.Errorf("api: no connector for %s", s.srcCur)
 	}
@@ -408,7 +408,7 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 // wallet I/O, not session-state access).
 func (n *Node) broadcastRefund(s *SwapSession) (string, error) {
 	cur := s.srcCur
-	conn := n.cfg.Connectors[cur]
+	conn := n.cfg().Connectors[cur]
 	if conn == nil {
 		return "", fmt.Errorf("api: no connector for %s", cur)
 	}
@@ -443,7 +443,7 @@ func (n *Node) BroadcastRefund(orderID string) (string, error) {
 	}
 	if o := n.store.Get(orderID); o != nil && o.RefundTx != "" {
 		for _, cur := range []string{o.FromCurrency, o.ToCurrency} {
-			conn := n.cfg.Connectors[cur]
+			conn := n.cfg().Connectors[cur]
 			if conn == nil {
 				continue
 			}
@@ -471,7 +471,7 @@ func (n *Node) checkRefunds() {
 		if s.refundDone || s.refundHex == "" || s.state == csFinished || s.state < csCreatedA {
 			continue
 		}
-		conn := n.cfg.Connectors[s.srcCur]
+		conn := n.cfg().Connectors[s.srcCur]
 		if conn == nil {
 			continue
 		}
@@ -507,7 +507,7 @@ func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
 // It is also used to compute our expectation of the counterparty's lockTime so we
 // can validate it via acceptableLockTimeDrift.
 func (s *SwapSession) computeLockTimeFor(cur string, isMaker bool) uint32 {
-	conn := s.n.cfg.Connectors[cur]
+	conn := s.n.cfg().Connectors[cur]
 	cc := s.conf(cur)
 	if conn == nil {
 		return 0
@@ -543,7 +543,7 @@ func (s *SwapSession) computeLockTimeFor(cur string, isMaker bool) uint32 {
 func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err error) {
 	cur := s.srcCur
 	amt := s.srcAmt
-	conn := s.n.cfg.Connectors[cur]
+	conn := s.n.cfg().Connectors[cur]
 	cc := s.conf(cur)
 	if conn == nil {
 		return "", "", fmt.Errorf("api: no connector for %s", cur)
@@ -747,8 +747,8 @@ func (s *SwapSession) destScript(cur, addrStr string) ([]byte, error) {
 }
 
 func (s *SwapSession) conf(cur string) *config.CoinConf {
-	if s.n.cfg.Confs != nil {
-		return s.n.cfg.Confs[cur]
+	if s.n.cfg().Confs != nil {
+		return s.n.cfg().Confs[cur]
 	}
 	return nil
 }

@@ -97,8 +97,8 @@ func newWalletTestCtx() *HandlerCtx {
 		panic(err)
 	}
 	store := NewStore()
-	node := &Node{cfg: cfg, store: store, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
-	return &HandlerCtx{Store: store, Node: node, Config: cfg}
+	node := &Node{config: cfg, store: store, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
+	return &HandlerCtx{Store: store, Node: node}
 }
 
 func TestDxGetNewTokenAddress(t *testing.T) {

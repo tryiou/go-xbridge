@@ -12,7 +12,7 @@ import (
 func newPersistNode(t *testing.T, dir string) *Node {
 	t.Helper()
 	return &Node{
-		cfg:      &Config{DataDir: dir},
+		config:   &Config{DataDir: dir},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),

@@ -9,9 +9,21 @@ import (
 
 // HandlerCtx carries the dependencies each dx* handler needs.
 type HandlerCtx struct {
-	Store  *Store
-	Node   *Node
-	Config *Config
+	Store *Store
+	Node  *Node
+}
+
+// Config returns the live node configuration. It is derived from the Node so
+// there is a single mutable config slot (hot-reload via dxLoadXBridgeConf swaps
+// the Node's config atomically; handlers never read a stale copy).
+func (h *HandlerCtx) Config() *Config {
+	if h.Node == nil {
+		return &Config{}
+	}
+	if c := h.Node.cfg(); c != nil {
+		return c
+	}
+	return &Config{}
 }
 
 // Handler implements one dx* method. It returns the JSON result (any

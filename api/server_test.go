@@ -13,7 +13,7 @@ import (
 
 func newTestCtx() *HandlerCtx {
 	store := NewStore()
-	return &HandlerCtx{Store: store, Node: &Node{store: store}, Config: &Config{}}
+	return &HandlerCtx{Store: store, Node: &Node{store: store}}
 }
 
 func TestDxGetOrderRoundTrip(t *testing.T) {

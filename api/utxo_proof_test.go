@@ -11,7 +11,7 @@ import (
 // carried in order/pending/accepting bodies.
 func TestBuildUtxoProofs(t *testing.T) {
 	ctx := newWalletTestCtx()
-	conn := ctx.Node.cfg.Connectors["BTC"]
+	conn := ctx.Node.cfg().Connectors["BTC"]
 	coin, ok := coins.Get("BTC")
 	if !ok {
 		t.Fatal("BTC coin not registered")
@@ -50,7 +50,7 @@ func TestBuildUtxoProofs(t *testing.T) {
 // verification: a valid 65-byte proof verifies, a truncated one does not.
 func TestVerifyUtxoProofTampered(t *testing.T) {
 	ctx := newWalletTestCtx()
-	conn := ctx.Node.cfg.Connectors["BTC"]
+	conn := ctx.Node.cfg().Connectors["BTC"]
 	good, err := conn.SignMessage(btcAddr, "1abc:0")
 	if err != nil {
 		t.Fatalf("SignMessage: %v", err)

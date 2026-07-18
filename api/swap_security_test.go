@@ -12,7 +12,7 @@ import (
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an
 // error (not a nil-interface panic) when the destination currency's wallet
 // connector is absent — the exact crash the audit flagged at api/swap.go:225.
-// Before the fix, s.n.cfg.Connectors[cur] returned a nil interface and the
+// Before the fix, s.n.cfg().Connectors[cur] returned a nil interface and the
 // SendRawTransaction call panicked, killing the feed goroutine (and process).
 func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
 	node := newWalletTestCtx().Node
@@ -24,7 +24,7 @@ func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate a missing connector for the destination currency.
-	delete(node.cfg.Connectors, "BTC")
+	delete(node.cfg().Connectors, "BTC")
 
 	s := &SwapSession{
 		n:                node,

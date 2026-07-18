@@ -183,7 +183,7 @@ func newKey(t *testing.T) ([]byte, []byte) {
 func newTestNode(t *testing.T, confs map[string]*config.CoinConf, conns map[string]wallet.Connector) *Node {
 	t.Helper()
 	return &Node{
-		cfg:      &Config{Confs: confs, Connectors: conns},
+		config:   &Config{Confs: confs, Connectors: conns},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
 		sessions: map[string]*SwapSession{},

@@ -140,7 +140,7 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *rpcError) {
-	return knownTokens(h.Config.ExchangeWallets), nil
+	return knownTokens(h.Config().ExchangeWallets), nil
 }
 
 func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, *rpcError) {
@@ -149,7 +149,7 @@ func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, 
 	// XbcServicesPing advertisements, falling back to config when none are
 	// connected.
 	if h.Node == nil {
-		return knownTokens(h.Config.NetworkTokens), nil
+		return knownTokens(h.Config().NetworkTokens), nil
 	}
 	return h.Node.NetworkTokens(), nil
 }
@@ -164,10 +164,10 @@ func knownTokens(tickers []string) []string {
 // connector returns the wallet connector configured for ticker, or a no-session
 // business error (mirroring C++ when no wallet is loaded for that coin).
 func (h *HandlerCtx) connector(ticker string) (wallet.Connector, *rpcError) {
-	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
+	if h.Node == nil || h.Node.cfg() == nil || h.Node.cfg().Connectors == nil {
 		return nil, makeError(errNoSession, "dx", ticker)
 	}
-	conn, ok := h.Node.cfg.Connectors[ticker]
+	conn, ok := h.Node.cfg().Connectors[ticker]
 	if !ok || conn == nil {
 		return nil, makeError(errNoSession, "dx", ticker)
 	}
@@ -717,7 +717,7 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 
 func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, *rpcError) {
 	out := map[string]string{}
-	if h.Node == nil || h.Node.cfg == nil || h.Node.cfg.Connectors == nil {
+	if h.Node == nil || h.Node.cfg() == nil || h.Node.cfg().Connectors == nil {
 		return out, nil
 	}
 	// UTXOs locked by active orders (keyed "txid:vout") are subtracted from each
@@ -740,7 +740,7 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 	// present.
 	var walletTicker, walletBalance string
 	if c, ok := coins.Get("BLOCK"); ok {
-		if conn, ok := h.Node.cfg.Connectors["BLOCK"]; ok && conn != nil {
+		if conn, ok := h.Node.cfg().Connectors["BLOCK"]; ok && conn != nil {
 			if utxos, err := conn.ListUnspent(0); err == nil {
 				var total uint64
 				for _, u := range utxos {
@@ -753,8 +753,8 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			}
 		}
 	}
-	for _, ticker := range h.Node.cfg.ExchangeWallets {
-		conn, ok := h.Node.cfg.Connectors[ticker]
+	for _, ticker := range h.Node.cfg().ExchangeWallets {
+		conn, ok := h.Node.cfg().Connectors[ticker]
 		if !ok || conn == nil {
 			continue
 		}
@@ -973,7 +973,7 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 	// no configured exchange wallets cannot serve locked-utxo data. Guard the nil
 	// Node/Config so an unconfigured handler returns the business error instead of
 	// panicking.
-	if h.Node == nil || h.Node.cfg == nil || len(h.Node.cfg.ExchangeWallets) == 0 {
+	if h.Node == nil || h.Node.cfg() == nil || len(h.Node.cfg().ExchangeWallets) == 0 {
 		return nil, makeError(errNotExchangeNode, "dxGetLockedUtxos", "not an exchange node")
 	}
 	keys, byOrder := h.Store.LockedUtxoInfo()
@@ -983,7 +983,7 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		// rendered as C++ Exchange::getUtxoItems "txid:vout:amount:address" strings
 		// in fixed-6 XBridge scale.
 		all := make([]string, 0)
-		for _, ticker := range h.Node.cfg.ExchangeWallets {
+		for _, ticker := range h.Node.cfg().ExchangeWallets {
 			conn, e := h.connector(ticker)
 			if e != nil {
 				continue
@@ -1198,7 +1198,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		return nil, makeError(errInvalidParameters, "dxSplit", "invalid split amount")
 	}
 	target := fromXBridgeAmt(c, targetXB)
-	cc, _ := h.Node.cfg.Confs[ticker]
+	cc, _ := h.Node.cfg().Confs[ticker]
 
 	// C++ dust gate on the minimum split amount.
 	if cc != nil && targetXB < effectiveDust(cc) {
@@ -1489,7 +1489,7 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 		return nil, e
 	}
 	minConf := 0
-	if cc, ok := h.Node.cfg.Confs[ticker]; ok {
+	if cc, ok := h.Node.cfg().Confs[ticker]; ok {
 		minConf = cc.Confirmations
 	}
 	utxos, err := conn.ListUnspent(minConf)
@@ -1539,11 +1539,11 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 	if len(params) != 0 {
 		return nil, makeError(errInvalidParameters, "getnetworkinfo", "no parameters")
 	}
-	ver := h.Config.WalletVersion
+	ver := h.Config().WalletVersion
 	if ver == 0 {
 		ver = 4040100
 	}
-	sub := h.Config.WalletVersionStr
+	sub := h.Config().WalletVersionStr
 	if sub == "" {
 		sub = "/blocknet:4.4.1/"
 	}
