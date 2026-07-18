@@ -33,12 +33,15 @@ decode **only** via `cashaddrDecode`. The BCH family is selected by
 `CreateTxMethod` (e.g. `"BCH"` → `FamilyUTXOBCH`) and round-trips P2KH/P2SH
 CashAddr addresses (`TestCashAddrRoundTripP2KH`/`P2SH`).
 
-BLOCK values are from `src/chainparams.cpp` (mainnet: `PUBKEY_ADDRESS = 26`,
+BLOCK's mainnet params mirror `src/chainparams.cpp` (`PUBKEY_ADDRESS = 26`,
 `SCRIPT_ADDRESS = 28`; no `BECH32_PREFIX`, so no native segwit). BTC/LTC/DOGE
-are standard. **DGB's chainparams are verified** (`TestDGBCoinConf`:
-`FamilyUTXOBTC`, `SegWit = true`, `Bech32HRP = "dgb"`) against Digibyte's
-connector. Extend `Coins` for the rest of XBridge's supported set (BCD, BTG,
-PART, DCR, DeVault, Stealth) as needed.
+are standard. **DGB's params are verified** (`TestDGBCoinConf`:
+`FamilyUTXOBTC`, `SegWit = true`, `Bech32HRP = "dgb"`). As with every coin,
+these values are *read* from the coin's `[TICKER]` section in `xbridge.conf`
+(by `InitFromConf`) — nothing here is hardcoded in the registry; the
+segwit/HRP selection in `coin.go` is a per-`CreateTxMethod` lookup table that
+reproduces C++'s connector classes. Extend `Coins` for the rest of XBridge's
+supported set (BCD, BTG, PART, DCR, DeVault, Stealth) as needed.
 
 ## Address model
 

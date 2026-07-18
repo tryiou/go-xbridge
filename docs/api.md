@@ -62,10 +62,16 @@ returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
   exact shape (no `partial_*` fields, per C++).
 
 **Shaped / partial (correct object shape, backing not yet wired):**
-- `dxGetOrderFills`, `dxGetMyPartialOrderChain` — correct shapes from the store.
-- `dxGetLocalTokens` / `dxGetNetworkTokens` — coin registry keys.
-- `dxGetNewTokenAddress`, `dxSplitAddress`, `dxSplitInputs` — require a wallet
-  connector (the `wallet` package exists); currently return empty/error shapes.
+- `dxGetOrderFills`, `dxGetMyPartialOrderChain` — correct shapes from the store
+  (see the Tier 1 + Tier 2 subsection below; `dxGetOrderFills` now emits the
+  full 12-field record).
+
+> **Note:** `dxGetLocalTokens` / `dxGetNetworkTokens`, `dxGetNewTokenAddress`,
+> `dxSplitAddress`, and `dxSplitInputs` previously returned empty/error shapes
+> but were brought to full C++-faithful behavior in the parity pass — they are
+> now **fully functional** (live servicenode union, `[]` on no-wallet,
+> 8-field split object). They live in the "Tier 1 + Tier 2" bucket below, not
+> here.
 
 **Fully functional after the C++ parity pass (Tier 1 + Tier 2):**
 - `dxPartialOrderChainDetails` — counts `total_orders_open` as

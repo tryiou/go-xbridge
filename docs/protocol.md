@@ -184,8 +184,9 @@ two-confirmation gate; the progression walks trJoined → trHold → trInitializ
 → trCreated → trFinished via `IncreaseStateCounter`. See `docs/swap.md` §2.)
 ```
 
-High-level flow (hub = the order maker / "exchange"; clients A and B are the
-two traders):
+High-level flow (hub = the **service node**; note this is *not* the maker — the
+maker is client A and the taker is client B. The service node brokers the
+handshake. clients A and B are the two traders):
 
 ```
 A (maker)                       hub                     B (taker)

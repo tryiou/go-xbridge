@@ -14,12 +14,12 @@ C++ and found wrong (see C1).
 
 ## Headline verdict
 
-**As originally audited:** zero of the 24 `dx*` commands were behaviorally 1:1 —
+**As originally audited:** zero of the 23 `dx*` commands were behaviorally 1:1 —
 every command diverged in at least one dapp-visible way, with the damage
 concentrated in (a) two **universal** substrate breaks and (b) the
 order-lifecycle + wallet/split commands.
 
-**Status (2026-07-17):** all 24 commands have been remediated against the C++
+**Status (2026-07-17):** all 23 `dx*` commands have been remediated against the C++
 wire contract. The **Tier 1** code bugs (`stateOrdinal` enum, `dxPartialOrderChainDetails`
 aggregation / empty-chain / id-validation, `dxTakeOrder` amount=0 full take,
 `FlushCancelled` uint64 underflow, `dxGetLockedUtxos` nil-guard) and **Tier 2**
@@ -103,8 +103,9 @@ BLOCK-DX handshake note in `server.go` before removing, using live captures.)
 
 *Equivalent cross-cutting areas:* timestamps (`iso8601` 3-digit ms `Z`), `status`
 strings (`statusString` matches `TransactionDescr::strState`, incl.
-"commited"/"canceled"), and the dispatch set (all 24 commands + `gettradingdata`
-alias present; `getnetworkinfo` is an intentional Go-only extension).
+"commited"/"canceled"), and the dispatch set (all 23 `dx*` commands + the
+`gettradingdata` alias present; `getnetworkinfo` is an intentional Go-only
+extension — not one of the 23 `dx*` commands).
 
 ## Per-command divergences
 

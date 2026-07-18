@@ -1,0 +1,220 @@
+# Using xbridge-go
+
+This guide covers **how to install, configure, run, and trade with `xbridged`**.
+It is the user-facing counterpart to the wire contract in
+[`docs/protocol.md`](protocol.md) and the API contract in
+[`docs/api.md`](api.md).
+
+## What you need
+
+- **Go 1.25+** (toolchain 1.26 works) to build.
+- An **`xbridge.conf`** describing your coins and wallet(s). The file is
+  **read-only** — `xbridged` never creates or mutates it (matching the
+  core-wallet `createConf()` behavior). If `-conf` points at a missing file,
+  startup is **fatal**.
+- A **connected Blocknet-core-compatible wallet** (or local keys via
+  `LocalConnector`) for anything that signs or broadcasts — making/taking
+  orders, deposits, refunds. Read-only commands (`dxGetOrders`, etc.) need only
+  the order book fed over P2P.
+
+`xbridged` is a **thin client**: it speaks the XBridge wire protocol to the
+live Blocknet service-node P2P network and never downloads or serves the
+blockchain.
+
+## Build
+
+```sh
+go build ./...
+go test ./...      # optional, runs the unit tests
+```
+
+This produces the `xbridged` daemon (plus `cmd/liveprobe` for ad-hoc live
+node checks). Point a dapp's RPC URL at `xbridged`'s JSON-RPC listener to use
+the `dx*` surface unchanged.
+
+## Configuration — `xbridge.conf`
+
+The same INI format the original core wallet reads. Two section kinds:
+
+- **`[Main]`** — global settings.
+- **`[TICKER]`** — one section per coin (BTC, LTC, DOGE, BLOCK, …). **Every
+  coin connector is defined entirely by its section** — there is no hardcoded
+  coin data. The schema below mirrors `config/conf.go` (a faithful port of
+  `src/xbridge/xbridgeapp.cpp createConf()`).
+
+### `[Main]`
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `ExchangeWallets` | csv | Tickters that have a local wallet configured (the connectors `xbridged` drives). |
+| `ShowAllOrders` | bool | Show orders for coins without a local wallet. |
+| `FullLog` | bool | Verbose logging. |
+
+### `[TICKER]`
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `Title` | string | Human name (defaults to the section name). |
+| `Ip` / `Port` | string / int | Wallet/node JSON-RPC endpoint. |
+| `Username` / `Password` | string | Wallet RPC auth. |
+| `CreateTxMethod` | string | Selects the tx-construction path (e.g. `"BTC"`). Drives segwit/bech32 support in `coins/`. |
+| `AddressPrefix` / `ScriptPrefix` / `SecretPrefix` | int | base58check version bytes (P2PKH / P2SH / WIF) as decimals. |
+| `COIN` | uint64 | Base-unit multiplier (e.g. `100000000`); decimals are derived from its trailing zeros. |
+| `MinimumAmount` | uint64 | Minimum trade amount (base units). |
+| `TxVersion` | int | Transaction version (default `1`). |
+| `DustAmount` / `MinTxFee` / `FeePerByte` | uint64 | Dust / fee rules (base units). |
+| `BlockTime` | int | Seconds per block (used for HTLC lock-time math). |
+| `Confirmations` | int | Required confirmations. |
+| `TxWithTimeField` | bool | Tx carries a time field. |
+| `LockCoinsSupported` / `GetNewKeySupported` / `ImportWithNoScanSupported` | bool | Wallet capability flags. |
+| `JSONVersion` | string | Wallet RPC JSON version (default `"1.0"`). |
+| `ContentType` | string | RPC `Content-Type` (default `"application/json"`). |
+| `OmitJSONVersion` | bool | Drop the `"jsonrpc"` field from RPC requests (XLite-style wallets require this). |
+
+### Sample (`xbridge.conf`)
+
+A minimal, working configuration (credentials redacted). It defines two coins
+under `[Main]` — `BLOCK` (the service-node fee coin) and `BTC` — each
+`[TICKER]` section pointing `xbridged` at that coin's local wallet RPC. Copy
+it, restore your own `Username`/`Password`, and adjust `Ip`/`Port` to match
+your wallets. Add more `[TICKER]` sections (and list them in
+`ExchangeWallets`) for each coin you trade.
+
+```ini
+[Main]
+ExchangeWallets=BLOCK,BTC
+FullLog=true
+ShowAllOrders=true
+
+[BLOCK]
+Title=Blocknet
+Address=
+Ip=127.0.0.1
+Port=41419
+Username=<your-rpc-user>
+Password=<your-rpc-pass>
+AddressPrefix=26
+ScriptPrefix=28
+SecretPrefix=154
+COIN=100000000
+MinimumAmount=0
+TxVersion=1
+DustAmount=0
+CreateTxMethod=BTC
+GetNewKeySupported=true
+ImportWithNoScanSupported=true
+MinTxFee=10000
+BlockTime=60
+FeePerByte=20
+Confirmations=0
+TxWithTimeField=false
+LockCoinsSupported=false
+
+[BTC]
+Title=Bitcoin
+Address=
+Ip=127.0.0.1
+Port=8332
+Username=<your-rpc-user>
+Password=<your-rpc-pass>
+AddressPrefix=0
+ScriptPrefix=5
+SecretPrefix=128
+COIN=100000000
+MinimumAmount=0
+TxVersion=2
+DustAmount=0
+CreateTxMethod=BTC
+GetNewKeySupported=false
+ImportWithNoScanSupported=false
+MinTxFee=12000
+BlockTime=600
+FeePerByte=60
+Confirmations=0
+TxWithTimeField=false
+LockCoinsSupported=false
+```
+
+> Only the coins listed in `[Main]`'s `ExchangeWallets` are driven as local
+> connectors; the rest of the network's orders still appear via P2P. BCH uses
+> **CashAddr** and would set `CreateTxMethod=BCH` (its legacy base58 version
+> bytes collide with BTC's). See [`docs/coins.md`](coins.md).
+
+## Running `xbridged`
+
+```sh
+# Default conf path is <home>/.blocknet/xbridge.conf (override with -conf):
+./xbridged -network mainnet -conf ~/.blocknet/xbridge.conf
+
+# Pin specific peers alongside discovered ones:
+./xbridged -network mainnet -addnode 1.2.3.4:41412
+
+# Legacy explicit-single-peer mode (skips discovery):
+./xbridged -node coreproxy.airdns.org:42111
+```
+
+Network discovery resolves DNS seeds, connects to healthy peers, and learns
+more via `addr` gossip — like a core wallet. Discovery picks the network magic
+from `-network`; `-magic` overrides it:
+
+| Network | Magic (hex) | Default port |
+|---------|--------------|--------------|
+| mainnet | `a1a0a2a3` | 41412 |
+| testnet | `457665bb` | 41474 |
+| staging | `a1cf7eac` | 41489 |
+
+### Flag reference
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `-network` | `mainnet` | Network to discover on: `mainnet`\|`testnet`\|`staging` (ignored if `-node` is set). |
+| `-node` | `""` | Explicit service-node P2P address `host:port`; empty enables network discovery. |
+| `-addnode` | `""` | Comma-separated peer addresses added to the discovered set. |
+| `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
+| `-key` | `""` | Hex-encoded 32-byte secp256k1 private key; **enables** `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder`. |
+| `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
+| `-rpcaddr` | `:41414` | JSON-RPC listen address for the `dx*` API. |
+| `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
+| `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
+
+## Making a trade (walkthrough)
+
+1. **Start the daemon** with a valid `-conf` and (for trading) a `-key`
+   (the private key signs orders; without it only read commands work).
+2. **Browse** the order book:
+   ```sh
+   dxGetOrders            # all open orders
+   dxGetOrderBook BTC BLOCK   # best bid/ask for a pair
+   ```
+3. **Make an order** (requires `-key`):
+   ```sh
+   dxMakeOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> exact
+   # or a partial order:
+   dxMakePartialOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> 0.001
+   ```
+4. **Take an order** (requires `-key`):
+   ```sh
+   dxTakeOrder <order_id>            # full take
+   dxTakeOrder <order_id> 0.005      # partial take
+   ```
+   The client driver (`api/swap.go`) runs the Maker ⇄ ServiceNode ⇄ Taker
+   handshake: it builds/broadcasts the HTLC deposits and claims/refunds as the
+   hub advances the state.
+5. **Cancel** an open order:
+   ```sh
+   dxCancelOrder <order_id>
+   ```
+
+Full field/param contracts for every `dx*` command (positional params, response
+shapes, error codes) are in [`docs/api.md`](api.md). Thin-client limitations
+(`dxGetOrderHistory` / `dxGetTradingData` reflect session-local fills only) are
+documented under "Tier 3" there.
+
+## Notes & troubleshooting
+
+- **`-conf` is required and fatal if missing** — `xbridged` never creates it.
+- The conf file is **read-only**; edit it yourself, don't expect regeneration.
+- Discovery needs at least one reachable service node; if all seeds/peers are
+  unreachable, use `-node <host:port>` to pin one.
+- `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` are no-ops for signing without
+  `-key`.
