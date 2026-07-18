@@ -180,20 +180,29 @@ func newKey(t *testing.T) ([]byte, []byte) {
 	return key.Serialize(), pub
 }
 
-func newTestNode(t *testing.T, priv []byte, confs map[string]*config.CoinConf, conns map[string]wallet.Connector) *Node {
+func newTestNode(t *testing.T, confs map[string]*config.CoinConf, conns map[string]wallet.Connector) *Node {
 	t.Helper()
-	pk, err := crypto.CompressedPubKey(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return &Node{
-		cfg:      &Config{PrivKey: priv, Confs: confs, Connectors: conns},
+		cfg:      &Config{Confs: confs, Connectors: conns},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
-		pubkey:   pk,
 		sessions: map[string]*SwapSession{},
 		stop:     make(chan struct{}),
 	}
+}
+
+// toArr33 converts a 33-byte pubkey slice to a fixed array.
+func toArr33(b []byte) [33]byte {
+	var a [33]byte
+	copy(a[:], b)
+	return a
+}
+
+// arr32 converts a 32-byte privkey slice to a fixed array.
+func arr32(b []byte) [32]byte {
+	var a [32]byte
+	copy(a[:], b)
+	return a
 }
 
 // TestSwapHandshake drives a full maker⇄hub⇄taker swap client-side, asserting
@@ -241,10 +250,16 @@ func TestSwapHandshake(t *testing.T) {
 		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
 	}
 
-	mkPriv, _ := newKey(t)
 	tkPriv, tkPub := newKey(t)
-	makerNode := newTestNode(t, mkPriv, confs, conns)
-	takerNode := newTestNode(t, tkPriv, confs, conns)
+	makerNode := newTestNode(t, confs, conns)
+	takerNode := newTestNode(t, confs, conns)
+
+	// Per-trade M keypairs (C++ mPubKey/mPrivKey). The taker's M pubkey is
+	// tkPub because the handshake assertions below expect the taker deposit's
+	// DepositorPub to equal tkPub.
+	mkMPriv, mkMPub := newKey(t)
+	tkMPriv := tkPriv
+	tkMPub := tkPub
 
 	var orderID [32]byte
 	oid := hash20("order-id")
@@ -256,8 +271,8 @@ func TestSwapHandshake(t *testing.T) {
 	makerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}
 	takerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}
 
-	makerNode.newMakerSession(makerOrder, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr})
-	takerNode.newTakerSession(takerOrder, TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr})
+	makerNode.newMakerSession(makerOrder, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(takerOrder, TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), toArr33(tkMPub))
 
 	var hub [20]byte
 	hb := hash20("hub")
@@ -382,7 +397,7 @@ func TestSwapHandshake(t *testing.T) {
 	}
 }
 
-func (s *SwapSession) pubkey() [33]byte { return s.n.pubkey }
+func (s *SwapSession) pubkey() [33]byte { return s.pubKey }
 
 // to33 copies a (33-byte) compressed pubkey slice into a fixed [33]byte.
 func to33(b []byte) [33]byte {
@@ -576,7 +591,7 @@ func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	priv, _ := newKey(t)
+	mPriv, mPub := newKey(t)
 	btcFundingPriv, btcFundingPub := newKey(t)
 	btcFunding := wallet.Utxo{
 		TxID:         strings.Repeat("aa", 32),
@@ -590,12 +605,12 @@ func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 	}
 	conns := map[string]wallet.Connector{"BTC": btcConn}
 	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
-	n := newTestNode(t, priv, confs, conns)
+	n := newTestNode(t, confs, conns)
 	var orderID [32]byte
 	oid := hash20("order-id")
 	copy(orderID[:], oid[:])
 	mkAddr := addrFor(0, "maker-btc-dest")
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr})
+	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	hub := hash20("hub")
 	s.hub = hub
@@ -610,7 +625,7 @@ func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 func TestRefundTx(t *testing.T) {
 	_, s, conn := setupSwapPair(t)
 
-	_, bodyA, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])})
+	_, bodyA, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.pubKey[:])})
 	if err != nil {
 		t.Fatalf("OnCreateA: %v", err)
 	}
@@ -642,7 +657,7 @@ func TestRefundTx(t *testing.T) {
 	if len(pushes) != 3 || len(ops) != 1 || ops[0] != coins.Op1 {
 		t.Fatalf("refund scriptSig wrong: pushes=%d ops=%v", len(pushes), ops)
 	}
-	wantInner := coins.BuildDepositUnlockScript(s.n.pubkey[:], s.theirPub[:], s.secretHash[:], createdA.ALockTime)
+	wantInner := coins.BuildDepositUnlockScript(s.pubKey[:], s.theirPub[:], s.secretHash[:], createdA.ALockTime)
 	if !bytes.Equal(pushes[2], wantInner) {
 		t.Error("refund scriptSig inner push != expected HTLC redeem script")
 	}
@@ -659,9 +674,9 @@ func TestComputeLockTime(t *testing.T) {
 	}
 	conn := &fakeConnector{ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{}}
 	conns := map[string]wallet.Connector{"BTC": conn}
-	priv, _ := newKey(t)
-	n := newTestNode(t, priv, confs, conns)
-	s := &SwapSession{n: n, isMaker: true, id: [32]byte{}, srcCur: "BTC", dstCur: "BTC"}
+	mPriv, mPub := newKey(t)
+	n := newTestNode(t, confs, conns)
+	s := &SwapSession{n: n, isMaker: true, id: [32]byte{}, srcCur: "BTC", dstCur: "BTC", privKey: arr32(mPriv), pubKey: toArr33(mPub)}
 	n.sessions["x"] = s
 
 	// blockTime 60: maker 7200/60=120 → 1120; taker 1800/60=30 → 1030.
@@ -699,7 +714,7 @@ func TestComputeLockTime(t *testing.T) {
 // (guarded by refundDone).
 func TestRefundWatcher(t *testing.T) {
 	n, s, conn := setupSwapPair(t)
-	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])}); err != nil {
+	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.pubKey[:])}); err != nil {
 		t.Fatalf("OnCreateA: %v", err)
 	}
 	if s.refundHex == "" {
@@ -733,7 +748,7 @@ func TestRefundWatcher(t *testing.T) {
 // force-broadcasts the stored refund and records it on the connector.
 func TestRefundEscapeHatch(t *testing.T) {
 	_, s, conn := setupSwapPair(t)
-	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.n.pubkey[:])}); err != nil {
+	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.pubKey[:])}); err != nil {
 		t.Fatalf("OnCreateA: %v", err)
 	}
 	orderIDHex := hexEncode(s.id[:])

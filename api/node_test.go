@@ -121,9 +121,13 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 
-	// Private key 1 (a valid non-zero secp256k1 scalar).
-	priv := make([]byte, 32)
-	priv[31] = 1
+	// Per-trade M keypair (C++ mPubKey/mPrivKey).
+	mPriv := make([]byte, 32)
+	mPriv[31] = 1
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var id [32]byte
 	copy(id[:], []byte("order-id-order-id-order-id-0")) // 32 bytes exactly
@@ -131,7 +135,6 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	hub[0] = 0xaa
 
 	cfg := &Config{
-		PrivKey:    priv,
 		Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}},
 	}
 	n := &Node{cfg: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), sessions: map[string]*SwapSession{}}
@@ -143,7 +146,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 		FromAmount:   100000000,
 		ToAmount:     200000000,
 	}
-	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr})
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
 
 	cc := &captureXConn{}
 	n.conn = cc

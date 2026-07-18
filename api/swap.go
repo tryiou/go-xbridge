@@ -99,6 +99,8 @@ type SwapSession struct {
 	ourSourceAddr, ourDestAddr string // our addresses for srcCur / dstCur
 
 	theirPub   [33]byte // counterparty's deposit pubkey (from CreateA/B)
+	privKey    [32]byte // per-trade M keypair (C++ mPrivKey): signs packets + HTLC
+	pubKey     [33]byte // per-trade M pubkey (C++ mPubKey): packet header + HTLC DepositorPub
 	secret     [33]byte // maker: xPubKey preimage; taker: recovered from A's payTx
 	secretHash [20]byte // HASH160(secret); both deposits share it
 
@@ -118,15 +120,12 @@ type SwapSession struct {
 // newMakerSession registers the client-side maker for a freshly created order and
 // generates the 33-byte HTLC secret (xPubKey); HASH160(xPubKey) is the secretHash
 // carried in the deposit. Both deposits use the same secretHash.
-func (n *Node) newMakerSession(o *Order, p MakeOrderParams) {
-	if len(n.cfg.PrivKey) != 32 {
-		return
-	}
-	priv, err := crypto.NewPrivateKey()
+func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [33]byte) {
+	xPub, err := crypto.NewPrivateKey()
 	if err != nil {
 		return
 	}
-	xPub, err := crypto.CompressedPubKey(priv)
+	xpk, err := crypto.CompressedPubKey(xPub)
 	if err != nil {
 		return
 	}
@@ -140,8 +139,10 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams) {
 		dstAmt:        o.ToAmount,
 		ourSourceAddr: p.MakerAddress,
 		ourDestAddr:   p.TakerAddress,
-		secret:        xPub,
-		secretHash:    coins.KeyID(xPub[:]),
+		privKey:       priv,
+		pubKey:        pub,
+		secret:        xpk,
+		secretHash:    coins.KeyID(xpk[:]),
 		state:         csMaker,
 	}
 	n.sessMu.Lock()
@@ -154,10 +155,7 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams) {
 // newTakerSession registers the client-side taker for a taken order. The secret
 // is unknown until CreateB teaches us the secretHash; the actual preimage is
 // recovered from the maker's payTx at ConfirmB.
-func (n *Node) newTakerSession(o *Order, p TakeOrderParams) {
-	if len(n.cfg.PrivKey) != 32 {
-		return
-	}
+func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [33]byte) {
 	s := &SwapSession{
 		n:             n,
 		isMaker:       false,
@@ -168,6 +166,8 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams) {
 		dstAmt:        o.FromAmount,
 		ourSourceAddr: p.FromAddress,
 		ourDestAddr:   p.ToAddress,
+		privKey:       priv,
+		pubKey:        pub,
 		state:         csTaker,
 	}
 	n.sessMu.Lock()
@@ -300,6 +300,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	}
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
+	s.n.persist()
 	return proto.XbcTransactionConfirmedA, &proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
 	}, nil
@@ -349,6 +350,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	}
 	s.state = csConfirmedB
 	xlog.Info("ConfirmB: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
+	s.n.persist()
 	return proto.XbcTransactionConfirmedB, &proto.ConfirmedBBody{
 		HubAddress: s.hub, ID: s.id, BPayTxID: payTxID,
 	}, nil
@@ -362,6 +364,7 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 	}
 	s.state = csFinished
 	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
+	s.n.persist()
 	return 0, nil, nil
 }
 
@@ -539,7 +542,7 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	spec := &swap.DepositSpec{
 		Currency:        cur,
 		Amount:          amt,
-		DepositorPub:    s.n.pubkey,
+		DepositorPub:    s.pubKey,
 		CounterpartyPub: s.theirPub,
 		Hash:            hash,
 		LockTime:        lockTime,
@@ -620,7 +623,7 @@ func (s *SwapSession) buildRefundTx(spec *swap.DepositSpec, cur string) (string,
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount - fee, ScriptPubKey: dest})
 
 	inner := spec.RedeemScript()
-	sig, err := coins.SignTxInput(tx, 0, inner, s.n.cfg.PrivKey)
+	sig, err := coins.SignTxInput(tx, 0, inner, s.privKey[:])
 	if err != nil {
 		return "", err
 	}
@@ -638,7 +641,7 @@ func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur strin
 		Currency:        s.dstCur,
 		Amount:          s.dstAmt,
 		DepositorPub:    s.theirPub,
-		CounterpartyPub: s.n.pubkey,
+		CounterpartyPub: s.pubKey,
 		LockTime:        s.theirLockTime,
 	}
 	if s.isMaker {
@@ -677,13 +680,13 @@ func (s *SwapSession) redeemCounterparty(isMaker bool) (payHex, depositCur strin
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: theirSpec.Amount - fee, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
-	sig, err := coins.SignTxInput(tx, 0, inner, s.n.cfg.PrivKey)
+	sig, err := coins.SignTxInput(tx, 0, inner, s.privKey[:])
 	if err != nil {
 		return "", "", err
 	}
 	// The ELSE branch requires <secret> <sig> <myPubKey> OP_0 <inner>, where
 	// myPubKey is the deposit's CounterpartyPub (== our trader key).
-	tx.Inputs[0].ScriptSig = coins.BuildPaymentScriptSig(s.secret[:], sig, s.n.pubkey[:], inner)
+	tx.Inputs[0].ScriptSig = coins.BuildPaymentScriptSig(s.secret[:], sig, s.pubKey[:], inner)
 	return hex.EncodeToString(tx.Serialize()), depositCur, nil
 }
 

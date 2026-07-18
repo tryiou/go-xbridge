@@ -27,10 +27,6 @@ type Config struct {
 	NodeAddr string
 	// Magic is the network magic (mainnet a1a0a2a3 by default).
 	Magic [4]byte
-	// PrivKey is the 32-byte secp256k1 scalar used to sign outbound packets.
-	// Empty disables order creation (dxMakeOrder/dxTakeOrder/dxCancelOrder
-	// return a no-session error, matching Blocknet when no wallet is loaded).
-	PrivKey []byte
 	// Confs holds the parsed [TICKER] sections from xbridge.conf.
 	Confs map[string]*config.CoinConf
 	// Connectors maps ticker -> the wallet connector xbridge-go drives for it
@@ -51,6 +47,12 @@ type Config struct {
 	// advertise Blocknet 4.4.1 (CLIENT_VERSION 4040100) by default.
 	WalletVersion    int
 	WalletVersionStr string
+	// DataDir is the directory local swap state (incl. each trade's per-trade
+	// M keypair) is persisted to, mirroring C++ orders.dat / loadOrders() /
+	// saveOrders(). When empty (the default) it resolves to the OS config dir
+	// (<UserConfigDir>/xbridged), so persistence is ON by default — matching
+	// C++'s always-on orders.dat. Set via xbridged's -datadir flag.
+	DataDir string
 }
 
 // XConn is the connection surface the Node needs. Both *p2p.Conn (a single
@@ -75,7 +77,6 @@ type Node struct {
 	conn   XConn
 	store  *Store
 	signer crypto.Signer
-	pubkey [33]byte
 	stop   chan struct{}
 
 	// sessMu guards sessions, the set of in-flight swaps we are a party to
@@ -83,6 +84,13 @@ type Node struct {
 	// sequence; the local SwapSession responds and signs the on-chain ops.
 	sessMu   sync.Mutex
 	sessions map[string]*SwapSession
+
+	// persistMu serializes persistence to disk (saveSwaps) against concurrent
+	// persist() calls from the feed, MakeOrder/TakeOrder/CancelOrder, and the
+	// refundWatcher. The actual read of sessions inside saveSwaps takes sessMu.
+	persistMu sync.Mutex
+	// tickCount counts refundWatcher ticks so we persist every Nth tick.
+	tickCount int
 
 	// blockMu guards the cached anti-replay blockHash stamped on outgoing
 	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
@@ -108,19 +116,29 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		sessions:  map[string]*SwapSession{},
 		svcByPeer: map[string][]string{},
 	}
-	if len(cfg.PrivKey) == 32 {
-		pk, err := crypto.CompressedPubKey(cfg.PrivKey)
-		if err != nil {
-			return nil, err
+
+	// Restore local swaps persisted to DataDir (mirrors C++ loadOrders). This
+	// runs BEFORE the dial so a swap-loaded node survives even when the service
+	// node is unreachable (read-only mode) — matching C++'s restart behaviour.
+	if cfg.DataDir != "" {
+		if ps, err := loadSwaps(swapStatePath(cfg.DataDir)); err != nil {
+			xlog.Warn("could not load persisted swaps; starting fresh", "dir", cfg.DataDir, "err", err)
+		} else if len(ps) > 0 {
+			n.sessMu.Lock()
+			for _, p := range ps {
+				n.restoreSwap(p)
+			}
+			n.sessMu.Unlock()
+			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", cfg.DataDir)
 		}
-		n.pubkey = pk
 	}
+
 	if cfg.NodeAddr != "" {
 		// Explicit single-peer override: skip discovery, dial the given
 		// service node directly (the legacy behaviour).
 		conn, err := p2p.Dial(cfg.NodeAddr, cfg.Magic, 30*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("api: dial service node: %w", err)
+			return n, fmt.Errorf("api: dial service node: %w", err)
 		}
 		n.conn = conn
 		xlog.Info("connected to explicit service node", "addr", cfg.NodeAddr)
@@ -311,6 +329,12 @@ func (n *Node) refundWatcher() {
 			return
 		case <-t.C:
 			n.checkRefunds()
+			// Mirror C++ saveOrders cadence: flush local swap state to disk
+			// periodically so a crash loses at most a few minutes of progress.
+			n.tickCount++
+			if n.tickCount%4 == 0 {
+				n.persist()
+			}
 		}
 	}
 }
@@ -467,23 +491,24 @@ func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*
 		xlog.Debug("swap handler produced no response", "order", orderID)
 		return
 	}
-	if err := n.send(cmd, body); err != nil {
+	if err := n.send(cmd, body, s.privKey[:]); err != nil {
 		xlog.Error("swap response send failed", "order", orderID, "command", cmd.String(), "err", err)
 	} else {
 		xlog.Info("swap response sent", "order", orderID, "command", cmd.String())
 	}
 }
 
-// send signs and broadcasts a handshake response packet.
-func (n *Node) send(cmd proto.XBridgeCommand, body responseBody) error {
+// send signs and broadcasts a handshake response packet with the swap's
+// per-trade M keypair (C++ xtx->mPrivKey).
+func (n *Node) send(cmd proto.XBridgeCommand, body responseBody, priv []byte) error {
 	if n.conn == nil {
 		return errors.New("api: not connected to a service node")
 	}
-	if len(n.cfg.PrivKey) != 32 {
+	if len(priv) != 32 {
 		return errors.New("api: no private key configured")
 	}
 	pkt := proto.NewPacket(cmd, body.Marshal())
-	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
+	if err := n.signer.Sign(pkt, priv); err != nil {
 		return err
 	}
 	return n.conn.WritePacket(pkt)
@@ -524,9 +549,6 @@ func decodeAddr(currency, addrStr string) ([20]byte, *rpcError) {
 func (n *Node) requireWrite() *rpcError {
 	if n.conn == nil {
 		return makeError(errNoServiceNode, "dx", "")
-	}
-	if len(n.cfg.PrivKey) != 32 {
-		return makeError(errBadRequest, "dx", "no private key configured")
 	}
 	return nil
 }
@@ -625,6 +647,20 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		MinFromAmount:  minFrom,
 	}
 
+	// Generate the per-trade M keypair (C++ xtx->mPubKey/mPrivKey). It signs the
+	// make packet and becomes the HTLC DepositorPub; generated here so the
+	// wire signing pubkey == the HTLC pubkey by construction.
+	mPriv, err := crypto.NewPrivateKey()
+	if err != nil {
+		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
+	}
+	var mPrivArr [32]byte
+	copy(mPrivArr[:], mPriv)
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
+	}
+
 	// Attach BIP137 ownership proofs for the maker's spendable UTXOs so a C++
 	// counterparty can verify we own the coins (best-effort: a wallet that
 	// cannot sign leaves Utxos empty rather than failing the order broadcast).
@@ -641,7 +677,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	}
 
 	pkt := proto.NewPacket(proto.XbcTransaction, body.Marshal())
-	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
+	if err := n.signer.Sign(pkt, mPriv); err != nil {
 		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
 	}
 	if p.DryRun {
@@ -653,7 +689,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		}
 	}
 
-	o := normalizeFromOrderBody(body, hexEncode(n.pubkey[:]))
+	o := normalizeFromOrderBody(body, hexEncode(mPub[:]))
 	o.MakerAddress = p.MakerAddress
 	o.TakerAddress = p.TakerAddress
 	o.BlockID = hexEncode(body.BlockHash[:])
@@ -667,7 +703,9 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if !p.DryRun {
 		n.store.Add(o)
 		// Begin driving the client-side deposit handshake for this order.
-		n.newMakerSession(o, p)
+		n.newMakerSession(o, p, mPrivArr, mPub)
+		// Persist the new local swap (incl. its per-trade M keypair) to disk.
+		n.persist()
 	}
 	return o, nil
 }
@@ -757,8 +795,20 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		ToBlockHeight:   toH,
 		ToBlockHash:     toHash,
 	}
+	// Generate the per-trade M keypair (C++ xtx->mPubKey/mPrivKey), generated
+	// at accept time so the wire signing pubkey == the HTLC pubkey by construction.
+	tPriv, err := crypto.NewPrivateKey()
+	if err != nil {
+		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
+	}
+	var tPrivArr [32]byte
+	copy(tPrivArr[:], tPriv)
+	tPub, err := crypto.CompressedPubKey(tPriv)
+	if err != nil {
+		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
+	}
 	pkt := proto.NewPacket(proto.XbcTransactionAccepting, acc.Marshal())
-	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
+	if err := n.signer.Sign(pkt, tPriv); err != nil {
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	if p.DryRun {
@@ -772,7 +822,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	o.Updated = NowMicro()
 	o.Status = "accepting"
 	// Begin driving the client-side deposit handshake for this taken order.
-	n.newTakerSession(o, p)
+	n.newTakerSession(o, p, tPrivArr, tPub)
+	// Persist the new local swap (incl. its per-trade M keypair) to disk.
+	n.persist()
 	return o.toTakeResult(fromSize, toSize), nil
 }
 
@@ -794,7 +846,16 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	var reason uint32 = 0
 	body := (&proto.CancelBody{ID: o.ID, Reason: reason}).Marshal()
 	pkt := proto.NewPacket(proto.XbcTransactionCancel, body)
-	if err := n.signer.Sign(pkt, n.cfg.PrivKey); err != nil {
+	// Cancel is signed with the trade's per-trade M keypair (C++ session
+	// sendCancelTransaction uses ptr->mPrivKey). Use the live session if we
+	// have one; otherwise there is no key to sign with.
+	n.sessMu.Lock()
+	s := n.sessions[p.ID]
+	n.sessMu.Unlock()
+	if s == nil {
+		return nil, makeError(errBadRequest, "dxCancelOrder", "no active session for order")
+	}
+	if err := n.signer.Sign(pkt, s.privKey[:]); err != nil {
 		return nil, makeError(errUnknown, "dxCancelOrder", err.Error())
 	}
 	if err := n.conn.WritePacket(pkt); err != nil {
@@ -810,5 +871,9 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 			xlog.Warn("dxCancelOrder refund broadcast failed", "order", p.ID, "err", rerr)
 		}
 	}
+	// Persist the cancelled (and possibly refund-broadcast) state so it survives
+	// a restart (matches C++ saveOrders). Placed last so the refund guard is
+	// captured.
+	n.persist()
 	return o, nil
 }

@@ -493,6 +493,23 @@ func TestDxCancelOrderGuards(t *testing.T) {
 	}
 }
 
+// TestDxCancelOrderNoLiveSession documents the per-trade M-key model: cancel is
+// signed with the trade's live SwapSession key (C++ session sendCancelTransaction
+// uses ptr->mPrivKey). An order stored in the order book with no live session —
+// e.g. after a daemon restart, since the M keypair is in-memory only, matching
+// C++ which also holds it only in the live XBridgeTransaction — must fail with
+// "no active session for order" rather than signing with a stale/global key.
+func TestDxCancelOrderNoLiveSession(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Node.conn = fakeXConn{}
+	ctx.Node.sessions = map[string]*SwapSession{} // open order in store, no live swap session
+	o := seedOrder(ctx)                           // status "open", cancelable by state
+
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(hexEncode(o.ID[:]))}); err == nil || err.Code != errBadRequest {
+		t.Errorf("dxCancelOrder(no live session) = %+v, want BAD_REQUEST (no active session for order)", err)
+	}
+}
+
 // TestDxSplitInputsBadBoolParam verifies a malformed (non-boolean) flag errors
 // out via errInvalidParameters instead of silently defaulting to true (Module F).
 func TestDxSplitInputsBadBoolParam(t *testing.T) {

@@ -103,7 +103,6 @@ func TestDxPartialOrderChainDetailsDeposits(t *testing.T) {
 func TestDxTakeOrderFullTake(t *testing.T) {
 	ctx := newWalletTestCtx()
 	ctx.Node.conn = fakeXConn{}
-	ctx.Node.cfg.PrivKey = make([]byte, 32)
 	ctx.Node.sessions = make(map[string]*SwapSession)
 	o := &Order{
 		ID:           [32]byte{0x07},

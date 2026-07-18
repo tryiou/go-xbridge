@@ -39,17 +39,33 @@ func defaultConfPath() string {
 	return filepath.Join(home, ".blocknet", "xbridge.conf")
 }
 
+// resolveDataDir returns dir if non-empty, otherwise the OS config dir joined
+// with "xbridged" (cross-platform: ~/.config/xbridged on Linux,
+// ~/Library/Application Support/xbridged on macOS,
+// %AppData%\xbridged on Windows). It falls back to ".xbridged" in the
+// working directory if UserConfigDir is unavailable.
+func resolveDataDir(dir string) string {
+	if dir != "" {
+		return dir
+	}
+	base, err := os.UserConfigDir()
+	if err != nil || base == "" {
+		return ".xbridged"
+	}
+	return filepath.Join(base, "xbridged")
+}
+
 func main() {
 	rpcAddr := flag.String("rpcaddr", ":41414", "JSON-RPC listen address")
 	network := flag.String("network", "mainnet", "Blocknet network to discover on: mainnet|testnet|staging (ignored if -node is set)")
 	nodeAddr := flag.String("node", "", "explicit Blocknet service-node P2P address (host:port); empty enables network discovery")
 	addNode := flag.String("addnode", "", "comma-separated explicit peer addresses (host:port) to add to discovered peers")
-	keyHex := flag.String("key", "", "hex-encoded 32-byte secp256k1 private key (enables dxMakeOrder/dxTakeOrder/dxCancelOrder)")
 	confPath := flag.String("conf", defaultConfPath(), "path to xbridge.conf (read-only; never created)")
 	magicHex := flag.String("magic", "", "network magic (hex, 4 bytes); derived from -network if empty")
 	walletVersion := flag.Int("walletversion", 4040100, "Blocknet CLIENT_VERSION advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	walletVersionStr := flag.String("walletversionstr", "/blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
+	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -74,15 +90,6 @@ func main() {
 		default:
 			magic = p2p.MainnetMagic
 		}
-	}
-
-	var priv []byte
-	if *keyHex != "" {
-		k, err := hex.DecodeString(*keyHex)
-		if err != nil || len(k) != 32 {
-			fatalf("invalid -key (must be 32 hex bytes): %v", err)
-		}
-		priv = k
 	}
 
 	// Read coin connectors from xbridge.conf (never creates it).
@@ -126,13 +133,13 @@ func main() {
 		Network:          *network,
 		AddNodes:         addNodes,
 		Magic:            magic,
-		PrivKey:          priv,
 		Confs:            conf.Coins,
 		Connectors:       connectors,
 		ExchangeWallets:  conf.Main.ExchangeWallets,
 		NetworkTokens:    networkTokens,
 		WalletVersion:    *walletVersion,
 		WalletVersionStr: *walletVersionStr,
+		DataDir:          resolveDataDir(*datadir),
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {
@@ -150,10 +157,10 @@ func main() {
 
 	if *nodeAddr != "" {
 		xlog.Info("xbridged listening", "addr", *rpcAddr, "mode", "explicit",
-			"node", *nodeAddr, "network", *network, "key", priv != nil, "conf", *confPath, "coins", len(conf.Coins))
+			"node", *nodeAddr, "network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	} else {
 		xlog.Info("xbridged listening", "addr", *rpcAddr, "mode", "discovery",
-			"network", *network, "key", priv != nil, "conf", *confPath, "coins", len(conf.Coins))
+			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
 	if err := http.ListenAndServe(*rpcAddr, srv); err != nil {
 		fatalf("http server: %v", err)

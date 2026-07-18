@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"xbridge-go/crypto"
 	"xbridge-go/proto"
 )
 
@@ -15,9 +16,13 @@ import (
 // SendRawTransaction call panicked, killing the feed goroutine (and process).
 func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
 	node := newWalletTestCtx().Node
-	// A valid-length scalar so redeemCounterparty can sign the payTx and reach
-	// the connector lookup.
-	node.cfg.PrivKey = bytes.Repeat([]byte{0x01}, 32)
+	// A valid per-trade M keypair so redeemCounterparty can sign the payTx and
+	// reach the connector lookup.
+	mPriv := bytes.Repeat([]byte{0x01}, 32)
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Simulate a missing connector for the destination currency.
 	delete(node.cfg.Connectors, "BTC")
 
@@ -29,6 +34,8 @@ func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
 		dstCur:           "BTC",
 		srcAmt:           100000000,
 		dstAmt:           100000000,
+		privKey:          arr32(mPriv),
+		pubKey:           mPub,
 		ourSourceAddr:    btcAddr,
 		ourDestAddr:      btcAddr,
 		theirPub:         [33]byte{0x02},
