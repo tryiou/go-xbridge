@@ -320,13 +320,13 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if err != nil {
 		return 0, nil, fmt.Errorf("api: getrawtransaction %s: %w", b.APayTxID, err)
 	}
-	secret, ok := secretFromPayTx(payHex)
+	secret, ok := secretFromPayTx(payHex, s.theirSecretHash)
 	if !ok {
 		return 0, nil, fmt.Errorf("api: could not recover secret from payTx %s", b.APayTxID)
 	}
 	s.secret = secret
 	xlog.Info("ConfirmB: secret recovered from maker payTx", "order", hexEncode(s.id[:]),
-		"makerPayTx", b.APayTxID, "secretHash", hexEncode(s.secretHash[:]))
+		"makerPayTx", b.APayTxID, "secretHash", hexEncode(s.theirSecretHash[:]))
 
 	payHex2, cur, err := s.redeemCounterparty(false)
 	if err != nil {
@@ -710,10 +710,11 @@ func (s *SwapSession) minConf(cc *config.CoinConf) int {
 	return cc.Confirmations
 }
 
-// secretFromPayTx extracts the 33-byte HTLC secret preimage (the first data push
-// of the payment scriptSig) from a serialized payTx. C++ does the same in
-// getSecretFromPaymentTransaction by reading the reveal script.
-func secretFromPayTx(payHex string) ([33]byte, bool) {
+// secretFromPayTx extracts the 33-byte HTLC secret preimage from a serialized
+// payTx, verifying it against the expected secretHash hx (the deposit's
+// HashedSecret). C++ does the same in getSecretFromPaymentTransaction, which only
+// adopts a push whose getKeyId(push) equals hx.
+func secretFromPayTx(payHex string, hx [20]byte) ([33]byte, bool) {
 	raw, err := hex.DecodeString(payHex)
 	if err != nil {
 		xlog.Debug("secretFromPayTx: bad hex", "err", err)
@@ -724,14 +725,19 @@ func secretFromPayTx(payHex string) ([33]byte, bool) {
 		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
 		return [33]byte{}, false
 	}
-	secret, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig)
+	secret, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig, hx)
 	xlog.Debug("secretFromPayTx", "ok", ok)
 	return secret, ok
 }
 
 // secretFromScriptSig parses a payment scriptSig (<secret 33> <sig> <myPubKey>
-// OP_0 <inner>) and returns the first 33-byte push as the secret preimage.
-func secretFromScriptSig(script []byte) ([33]byte, bool) {
+// OP_0 <inner>) and returns the 33-byte push whose HASH160 (coins.KeyID) equals
+// the expected secretHash hx. This mirrors C++ getSecretFromPaymentTransaction,
+// which only adopts a push when getKeyId(chk) == hx — verifying the preimage
+// actually unlocks the deposit rather than blindly taking the first 33-byte
+// element. A malleated/non-conforming scriptSig (e.g. myPubKey pushed ahead of
+// the real secret) yields ok == false instead of the wrong element.
+func secretFromScriptSig(script []byte, hx [20]byte) ([33]byte, bool) {
 	i := 0
 	var secret [33]byte
 	for i < len(script) {
@@ -759,8 +765,9 @@ func secretFromScriptSig(script []byte) ([33]byte, bool) {
 		if i+n > len(script) {
 			return secret, false
 		}
-		if n == 33 {
-			copy(secret[:], script[i:i+33])
+		push := script[i : i+n]
+		if n == 33 && coins.KeyID(push) == hx {
+			copy(secret[:], push)
 			return secret, true
 		}
 		i += n

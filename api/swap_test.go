@@ -351,7 +351,7 @@ func TestSwapHandshake(t *testing.T) {
 		t.Fatal("empty maker payTx id")
 	}
 	// The maker's payTx must spend taker's deposit and reveal the secret.
-	assertRevealsSecret(t, ltcConn, makerPayTxID, takerDepositTxID, makerSecret)
+	assertRevealsSecret(t, ltcConn, makerPayTxID, takerDepositTxID, makerSecret, makerSecretHash(t, makerSecret))
 
 	// 6) ConfirmB (hub→taker's dest): taker recovers the secret from the maker's
 	// payTx, then redeems maker's deposit A.
@@ -368,7 +368,7 @@ func TestSwapHandshake(t *testing.T) {
 		t.Error("taker did not recover the maker's secret from the payTx")
 	}
 	// The taker's payTx must spend maker's deposit and reveal the (same) secret.
-	assertRevealsSecret(t, btcConn, takerPayTxID, makerDepositTxID, makerSecret)
+	assertRevealsSecret(t, btcConn, takerPayTxID, makerDepositTxID, makerSecret, makerSecretHash(t, makerSecret))
 
 	// 7) Finished (hub→both).
 	if _, _, err := makerSession.OnFinished(&proto.FinishedBody{ID: orderID}); err != nil {
@@ -419,8 +419,10 @@ func assertDepositHTLC(t *testing.T, conn *fakeConnector, depositTxID string, de
 }
 
 // assertRevealsSecret decodes payTxID from conn and checks it spends the given
-// deposit and that its scriptSig's first push is the 33-byte secret.
-func assertRevealsSecret(t *testing.T, conn *fakeConnector, payTxID, depositTxID string, wantSecret [33]byte) {
+// deposit and that its scriptSig reveals the expected secret — i.e. the 33-byte
+// push whose HASH160 equals wantHash. This mirrors the C++ getKeyId(push)==hx
+// guard, so a malleated scriptSig (wrong 33-byte push) is rejected.
+func assertRevealsSecret(t *testing.T, conn *fakeConnector, payTxID, depositTxID string, wantSecret [33]byte, wantHash [20]byte) {
 	t.Helper()
 	raw, ok := conn.rawTx[payTxID]
 	if !ok {
@@ -440,12 +442,61 @@ func assertRevealsSecret(t *testing.T, conn *fakeConnector, payTxID, depositTxID
 	if tx.Inputs[0].PrevOut.Hash != depHash {
 		t.Errorf("%s payTx does not spend the expected deposit", conn.ticker)
 	}
-	got, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig)
+	got, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig, wantHash)
 	if !ok {
-		t.Fatalf("%s payTx scriptSig yields no 33-byte secret", conn.ticker)
+		t.Fatalf("%s payTx scriptSig yields no 33-byte secret matching the deposit hash", conn.ticker)
 	}
 	if got != wantSecret {
 		t.Errorf("%s payTx revealed secret mismatch", conn.ticker)
+	}
+}
+
+// TestSecretFromScriptSig locks in the C++ getKeyId(push)==hx safeguard: the
+// recovered secret must be the 33-byte push whose HASH160 equals the expected
+// secretHash, not merely the first 33-byte element. This guards against a
+// malleated/non-conforming scriptSig that pushes a decoy 33-byte element (e.g.
+// myPubKey) ahead of the real secret.
+func TestSecretFromScriptSig(t *testing.T) {
+	// real secret and a decoy 33-byte element (myPubKey) with a different hash.
+	realSecret := make([]byte, 33)
+	for i := range realSecret {
+		realSecret[i] = byte(i + 1)
+	}
+	myPubKey := make([]byte, 33)
+	for i := range myPubKey {
+		myPubKey[i] = byte(200 - i)
+	}
+	sig := make([]byte, 71)
+	inner := []byte{0x51, 0x20} // arbitrary inner redeem-script fragment
+
+	realHash := coins.KeyID(realSecret)
+	// An unrelated hash that matches neither push in any scriptSig below.
+	wrongHash := coins.KeyID([]byte("unrelated-preimage-material-that-matches-nothing"))
+
+	// Well-formed: <realSecret> <sig> <myPubKey> OP_0 <inner>.
+	good := coins.BuildPaymentScriptSig(realSecret, sig, myPubKey, inner)
+	got, ok := secretFromScriptSig(good, realHash)
+	if !ok || got != to33(realSecret) {
+		t.Fatalf("well-formed: ok=%v got=%x want=%x", ok, got, realSecret)
+	}
+	// A wrong expected hash must be rejected even on a well-formed scriptSig.
+	if _, ok := secretFromScriptSig(good, wrongHash); ok {
+		t.Error("well-formed scriptSig with wrong hash should be rejected")
+	}
+
+	// Malleated: <myPubKey> <sig> <realSecret> OP_0 <inner> — a decoy 33-byte
+	// element appears first. The old code would adopt it; the fixed code must
+	// skip it and return the matching real secret.
+	malleated := coins.BuildPaymentScriptSig(myPubKey, sig, realSecret, inner)
+	got2, ok2 := secretFromScriptSig(malleated, realHash)
+	if !ok2 || got2 != to33(realSecret) {
+		t.Fatalf("malleated: ok=%v got=%x want real secret %x", ok2, got2, realSecret)
+	}
+
+	// Decoy-only: no push matches realHash → rejected outright.
+	decoy := coins.BuildPaymentScriptSig(myPubKey, sig, myPubKey, inner)
+	if _, ok := secretFromScriptSig(decoy, realHash); ok {
+		t.Error("decoy-only scriptSig (no matching secret) should be rejected")
 	}
 }
 
