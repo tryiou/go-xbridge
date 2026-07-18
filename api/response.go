@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"xbridge-go/coins"
+	"xbridge-go/swap"
 )
 
 // ---------------------------------------------------------------------------
@@ -460,44 +461,11 @@ func statusString(s string) string {
 
 // stateOrdinal maps a status string to its xbridge::TransactionDescr::State
 // integer, mirroring the C++ enum order. Used by guards such as dxCancelOrder's
-// "cannot cancel once state >= trCreated".
+// "cannot cancel once state >= trCreated". The ordinal values are delegated to
+// swap.DescrStateOrdinal so the descriptor enum (swap/state.go) is the single
+// source of truth and cannot drift from this layer.
 func stateOrdinal(s string) int {
-	switch statusString(s) {
-	case "expired":
-		return -1
-	case "new":
-		return 0
-	case "offline":
-		return 1
-	case "open":
-		return 2
-	case "accepting":
-		return 3
-	case "hold":
-		return 4
-	case "initialized":
-		return 5
-	case "created":
-		return 6
-	case "signed":
-		return 7
-	case "commited":
-		return 8
-	case "finished":
-		return 9
-	case "rolled back":
-		return 10
-	case "rollback failed":
-		return 11
-	case "dropped":
-		return 12
-	case "canceled":
-		return 13
-	case "invalid":
-		return 14
-	default:
-		return 0
-	}
+	return swap.DescrStateOrdinal(statusString(s))
 }
 
 // ---------------------------------------------------------------------------
