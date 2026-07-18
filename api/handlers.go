@@ -993,11 +993,11 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 				if !keys[k] {
 					continue
 				}
-				amt := u.Amount
+				amtStr := formatXAmount(u.Amount)
 				if cok {
-					amt = toXBridgeAmt(c, u.Amount)
+					amtStr = coins.FormatAmount(c, u.Amount)
 				}
-				all = append(all, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+formatXAmount(amt)+":"+u.Address)
+				all = append(all, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+amtStr+":"+u.Address)
 			}
 		}
 		return map[string]interface{}{"all_locked_utxo": all}, nil
@@ -1018,11 +1018,11 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 				if byOrder[k] != id {
 					continue
 				}
-				amt := u.Amount
+				amtStr := formatXAmount(u.Amount)
 				if cok {
-					amt = toXBridgeAmt(c, u.Amount)
+					amtStr = coins.FormatAmount(c, u.Amount)
 				}
-				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+formatXAmount(amt)+":"+u.Address)
+				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+amtStr+":"+u.Address)
 			}
 		}
 	}

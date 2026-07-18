@@ -180,6 +180,35 @@ func TestDxLockedUtxoExclusion(t *testing.T) {
 	}
 }
 
+// TestDxLockedUtxoNativeAmount verifies dxGetLockedUtxos renders the UTXO amount
+// in NATIVE coin units (matching C++ UtxoEntry::toString(), which streams the
+// whole-coin double — e.g. "1" for 1 BTC), not the XBridge 1e6 scale that the
+// previous port emitted ("1.000000"). This is C2. T2.1.
+func TestDxLockedUtxoNativeAmount(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx)
+	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order so it is
+	// reported as locked. The stub utxo carries Amount 100000000 (= 1 BTC).
+	o.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
+	res, err := ctx.dxGetLockedUtxos(nil)
+	if err != nil {
+		t.Fatalf("dxGetLockedUtxos: %v", err)
+	}
+	m := res.(map[string]interface{})
+	all, ok := m["all_locked_utxo"].([]string)
+	if !ok || len(all) != 1 {
+		t.Fatalf("all_locked_utxo = %v, want exactly 1 locked utxo", m["all_locked_utxo"])
+	}
+	// Native rendering of 1 BTC must be the trimmed "1", never "1.000000"
+	// (XBridge 1e6 scale) nor a raw satoshi integer.
+	if !strings.Contains(all[0], ":1:") {
+		t.Fatalf("locked utxo amount not rendered natively: %q (want ...:1:...)", all[0])
+	}
+	if strings.Contains(all[0], "1.000000") {
+		t.Fatalf("locked utxo amount rendered in XBridge 1e6 scale: %q", all[0])
+	}
+}
+
 // TestFlushCancelledUnderflow verifies a huge ageMillis does not underflow uint64
 // (it prunes everything) and age 0 prunes all remaining entries. T1.4.
 func TestFlushCancelledUnderflow(t *testing.T) {
