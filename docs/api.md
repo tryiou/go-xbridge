@@ -69,7 +69,10 @@ silently divergent**.
     rather than only from this session's memory.
 - **`dxGetNetworkTokens`** — completeness is bounded by the P2P servicenode-ping
   coverage the client currently sees; it cannot enumerate every token C++
-  learns from the full servicenode network.
+  learns from the full servicenode network. The token set is now learned from
+  real `SNREGISTER`/`SNPING`/`SNLISTPING` messages via `p2p/servicenode.Registry`
+  (wallet-token regex, `xr`/`xrs` exclusion, 5-minute running window), but
+  remains P2P-bounded.
   - *Why:* P2P discovery is incremental and depends on which servicenodes the
     client has connected to.
   - *What parity would require:* a fuller servicenode handshake / network-state
@@ -112,7 +115,13 @@ divergence register.
    handshake **is now wired** — `dxMakeOrder`/`dxTakeOrder` spawn sessions
    (`newMakerSession`/`newTakerSession`) and `Node.feed` dispatches the
    hub-originated handshake packets (Hold/Init/CreateA/CreateB/ConfirmA/ConfirmB/
-   Finished) to the session handlers in `api/swap.go`, which build/broadcast the
-   HTLC deposits and claim/refund spends. Covered by `TestSwapHandshake` with
-   in-memory connectors; the remaining gap is verification against a **live**
-   Blocknet hub over `p2p`.
+    Finished) to the session handlers in `api/swap.go`, which build/broadcast the
+    HTLC deposits and claim/refund spends. Covered by `TestSwapHandshake` with
+    in-memory connectors; the remaining gap is verification against a **live**
+    Blocknet hub over `p2p`.
+ 6. **Remote cancel/reject, packet-signature, lockTime drift (now wired).** Inbound
+    XBridge packets are signature-verified against `pkt.Pubkey` (`Node.feed`);
+    remote `xbcTransactionCancel`/`xbcTransactionReject` are handled by
+    `onRemoteCancel`/`onRemoteReject` (ports of `xbridgesession.cpp:3288-3485`);
+    the counterparty deposit lockTime is validated via `acceptableLockTimeDrift`
+    before our own deposit and before redeem. See audit register C6–C8.
