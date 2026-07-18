@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,6 +24,11 @@ var mockMsgSigB64 = func() string {
 
 // mockRPC returns a test server that answers the RPC methods the connector
 // calls with canned responses, checking basic auth.
+// lastReq captures the most recent JSON-RPC request the mock received, so tests
+// can assert on the method and params shape (e.g. getnewaddress must be sent
+// with an empty params array, matching C++ rpc::getNewAddress).
+var lastReq rpcRequest
+
 func mockRPC(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -36,6 +42,7 @@ func mockRPC(t *testing.T) *httptest.Server {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
+		lastReq = req
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		res := func(raw string) { enc.Encode(rpcResponse{Result: json.RawMessage(raw), ID: req.ID}) }
@@ -81,6 +88,16 @@ func TestRPCConnector(t *testing.T) {
 		}
 		if addr != "bc1qw508d6qezfhxq0t9wy3j9tg9z4r0r8e0j0q0w" {
 			t.Fatalf("addr = %q", addr)
+		}
+		// Loyalty check: C++ rpc::getNewAddress calls "getnewaddress" with an
+		// EMPTY params array (no label / no address-type). The Go port must not
+		// force positional args (e.g. ["", "bech32"]), which strict wallets such
+		// as DASH reject with code=-1 "Usage: getnewaddress".
+		if lastReq.Method != "getnewaddress" {
+			t.Fatalf("method = %q, want getnewaddress", lastReq.Method)
+		}
+		if len(lastReq.Params) != 0 {
+			t.Fatalf("getnewaddress params = %v, want empty (C++ sends no params)", lastReq.Params)
 		}
 	})
 
@@ -187,7 +204,7 @@ func slowRPC(delay time.Duration) *httptest.Server {
 func TestRPCClientTimeout(t *testing.T) {
 	srv := slowRPC(300 * time.Millisecond)
 	defer srv.Close()
-	c := NewRPCClient(srv.URL, "u", "p", "", "", 50*time.Millisecond)
+	c := NewRPCClient(srv.URL, "u", "p", "", "", false, 50*time.Millisecond, "BTC")
 	var out string
 	err := c.Call("getblockcount", nil, &out)
 	if err == nil {
@@ -202,9 +219,77 @@ func TestRPCClientTimeout(t *testing.T) {
 // when no explicit timeout is given (zero value), so callers relying on the
 // constructor always get a bounded client.
 func TestRPCClientDefaultTimeout(t *testing.T) {
-	c := NewRPCClient("http://example.invalid", "u", "p", "", "", 0)
+	c := NewRPCClient("http://example.invalid", "u", "p", "", "", false, 0, "BTC")
 	if c.http.Timeout != defaultRPCTimeout {
 		t.Fatalf("expected default timeout %v, got %v", defaultRPCTimeout, c.http.Timeout)
+	}
+}
+
+// captureServer echoes the request body it received so tests can assert on the
+// exact JSON the client sends (including the jsonrpc field and params shape).
+func captureServer(t *testing.T) (*httptest.Server, *[]byte) {
+	t.Helper()
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = b
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
+	}))
+	return srv, &got
+}
+
+// TestRPCClientJSONRPCField asserts the "jsonrpc" field is present by default
+// (Bitcoin Core / blocknetd expect {"jsonrpc":"1.0",...}) and omitted only when
+// omitJSONVersion is set (XLite-style wallets reject the field).
+func TestRPCClientJSONRPCField(t *testing.T) {
+	cases := []struct {
+		name      string
+		version   string
+		omit      bool
+		wantField bool
+	}{
+		{"default keeps 1.0", "", false, true},
+		{"explicit 1.0 keeps field", "1.0", false, true},
+		{"omit drops field", "1.0", true, false},
+		{"omit drops field even when empty version", "", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := captureServer(t)
+			defer srv.Close()
+			c := NewRPCClient(srv.URL, "u", "p", tc.version, "", tc.omit, 0, "BTC")
+			var out int
+			if err := c.Call("getblockcount", nil, &out); err != nil {
+				t.Fatal(err)
+			}
+			has := bytes.Contains(*got, []byte(`"jsonrpc"`))
+			if has != tc.wantField {
+				t.Fatalf("jsonrpc field present=%v, want %v (body %s)", has, tc.wantField, *got)
+			}
+			if tc.wantField && !bytes.Contains(*got, []byte(`"jsonrpc":"1.0"`)) {
+				t.Fatalf("expected jsonrpc:\"1.0\", got %s", *got)
+			}
+		})
+	}
+}
+
+// TestRPCClientParamsDefault asserts a nil params argument is sent as an empty
+// array "params":[], never as "params":null — XLite rejects null params with an
+// empty body (HTTP 400), surfacing as a decode error.
+func TestRPCClientParamsDefault(t *testing.T) {
+	srv, got := captureServer(t)
+	defer srv.Close()
+	c := NewRPCClient(srv.URL, "u", "p", "1.0", "", false, 0, "BTC")
+	var out int
+	if err := c.Call("getblockcount", nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(*got, []byte(`"params":null`)) {
+		t.Fatalf("params must not be null, got %s", *got)
+	}
+	if !bytes.Contains(*got, []byte(`"params":[]`)) {
+		t.Fatalf("expected params:[], got %s", *got)
 	}
 }
 

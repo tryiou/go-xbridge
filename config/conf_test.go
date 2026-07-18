@@ -48,6 +48,7 @@ DustAmount=1000
 BlockTime=60
 FeePerByte=20
 Confirmations=10
+OmitJSONVersion=1
 `
 
 func writeConf(t *testing.T, body string) string {
@@ -91,6 +92,14 @@ func TestLoadSample(t *testing.T) {
 	}
 	if block.Port != 41414 || block.CreateTxMethod != "BLOCK" || block.Ip != "127.0.0.1" {
 		t.Errorf("BLOCK conf wrong: %+v", block)
+	}
+	if !block.OmitJSONVersion {
+		t.Error("BLOCK OmitJSONVersion should be true")
+	}
+
+	// BTC sets JSONVersion=1.0 explicitly; OmitJSONVersion defaults to false.
+	if btc.JSONVersion != "1.0" || btc.OmitJSONVersion {
+		t.Errorf("BTC jsonrpc conf wrong: version=%q omit=%v", btc.JSONVersion, btc.OmitJSONVersion)
 	}
 }
 

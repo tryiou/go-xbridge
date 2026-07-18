@@ -36,6 +36,10 @@ type Chain struct {
 	// wallet expects (from conf; defaults applied by the builder).
 	JSONVersion string
 	ContentType string
+	// OmitJSONVersion, when true, drops the "jsonrpc" field from RPC requests.
+	// XLite-style wallets reject requests that carry it; Bitcoin Core and
+	// blocknetd expect {"jsonrpc":"1.0",...}. Off by default.
+	OmitJSONVersion bool
 	// Confirmations is the min confirmations for spendable UTXOs (from conf).
 	Confirmations int
 	// Timeout bounds each JSON-RPC call to the wallet/node. A hung wallet must

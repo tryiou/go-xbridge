@@ -66,6 +66,10 @@ type CoinConf struct {
 	// connected wallet expects (some wallets require a specific value).
 	JSONVersion string
 	ContentType string
+	// OmitJSONVersion, when true, drops the "jsonrpc" field from RPC requests
+	// entirely. XLite-style wallets reject requests that carry it; Bitcoin Core
+	// and blocknetd expect {"jsonrpc":"1.0",...}. Off by default.
+	OmitJSONVersion bool
 }
 
 // Conf is the parsed xbridge.conf.
@@ -244,5 +248,6 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		ImportWithNoScanSupported: s.boolp("ImportWithNoScanSupported"),
 		JSONVersion:               s.str("JSONVersion", "1.0"),
 		ContentType:               s.str("ContentType", "application/json"),
+		OmitJSONVersion:           s.boolp("OmitJSONVersion"),
 	}
 }
