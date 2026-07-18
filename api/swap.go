@@ -221,6 +221,10 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	}
 	s.theirPub = b.BPubKey
 	xlog.Info("CreateA: building deposit A", "order", hexEncode(s.id[:]), "counterparty", hexEncode(b.BPubKey[:]))
+	// Record the counterparty (taker) M pubkey on the order (C++ oPubKey).
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.OtherPubkey = hexEncode(b.BPubKey[:])
+	}
 	txid, refundHex, err := s.buildDeposit(true)
 	if err != nil {
 		return 0, nil, err
@@ -250,9 +254,20 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
 	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
 		o.OBinTxId = b.ADepositTxID
+		// Record the counterparty (maker) M pubkey on the order (C++ oPubKey).
+		o.OtherPubkey = hexEncode(b.APubKey[:])
 	}
 	s.theirSecretHash = b.HashedSecret
 	s.theirLockTime = b.ALockTime
+	// Validate the counterparty (maker) A-deposit lockTime BEFORE we broadcast
+	// our own deposit (mirrors C++ xbridgesession.cpp:2464 bad-locktime cancel).
+	// Compare the received value against our own expectation for that same
+	// deposit role on the maker's coin (dstCur) — NOT against our B lockTime,
+	// which legitimately differs by ~90 blocks.
+	expLT := s.computeLockTimeFor(s.dstCur, true)
+	if !acceptableLockTimeDrift(expLT, b.ALockTime, s.blockTimeFor(s.dstCur)) {
+		return 0, nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", hexEncode(s.id[:]), b.ALockTime, expLT)
+	}
 	xlog.Info("CreateB: learned maker deposit", "order", hexEncode(s.id[:]),
 		"makerDeposit", b.ADepositTxID, "makerLockTime", b.ALockTime, "secretHash", hexEncode(b.HashedSecret[:]))
 	txid, refundHex, err := s.buildDeposit(false)
@@ -277,12 +292,21 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", hexEncode(s.id[:]))
 	}
 	s.theirDepositTxID = b.BDepositTxID
+	// Validate the counterparty (taker) B-deposit lockTime (C++ acceptableLockTimeDrift).
+	// Compare against our own expectation for that same deposit role on the taker's
+	// coin (dstCur). In Go's hub-driven flow this is the earliest the maker learns
+	// it (after our own deposit is already broadcast); if it fails we must not
+	// proceed to redeem.
+	s.theirLockTime = b.BLockTime
+	expLT := s.computeLockTimeFor(s.dstCur, false)
+	if !acceptableLockTimeDrift(expLT, b.BLockTime, s.blockTimeFor(s.dstCur)) {
+		return 0, nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", hexEncode(s.id[:]), b.BLockTime, expLT)
+	}
 	// Record the counterparty (taker) deposit txid on the order so
 	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
 	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
 		o.OBinTxId = b.BDepositTxID
 	}
-	s.theirLockTime = b.BLockTime
 
 	xlog.Info("ConfirmA: redeeming taker deposit", "order", hexEncode(s.id[:]), "takerDeposit", b.BDepositTxID)
 	payHex, cur, err := s.redeemCounterparty(true)
@@ -300,6 +324,10 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	}
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
+	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.CounterpartyRedeemed = true
+	}
 	s.n.persist()
 	return proto.XbcTransactionConfirmedA, &proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
@@ -350,6 +378,10 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	}
 	s.state = csConfirmedB
 	xlog.Info("ConfirmB: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
+	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
+	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+		o.CounterpartyRedeemed = true
+	}
 	s.n.persist()
 	return proto.XbcTransactionConfirmedB, &proto.ConfirmedBBody{
 		HubAddress: s.hub, ID: s.id, BPayTxID: payTxID,
@@ -463,10 +495,18 @@ func (n *Node) checkRefunds() {
 // Deposit / claim / refund construction
 // ---------------------------------------------------------------------------
 
-// computeLockTime returns the absolute block height to embed in the deposit's
-// HTLC (mirrors C++: currentBlock + target/blockTime).
+// computeLockTime returns the absolute block height for OUR deposit on srcCur
+// (mirrors C++: currentBlock + target/blockTime). See computeLockTimeFor for the
+// general form used to validate a counterparty's lockTime on THEIR coin.
 func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
-	cur := s.srcCur
+	return s.computeLockTimeFor(s.srcCur, isMaker)
+}
+
+// computeLockTimeFor returns the absolute block height to embed in the deposit
+// HTLC for a given coin (mirrors C++ lockTime(): currentBlock + target/blockTime).
+// It is also used to compute our expectation of the counterparty's lockTime so we
+// can validate it via acceptableLockTimeDrift.
+func (s *SwapSession) computeLockTimeFor(cur string, isMaker bool) uint32 {
 	conn := s.n.cfg.Connectors[cur]
 	cc := s.conf(cur)
 	if conn == nil {
@@ -572,9 +612,10 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	s.ourDepositTxID = txid
 	s.ourLockTime = lockTime
 	// Record our own deposit txid on the order so dxPartialOrderChainDetails can
-	// emit p2sh_deposits.
+	// emit p2sh_deposits. DepositSent proxies C++ didSendDeposit().
 	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
 		o.BinTxId = txid
+		o.DepositSent = true
 	}
 
 	refundHex, err = s.buildRefundTx(spec, cur)
