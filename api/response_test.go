@@ -45,8 +45,8 @@ func TestFormatBalanceNative(t *testing.T) {
 		{btc8, 1476550, "0.014766"},    // DOGE-style
 		{pivx6, 14013258, "14.013258"}, // PIVX CORE value (sub-sat kept)
 		{pivx6, 492755, "0.492755"},    // UNO CORE value
-		{btc8, 0, "0.000000"},                         // zero
-		{btc8, 1, "0.000000"},                         // 1 sat < 6dp rounds to 0 (%.6f)
+		{btc8, 0, "0.000000"},          // zero
+		{btc8, 1, "0.000000"},          // 1 sat < 6dp rounds to 0 (%.6f)
 	}
 	for _, c := range cases {
 		if got := formatBalanceNative(c.c, c.nat); got != c.want {

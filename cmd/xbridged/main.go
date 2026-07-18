@@ -10,7 +10,6 @@ package main
 import (
 	"encoding/hex"
 	"flag"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,9 +24,11 @@ import (
 	"xbridge-go/wallet"
 )
 
-// fatalf logs an error at ERROR level and exits non-zero (slog has no Fatal).
-func fatalf(format string, args ...any) {
-	xlog.Error(fmt.Sprintf(format, args...))
+// fatalf logs an error at ERROR level with the given structured fields and
+// exits non-zero (slog has no Fatal). It mirrors the xlog.Error(msg, key,
+// value, ...) convention used across the daemon.
+func fatalf(msg string, args ...any) {
+	xlog.Error(msg, args...)
 	os.Exit(1)
 }
 
@@ -66,6 +67,7 @@ func main() {
 	walletVersionStr := flag.String("walletversionstr", "/blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
+	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -74,10 +76,34 @@ func main() {
 		xlog.SetLevel(lvl)
 	}
 
+	// Ensure the data directory exists before logging to it (it is otherwise
+	// only created lazily on the first swap-state save).
+	dataDir := resolveDataDir(*datadir)
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		fatalf("cannot create datadir %q: %v", dataDir, err)
+	}
+
+	// Set up file logging (stderr remains active). Default to
+	// <datadir>/xbridged.log unless -logfile overrides. An empty -logfile
+	// disables the file entirely.
+	if *logFile != "" {
+		rw, err := xlog.SetFileLogger(*logFile, 10<<20, 2)
+		if err != nil {
+			fatalf("log file: %v", err)
+		}
+		defer rw.Close()
+	} else {
+		rw, err := xlog.SetFileLogger(filepath.Join(dataDir, "xbridged.log"), 10<<20, 2)
+		if err != nil {
+			fatalf("log file: %v", err)
+		}
+		defer rw.Close()
+	}
+
 	var magic [4]byte
 	if *magicHex != "" {
 		if b, err := hex.DecodeString(*magicHex); err != nil || len(b) != 4 {
-			fatalf("invalid -magic %q (must be 4 hex bytes)", *magicHex)
+			fatalf("invalid -magic", "value", *magicHex, "want", "4 hex bytes")
 		} else {
 			copy(magic[:], b)
 		}
@@ -95,10 +121,10 @@ func main() {
 	// Read coin connectors from xbridge.conf (never creates it).
 	conf, err := config.Load(*confPath)
 	if err != nil {
-		fatalf("xbridge.conf: %v", err)
+		fatalf("xbridge.conf", "err", err)
 	}
 	if err := coins.InitFromConf(conf.Coins); err != nil {
-		fatalf("coin config: %v", err)
+		fatalf("coin config", "err", err)
 	}
 
 	connectors := map[string]wallet.Connector{}
@@ -139,7 +165,7 @@ func main() {
 		NetworkTokens:    networkTokens,
 		WalletVersion:    *walletVersion,
 		WalletVersionStr: *walletVersionStr,
-		DataDir:          resolveDataDir(*datadir),
+		DataDir:          dataDir,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {
@@ -163,6 +189,6 @@ func main() {
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
 	if err := http.ListenAndServe(*rpcAddr, srv); err != nil {
-		fatalf("http server: %v", err)
+		fatalf("http server", "err", err)
 	}
 }

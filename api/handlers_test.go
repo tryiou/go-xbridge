@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -89,6 +90,36 @@ func TestDxGetMyOrdersRead(t *testing.T) {
 	}
 	if arr, ok := res.([]orderDetailResult); !ok || len(arr) != 1 {
 		t.Fatalf("dxGetMyOrders = %v (%T)", res, res)
+	}
+}
+
+func TestDxGetOrderBookEmptyPairEmitsArrays(t *testing.T) {
+	// An empty trading pair must serialize asks/bids as "[]" (not "null"),
+	// matching C++ dxGetOrderBook which emits default-constructed Array
+	// objects for an empty book (rpcxbridge.cpp:1568-1576).
+	ctx := newWalletTestCtx()
+	res, err := ctx.dxGetOrderBook([]json.RawMessage{
+		jstr("1"), jstr("BTC"), jstr("LTC"),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderBook: %v", err)
+	}
+	ob, ok := res.(orderBookResult)
+	if !ok {
+		t.Fatalf("dxGetOrderBook = %v (%T)", res, res)
+	}
+	if ob.Asks == nil {
+		t.Fatal("asks must be non-nil (serialize as [])")
+	}
+	if ob.Bids == nil {
+		t.Fatal("bids must be non-nil (serialize as [])")
+	}
+	b, merr := json.Marshal(ob)
+	if merr != nil {
+		t.Fatalf("marshal: %v", merr)
+	}
+	if !strings.Contains(string(b), `"asks":[]`) || !strings.Contains(string(b), `"bids":[]`) {
+		t.Fatalf("empty book JSON = %s, want asks/bids as []", string(b))
 	}
 }
 

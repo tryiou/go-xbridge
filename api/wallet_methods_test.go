@@ -7,6 +7,7 @@ import (
 	"xbridge-go/coins"
 	"xbridge-go/config"
 	"xbridge-go/crypto"
+	"xbridge-go/p2p/servicenode"
 	"xbridge-go/wallet"
 )
 
@@ -96,7 +97,7 @@ func newWalletTestCtx() *HandlerCtx {
 		panic(err)
 	}
 	store := NewStore()
-	node := &Node{cfg: cfg, store: store, signer: crypto.NewBtcSigner(), stop: make(chan struct{})}
+	node := &Node{cfg: cfg, store: store, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
 	return &HandlerCtx{Store: store, Node: node, Config: cfg}
 }
 
@@ -237,14 +238,23 @@ func TestDxTokenListsFromConf(t *testing.T) {
 	}
 }
 
-// TestDxGetNetworkTokensLive verifies the live servicenode union: advertised
-// ServicesPing token lists from connected servicenodes are unioned (plus the
-// config's local tokens).
+// TestDxGetNetworkTokensLive verifies the live servicenode union: tokens
+// learned from SNREGISTER / SNPING messages (the same wire source a core
+// XBridge wallet uses) are unioned with the config's local tokens.
 func TestDxGetNetworkTokensLive(t *testing.T) {
 	ctx := newWalletTestCtx()
-	// Simulate two servicenodes advertising their supported tokens.
-	ctx.Node.recordServices("sn1", []string{"BTC", "LTC", "SYS"})
-	ctx.Node.recordServices("sn2", []string{"LTC", "DOGE"})
+	// Simulate two SPV servicenodes advertising their supported tokens via
+	// the registry (as if parsed from SNREGISTER / SNPING payloads).
+	ctx.Node.snReg.AddPing(servicenode.ServiceNode{
+		PubKey:   [33]byte{0x02},
+		Tier:     servicenode.TierSPV,
+		Services: []string{"BTC", "LTC", "SYS"},
+	})
+	ctx.Node.snReg.AddPing(servicenode.ServiceNode{
+		PubKey:   [33]byte{0x03},
+		Tier:     servicenode.TierSPV,
+		Services: []string{"LTC", "DOGE"},
+	})
 	net, err := ctx.dxGetNetworkTokens(nil)
 	if err != nil {
 		t.Fatalf("dxGetNetworkTokens: %v", err)

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	xlog "xbridge-go/log"
 )
 
 // rpcRequest is the bitcoind-style JSON-RPC 1.0 request envelope used by
@@ -44,6 +46,22 @@ func NewServer(ctx *HandlerCtx) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	// Never return an empty body: a panic in a handler must still produce a
+	// valid JSON-RPC envelope (mirrors blocknetd, which never emits an empty
+	// HTTP response). Without this, a transient handler panic would surface as
+	// an empty body to the caller.
+	var reqID json.RawMessage
+	defer func() {
+		if rec := recover(); rec != nil {
+			xlog.Error("server: recovered panic in handler", "panic", rec)
+			writeJSON(w, rpcResponse{
+				Result: nil,
+				Error:  &envelopeError{Code: -32603, Message: fmt.Sprintf("Internal error: %v", rec)},
+				ID:     reqID,
+			})
+		}
+	}()
+
 	body := rpcRequest{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, rpcResponse{
@@ -53,6 +71,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	reqID = body.ID
 
 	handler := Lookup(body.Method)
 	if handler == nil {

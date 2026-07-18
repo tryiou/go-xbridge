@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"testing"
 
@@ -90,5 +91,30 @@ func TestEnvelopeLengthMismatch(t *testing.T) {
 	bad := append([]byte{0x05}, make([]byte, 3)...) // claims 5 bytes, only 3
 	if _, err := DecodeXBridgePayload(bad); err == nil {
 		t.Fatal("expected length-mismatch error")
+	}
+}
+
+func TestEnvelopeTimestampUnit(t *testing.T) {
+	// The 8-byte transport timestamp MUST be in MICROSECONDS to match C++
+	// (timeToInt = total_microseconds(), xutil.cpp:280) — it is part of the
+	// signed body. Microsecond scale for a 21st-century date is >= 1e15
+	// (2026-ish ≈ 1.7e15); millisecond scale would be ≈ 1.7e12. Asserting the
+	// microsecond scale rules out the prior millisecond regression.
+	pkt := make([]byte, proto.HeaderSize) // any packet body works for this check
+	env := encodeXBridgePayload(pkt)
+
+	n, off, err := readVarInt(env, 0)
+	if err != nil {
+		t.Fatalf("readVarInt: %v", err)
+	}
+	if n < xbridgeEnvelopeSize {
+		t.Fatalf("envelope len = %d, want >= %d", n, xbridgeEnvelopeSize)
+	}
+	// Timestamp immediately follows the 20-byte broadcast dest addr.
+	tsOff := off + xbridgeAddrSize
+	ts := binary.LittleEndian.Uint64(env[tsOff : tsOff+xbridgeTimestampSize])
+
+	if ts < 1e15 {
+		t.Fatalf("timestamp = %d, want microsecond scale (>= 1e15); got millisecond-scale value", ts)
 	}
 }
