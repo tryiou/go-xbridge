@@ -16,6 +16,15 @@ It is the user-facing counterpart to the wire contract in
   `LocalConnector`) for anything that signs or broadcasts — making/taking
   orders, deposits, refunds. Read-only commands (`dxGetOrders`, etc.) need only
   the order book fed over P2P.
+- **Your own coin daemons, running and synced.** `xbridged` does not bundle or
+  sync any chain: for every `[TICKER]` you list in `ExchangeWallets` you must run
+  that coin's own wallet/node (e.g. `bitcoind` for BTC, the Blocknet BLOCK
+  wallet for BLOCK) and have its JSON-RPC reachable at the `Ip`/`Port` in that
+  section. `xbridged` drives those daemons over RPC to sign, broadcast, and
+  (for BLOCK) pay the service-node fee.
+
+Trades incur the Blocknet **service-node fee**, paid by your connected **BLOCK**
+wallet via core RPC — BLOCK is just another coin through the wallet connector.
 
 `xbridged` is a **thin client**: it speaks the XBridge wire protocol to the
 live Blocknet service-node P2P network and never downloads or serves the
@@ -46,7 +55,7 @@ The same INI format the original core wallet reads. Two section kinds:
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `ExchangeWallets` | csv | Tickters that have a local wallet configured (the connectors `xbridged` drives). |
+| `ExchangeWallets` | csv | Tickers that have a local wallet configured (the connectors `xbridged` drives). |
 | `ShowAllOrders` | bool | Show orders for coins without a local wallet. |
 | `FullLog` | bool | Verbose logging. |
 
@@ -88,7 +97,6 @@ ShowAllOrders=true
 
 [BLOCK]
 Title=Blocknet
-Address=
 Ip=127.0.0.1
 Port=41419
 Username=<your-rpc-user>
@@ -112,7 +120,6 @@ LockCoinsSupported=false
 
 [BTC]
 Title=Bitcoin
-Address=
 Ip=127.0.0.1
 Port=8332
 Username=<your-rpc-user>
@@ -155,13 +162,9 @@ LockCoinsSupported=false
 
 Network discovery resolves DNS seeds, connects to healthy peers, and learns
 more via `addr` gossip — like a core wallet. Discovery picks the network magic
-from `-network`; `-magic` overrides it:
-
-| Network | Magic (hex) | Default port |
-|---------|--------------|--------------|
-| mainnet | `a1a0a2a3` | 41412 |
-| testnet | `457665bb` | 41474 |
-| staging | `a1cf7eac` | 41489 |
+and default port from `-network` (`-magic` overrides the magic). The per-network
+magics and default ports are in
+[`docs/protocol.md` §1.1](protocol.md#11-network-magics-srcchainparamscpp).
 
 ### Flag reference
 
@@ -171,39 +174,54 @@ from `-network`; `-magic` overrides it:
 | `-node` | `""` | Explicit service-node P2P address `host:port`; empty enables network discovery. |
 | `-addnode` | `""` | Comma-separated peer addresses added to the discovered set. |
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
-| `-key` | `""` | Hex-encoded 32-byte secp256k1 private key; **enables** `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder`. |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
 | `-rpcaddr` | `:41414` | JSON-RPC listen address for the `dx*` API. |
 | `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
+| `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
 | `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
 
 ## Making a trade (walkthrough)
 
-1. **Start the daemon** with a valid `-conf` and (for trading) a `-key`
-   (the private key signs orders; without it only read commands work).
-2. **Browse** the order book:
-   ```sh
-   dxGetOrders            # all open orders
-   dxGetOrderBook BTC BLOCK   # best bid/ask for a pair
-   ```
-3. **Make an order** (requires `-key`):
-   ```sh
-   dxMakeOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> exact
-   # or a partial order:
-   dxMakePartialOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> 0.001
-   ```
-4. **Take an order** (requires `-key`):
-   ```sh
-   dxTakeOrder <order_id>            # full take
-   dxTakeOrder <order_id> 0.005      # partial take
-   ```
-   The client driver (`api/swap.go`) runs the Maker ⇄ ServiceNode ⇄ Taker
-   handshake: it builds/broadcasts the HTLC deposits and claims/refunds as the
-   hub advances the state.
-5. **Cancel** an open order:
-   ```sh
-   dxCancelOrder <order_id>
-   ```
+The `dx*` names below are **JSON-RPC methods, not shell commands** — you call
+them over HTTP against `xbridged`'s `-rpcaddr` (default `:41414`), exactly like
+bitcoind's RPC. Params are **positional** (a JSON array). For example:
+
+```sh
+curl -s http://127.0.0.1:41414 \
+  -H 'content-type: application/json' \
+  -d '{"method":"dxGetOrderBook","params":[1,"BTC","BLOCK"],"id":1}'
+```
+
+A successful response is JSON-RPC 1.0 (`result`/`error`/`id`, no `jsonrpc`
+field); business errors ride in `result`, not the envelope `error`:
+
+```json
+{"result":{"maker":"BTC","taker":"BLOCK","bids":[],"asks":[]},"error":null,"id":1}
+```
+
+Steps (params shown positionally — wrap them in the `"params"` array as above):
+
+ 1. **Start the daemon** with a valid `-conf`. Trading requires the wallets
+    for both currencies to be reachable via their `[TICKER]` connector sections
+    in `xbridge.conf` (the wallets fund, sign, and broadcast; `xbridged` itself
+    holds no coin keys).
+ 2. **Browse** the order book:
+    - `dxGetOrders` — all open orders.
+    - `dxGetOrderBook 1 BTC BLOCK` — best bid/ask for a pair (detail level 1).
+ 3. **Make an order**:
+    - `dxMakeOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> exact`
+    - partial: `dxMakePartialOrder BTC 0.01 <maker_addr> BLOCK 100 <taker_addr> 0.001`
+ 4. **Take an order**:
+    - `dxTakeOrder <order_id>` — full take (omit amount).
+    - `dxTakeOrder <order_id> 0.005` — partial take.
+
+    Per trade, `xbridged` generates a fresh ephemeral secp256k1 keypair
+    (C++ `mPubKey`/`mPrivKey`) that signs the order/accept packets and becomes
+    the HTLC deposit pubkey. No operator key is configured. The client driver
+    (`api/swap.go`) runs the Maker ⇄ ServiceNode ⇄ Taker handshake: it
+    builds/broadcasts the HTLC deposits and claims/refunds as the hub advances
+    the state.
+ 5. **Cancel** an open order: `dxCancelOrder <order_id>`.
 
 Full field/param contracts for every `dx*` command (positional params, response
 shapes, error codes) are in [`docs/api.md`](api.md). Thin-client limitations
@@ -216,5 +234,23 @@ documented under "Tier 3" there.
 - The conf file is **read-only**; edit it yourself, don't expect regeneration.
 - Discovery needs at least one reachable service node; if all seeds/peers are
   unreachable, use `-node <host:port>` to pin one.
-- `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` are no-ops for signing without
-  `-key`.
+- **Local swap state survives a restart (matches C++ `orders.dat` /
+  `loadOrders()` / `saveOrders()`).** Each trade's order and its per-trade M
+  keypair are persisted to `<datadir>/xbridged-swaps.json` (default OS config
+  dir: `~/.config/xbridged` Linux, `~/Library/Application Support/xbridged`
+  macOS, `%AppData%\xbridged` Windows; override with `-datadir`). Persistence
+  is **on by default** (as C++ always writes `orders.dat`); to point it at a
+  throwaway location, pass `-datadir`. On `xbridged` start the node reloads
+  these swaps *before* it dials, so `dxCancelOrder` and the refund path keep
+  working after a restart using the restored key — `crypto.BtcSigner.Sign`
+  re-derives the packet header pubkey from the restored privkey, so persisting
+  `privKey` alone is enough. Only locally-created orders (`Mine=true`) are
+  persisted (mirroring C++'s `isLocal()` filter). Persistence is best-effort:
+  a corrupt/missing file is logged and the node starts fresh rather than crashing.
+- `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` require the relevant wallets to
+  be connected (they fund/sign/broadcast); without a reachable wallet the call
+  returns a "no session" / "unable to connect to wallet" error.
+- **No operator key is configured.** `xbridged` generates a fresh ephemeral
+  secp256k1 keypair per trade to sign packets and build the HTLC deposit (the
+  trader identity is not a static, operator-supplied key). Coin signing is
+  delegated to your connected wallets.

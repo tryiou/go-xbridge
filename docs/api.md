@@ -9,8 +9,8 @@ dapp's RPC URL at `xbridged` and it reaches the XBridge API unchanged.
 - **Transport:** JSON-RPC 1.0 over HTTP (bitcoind-style). Request
   `{"method":..., "params":[...positional...], "id":...}`.
 - **Params are positional**, not named (C++ uses a `json_spirit` array).
-- **Method names** (24, exact — including the lowercase `gettradingdata`
-  alias): see `dispatch.go`.
+- **Method names** — 23 distinct `dx*` commands plus the lowercase
+  `gettradingdata` alias (24 dispatch entries total), exact: see `dispatch.go`.
 - **Response object field names and JSON value types match C++ exactly:**
   - amounts are **strings** (`"100.000000"`) to preserve precision;
   - dates are **ISO-8601 strings with millisecond precision**
@@ -44,53 +44,13 @@ misleading; the code emits 3 ms digits).
 returns): `open`, `created`, `accepting`, `hold`, `initialized`, `signed`,
 `commited`, `finished`, `canceled`, `expired`, `dropped`, `invalid`, ...
 
-## Implemented vs. shaped
+## Implementation status
 
-**Fully functional (real behavior):**
-- `dxGetOrders`, `dxGetOrder`, `dxGetMyOrders`, `dxGetOrderBook` — read from the
-  live P2P-fed order book (`Store`, populated by `xbcPendingTransaction` /
-  `xbcTransaction` broadcasts).
-- `dxMakeOrder` / `dxMakePartialOrder` — build, sign (secp256k1 compact ECDSA
-  via `crypto.BtcSigner`), and broadcast a real `xbcTransaction` packet; return
-  the exact `makeOrderResult`. `dxMakeOrder` (exact) emits `partial_*` =
-  `"0.000000"` and `status` = `"created"`; `dxMakePartialOrder` emits
-  `order_type` = `"partial"` with the real `partial_minimum` /
-  `partial_orig_*_size` and `partial_repost`, `status` = `"created"`.
-- `dxTakeOrder` — broadcasts an `xbcTransactionAccepting` packet, returns the
-  exact order-list shape.
-- `dxCancelOrder` — broadcasts an `xbcTransactionCancel` packet, returns the
-  exact shape (no `partial_*` fields, per C++).
-
-**Shaped / partial (correct object shape, backing not yet wired):**
-- `dxGetOrderFills`, `dxGetMyPartialOrderChain` — correct shapes from the store
-  (see the Tier 1 + Tier 2 subsection below; `dxGetOrderFills` now emits the
-  full 12-field record).
-
-> **Note:** `dxGetLocalTokens` / `dxGetNetworkTokens`, `dxGetNewTokenAddress`,
-> `dxSplitAddress`, and `dxSplitInputs` previously returned empty/error shapes
-> but were brought to full C++-faithful behavior in the parity pass — they are
-> now **fully functional** (live servicenode union, `[]` on no-wallet,
-> 8-field split object). They live in the "Tier 1 + Tier 2" bucket below, not
-> here.
-
-**Fully functional after the C++ parity pass (Tier 1 + Tier 2):**
-- `dxPartialOrderChainDetails` — counts `total_orders_open` as
-  `stateOrdinal(status) <= trPending(2)` (matches C++); returns an empty `{}`
-  for an unknown chain instead of an error; validates the order id (64-hex,
-  `INVALID_PARAMETERS` otherwise); emits `p2sh_deposits` /
-  `p2sh_deposits_counterparty` from each order's `BinTxId` / `OBinTxId`.
-- `dxTakeOrder` — an omitted or zero `amount` is a **full-order** take
-  (sizes equal the order's maker/taker sizes), matching C++.
-- `dxGetLockedUtxos` — nil-guarded; derives the locked set from each active
-  order's reserved `Utxos` (`Store.LockedUtxoInfo`), keyed `txid:vout`.
-- `dxGetUtxos` — excludes UTXOs reserved by active orders (`include_used=false`),
-  returns them with `orderid` set when `include_used=true`.
-- `dxGetTokenBalances` — subtracts each currency's locked UTXOs from the wallet
-  total; the `Wallet` key is derived from the BLOCK connector (fallback: the
-  first configured exchange wallet).
-- `dxFlushCancelledOrders` — `Store.FlushCancelled` clamps the `uint64`
-  subtraction so a huge `minAgeMillis` prunes everything instead of wrapping
-  around.
+All 23 `dx*` commands are wire-correct against the C++ writers, with the sole
+exceptions being the **Tier 3** limits below. For the per-command verdict matrix
+see [`audit-dx-equivalence.md`](audit-dx-equivalence.md); for per-package state
+see [`STATUS.md`](STATUS.md). This document is the stable **contract**, not the
+status log.
 
 ## Tier 3 — architectural limits (thin-client, cannot fully match C++)
 
@@ -121,9 +81,9 @@ silently divergent**.
   - *What parity would require:* tracking every in-flight order network-wide
     (same root cause as `dxGetNetworkTokens`).
 
-The Tier 1 (code bugs) and Tier 2 (achievable backing gaps) items above are
-**fixed**; see `audit-dx-equivalence.md` for the divergence register and the
-fixes applied per method.
+Everything outside Tier 3 is behaviorally 1:1; see
+[`audit-dx-equivalence.md`](audit-dx-equivalence.md) for the per-command
+divergence register.
 
 ## Known deviations / VERIFY
 

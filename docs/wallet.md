@@ -78,7 +78,8 @@ an error — the deposit flow supplies inputs and `prevTxs` explicitly instead.
 
 ## Not yet here
 
-- **Non-UTXO adapters** (Decred, Particl) — need their own `Connector` shapes.
-- **Live-network execution** — the deposit/refund/payment driver is built and
-  unit-tested against mocks (see `swap.md` §6–7); end-to-end execution against a
-  real C++ service node still needs a live wallet and is the remaining gap.
+Non-UTXO adapters (Decred, Particl) need their own `Connector` shapes, and
+live-network execution against a real C++ service node still needs a live wallet
+(the deposit/refund/payment driver is built and unit-tested against mocks — see
+[`swap.md`](swap.md) §6–7). See [`STATUS.md`](STATUS.md) for current status and
+open items.

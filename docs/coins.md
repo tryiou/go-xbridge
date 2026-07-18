@@ -90,8 +90,7 @@ with `SignTxInput`.
 
 ## Not yet here
 
-- **Non-UTXO chains** (Decred, Particl) need their own adapters — out of scope
-  for this foundation.
-- **Wallet connector** (`wallet/`): an RPC client to the connected SPV wallet
-  that broadcasts/signs; the local `coins` signer can also sign directly.
-- Per-coin fee/utxo/dust rules.
+Non-UTXO chains (Decred, Particl) and per-coin fee/utxo/dust rules are out of
+scope for this foundation; the wallet connector lives in `wallet/`
+([`wallet.md`](wallet.md)). See [`STATUS.md`](STATUS.md) for the current
+per-package state and open items.

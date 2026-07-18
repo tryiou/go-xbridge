@@ -22,7 +22,7 @@ go test ./...
 
 Requires Go 1.25+ (toolchain 1.26 works).
 
-## Running — network discovery (no manual node URL)
+## Running
 
 `xbridged` discovers the Blocknet P2P network like a core wallet: it resolves
 the DNS seeds, connects to a few healthy peers, and learns more via `addr`
@@ -30,19 +30,12 @@ gossip. No `-node` (service-node URL) is required, and it never downloads or
 serves the blockchain — it only relays XBridge order/swap traffic.
 
 ```sh
-# Discover the mainnet network automatically (default; -node is empty):
 ./xbridged -network mainnet -conf ~/.blocknet/xbridge.conf
-
-# Optional: pin specific peers alongside discovered ones (the -addnode flag):
-./xbridged -network mainnet -addnode 1.2.3.4:41412
-
-# Legacy explicit-single-peer mode still works (skips discovery):
-./xbridged -node coreproxy.airdns.org:42111
 ```
 
-Full configuration (`xbridge.conf` schema + sample), the complete flag
-reference, and a make/take-order walkthrough are in
-[`docs/usage.md`](docs/usage.md).
+The `xbridge.conf` schema + sample, the complete flag reference, the network
+table, and a make/take-order walkthrough are all in
+[`docs/usage.md`](docs/usage.md) — **start there as a user.**
 
 ## Documentation
 
