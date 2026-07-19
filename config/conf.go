@@ -2,8 +2,16 @@
 // core-wallet XBridge reads. go-xbridge only READS this file (it never generates
 // or mutates it); every coin connector, including BLOCK and BTC, is defined
 // entirely by its [TICKER] section here. There is no hardcoded coin data anywhere
-// in the library — the schema below is a faithful mirror of
-// src/xbridge/xbridgeapp.cpp createConf().
+// in the library — the schema below is a faithful mirror of the **createConf()
+// reader** (src/xbridge/xbridgeapp.cpp:976-997). Every field is a real
+// `[TICKER]` conf key; nothing here is invented. Note: C++ does NOT read a
+// `RelayFee` conf key — relay fee comes live from the wallet RPC
+// `getmininginfo.relayfee` (xbridgewalletconnectorbtc.cpp:74-76) and is used
+// only for dust fallback (`dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460`,
+// xbridgewalletconnectorbtc.cpp:1526). go-xbridge has no live relay-fee feed
+// (thin client), so dust resolves from the conf `DustAmount` key, else the
+// C++-defined constant 5460. `GetNewKeySupported`/`ImportWithNoScanSupported`
+// are written by the createConf() template but are not read back by the reader.
 package config
 
 import (
@@ -29,6 +37,7 @@ type Main struct {
 type CoinConf struct {
 	Ticker   string // section name, e.g. "BTC"
 	Title    string
+	Address  string // wallet/RPC bind address (C++ xbridgeapp.cpp:977 ".Address")
 	Ip       string
 	Port     int
 	Username string
@@ -52,7 +61,6 @@ type CoinConf struct {
 	MinimumAmount uint64
 	TxVersion     int
 	DustAmount    uint64
-	RelayFee      float64 // per-KB relay fee in coin units (C++ info.relayFee); drives dust
 	MinTxFee      uint64
 	BlockTime     int // seconds per block
 	FeePerByte    uint64
@@ -62,6 +70,8 @@ type CoinConf struct {
 	LockCoinsSupported        bool
 	GetNewKeySupported        bool
 	ImportWithNoScanSupported bool
+
+	CashAddrPrefix string // BCH cashaddr HRP (C++ xbridgeapp.cpp:997 ".CashAddrPrefix"); empty for non-BCH coins.
 
 	// JSONVersion / ContentType are the RPC client version and content-type the
 	// connected wallet expects (some wallets require a specific value).
@@ -239,6 +249,7 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 	return &CoinConf{
 		Ticker:                    name,
 		Title:                     s.str("Title", name),
+		Address:                   s.str("Address", ""),
 		Ip:                        s.str("Ip", ""),
 		Port:                      s.intp("Port", 0),
 		Username:                  s.str("Username", ""),
@@ -251,7 +262,6 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		MinimumAmount:             s.uintp("MinimumAmount", 0),
 		TxVersion:                 s.intp("TxVersion", 1), // C++ xbridgeapp.cpp: s.get<uint32_t>(*i+".TxVersion", 1)
 		DustAmount:                s.uintp("DustAmount", 0),
-		RelayFee:                  s.floatp("RelayFee", 0),
 		MinTxFee:                  s.uintp("MinTxFee", 0),
 		BlockTime:                 s.intp("BlockTime", 0),
 		FeePerByte:                s.uintp("FeePerByte", 0),
@@ -260,6 +270,7 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		LockCoinsSupported:        s.boolp("LockCoinsSupported"),
 		GetNewKeySupported:        s.boolp("GetNewKeySupported"),
 		ImportWithNoScanSupported: s.boolp("ImportWithNoScanSupported"),
+		CashAddrPrefix:            s.str("CashAddrPrefix", ""),
 		JSONVersion:               s.str("JSONVersion", "1.0"),
 		ContentType:               s.str("ContentType", "application/json"),
 		OmitJSONVersion:           s.boolp("OmitJSONVersion"),

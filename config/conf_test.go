@@ -14,6 +14,7 @@ FullLog=0
 
 [BTC]
 Title=Bitcoin
+Address=
 Ip=127.0.0.1
 Port=8332
 Username=bitcoinrpc
@@ -31,6 +32,29 @@ FeePerByte=2
 Confirmations=2
 JSONVersion=1.0
 ContentType=application/json
+CashAddrPrefix=
+
+[BCH]
+Title=Bitcoin Cash
+Address=
+Ip=127.0.0.1
+Port=8332
+Username=bchrpc
+Password=bchsecret
+CreateTxMethod=BCH
+AddressPrefix=0
+ScriptPrefix=5
+SecretPrefix=128
+COIN=100000000
+TxVersion=2
+DustAmount=546
+MinTxFee=1000
+BlockTime=600
+FeePerByte=2
+Confirmations=2
+JSONVersion=1.0
+ContentType=application/json
+CashAddrPrefix=bitcoincash
 
 [BLOCK]
 Title=Blocknet
@@ -100,6 +124,22 @@ func TestLoadSample(t *testing.T) {
 	// BTC sets JSONVersion=1.0 explicitly; OmitJSONVersion defaults to false.
 	if btc.JSONVersion != "1.0" || btc.OmitJSONVersion {
 		t.Errorf("BTC jsonrpc conf wrong: version=%q omit=%v", btc.JSONVersion, btc.OmitJSONVersion)
+	}
+
+	// Address / CashAddrPrefix mirror the C++ reader (xbridgeapp.cpp:977/997).
+	// BTC leaves them empty (non-BCH coin); BCH sets CashAddrPrefix.
+	if btc.Address != "" {
+		t.Errorf("BTC Address = %q, want empty", btc.Address)
+	}
+	if btc.CashAddrPrefix != "" {
+		t.Errorf("BTC CashAddrPrefix = %q, want empty", btc.CashAddrPrefix)
+	}
+	bch, ok := conf.Coins["BCH"]
+	if !ok {
+		t.Fatal("BCH section missing")
+	}
+	if bch.CashAddrPrefix != "bitcoincash" {
+		t.Errorf("BCH CashAddrPrefix = %q, want bitcoincash", bch.CashAddrPrefix)
 	}
 }
 
