@@ -74,7 +74,11 @@ type CoinConf struct {
 	CashAddrPrefix string // BCH cashaddr HRP (C++ xbridgeapp.cpp:997 ".CashAddrPrefix"); empty for non-BCH coins.
 
 	// JSONVersion / ContentType are the RPC client version and content-type the
-	// connected wallet expects (some wallets require a specific value).
+	// connected wallet expects (some wallets require a specific value). Both
+	// default to empty, mirroring C++ xbridgeapp.cpp:995-996: an empty
+	// JSONVersion omits the "jsonrpc" request field entirely
+	// (XBridgeJSONRPCRequestObj) and an empty ContentType leaves the
+	// Content-Type header unset (CallRPC), matching stock XBridge.
 	JSONVersion string
 	ContentType string
 	// OmitJSONVersion, when true, drops the "jsonrpc" field from RPC requests
@@ -271,8 +275,8 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		GetNewKeySupported:        s.boolp("GetNewKeySupported"),
 		ImportWithNoScanSupported: s.boolp("ImportWithNoScanSupported"),
 		CashAddrPrefix:            s.str("CashAddrPrefix", ""),
-		JSONVersion:               s.str("JSONVersion", "1.0"),
-		ContentType:               s.str("ContentType", "application/json"),
+		JSONVersion:               s.str("JSONVersion", ""),
+		ContentType:               s.str("ContentType", ""),
 		OmitJSONVersion:           s.boolp("OmitJSONVersion"),
 	}
 }

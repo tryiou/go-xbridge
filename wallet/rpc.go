@@ -60,18 +60,14 @@ type rpcResponse struct {
 const defaultRPCTimeout = 30 * time.Second
 
 // NewRPCClient builds a client for the given endpoint + basic-auth credentials.
-// jsonVersion and contentType honor the wallet's xbridge.conf (defaults applied
-// by the caller if empty). When omitJSONVersion is true the "jsonrpc" field is
-// omitted from requests (XLite-style wallets reject it). A zero timeout applies
-// defaultRPCTimeout. ticker (may be empty) labels transport logs/errors with the
-// coin this client serves.
+// jsonVersion and contentType honor the wallet's xbridge.conf and are used
+// verbatim (empty stays empty, matching C++ CallRPC/XBridgeJSONRPCRequestObj):
+// an empty jsonVersion omits the "jsonrpc" request field, and an empty
+// contentType leaves the Content-Type header unset. When omitJSONVersion is
+// true the "jsonrpc" field is omitted regardless (XLite-style wallets reject
+// it). A zero timeout applies defaultRPCTimeout. ticker (may be empty) labels
+// transport logs/errors with the coin this client serves.
 func NewRPCClient(url, user, pass, jsonVersion, contentType string, omitJSONVersion bool, timeout time.Duration, ticker string) *RPCClient {
-	if jsonVersion == "" {
-		jsonVersion = "1.0"
-	}
-	if contentType == "" {
-		contentType = "application/json"
-	}
 	if timeout <= 0 {
 		timeout = defaultRPCTimeout
 	}
@@ -91,7 +87,9 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 		params = []interface{}{}
 	}
 	// When omitJSONVersion is set, drop the "jsonrpc" field (XLite-style
-	// wallets reject it); otherwise honor the configured version (default 1.0).
+	// wallets reject it); otherwise use the configured version verbatim. An
+	// empty version is omitted via the rpcRequest omitempty tag, matching C++
+	// XBridgeJSONRPCRequestObj (jsonrpc pushed only when non-empty).
 	ver := c.jsonVersion
 	if c.omitJSONVersion {
 		ver = ""
@@ -105,7 +103,12 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 		return err
 	}
 	req.SetBasicAuth(c.user, c.pass)
-	req.Header.Set("Content-Type", c.contentType)
+	// Only set Content-Type when configured; an empty contentType leaves the
+	// header unset, matching C++ CallRPC (Content-Type added only when
+	// non-empty).
+	if c.contentType != "" {
+		req.Header.Set("Content-Type", c.contentType)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -189,19 +192,49 @@ type rpcUtxo struct {
 	Address       string  `json:"address"`
 	Amount        float64 `json:"amount"`
 	ScriptPubKey  string  `json:"scriptPubKey"`
-	Confirmations int     `json:"confirmations"`
+	Confirmations *int    `json:"confirmations"`
+	Spendable     *bool   `json:"spendable"`
 }
 
-// ListUnspent returns spendable UTXOs with at least minConf confirmations,
-// converting the wallet's float amounts into base units via the coin decimals.
+// ListUnspent returns spendable UTXOs with at least minConf confirmations.
+//
+// C++ XBridge calls listunspent with NO parameters
+// (xbridgewalletconnectorbtc.cpp:509-512), relying on the wallet default
+// (minconf=1, maxconf=9999999), and then filters the result: it skips entries
+// with spendable==false, requires amount>0, and requires confs==-1 (field
+// absent) or confs>0 (xbridgewalletconnectorbtc.cpp:536-577). We mirror that
+// exactly on the wire (empty params) and apply the same filter client-side.
+// minConf is a Go-side caller contract (C++ has no per-call minconf here); a
+// UTXO with a known confirmation count below minConf is dropped.
 func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
 	var raw []rpcUtxo
-	// listunspent minconf maxconf addresses include_unsafe query_options
-	if err := c.cli.Call("listunspent", []interface{}{minConf, 9999999, nil, true}, &raw); err != nil {
+	// C++ parity: empty params (wallet default minconf/maxconf).
+	if err := c.cli.Call("listunspent", []interface{}{}, &raw); err != nil {
 		return nil, c.wrapErr("listunspent", err)
 	}
 	out := make([]Utxo, 0, len(raw))
 	for _, u := range raw {
+		// Skip explicitly non-spendable outputs (C++ spendable==false guard).
+		if u.Spendable != nil && !*u.Spendable {
+			continue
+		}
+		// Require a positive amount (C++ amount>0 guard).
+		if u.Amount <= 0 {
+			continue
+		}
+		// C++ confs guard: keep when the field is absent (confs==-1) or >0;
+		// drop when present and <=0 (unconfirmed/conflicted).
+		if u.Confirmations != nil && *u.Confirmations <= 0 {
+			continue
+		}
+		confs := 0
+		if u.Confirmations != nil {
+			confs = *u.Confirmations
+		}
+		// Go-side minConf contract: drop known-confs below the caller's floor.
+		if u.Confirmations != nil && confs < minConf {
+			continue
+		}
 		amt, err := amountFloatToBase(c.chain.Decimals, u.Amount)
 		if err != nil {
 			return nil, fmt.Errorf("wallet: utxo %s:%d amount: %w", u.TxID, u.Vout, err)
@@ -212,7 +245,7 @@ func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
 			Address:       u.Address,
 			Amount:        amt,
 			ScriptPubKey:  u.ScriptPubKey,
-			Confirmations: u.Confirmations,
+			Confirmations: confs,
 		})
 	}
 	return out, nil
@@ -230,9 +263,12 @@ type rpcSignResult struct {
 	Complete bool   `json:"complete"`
 }
 
-// SignRawTransaction signs txHex with the wallet's keys via
-// signrawtransactionwithwallet. prevTxs carry each input's previous output
-// script/amount (Bitcoin Core needs the amount to derive the sighash).
+// SignRawTransaction signs txHex with the wallet's keys. It mirrors C++
+// XBridge (xbridgewalletconnectorbtc.cpp:1091-1100): it calls the legacy
+// "signrawtransaction" first and, if that errors (newer wallets removed it),
+// falls back to "signrawtransactionwithwallet". prevTxs carry each input's
+// previous output script/amount (Bitcoin Core needs the amount to derive the
+// sighash).
 func (c *RPCConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (string, bool, error) {
 	prev := make([]rpcPrevTx, 0, len(prevTxs))
 	for _, p := range prevTxs {
@@ -247,9 +283,13 @@ func (c *RPCConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (strin
 			Amount:       amt,
 		})
 	}
+	args := []interface{}{txHex, prev, "ALL"}
 	var res rpcSignResult
-	if err := c.cli.Call("signrawtransactionwithwallet", []interface{}{txHex, prev, "ALL"}, &res); err != nil {
-		return "", false, c.wrapErr("signrawtransactionwithwallet", err)
+	// Legacy primary (old wallets); fall back to the modern RPC on error.
+	if err := c.cli.Call("signrawtransaction", args, &res); err != nil {
+		if ferr := c.cli.Call("signrawtransactionwithwallet", args, &res); ferr != nil {
+			return "", false, c.wrapErr("signrawtransactionwithwallet", ferr)
+		}
 	}
 	return res.Hex, res.Complete, nil
 }

@@ -50,7 +50,9 @@ func mockRPC(t *testing.T) *httptest.Server {
 		case "getnewaddress":
 			res(`"bc1qw508d6qezfhxq0t9wy3j9tg9z4r0r8e0j0q0w"`)
 		case "listunspent":
-			res(`[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0,"address":"bc1qw508d6qezfhxq0t9wy3j9tg9z4r0r8e0j0q0w","amount":1.5,"scriptPubKey":"76a914deadbeef88ac","confirmations":6}]`)
+			res(`[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0,"address":"bc1qw508d6qezfhxq0t9wy3j9tg9z4r0r8e0j0q0w","amount":1.5,"scriptPubKey":"76a914deadbeef88ac","confirmations":6,"spendable":true}]`)
+		case "signrawtransaction":
+			res(`{"hex":"deadbeef","complete":true}`)
 		case "signrawtransactionwithwallet":
 			res(`{"hex":"deadbeef","complete":true}`)
 		case "sendrawtransaction":
@@ -105,6 +107,13 @@ func TestRPCConnector(t *testing.T) {
 		utxos, err := c.ListUnspent(1)
 		if err != nil {
 			t.Fatalf("ListUnspent: %v", err)
+		}
+		// C++ parity: listunspent is called with NO params (empty array).
+		if lastReq.Method != "listunspent" {
+			t.Fatalf("method = %q, want listunspent", lastReq.Method)
+		}
+		if len(lastReq.Params) != 0 {
+			t.Fatalf("listunspent params = %v, want empty (C++ sends no params)", lastReq.Params)
 		}
 		if len(utxos) != 1 {
 			t.Fatalf("want 1 utxo, got %d", len(utxos))
@@ -188,6 +197,116 @@ func TestRPCConnectorUnauthorized(t *testing.T) {
 	}
 }
 
+// TestListUnspentFiltering verifies the C++-parity client-side filter
+// (xbridgewalletconnectorbtc.cpp:536-577): non-spendable entries, non-positive
+// amounts, and non-positive confirmations are dropped; a UTXO with confirmations
+// below the caller's minConf is dropped; a UTXO missing the confirmations field
+// (confs==-1 in C++) is kept.
+func TestListUnspentFiltering(t *testing.T) {
+	body := `[
+		{"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":6,"spendable":true},
+		{"txid":"2222222222222222222222222222222222222222222222222222222222222222","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":6,"spendable":false},
+		{"txid":"3333333333333333333333333333333333333333333333333333333333333333","vout":0,"amount":0,"scriptPubKey":"51","confirmations":6,"spendable":true},
+		{"txid":"4444444444444444444444444444444444444444444444444444444444444444","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":0,"spendable":true},
+		{"txid":"5555555555555555555555555555555555555555555555555555555555555555","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":2,"spendable":true},
+		{"txid":"6666666666666666666666666666666666666666666666666666666666666666","vout":0,"amount":1.0,"scriptPubKey":"51","spendable":true}
+	]`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "listunspent" && len(req.Params) != 0 {
+			t.Errorf("listunspent params = %v, want empty", req.Params)
+		}
+		json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(body), ID: req.ID})
+	}))
+	defer srv.Close()
+
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	utxos, err := c.ListUnspent(5)
+	if err != nil {
+		t.Fatalf("ListUnspent: %v", err)
+	}
+	// Kept: #1 (confs 6 >= 5), #6 (confirmations field absent -> confs==-1 kept).
+	// Dropped: #2 (spendable=false), #3 (amount 0), #4 (confs 0), #5 (confs 2 < 5).
+	got := map[string]bool{}
+	for _, u := range utxos {
+		got[u.TxID[:1]] = true
+	}
+	if len(utxos) != 2 || !got["1"] || !got["6"] {
+		t.Fatalf("filtered utxos = %d %+v, want #1 and #6 only", len(utxos), utxos)
+	}
+}
+
+// TestSignRawTransactionFallback verifies the C++ legacy-first behavior
+// (xbridgewalletconnectorbtc.cpp:1091-1100): "signrawtransaction" is tried
+// first, and when the wallet has removed it (error), the connector falls back
+// to "signrawtransactionwithwallet".
+func TestSignRawTransactionFallback(t *testing.T) {
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		calls = append(calls, req.Method)
+		enc := json.NewEncoder(w)
+		switch req.Method {
+		case "signrawtransaction":
+			// Simulate a newer wallet that removed the legacy RPC.
+			enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
+		case "signrawtransactionwithwallet":
+			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
+		default:
+			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+		}
+	}))
+	defer srv.Close()
+
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	hex, complete, err := c.SignRawTransaction("abcd", nil)
+	if err != nil {
+		t.Fatalf("SignRawTransaction: %v", err)
+	}
+	if hex != "cafe" || !complete {
+		t.Fatalf("sign = %q complete=%v, want cafe/true", hex, complete)
+	}
+	if len(calls) != 2 || calls[0] != "signrawtransaction" || calls[1] != "signrawtransactionwithwallet" {
+		t.Fatalf("call order = %v, want [signrawtransaction signrawtransactionwithwallet]", calls)
+	}
+}
+
+// TestSignRawTransactionLegacyPrimary verifies that when the legacy RPC
+// succeeds, the connector uses it and does NOT call the modern fallback.
+func TestSignRawTransactionLegacyPrimary(t *testing.T) {
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		calls = append(calls, req.Method)
+		enc := json.NewEncoder(w)
+		switch req.Method {
+		case "signrawtransaction":
+			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"beef","complete":true}`), ID: req.ID})
+		case "signrawtransactionwithwallet":
+			t.Error("modern RPC must not be called when legacy succeeds")
+			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"WRONG","complete":true}`), ID: req.ID})
+		default:
+			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+		}
+	}))
+	defer srv.Close()
+
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	hex, complete, err := c.SignRawTransaction("abcd", nil)
+	if err != nil {
+		t.Fatalf("SignRawTransaction: %v", err)
+	}
+	if hex != "beef" || !complete {
+		t.Fatalf("sign = %q complete=%v, want beef/true", hex, complete)
+	}
+	if len(calls) != 1 || calls[0] != "signrawtransaction" {
+		t.Fatalf("call order = %v, want [signrawtransaction] only", calls)
+	}
+}
+
 // slowRPC returns a test server whose every handler blocks longer than the
 // client timeout, to exercise the timeout path.
 func slowRPC(delay time.Duration) *httptest.Server {
@@ -238,20 +357,23 @@ func captureServer(t *testing.T) (*httptest.Server, *[]byte) {
 	return srv, &got
 }
 
-// TestRPCClientJSONRPCField asserts the "jsonrpc" field is present by default
-// (Bitcoin Core / blocknetd expect {"jsonrpc":"1.0",...}) and omitted only when
-// omitJSONVersion is set (XLite-style wallets reject the field).
+// TestRPCClientJSONRPCField asserts the "jsonrpc" field is emitted only when a
+// non-empty JSONVersion is configured (C++ XBridgeJSONRPCRequestObj pushes
+// "jsonrpc" only when non-empty) and is always omitted when omitJSONVersion is
+// set (XLite-style wallets reject the field).
 func TestRPCClientJSONRPCField(t *testing.T) {
 	cases := []struct {
 		name      string
 		version   string
 		omit      bool
 		wantField bool
+		wantValue string
 	}{
-		{"default keeps 1.0", "", false, true},
-		{"explicit 1.0 keeps field", "1.0", false, true},
-		{"omit drops field", "1.0", true, false},
-		{"omit drops field even when empty version", "", true, false},
+		{"empty version omits field", "", false, false, ""},
+		{"explicit 1.0 keeps field", "1.0", false, true, `"jsonrpc":"1.0"`},
+		{"explicit 2.0 keeps field verbatim", "2.0", false, true, `"jsonrpc":"2.0"`},
+		{"omit drops field", "1.0", true, false, ""},
+		{"omit drops field even when empty version", "", true, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -266,8 +388,49 @@ func TestRPCClientJSONRPCField(t *testing.T) {
 			if has != tc.wantField {
 				t.Fatalf("jsonrpc field present=%v, want %v (body %s)", has, tc.wantField, *got)
 			}
-			if tc.wantField && !bytes.Contains(*got, []byte(`"jsonrpc":"1.0"`)) {
-				t.Fatalf("expected jsonrpc:\"1.0\", got %s", *got)
+			if tc.wantField && !bytes.Contains(*got, []byte(tc.wantValue)) {
+				t.Fatalf("expected %s, got %s", tc.wantValue, *got)
+			}
+		})
+	}
+}
+
+// TestRPCClientContentTypeHeader asserts the Content-Type request header is set
+// only when a non-empty ContentType is configured, matching C++ CallRPC which
+// adds the header only when contenttype is non-empty.
+func TestRPCClientContentTypeHeader(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		wantHeader  string // "" means header must be absent
+	}{
+		{"empty leaves header unset", "", ""},
+		{"explicit application/json", "application/json", "application/json"},
+		{"explicit custom", "text/plain", "text/plain"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotCT string
+			var present bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, present = r.Header["Content-Type"]
+				gotCT = r.Header.Get("Content-Type")
+				json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
+			}))
+			defer srv.Close()
+			c := NewRPCClient(srv.URL, "u", "p", "1.0", tc.contentType, false, 0, "BTC")
+			var out int
+			if err := c.Call("getblockcount", nil, &out); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantHeader == "" {
+				if present {
+					t.Fatalf("Content-Type header should be absent, got %q", gotCT)
+				}
+				return
+			}
+			if gotCT != tc.wantHeader {
+				t.Fatalf("Content-Type = %q, want %q", gotCT, tc.wantHeader)
 			}
 		})
 	}
