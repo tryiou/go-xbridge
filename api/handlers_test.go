@@ -165,9 +165,20 @@ func TestDxGetOrderBookRead(t *testing.T) {
 	}
 }
 
+// TestDxGetOrderBookDetailLevels is a C++-derived known-answer test (KAT) that
+// locks in the four detail-level element shapes emitted by dxGetOrderBook,
+// matching rpcxbridge.cpp exactly:
+//
+//	level 1 (best only):       [price, size, count]            (rpcxbridge.cpp:1697-99)
+//	level 2 (aggregated top):  [price, sum,  count]
+//	level 3 (full, capped):    [price, amount, id]
+//	level 4 (best + ids):      [price, amount, [ids]]
+//
+// This also cements the refuted audit-D1 claim: detail 1 is [price,size,count]
+// in C++ too, not a different shape.
 func TestDxGetOrderBookDetailLevels(t *testing.T) {
 	ctx := newWalletTestCtx()
-	seedOrder(ctx)
+
 	// detail out of range -> errInvalidDetailLevel.
 	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("0"), jstr("BTC"), jstr("BTC")}); err == nil {
 		t.Error("detail=0 should error")
@@ -175,25 +186,82 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("5"), jstr("BTC"), jstr("BTC")}); err == nil {
 		t.Error("detail=5 should error")
 	}
-	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("2"), jstr("BTC"), jstr("BTC")}); err != nil {
-		t.Fatalf("detail=2: %v", err)
+
+	// Seed two asks (BTC->LTC) and two bids (LTC->BTC) at distinct prices so we
+	// can assert per-level element counts/shapes.
+	seed := func(from, to string, fAmt, tAmt uint64) {
+		ctx.Store.Add(&Order{
+			ID:           [32]byte{byte(len(ctx.Store.List()) + 1)},
+			Type:         OrderTypeMaker,
+			FromCurrency: from,
+			FromAmount:   fAmt,
+			ToCurrency:   to,
+			ToAmount:     tAmt,
+			Status:       "open",
+		})
 	}
-	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("3"), jstr("BTC"), jstr("BTC")}); err != nil {
-		t.Fatalf("detail=3: %v", err)
+	seed("BTC", "LTC", 1_500_000, 300_000) // ask price 0.2
+	seed("BTC", "LTC", 1_500_000, 150_000) // ask price 0.1
+	seed("LTC", "BTC", 300_000, 1_500_000) // bid price 5.0
+	seed("LTC", "BTC", 300_000, 3_000_000) // bid price 10.0
+
+	wantLen := func(side [][]interface{}, n int) {
+		if len(side) != n {
+			t.Fatalf("side len = %d, want %d (%v)", len(side), n, side)
+		}
 	}
-	// detail=4: best ask/bid with an order-id array.
-	res, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("4"), jstr("BTC"), jstr("BTC")})
-	if err != nil {
-		t.Fatalf("detail=4: %v", err)
-	}
-	ob := res.(orderBookResult)
-	if len(ob.Asks) != 1 {
-		t.Fatalf("detail=4 asks=%d", len(ob.Asks))
-	}
-	if e := ob.Asks[0]; len(e) != 3 {
-		t.Errorf("detail=4 ask entry = %v", e)
-	} else if ids, ok := e[2].([]string); !ok || len(ids) != 1 {
-		t.Errorf("detail=4 ask ids = %v", e[2])
+
+	for lvl := 1; lvl <= 4; lvl++ {
+		res, err := ctx.dxGetOrderBook([]json.RawMessage{
+			jstr(strconv.Itoa(lvl)), jstr("BTC"), jstr("LTC"),
+		})
+		if err != nil {
+			t.Fatalf("detail %d: %v", lvl, err)
+		}
+		ob := res.(orderBookResult)
+		if ob.Detail != lvl {
+			t.Errorf("detail %d: Detail field = %d", lvl, ob.Detail)
+		}
+
+		switch lvl {
+		case 1:
+			// best ask (price 0.1) and best bid (price 10.0), each 1 element.
+			wantLen(ob.Asks, 1)
+			wantLen(ob.Bids, 1)
+			if len(ob.Asks[0]) != 3 {
+				t.Errorf("detail1 ask len = %d, want 3", len(ob.Asks[0]))
+			}
+			if _, ok := ob.Asks[0][2].(int); !ok {
+				t.Errorf("detail1 ask[2] (count) not int: %T", ob.Asks[0][2])
+			}
+		case 2:
+			wantLen(ob.Asks, 2) // two distinct ask prices
+			wantLen(ob.Bids, 2)
+			if len(ob.Asks[0]) != 3 {
+				t.Errorf("detail2 ask len = %d, want 3", len(ob.Asks[0]))
+			}
+		case 3:
+			wantLen(ob.Asks, 2)
+			wantLen(ob.Bids, 2)
+			if len(ob.Asks[0]) != 3 {
+				t.Errorf("detail3 ask len = %d, want 3", len(ob.Asks[0]))
+			}
+			if _, ok := ob.Asks[0][2].(string); !ok {
+				t.Errorf("detail3 ask[2] (id) not string: %T", ob.Asks[0][2])
+			}
+		case 4:
+			wantLen(ob.Asks, 1)
+			wantLen(ob.Bids, 1)
+			if len(ob.Asks[0]) != 3 {
+				t.Errorf("detail4 ask len = %d, want 3", len(ob.Asks[0]))
+			}
+			ids, ok := ob.Asks[0][2].([]string)
+			if !ok {
+				t.Errorf("detail4 ask[2] (ids) not []string: %T", ob.Asks[0][2])
+			} else if len(ids) != 1 {
+				t.Errorf("detail4 ask ids len = %d, want 1", len(ids))
+			}
+		}
 	}
 }
 

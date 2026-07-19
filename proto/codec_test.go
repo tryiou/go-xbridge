@@ -53,7 +53,9 @@ func TestPacketRoundTrip(t *testing.T) {
 	}
 
 	// Digest must be deterministic.
-	if p.Digest() != p.Digest() {
+	d1 := p.Digest()
+	d2 := p.Digest()
+	if d1 != d2 {
 		t.Fatal("digest not deterministic")
 	}
 

@@ -14,8 +14,9 @@ C++ writers, not the comments.
 
 ## Current state (2026-07-18)
 
-All 23 `dx*` commands (plus the `gettradingdata` alias) have been remediated
-against the C++ wire contract. The **Tier 1** code bugs and **Tier 2** achievable
+All 23 `dx*` commands have been remediated against the C++ wire contract. The
+C++ `gettradingdata` command is intentionally NOT exposed in the Go interface —
+only `dxGetTradingData` is. The **Tier 1** code bugs and **Tier 2** achievable
 backing gaps are **fixed**, and the subsequent pass below closed the remaining
 cancel/reject, packet-signature, lockTime-drift, dust/fee-fidelity, and
 network-token-source gaps (C6–C12). The only remaining deltas are **Tier 3 —
@@ -33,7 +34,7 @@ bounded by the thin-client design. `GO-ONLY` = no C++ `dx*` counterpart.
 | dxGetOrders | DONE | conf/connector filter + id-sorted |
 | dxGetOrder | DONE | `NO_SESSION` gate; case-insensitive id |
 | dxGetMyOrders | DONE | includes finished/cancelled locals; sorted by `txtime` |
-| dxGetOrderBook | DONE | ask=`to/from`, bid=`from/to`; detail levels 1–4 |
+| dxGetOrderBook | DONE | ask=`to/from`, bid=`from/to`; detail levels 1–4 PARITY — level 1 emits `[price,size,count]` (rpcxbridge.cpp:1697-99), matching C++ exactly (audit D1 was a false positive) |
 | dxGetOrderFills | DONE | full 12-field record |
 | dxGetMyPartialOrderChain | DONE | ancestors + descendants |
 | dxPartialOrderChainDetails | DONE | `stateOrdinal<=trPending` totals; empty `{}`; id validated; `p2sh_deposits` |
@@ -52,7 +53,7 @@ bounded by the thin-client design. `GO-ONLY` = no C++ `dx*` counterpart.
 | dxSplitAddress | DONE | 8-field object; 1e6-scale amounts |
 | dxSplitInputs | DONE | 8-field object; C++ 7-param contract |
 | dxGetOrderHistory | TIER3 | OHLCV buckets from local fills only |
-| dxGetTradingData / gettradingdata | TIER3 | 8-field record from local fills (`fee_txid`/`nodepubkey` empty) |
+| dxGetTradingData | TIER3 | 8-field record from local fills (`fee_txid`/`nodepubkey` empty). The C++ `gettradingdata` command is not exposed in Go; only `dxGetTradingData`. |
 | getNetworkInfo | GO-ONLY | Go-only extension; not one of the 23 `dx*` |
 
 ## Cross-cutting substrate (fixed)
@@ -75,8 +76,8 @@ These once hit every command; all are corrected and covered by tests.
 
 Equivalent cross-cutting areas (already faithful): timestamps (`iso8601` 3-digit
 ms `Z`), `status` strings (`statusString` == `TransactionDescr::strState`), and
-the dispatch set (23 `dx*` + the `gettradingdata` alias; `getnetworkinfo` is a
-Go-only extension).
+the dispatch set (23 `dx*`; `getnetworkinfo` is a Go-only extension). The C++
+`gettradingdata` command is not part of the Go interface.
 
 ## Cross-cutting substrate (added in the 2026-07-18 pass)
 
@@ -99,10 +100,13 @@ tests (`api/node_test.go`, `api/divergence_test.go`, `api/parity_dustfee_test.go
   and before redeem (`api/locktime.go`, `api/swap.go`), mirroring
   `BtcWalletConnector::acceptableLockTimeDrift` (`xbridgewalletconnectorbtc.cpp:2331`)
   and its `xbridgesession.cpp:2464` call site.
-- **C9 — dust/fee fidelity.** `effectiveDust` mirrors
-  `xbridgewalletconnectorbtc.cpp:1526` (`dust = relayFee>0 ? 0.546*relayFee*COIN
-  : configured : 5460`); `estimateFee` applies the `MinTxFee` floor
-  (`xbridgewalletconnectorbtc.cpp:1952/1968`). `RelayFee` added to `CoinConf`.
+- **C9 — dust/fee fidelity.** `effectiveDust` resolves from the conf `DustAmount`
+  key (xbridgeapp.cpp:345) and falls back to the C++-defined constant 5460
+  (xbridgewalletconnectorbtc.cpp:1526 else-branch). C++ computes dust from the
+  wallet RPC relay fee (`relayFee>0 ? 0.546*relayFee*COIN : 5460`); Go has no
+  live relay-fee feed (thin client), so it uses the conf key instead. `estimateFee`
+  applies the `MinTxFee` floor with `FeePerByte` (xbridgewalletconnectorbtc.cpp:1952/1968).
+  No `RelayFee` conf key exists in C++ or Go — it is a live RPC value in C++.
 - **C10 — network-token source.** `dxGetNetworkTokens` now learns tokens from real
   `SNREGISTER`/`SNPING`/`SNLISTPING` P2P messages via `p2p/servicenode.Registry`
   (wallet-token regex `^[^:]+$`, `xr`/`xrs` exclusion, 5-minute running window)
@@ -132,6 +136,9 @@ scope; see the "Tier 3 — architectural limits" section in [`api.md`](api.md):
 ## Verification gaps to close before shipping
 
 - Byte-level capture of `OrderBody`/`AcceptingBody`/`CancelBody` UTXO-entry
-  encoding vs live C++ (Go uses BIP137 proofs; C++ embeds real funding UTXOs).
+  encoding vs live C++. Both Go and C++ embed a 65-byte `signmessage`/BIP137
+  proof (C++ signs `UtxoEntry::toString()` in xbridgeapp.cpp:1691); the
+  challenge-string format was the real gap and is now fixed (see P1 — the
+  signed message is `txid:vout:amount:address`, matching C++ `toString()`).
 - Live P2P verification of the swap-handshake claim/refund spends (in-memory
   only today).

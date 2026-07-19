@@ -288,9 +288,10 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
 
 1. **`version` handshake payload** (§1.3) — ✅ DONE + VERIFIED live (2026-07-14).
 2. **`NetMsgType::XBRIDGE` command string** — ✅ confirmed `"xbridge"` live.
-3. **uint256 byte order** — confirm Bitcoin internal LE order is preserved
-   verbatim on the wire (no reversal) by inspecting how `xbridgeapp` appends
-   uint256 fields.
+3. **uint256 byte order** — ✅ VERIFIED. Bitcoin internal LE order is preserved
+   verbatim on the wire (no reversal): C++ appends `blockHash.begin()` for 32
+   bytes (xbridgeapp.cpp:2082), and Go's `body_types.go` carries uint256 fields
+   byte-for-byte. Matches.
 4. **Per-coin transaction construction** — `src/xbridge/xbridgewalletconnector*`
    + `xbitcointransaction*`: build/serialize each coin's deposit/refund tx and
    parse addresses/amounts. UTXO coins share `xbitcointransaction`; Decred

@@ -9,8 +9,9 @@ dapp's RPC URL at `xbridged` and it reaches the XBridge API unchanged.
 - **Transport:** JSON-RPC 1.0 over HTTP (bitcoind-style). Request
   `{"method":..., "params":[...positional...], "id":...}`.
 - **Params are positional**, not named (C++ uses a `json_spirit` array).
-- **Method names** — 23 distinct `dx*` commands plus the lowercase
-  `gettradingdata` alias (24 dispatch entries total), exact: see `dispatch.go`.
+- **Method names** — 23 distinct `dx*` commands (the C++ `gettradingdata`
+  command is intentionally NOT exposed; only `dxGetTradingData` is), exact:
+  see `dispatch.go`.
 - **Response object field names and JSON value types match C++ exactly:**
   - amounts are **strings** (`"100.000000"`) to preserve precision;
   - dates are **ISO-8601 strings with millisecond precision**
@@ -59,10 +60,12 @@ client that speaks the XBridge wire protocol to live service nodes but holds no
 BLOCK block index and replays no historical chain. They are **documented, not
 silently divergent**.
 
-- **`dxGetOrderHistory` / `dxGetTradingData` (`gettradingdata`)** — reflect
-  *session-local* fills only (the `Store.fills` recorded by this client).
-  `fee_txid` and `nodepubkey` are empty. C++ derives these from the BLOCK chain
-  index across all servicenode-confirmed trades.
+- **`dxGetOrderHistory` / `dxGetTradingData`** — reflect *session-local* fills
+  only (the `Store.fills` recorded by this client). `dxGetTradingData` emits the
+  8-field record (`fee_txid`/`nodepubkey` empty, session-local data source).
+  The C++ `gettradingdata` command is **not exposed** in the Go interface — only
+  `dxGetTradingData` is. C++ derives these from the BLOCK chain index across all
+  servicenode-confirmed trades.
   - *Why:* no local block index; the client never replays historical BLOCK data.
   - *What parity would require:* embedding `blocknetd` (or a BLOCK block
     indexer + XSeries trade-history RPC) so fills can be fetched from chain

@@ -123,7 +123,9 @@ func TestSignWrongKeyLength(t *testing.T) {
 // so this test pins the property that matters for interop: the same key and
 // same digest always produce the identical 64-byte compact signature (a
 // tampered/flaky signer would diverge and fail here). TODO(audit): validate
-// this exact signature against a captured C++ node to close the [VERIFY] item.
+// this exact signature against a live C++ node (e.g. the reachable
+// coreproxy.airdns.org:42111 XBridge hub) to close the [VERIFY] item; the one
+// remaining live cross-check.
 func TestSignDeterministicKAT(t *testing.T) {
 	signer := NewBtcSigner()
 

@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 )
@@ -58,6 +59,42 @@ func TestOrderBodyRoundTrip(t *testing.T) {
 		func() []byte { return b2.Marshal() },
 		func(d []byte) error { return b2.Unmarshal(d) },
 	)
+}
+
+// TestUint256Verbatim is a C++-derived KAT confirming that 32-byte uint256
+// fields (ID, BlockHash) are carried byte-for-byte in Bitcoin internal
+// little-endian order with NO reversal. C++ appends them verbatim via
+// blockHash.begin() for 32 bytes (xbridgeapp.cpp:2082), and Go's body_types.go
+// does the same — so a value seeded with non-symmetric bytes must survive a
+// round-trip unchanged.
+func TestUint256Verbatim(t *testing.T) {
+	want := [32]byte{}
+	for i := range want {
+		want[i] = byte(i) // 00 01 02 ... 1f — ordering would be obvious if reversed
+	}
+	b := &PendingTransactionBody{
+		ID:             want,
+		FromCurrency:   "BTC",
+		FromAmount:     100,
+		ToCurrency:     "DGB",
+		ToAmount:       200,
+		HubAddress:     [20]byte{3, 4, 5},
+		Created:        42,
+		PartialAllowed: true,
+	}
+
+	raw := b.Marshal()
+	dec := &PendingTransactionBody{}
+	if err := dec.Unmarshal(raw); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if dec.ID != want {
+		t.Fatalf("ID not carried verbatim: got %x want %x", dec.ID, want)
+	}
+	// Also confirm the raw bytes appear in order on the wire (no byte-swap).
+	if !bytes.Contains(raw, want[:]) {
+		t.Fatal("uint256 bytes not present in wire order")
+	}
 }
 
 func TestPendingTransactionBodyRoundTrip(t *testing.T) {
