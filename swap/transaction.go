@@ -227,6 +227,12 @@ func (t *Transaction) IsExpired(now time.Time) bool {
 // the time-based TTL, so we delegate to IsExpired; the block parameter is only
 // consulted for the trNew block window.
 func (t *Transaction) IsExpiredByBlockNumber(currentBlock uint32) bool {
+	// C++ Transaction::isExpiredByBlockNumber (xbridgetransaction.cpp:295-296):
+	// once past trNew and not yet finished, block-height expiry no longer
+	// applies — the time-based TTL governs instead.
+	if t.State > TrNew && !t.IsFinished() {
+		return false
+	}
 	if t.State == TrNew {
 		return int64(currentBlock)-int64(t.BlockNumber) > BlocksTTL
 	}

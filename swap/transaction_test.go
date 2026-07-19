@@ -254,18 +254,49 @@ func TestIsExpiredByBlockNumber(t *testing.T) {
 		t.Error("trNew past BlocksTTL must be expired")
 	}
 
-	// Post-trNew delegates to the time-based TTL (block height ignored), so an
-	// order that is fresh by time is not expired by this check either.
+	// Post-trNew and NOT finished short-circuits to false (the C++ guard at
+	// xbridgetransaction.cpp:295-296): block-height expiry no longer applies and
+	// the time-based TTL is what governs, but IsExpiredByBlockNumber itself
+	// returns false regardless of how idle the order is.
 	joined := makerOrder()
 	joined.TryJoin(takerOrder())
 	joined.BlockNumber = createdAtBlock
-	joined.LastAt = time.Now().Unix()
-	if joined.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL + 1) {
-		t.Error("post-trNew fresh by time must not be expired by block check")
+	joined.LastAt = time.Now().Add(-(TTL + 10) * time.Second).Unix()
+	if joined.IsExpiredByBlockNumber(createdAtBlock) {
+		t.Error("post-trNew !finished must return false (C++ block-height guard)")
 	}
-	// And an order idle past the time TTL is expired even with a low block.
+	// Only a finished (terminal) post-trNew order can be expired by this call,
+	// and then it delegates to the time-based TTL.
+	joined.State = TrFinished
 	joined.LastAt = time.Now().Add(-(TTL + 10) * time.Second).Unix()
 	if !joined.IsExpiredByBlockNumber(createdAtBlock) {
-		t.Error("post-trNew idle past time TTL must be expired")
+		t.Error("post-trNew finished + idle past time TTL must be expired")
+	}
+}
+
+// TestIsExpiredByBlockNumberFinishedGuard locks in C++'s short-circuit: once
+// the transaction is past trNew and NOT yet finished, block-height expiry does
+// not apply and the call returns false regardless of how far the chain has
+// advanced (xbridgetransaction.cpp:295-296).
+func TestIsExpiredByBlockNumberFinishedGuard(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	const createdAtBlock = 1_000_000
+
+	// TrCreated is past trNew and not terminal (finished = false), so block
+	// height must be ignored.
+	created := NewTransaction([32]byte{}, "BTC", "LTC", 100, 200,
+		Member{Source: aMakerSrc, Dest: aMakerDst}, false, 0, now)
+	created.State = TrCreated
+	if created.State != TrCreated {
+		t.Fatalf("setup: state = %v, want TrCreated", created.State)
+	}
+	if created.IsFinished() {
+		t.Fatal("TrCreated must not be finished")
+	}
+	created.BlockNumber = createdAtBlock
+	for _, h := range []uint32{createdAtBlock, createdAtBlock + BlocksTTL, createdAtBlock + BlocksTTL + 100} {
+		if created.IsExpiredByBlockNumber(h) {
+			t.Errorf("TrCreated !finished must return false at block %d", h)
+		}
 	}
 }
