@@ -65,31 +65,60 @@ Implemented in `p2p/message.go` (`Message`, `Checksum`, `Marshal`,
 ### 1.3 Handshake
 
 Before any `xbridge` traffic, a standard Bitcoin `version` / `verack` exchange
-is required. The C++ node expects a well-formed `version` message
-(version, services, timestamp, addr_recv, addr_from, nonce, user-agent,
-start_height, relay). Implemented in `p2p/version.go` (`VersionMessage`,
-`NetAddr`, `Marshal`, `NewVersion`) and driven by `p2p/conn.go`'s `handshake()`.
+is required. The C++ node expects a well-formed `version` message. Implemented
+in `p2p/version.go` (`VersionMessage`, `NetAddr`, `Marshal`, `NewVersion`) and
+driven by `p2p/conn.go`'s `handshake()`.
+
+Wire layout (`p2p/version.go` `Marshal`):
+
+```
+version(4 LE) || services(8 LE) || timestamp(8 LE) ||
+addr_recv(30) || addr_from(30) || nonce(8 LE) ||
+user_agent(varstr) || start_height(4 LE) || relay(1) || fxrouter(1)
+```
 
 Field values (`p2p/version.go`):
 
 - `version` = `70713` (`BitcoinProtocolVersion`, from `src/version.h:12`).
 - `services` = `0` (thin client advertises no services).
-- `addr_recv` = the peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from`
-  left zeroed. Port is **big-endian** in `net_addr` (network byte order).
+- `timestamp` = current unix seconds (`int64`).
+- `addr_recv` / `addr_from` = 30-byte CAddress (see §1.3.1). `addr_recv` is the
+  peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from` is a CAddress with
+  `nTime` stamped and services=0, but IP/port left zeroed (thin client advertises
+  no address of its own).
 - `nonce` = random `uint64`.
 - `user_agent` = `"/go-xbridge:0.1.0/"`.
 - `start_height` = `0` (thin client has no chain).
 - `relay` = `false`.
+- `fxrouter` = `false` (thin client is not an XRouter hub). Sent explicitly so
+  address gossip/discovery works against stock service nodes.
 
 The handshake sends `version`, then reads until it has seen both the peer's
 `version` (to which it replies `verack`) and the peer's `verack`; unrelated
 messages are ignored. A 30 s deadline bounds the exchange.
 
-**VERIFIED (2026-07-14):** the version/verack handshake was exercised against a
-live Blocknet 4.4.1 service node (`coreproxy.airdns.org:42111`, magic
-`a1 a0 a2 a3`). The peer returned `proto=70713`, `ua="/Blocknet:4.4.1/"`,
-`relay=true`, and immediately began emitting `xbridge` messages. The `xbridge`
-command string is confirmed to be `"xbridge"`.
+#### 1.3.1 `net_addr` / CAddress layout
+
+Each addr field is a Bitcoin `CAddress`, 30 bytes:
+
+```
+nTime(4 LE) || services(8 LE) || ip(16) || port(2 BE)
+```
+
+- `nTime` is always written for `PROTOCOL_VERSION >= CADDR_TIME_VERSION (31402)`;
+  Blocknet's `PROTOCOL_VERSION` is 70713, so it is always present
+  (`src/protocol.h:379-381`, `src/net_processing.cpp:207-211`). `NewVersion`
+  stamps both addrs with the current unix seconds (`p2p/version.go`).
+- `ip` is 16 bytes; IPv4 is mapped into `::ffff:/96` (matches
+  `CNetAddr::Serialize`).
+- `port` is **big-endian** (network byte order), unlike the rest of the frame.
+
+**VERIFIED:** the version/verack handshake was exercised against a live Blocknet
+4.4.1 service node (`coreproxy.airdns.org:42111`, magic `a1 a0 a2 a3`); the peer
+returned `proto=70713`, `ua="/Blocknet:4.4.1/"`, `relay=true`, and immediately
+began emitting `xbridge` messages (the `xbridge` command string is confirmed).
+The addr encoding was corrected to the 30-byte CAddress (incl. `nTime`) on
+2026-07-15 — see §1.3.1.
 
 ---
 
@@ -286,7 +315,7 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
 
 ## 6. Open questions / TODO for next phases
 
-1. **`version` handshake payload** (§1.3) — ✅ DONE + VERIFIED live (2026-07-14).
+1. **`version` handshake payload** (§1.3, §1.3.1) — ✅ DONE.
 2. **`NetMsgType::XBRIDGE` command string** — ✅ confirmed `"xbridge"` live.
 3. **uint256 byte order** — ✅ VERIFIED. Bitcoin internal LE order is preserved
    verbatim on the wire (no reversal): C++ appends `blockHash.begin()` for 32
