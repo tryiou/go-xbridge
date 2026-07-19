@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -140,8 +141,9 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 
 // RPCConnector drives a single coin wallet over JSON-RPC.
 type RPCConnector struct {
-	chain Chain
-	cli   *RPCClient
+	chain    Chain
+	cli      *RPCClient
+	relayFee relayFeeCache
 }
 
 // NewRPCConnector builds a Connector for the given chain endpoint.
@@ -261,25 +263,52 @@ func (c *RPCConnector) SendRawTransaction(txHex string) (string, error) {
 	return txid, nil
 }
 
-// EstimateFee returns the fee rate in sat/vB for confTarget confirmations,
-// derived from estimatesmartfee's BTC/kvB result.
-func (c *RPCConnector) EstimateFee(confTarget int) (uint64, error) {
+// relayFeeCache memoizes the live relay fee from getinfo so the wallet is not
+// probed on every dust calculation (C++ caches relayFee in init()).
+type relayFeeCache struct {
+	mu   sync.Mutex
+	once bool
+	val  float64
+	err  error
+}
+
+// GetRelayFee returns the per-coin relay fee (BTC per kB) gathered from the
+// wallet's getinfo RPC (C++ xbridgewalletconnectorbtc.cpp:74-76), which C++
+// uses to compute dust (dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460,
+// xbridgewalletconnectorbtc.cpp:1526). It is fetched once and cached.
+func (c *RPCConnector) GetRelayFee() (float64, error) {
+	c.relayFee.mu.Lock()
+	defer c.relayFee.mu.Unlock()
+	if c.relayFee.once {
+		return c.relayFee.val, c.relayFee.err
+	}
 	var res struct {
-		Feerate float64  `json:"feerate"` // BTC per kB
-		Errors  []string `json:"errors"`
+		RelayFee float64 `json:"relayfee"`
 	}
-	if err := c.cli.Call("estimatesmartfee", []interface{}{confTarget, "ECONOMICAL"}, &res); err != nil {
-		return 0, c.wrapErr("estimatesmartfee", err)
+	// Go order preference (deliberate deviation from C++'s
+	// getblockchaininfo/getnetworkinfo-then-getinfo,
+	// xbridgewalletconnectorbtc.cpp:1586-1593): XLite reliably serves getinfo
+	// with relayfee, so try getinfo first, then getnetworkinfo as a fallback.
+	var err error
+	var getInfoErr error
+	if e := c.cli.Call("getinfo", nil, &res); e != nil {
+		getInfoErr = e
 	}
-	if res.Feerate <= 0 {
-		return 0, fmt.Errorf("wallet: no fee estimate: %v", res.Errors)
+	if res.RelayFee <= 0 {
+		if e2 := c.cli.Call("getnetworkinfo", nil, &res); e2 != nil {
+			if getInfoErr != nil {
+				err = c.wrapErr("getinfo/relayfee", getInfoErr)
+			} else {
+				err = c.wrapErr("getnetworkinfo/relayfee", e2)
+			}
+		}
 	}
-	// BTC/kvB → sat/vB: feerate * 1e8 (sat/BTC) / 1000 (vB/kB).
-	satPerVByte := res.Feerate * 1e8 / 1000
-	if satPerVByte < 1 {
-		satPerVByte = 1
+	if err == nil {
+		c.relayFee.once = true
+		c.relayFee.val = res.RelayFee
+		c.relayFee.err = err
 	}
-	return uint64(satPerVByte), nil
+	return res.RelayFee, err
 }
 
 // GetBlockCount returns the best block height of the coin's chain via the

@@ -130,7 +130,7 @@ func (f *fakeConnector) SendRawTransaction(txHex string) (string, error) {
 	return txid, nil
 }
 
-func (f *fakeConnector) EstimateFee(confTarget int) (uint64, error) { return 1000, nil }
+func (f *fakeConnector) GetRelayFee() (float64, error) { return 0.0001, nil }
 
 func (f *fakeConnector) GetBlockCount() (int64, error) { return f.blockHeight, nil }
 

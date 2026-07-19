@@ -55,8 +55,8 @@ func mockRPC(t *testing.T) *httptest.Server {
 			res(`{"hex":"deadbeef","complete":true}`)
 		case "sendrawtransaction":
 			res(`"txid1234567890"`)
-		case "estimatesmartfee":
-			res(`{"feerate":0.0001,"errors":[]}`)
+		case "getinfo":
+			res(`{"relayfee":0.0001}`)
 		case "getblockcount":
 			res(`100`)
 		case "getblockhash":
@@ -147,14 +147,13 @@ func TestRPCConnector(t *testing.T) {
 		}
 	})
 
-	t.Run("EstimateFee", func(t *testing.T) {
-		// 0.0001 BTC/kB = 10000 sat/kB = 10 sat/vB.
-		fee, err := c.EstimateFee(6)
+	t.Run("GetRelayFee", func(t *testing.T) {
+		fee, err := c.GetRelayFee()
 		if err != nil {
-			t.Fatalf("EstimateFee: %v", err)
+			t.Fatalf("GetRelayFee: %v", err)
 		}
-		if fee != 10 {
-			t.Fatalf("fee = %d sat/vB, want 10", fee)
+		if fee != 0.0001 {
+			t.Fatalf("relayfee = %v, want 0.0001", fee)
 		}
 	})
 	t.Run("GetBlockCount", func(t *testing.T) {

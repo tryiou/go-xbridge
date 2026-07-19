@@ -7,22 +7,32 @@ import (
 )
 
 func TestEffectiveDust(t *testing.T) {
+	// C++: dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460
+	// (xbridgewalletconnectorbtc.cpp:1526). Coin=1e8 (BTC-like) unless noted.
+	const coin = uint64(100_000_000)
 	tests := []struct {
-		name  string
-		relay float64
-		dust  uint64
-		want  uint64
+		name     string
+		dust     uint64
+		relayFee float64
+		want     uint64
 	}{
-		// 0.546 * 0.00001 * 1e6 = 5.46 -> 5
-		{"relayFee primary", 0.00001, 100, 5},
-		{"relayFee only", 0.0001, 0, 54}, // 0.546*0.0001*1e6 = 54.6 -> 54
-		{"dustAmount fallback", 0, 100, 100},
-		{"default 5460", 0, 0, 5460},
+		// Live relayfee wins (C++ order): 0.546*0.0001*1e8 = 5460.
+		{"relayFee set", 0, 0.0001, 5460},
+		// Relayfee differs from fallback (COIN=1e6) -> 0.546*0.0001*1e6 = 54.6 -> 54.
+		{"relayFee set small coin", 0, 0.0001, 54},
+		// No relayfee: conf DustAmount used directly when set.
+		{"dustAmount set", 100, 0, 100},
+		{"dustAmount set (large)", 546, 0, 546},
+		// No relayfee, no DustAmount: falls back to C++ constant 5460.
+		{"default 5460", 0, 0, cppDustFallback},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cc := &config.CoinConf{RelayFee: tc.relay, DustAmount: tc.dust}
-			if got := effectiveDust(cc); got != tc.want {
+			cc := &config.CoinConf{DustAmount: tc.dust, Coin: coin}
+			if tc.name == "relayFee set small coin" {
+				cc.Coin = 1_000_000
+			}
+			if got := effectiveDust(cc, tc.relayFee); got != tc.want {
 				t.Errorf("effectiveDust = %d, want %d", got, tc.want)
 			}
 		})

@@ -1086,7 +1086,7 @@ func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface
 }
 
 // ---------------------------------------------------------------------------
-// dxGetTradingData / gettradingdata — trade history (requires blockchain data).
+// dxGetTradingData — trade history (requires blockchain data).
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetTradingData(params []json.RawMessage) (interface{}, *rpcError) {
@@ -1207,7 +1207,8 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	cc, _ := h.Node.cfg().Confs[ticker]
 
 	// C++ dust gate on the minimum split amount.
-	if cc != nil && targetXB < effectiveDust(cc) {
+	relayFee, _ := conn.GetRelayFee()
+	if cc != nil && targetXB < effectiveDust(cc, relayFee) {
 		return nil, makeError(errBadRequest, "dxSplit", "split amount is dust ["+formatXAmount(targetXB)+"]")
 	}
 
@@ -1267,7 +1268,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		change = total - spent
 	}
 	// Dust change is dropped (C++ claws it back into fees); keeps the tx relayable.
-	if cc != nil && change < effectiveDust(cc) {
+	if cc != nil && change < effectiveDust(cc, relayFee) {
 		change = 0
 	}
 
@@ -1328,27 +1329,31 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}, nil
 }
 
-// effectiveDust returns the minimum non-dust amount (base units) for a coin,
-// mirroring C++ xbridgewalletconnectorbtc.cpp:1526:
-//
-//	dustAmount = info.relayFee > 0 ? 0.546 * info.relayFee * COIN : 5460;
-//
-// Go has no live relayFee feed (thin client), so: prefer an explicit RelayFee
-// config; else an explicit DustAmount override; else the C++ default 5460.
-func effectiveDust(cc *config.CoinConf) uint64 {
-	const coin = 1_000_000 // COIN (go-xbridge base units, 6 decimals)
-	if cc != nil && cc.RelayFee > 0 {
-		return uint64(0.546 * cc.RelayFee * coin)
+// cppDustFallback is C++'s own dust fallback constant (xbridgewalletconnectorbtc.cpp:1526):
+// when no relay fee is available, C++ uses 5460 base units. go-xbridge gathers
+// the relay fee live from the wallet's getinfo.relayfee (C++ :74-76); when that
+// is unavailable it falls back to the conf `DustAmount` key, and finally to this
+// C++-defined constant.
+const cppDustFallback = 5460
+
+// effectiveDust returns the minimum non-dust amount (base units) for a coin.
+// It mirrors C++ exactly (xbridgewalletconnectorbtc.cpp:1526):
+// dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460. The conf `DustAmount`
+// key is a secondary override and 5460 the final fallback, matching C++'s order.
+func effectiveDust(cc *config.CoinConf, relayFee float64) uint64 {
+	if relayFee > 0 {
+		return uint64(0.546 * relayFee * float64(cc.Coin))
 	}
 	if cc != nil && cc.DustAmount > 0 {
 		return cc.DustAmount
 	}
-	return 5460
+	return cppDustFallback
 }
 
-// estimateFee returns a rough satoshi fee for a tx with nIn inputs and nOut
-// outputs, using the connector's estimate when available and conf FeePerByte
-// otherwise.
+// estimateFee returns the fee (base units) for a tx with nIn inputs and nOut
+// outputs. It mirrors C++'s minTxFee1/minTxFee2 (xbridgewalletconnectorbtc.cpp:1948-1969):
+// fee = (192*nIn + 34*nOut) * FeePerByte (FeePerByte from xbridge.conf [TICKER]),
+// floored at MinTxFee. No estimatesmartfee/estimatefee RPC is used, matching C++.
 func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
 	// Virtual-size estimate matches C++ xbridgewalletconnectorbtc.cpp:1948
 	// (192 bytes per legacy input, 34 per output). Modeling inputs at 192 keeps

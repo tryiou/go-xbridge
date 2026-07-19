@@ -95,8 +95,8 @@ func (l *LocalConnector) SendRawTransaction(txHex string) (string, error) {
 	return l.broadcast(txHex)
 }
 
-func (l *LocalConnector) EstimateFee(confTarget int) (uint64, error) {
-	return 0, errors.New("wallet: LocalConnector has no fee source")
+func (l *LocalConnector) GetRelayFee() (float64, error) {
+	return 0, errors.New("wallet: LocalConnector has no relay-fee source")
 }
 
 // GetBlockCount / GetBlockHash have no local blockchain source.

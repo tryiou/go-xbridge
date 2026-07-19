@@ -82,8 +82,9 @@ type Connector interface {
 	SignRawTransaction(txHex string, prevTxs []PrevTx) (signedHex string, complete bool, err error)
 	// SendRawTransaction broadcasts txHex, returning the network txid.
 	SendRawTransaction(txHex string) (txid string, err error)
-	// EstimateFee returns the fee rate in sat/vB for confTarget confirmations.
-	EstimateFee(confTarget int) (uint64, error)
+	// GetRelayFee returns the per-coin relay fee (BTC per kB) from the wallet's
+	// getinfo (C++ xbridgewalletconnectorbtc.cpp:74-76), used for dust (C++ :1526).
+	GetRelayFee() (float64, error)
 	// GetBlockCount returns the best block height of the coin's chain.
 	GetBlockCount() (int64, error)
 	// GetBlockHash returns the block hash at height as a 32-byte internal
