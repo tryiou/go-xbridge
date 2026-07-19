@@ -302,6 +302,18 @@ func (n *Node) connector(t string) (wallet.Connector, error) {
 	return conn, nil
 }
 
+// relayFeeFor returns the live relay fee (BTC per kB) for a coin's wallet, used
+// by effectiveDust to compute C++'s dust threshold (xbridgewalletconnectorbtc.cpp:1526).
+// A missing/invalid connector yields 0, letting effectiveDust fall back to the
+// conf DustAmount or the C++ 5460 constant.
+func (n *Node) relayFeeFor(ticker string) (float64, error) {
+	conn, err := n.connector(ticker)
+	if err != nil {
+		return 0, err
+	}
+	return conn.GetRelayFee()
+}
+
 // blockContext returns the best block height and the first 8 bytes of the block
 // hash for ticker, mirroring C++ xbridgeapp.cpp:2420 (the chain tip stamped on
 // AcceptingBody). A missing/unreachable connector yields zeros — the order is
@@ -326,12 +338,15 @@ func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte) {
 	return height, hash
 }
 
-// utxoChallenge builds the BIP137 message an order UTXO is signed over,
-// matching C++ CXBridgeWalletConnector::signMessage: "<display-txid>:<vout>".
-// VERIFY: confirm the exact challenge string against a live C++ hub before
-// relying on cross-implementation acceptance of the proof.
-func utxoChallenge(txid string, vout uint32) string {
-	return fmt.Sprintf("%s:%d", txid, vout)
+// utxoChallenge builds the message an order UTXO is signed over, matching
+// C++ xbridge::wallet::UtxoEntry::toString(): "txid:vout:amount:address"
+// (xbridgewalletconnector.cpp:28). C++ signs/verifies it via
+// conn->signMessage(entry.address, entry.toString(), sig) and
+// conn->verifyMessage(entry.address, entry.toString(), sig)
+// (xbridgeapp.cpp:1691/1896/2312, xbridgesession.cpp:550/1123). The txid is the
+// raw display hex and amount is in base units, exactly as C++ emits.
+func utxoChallenge(txid string, vout uint32, amount uint64, address string) string {
+	return fmt.Sprintf("%s:%d:%d:%s", txid, vout, amount, address)
 }
 
 // buildUtxoProofs attaches a BIP137 ownership proof to each spendable UTXO,
@@ -353,7 +368,7 @@ func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) (
 		if !ok {
 			return nil, fmt.Errorf("api: utxo address %s has no id", u.Address)
 		}
-		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout))
+		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout, u.Amount, u.Address))
 		if err != nil {
 			return nil, err
 		}
@@ -727,7 +742,8 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
 		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
-		if cc := n.cfg().Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc) {
+		relayFee, _ := n.relayFeeFor(p.Maker)
+		if cc := n.cfg().Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc, relayFee) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
