@@ -1144,7 +1144,13 @@ func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpc
 }
 
 func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcError) {
-	// C++ requires exactly 7 params: (token, splitamount, address, include_fees, show_rawtx, submit, utxos)
+	// C++ advertises 3-7 params (rpcxbridge.cpp:3295) but then reads params[3]
+	// through params[6] unconditionally via get_bool()/get_array(); on a missing
+	// index UniValue::operator[] yields NullUniValue and get_bool()/get_array()
+	// throw. So C++ only actually succeeds with all 7 params present — the 3-6
+	// range throws a generic type error at the first missing param. We therefore
+	// require exactly 7: (token, splitamount, address, include_fees, show_rawtx,
+	// submit, utxos).
 	if len(params) != 7 {
 		return nil, makeError(errInvalidParameters, "dxSplitInputs", "(token) (splitamount) (address) (include_fees) (show_rawtx) (submit) (utxos)")
 	}
