@@ -32,8 +32,9 @@ func (h *HandlerCtx) Config() *Config {
 // result, leaving the envelope error null).
 type Handler func(h *HandlerCtx, params []json.RawMessage) (interface{}, *rpcError)
 
-// dispatch maps every dx* method name (and the lowercase gettradingdata alias)
-// to its handler. The set and names match src/xbridge/rpcxbridge.cpp commands[].
+// dispatch maps every dx* method name to its handler. The set and names match
+// src/xbridge/rpcxbridge.cpp commands[]. Only dxGetTradingData is exposed for
+// trade history (gettradingdata is not part of the Go XBridge interface).
 var dispatch = map[string]Handler{
 	"dxGetOrderFills":            (*HandlerCtx).dxGetOrderFills,
 	"dxGetOrders":                (*HandlerCtx).dxGetOrders,
@@ -54,7 +55,6 @@ var dispatch = map[string]Handler{
 	"dxPartialOrderChainDetails": (*HandlerCtx).dxPartialOrderChainDetails,
 	"dxGetLockedUtxos":           (*HandlerCtx).dxGetLockedUtxos,
 	"dxFlushCancelledOrders":     (*HandlerCtx).dxFlushCancelledOrders,
-	"gettradingdata":             (*HandlerCtx).dxGetTradingData,
 	"dxGetTradingData":           (*HandlerCtx).dxGetTradingData,
 	"dxSplitAddress":             (*HandlerCtx).dxSplitAddress,
 	"dxSplitInputs":              (*HandlerCtx).dxSplitInputs,
