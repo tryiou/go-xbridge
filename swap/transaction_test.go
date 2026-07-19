@@ -232,8 +232,8 @@ func TestIsExpired(t *testing.T) {
 
 // TestIsExpiredByBlockNumber checks the block-height expiry variant: a trNew
 // order expires once the chain advances more than BlocksTTL beyond the block it
-// was created at, and stays valid within that window. Post-trNew delegates to
-// the time-based TTL.
+// was created at, and stays valid within that window. Finished/terminal orders
+// are governed by the same block-height TTL (C++ isExpiredByBlockNumber).
 func TestIsExpiredByBlockNumber(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	const createdAtBlock = 1_000_000
@@ -255,22 +255,30 @@ func TestIsExpiredByBlockNumber(t *testing.T) {
 	}
 
 	// Post-trNew and NOT finished short-circuits to false (the C++ guard at
-	// xbridgetransaction.cpp:295-296): block-height expiry no longer applies and
-	// the time-based TTL is what governs, but IsExpiredByBlockNumber itself
-	// returns false regardless of how idle the order is.
+	// xbridgetransaction.cpp:295-296): block-height expiry no longer applies,
+	// regardless of how idle the order is or how far the chain has advanced.
 	joined := makerOrder()
 	joined.TryJoin(takerOrder())
 	joined.BlockNumber = createdAtBlock
 	joined.LastAt = time.Now().Add(-(TTL + 10) * time.Second).Unix()
-	if joined.IsExpiredByBlockNumber(createdAtBlock) {
+	if joined.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL + 100) {
 		t.Error("post-trNew !finished must return false (C++ block-height guard)")
 	}
-	// Only a finished (terminal) post-trNew order can be expired by this call,
-	// and then it delegates to the time-based TTL.
+
+	// A finished (terminal) post-trNew order is governed by the block-height
+	// TTL, NOT the time-based TTL (C++ isExpiredByBlockNumber uses
+	// lastBlockHeight - trBlockHeight > blocksTTL for all non-short-circuited
+	// states). Idle time is irrelevant here.
 	joined.State = TrFinished
 	joined.LastAt = time.Now().Add(-(TTL + 10) * time.Second).Unix()
-	if !joined.IsExpiredByBlockNumber(createdAtBlock) {
-		t.Error("post-trNew finished + idle past time TTL must be expired")
+	if joined.IsExpiredByBlockNumber(createdAtBlock) {
+		t.Error("finished within block window must not be expired (idle time irrelevant)")
+	}
+	if joined.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL - 1) {
+		t.Error("finished just inside BlocksTTL must not be expired")
+	}
+	if !joined.IsExpiredByBlockNumber(createdAtBlock + BlocksTTL + 1) {
+		t.Error("finished past BlocksTTL must be expired")
 	}
 }
 

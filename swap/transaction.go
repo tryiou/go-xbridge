@@ -220,21 +220,30 @@ func (t *Transaction) IsExpired(now time.Time) bool {
 }
 
 // IsExpiredByBlockNumber reports whether the transaction has exceeded its
-// block-height TTL (C++ Transaction::isExpiredByBlockNumber). currentBlock is
-// the chain tip height (e.g. from Connector.GetBlockCount). For trNew the check
-// is purely block-based: currentBlock - BlockNumber > BlocksTTL (the
-// block-height analog of DeadlineTTL). For later states XBridge still gates on
-// the time-based TTL, so we delegate to IsExpired; the block parameter is only
-// consulted for the trNew block window.
+// block-height TTL (C++ Transaction::isExpiredByBlockNumber,
+// xbridgetransaction.cpp:288-311). currentBlock is the chain tip height (e.g.
+// from Connector.GetBlockCount).
+//
+// C++ has a single short-circuit: once the order is past trNew and NOT yet
+// finished, block-height expiry does not apply and the call returns false. For
+// every other state — trNew, and finished/terminal states — expiry is governed
+// purely by block height: currentBlock - BlockNumber > BlocksTTL. (C++ looks up
+// the order's block via its hash; if the hash is unknown it treats the order as
+// expired, which does not apply to this thin-client model where BlockNumber is
+// tracked directly.)
 func (t *Transaction) IsExpiredByBlockNumber(currentBlock uint32) bool {
 	// C++ Transaction::isExpiredByBlockNumber (xbridgetransaction.cpp:295-296):
 	// once past trNew and not yet finished, block-height expiry no longer
-	// applies — the time-based TTL governs instead.
+	// applies.
 	if t.State > TrNew && !t.IsFinished() {
 		return false
 	}
-	if t.State == TrNew {
-		return int64(currentBlock)-int64(t.BlockNumber) > BlocksTTL
-	}
-	return t.IsExpired(time.Now())
+	// All other states (trNew and finished/terminal) use the block-height TTL.
+	//
+	// Callers must apply this only to the OPEN order set, never to finished history:
+	// in C++ eraseExpiredTransactions() sweeps m_pendingTransactions (the open
+	// book) and finished orders live in a separate store (finishedTransactions())
+	// that is never block-expired. Applying this to a combined store would prune
+	// completed swaps.
+	return int64(currentBlock)-int64(t.BlockNumber) > BlocksTTL
 }
