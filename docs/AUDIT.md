@@ -119,3 +119,62 @@ deliberate).
 ## Bottom line
 One real S1 fix needed (the `version` nTime omission). Everything else is faithful or a
 low-risk, mostly-documented thin-client divergence.
+
+---
+
+## Resolution status (implementation phase)
+
+Each item below was re-verified against the C++ writers before acting. Line
+references point at the authoritative C++ source in `blocknet_core/src/xbridge/`
+(and `src/protocol.h`, `src/net_processing.cpp` for the wire handshake).
+
+### Fixed (now byte/behaviour parity with C++)
+
+**S1-A — `version` `net_addr` now 30-byte CAddress.** RESOLVED.
+- Ground truth: `protocol.h:379-381` writes `nTime` when `nVersion >= CADDR_TIME_VERSION`; `net_processing.cpp:210` serializes `addrYou`/`addrMe` at `PROTOCOL_VERSION=70713`.
+- Fix: `NetAddr.Timestamp` added; `marshalNetAddr`/`unmarshalNetAddr` are 30 bytes (`nTime(4 LE) || services(8 LE) || ip(16) || port(2 BE)`); `NewVersion` stamps both addrs with `uint32(time.Now().Unix())`; `UnmarshalVersion` recovers the timestamp.
+- Tests: `p2p/version_test.go` (30-byte shape, round-trip, short-buffer error, addr-timestamp round-trip, updated offsets).
+
+**S2-B — `IsExpiredByBlockNumber` uses block-height for finished states.** RESOLVED.
+- Ground truth: `xbridgetransaction.cpp:288-311` — the only short-circuit is `gtNew && !isFinished() → false`; every other state (trNew and finished/terminal) uses `lastBlockHeight - trBlockHeight > blocksTTL`.
+- Fix: `swap/transaction.go` finished path no longer delegates to the time-based `IsExpired`; it uses `int64(currentBlock)-int64(BlockNumber) > BlocksTTL`.
+- Tests: `swap/transaction_test.go` rewritten — finished orders are governed by block-height, not idle time; the not-finished short-circuit is retained.
+
+**S3-A — empty `JSONVersion`/`ContentType` defaults + client parity.** RESOLVED.
+- Ground truth: `xbridgeapp.cpp:995-996` default both empty; `xbridgewalletconnectorbtc.h:103-104` pushes `"jsonrpc"` only when non-empty; `:139-140` adds the `Content-Type` header only when non-empty.
+- Fix: `config/conf.go` defaults `""`/`""`. `wallet/rpc.go` `NewRPCClient` no longer re-injects `"1.0"`/`"application/json"`; an empty version omits the `"jsonrpc"` field (via `omitempty`), and an empty content-type leaves the header unset.
+- Tests: `wallet/rpc_test.go` `TestRPCClientJSONRPCField` (empty→omitted, explicit→verbatim) + new `TestRPCClientContentTypeHeader`.
+
+**S3-G (listunspent) — empty params + C++ client-side filter.** RESOLVED.
+- Ground truth: `xbridgewalletconnectorbtc.cpp:509-512` calls `listunspent` with an empty `Array`; `:536-577` filters (`spendable==false` skipped, `amount>0`, `confs==-1 || confs>0`).
+- Fix: `wallet/rpc.go` `ListUnspent` sends `[]` and applies the same filter client-side; the Go-only `minConf` caller contract is preserved by dropping known-confs below the floor (C++ has no per-call minconf; it relies on the wallet default).
+- Tests: `wallet/rpc_test.go` `TestListUnspentFiltering` + empty-params assertion in `TestRPCConnector/ListUnspent`.
+
+**S3-G (signrawtransaction) — legacy primary + modern fallback.** RESOLVED.
+- Ground truth: `xbridgewalletconnectorbtc.cpp:1091-1100` calls `signrawtransaction` first, falling back to `signrawtransactionwithwallet` on error.
+- Fix: `wallet/rpc.go` `SignRawTransaction` tries the legacy RPC first, then the modern one, with identical args `(txHex, prevTxs, "ALL")`.
+- Tests: `wallet/rpc_test.go` `TestSignRawTransactionFallback` + `TestSignRawTransactionLegacyPrimary`.
+
+### Analyzed — NOT a deviation (no code change)
+
+**S3-D — display `+1/COIN` round-up.** NO DEVIATION.
+- The bump is `1.0 / ::COIN` where `::COIN = 100000000` (`amount.h:14`), i.e. `1e-8` — **not** `1/TransactionDescr::COIN (1e6)`. The audit misread the denominator.
+- Display uses `std::fixed << setprecision(xBridgeSignificantDigits(TransactionDescr::COIN))` = `setprecision(7)` (`util/xutil.cpp:205,263-274`), a `1e-7` floor. A `1e-8` bump is two orders below the floor and never renders. C++ output equals Go's truncate-to-6 `formatXAmount` for all real amounts.
+
+**S3-E — `dxSplitInputs` param count.** NO DEVIATION (Go already correct).
+- The guard advertises 3–7 (`rpcxbridge.cpp:3295`) but the body reads `params[3]`..`params[6]` unconditionally via `get_bool()`/`get_array()`. On a missing index, `UniValue::operator[]` returns `NullUniValue` and `get_bool()`/`get_array()` **throw** (`univalue.cpp:209-217`, `univalue_get.cpp:90-95,141`). So C++ only succeeds with all 7 params; a 3–6 call throws a generic type error. Go's exact-7 requirement matches real C++ runtime behaviour. Only the code comment was clarified.
+
+**S3-F — `dxGetOrderBook` max_orders cap.** NO DEVIATION (matches Go).
+- C++ caps `bids` and `asks` **independently**: `std::min<int32_t>(maxOrders, bidsVector.size())` and `...asksVector.size()` (`rpcxbridge.cpp:1763,1796,1838,1854`). Go also caps per side (`api/handlers.go` cases 2/3/4 use `len(res.Asks) >= maxOrders` / `len(res.Bids) >= maxOrders`). The audit's "combined cap" premise was incorrect.
+
+### Documented — deliberate / default-equivalent (no code change)
+
+**S2-A — base58check strictness.** Kept strict (deliberate hardening). Go rejects mismatched prefixes; C++ `toXAddr` strips blindly. For valid inputs both yield the same 20-byte id; divergence only on malformed/foreign input.
+
+**S3-B — `FeePerByte==0` → 2 sat/vB thin-client default.** Deliberate. Operators should set `FeePerByte` explicitly; for a real conf value both match.
+
+**S3-C — `DustAmount` conf tier.** Deliberate thin-client substitution; for `DustAmount=0` Go collapses to `5460`, matching C++.
+
+**S3-G (sendrawtransaction).** Documented as default-equivalent. Go passes `false` (allowhighfees); C++ passes txid only (`:1236-1238`). Bitcoin Core's default `allowhighfees=false` → identical wire effect.
+
+**S3-G (getrawtransaction).** Documented as default-equivalent. Go passes verbosity `0`; C++ passes txid only (`:728-730`). Core's default verbosity is `0` → identical.
