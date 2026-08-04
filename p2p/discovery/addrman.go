@@ -18,6 +18,14 @@ import (
 	"go-xbridge/p2p"
 )
 
+// now is the clock used for cooldown decisions; overridable in tests to avoid
+// real sleeps.
+var now = time.Now
+
+// dialCooldown is how long an address is skipped after a dial attempt, so a
+// host that just timed out is not re-hammered on every maintain tick.
+const dialCooldown = 2 * time.Minute
+
 // addrEntry is a discovered peer address tracked by AddrMan.
 type addrEntry struct {
 	addr     string // "host:port", also the map key
@@ -73,6 +81,28 @@ func (a *AddrMan) AddSlice(entries []p2p.AddrEntry) {
 	for _, e := range entries {
 		a.Add(e.IP, e.Port, e.Services)
 	}
+}
+
+// MarkTried records that we just attempted (success or failure) to dial addr,
+// starting its cooldown so it is not re-hammered every maintain tick.
+func (a *AddrMan) MarkTried(addr string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if e, ok := a.addrs[addr]; ok {
+		e.lastTry = now()
+	}
+}
+
+// NeedsTry reports whether addr should be dialed now: true if unknown or if it
+// was last tried longer ago than cooldown.
+func (a *AddrMan) NeedsTry(addr string, cooldown time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.addrs[addr]
+	if !ok {
+		return true
+	}
+	return now().Sub(e.lastTry) > cooldown
 }
 
 // Count returns the number of unique known addresses.

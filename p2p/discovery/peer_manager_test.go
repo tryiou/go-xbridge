@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -201,5 +202,92 @@ func TestPeerManagerFakePeer(t *testing.T) {
 	// And at least one healthy peer should be tracked.
 	if len(pm.Peers()) < 1 {
 		t.Fatalf("connected peers = %d, want >= 1", len(pm.Peers()))
+	}
+}
+
+// TestPeerManagerExplicitCooldown verifies that an explicit (-addnode) address,
+// which is not tracked by the addrman (it may be a hostname), still honors the
+// dial cooldown: it must not be re-candidated within the window after a failed
+// dial, and must become a candidate again once the window elapses.
+func TestPeerManagerExplicitCooldown(t *testing.T) {
+	orig := now
+	defer func() { now = orig }()
+	fake := time.Unix(1000, 0)
+	now = func() time.Time { return fake }
+
+	pm := New(p2p.MainnetMagic, "staging", Options{
+		TargetPeers:   1,
+		ExplicitAddrs: []string{"hostname.example:41412"},
+		DialCooldown:  2 * time.Minute,
+		Dialer: func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+			return nil, errors.New("dial failed")
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const addr = "hostname.example:41412"
+	if got := pm.nextCandidate(); got != addr {
+		t.Fatalf("fresh explicit addr should be a candidate, got %q", got)
+	}
+	pm.connectOne(ctx, addr)
+
+	// Within the cooldown window the explicit addr must not be re-candidated.
+	if got := pm.nextCandidate(); got != "" {
+		t.Fatalf("explicit addr re-candidated within cooldown, got %q", got)
+	}
+
+	// Past the cooldown it becomes a candidate again.
+	fake = fake.Add(pm.dialCooldown + time.Second)
+	if got := pm.nextCandidate(); got != addr {
+		t.Fatalf("explicit addr past cooldown should be a candidate, got %q", got)
+	}
+}
+
+// TestPeerManagerSeedSurvivesPrune verifies that per-tick re-seeding keeps the
+// static bootstrap set resident in the addrman (its seen time refreshed), so
+// Prune never evicts a seed and wipes its dial-cooldown bookkeeping — which
+// would otherwise degrade unreachable seeds to a dial attempt every tick.
+func TestPeerManagerSeedSurvivesPrune(t *testing.T) {
+	origNow := now
+	origBA := bootstrapAddrs
+	defer func() {
+		now = origNow
+		bootstrapAddrs = origBA
+	}()
+	fake := time.Unix(1000, 0)
+	now = func() time.Time { return fake }
+	bootstrapAddrs = func(string) []string { return []string{"1.2.3.4:41412"} }
+
+	pm := New(p2p.MainnetMagic, "mainnet", Options{
+		TargetPeers:  1,
+		DialCooldown: 2 * time.Minute,
+	})
+	pm.seedAddrMan()
+	const seed = "1.2.3.4:41412"
+	if !pm.addrMan.NeedsTry(seed, pm.dialCooldown) {
+		t.Fatal("fresh seed should need a try")
+	}
+	pm.addrMan.MarkTried(seed)
+
+	// Simulate 31 minutes of 15s maintain ticks (prune + re-seed each tick).
+	for i := 0; i < 124; i++ {
+		fake = fake.Add(15 * time.Second)
+		pm.addrMan.Prune(30 * time.Minute)
+		pm.seedAddrMan()
+	}
+
+	// The seed must still be resident (re-seeding keeps seen fresh so Prune
+	// never drops it), unlike the pre-fix behavior where the first prune past
+	// 30 minutes evicted it permanently.
+	if pm.addrMan.Count() == 0 {
+		t.Fatal("seed was pruned away despite per-tick re-seeding")
+	}
+	if !pm.addrMan.NeedsTry(seed, pm.dialCooldown) {
+		t.Fatal("seed should need a try again after the cooldown elapsed")
+	}
+	pm.addrMan.MarkTried(seed)
+	if pm.addrMan.NeedsTry(seed, pm.dialCooldown) {
+		t.Fatal("just-tried seed must be cooled down even after 30+ min of ticks")
 	}
 }

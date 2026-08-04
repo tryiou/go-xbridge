@@ -23,6 +23,9 @@ type Options struct {
 	SeedOverride []string
 	// TargetPeers is how many healthy outbound peers to maintain. Defaults to 8.
 	TargetPeers int
+	// DialCooldown is how long a failed/used address is skipped before being
+	// re-candidated. Defaults to 2 minutes.
+	DialCooldown time.Duration
 	// Dialer optionally overrides the connect function (used by tests). The
 	// default is p2p.Dial.
 	Dialer func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
@@ -44,15 +47,26 @@ type PeerManager struct {
 	done      chan struct{}
 	once      sync.Once
 
-	mu       sync.Mutex
-	peers    map[string]*p2p.Conn // addr -> conn (nil while connecting)
-	rr       int                  // round-robin cursor over candidates
-	explicit []string
+	// seeds is the resolved bootstrap address list for the network, populated
+	// once on first use so we do not re-run a blocking DNS lookup every tick.
+	seeds    []string
+	seedOnce sync.Once
+
+	mu            sync.Mutex
+	peers         map[string]*p2p.Conn // addr -> conn (nil while connecting)
+	rr            int                  // round-robin cursor over candidates
+	explicit      []string
+	explicitSet   map[string]bool
+	explicitTried map[string]time.Time
 
 	// snReg is the servicenode registry, populated from SNREGISTER / SNPING /
 	// SNLISTPING P2P messages (mirrors a core XBridge wallet learning the
 	// network token set). Exposed via ServiceNodes() for dxGetNetworkTokens.
 	snReg *servicenode.Registry
+
+	// dialCooldown is how long a failed/used address is skipped before being
+	// re-candidated, so unreachable peers are not dialed every maintain tick.
+	dialCooldown time.Duration
 }
 
 // peerPacket couples an XBridge packet with the TCP peer address it arrived
@@ -77,18 +91,29 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		// SeedOverride acts as the explicit set when provided.
 		explicit = append(explicit, opts.SeedOverride...)
 	}
+	explicitSet := make(map[string]bool, len(explicit))
+	for _, a := range explicit {
+		explicitSet[a] = true
+	}
+	dialCooldown := opts.DialCooldown
+	if dialCooldown <= 0 {
+		dialCooldown = 2 * time.Minute
+	}
 	return &PeerManager{
-		magic:     magic,
-		network:   network,
-		opts:      opts,
-		target:    target,
-		dial:      dial,
-		explicit:  explicit,
-		addrMan:   NewAddrMan(),
-		xbridgeCh: make(chan peerPacket, 256),
-		done:      make(chan struct{}),
-		peers:     make(map[string]*p2p.Conn),
-		snReg:     servicenode.NewRegistry(),
+		magic:         magic,
+		network:       network,
+		opts:          opts,
+		target:        target,
+		dial:          dial,
+		explicit:      explicit,
+		explicitSet:   explicitSet,
+		explicitTried: make(map[string]time.Time),
+		addrMan:       NewAddrMan(),
+		xbridgeCh:     make(chan peerPacket, 256),
+		done:          make(chan struct{}),
+		peers:         make(map[string]*p2p.Conn),
+		snReg:         servicenode.NewRegistry(),
+		dialCooldown:  dialCooldown,
 	}
 }
 
@@ -98,7 +123,30 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 func (m *PeerManager) Start(ctx context.Context) {
 	// Seed the AddrMan with the network's bootstrap addresses so we always have
 	// a candidate set even before any peer advertises addresses.
-	for _, a := range p2p.BootstrapAddrs(m.network) {
+	m.seedAddrMan()
+	m.connectUpTo(ctx, m.target)
+	go m.maintain(ctx)
+}
+
+// bootstrapAddrs is the seed source; overridable in tests to keep them
+// hermetic (mirrors the addrman `now` clock hook).
+var bootstrapAddrs = p2p.BootstrapAddrs
+
+// bootstrapSeeds returns the network's resolved bootstrap addresses, resolving
+// them (from bootstrapAddrs) only once. The result is cached so the per-tick
+// seedAddrMan refresh and candidates() never re-trigger a DNS lookup.
+func (m *PeerManager) bootstrapSeeds() []string {
+	m.seedOnce.Do(func() {
+		m.seeds = bootstrapAddrs(m.network)
+	})
+	return m.seeds
+}
+
+// seedAddrMan registers the network's bootstrap seeds with the address manager.
+// Re-adding a known seed refreshes its seen time (so Prune never evicts the
+// static seed set) while preserving its dial-cooldown state.
+func (m *PeerManager) seedAddrMan() {
+	for _, a := range m.bootstrapSeeds() {
 		if host, portStr, err := net.SplitHostPort(a); err == nil {
 			if ip := net.ParseIP(host); ip != nil {
 				if port, perr := parsePort(portStr); perr == nil {
@@ -107,8 +155,6 @@ func (m *PeerManager) Start(ctx context.Context) {
 			}
 		}
 	}
-	m.connectUpTo(ctx, m.target)
-	go m.maintain(ctx)
 }
 
 // maintain keeps the pool at the target size on a ticker.
@@ -123,6 +169,11 @@ func (m *PeerManager) maintain(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.connectUpTo(ctx, m.target)
+			m.addrMan.Prune(30 * time.Minute)
+			// Prune drops discovered peers whose seen time went stale. Re-seed
+			// afterwards so the static bootstrap set is never pruned away (which
+			// would also wipe its dial-cooldown state).
+			m.seedAddrMan()
 		}
 	}
 }
@@ -163,10 +214,20 @@ func (m *PeerManager) nextCandidate() string {
 	for i := 0; i < len(cands); i++ {
 		idx := (m.rr + i) % len(cands)
 		c := cands[idx]
-		if _, ok := m.peers[c]; !ok {
-			m.rr = (idx + 1) % len(cands)
-			return c
+		if _, ok := m.peers[c]; ok {
+			continue
 		}
+		if m.explicitSet[c] {
+			// Explicit addrs are not tracked by the addrman (they may be
+			// hostnames), so their cooldown lives here.
+			if t, tried := m.explicitTried[c]; tried && now().Sub(t) < m.dialCooldown {
+				continue
+			}
+		} else if !m.addrMan.NeedsTry(c, m.dialCooldown) {
+			continue
+		}
+		m.rr = (idx + 1) % len(cands)
+		return c
 	}
 	return ""
 }
@@ -179,13 +240,19 @@ func (m *PeerManager) candidates() []string {
 	for _, e := range m.addrMan.Random(m.addrMan.Count()) {
 		c = append(c, net.JoinHostPort(e.IP.String(), itoa(e.Port)))
 	}
-	c = append(c, p2p.BootstrapAddrs(m.network)...)
+	c = append(c, m.bootstrapSeeds()...)
 	return c
 }
 
 // connectOne dials a single candidate, registers the live conn, and starts its
 // read loop. On failure it frees the reservation so the address can be retried.
 func (m *PeerManager) connectOne(ctx context.Context, addr string) {
+	m.mu.Lock()
+	if m.explicitSet[addr] {
+		m.explicitTried[addr] = now()
+	}
+	m.mu.Unlock()
+	m.addrMan.MarkTried(addr)
 	conn, err := m.dial(addr, m.magic, 30*time.Second)
 	if err != nil {
 		m.mu.Lock()
@@ -235,10 +302,12 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		case p2p.XBridgeNetCommand:
 			pktBytes, derr := p2p.DecodeXBridgePayload(msg.Payload)
 			if derr != nil {
+				xlog.Debug("peer xbridge payload decode failed", "peer", addr, "err", derr)
 				continue
 			}
 			pkt, perr := proto.Unmarshal(pktBytes)
 			if perr != nil {
+				xlog.Debug("peer xbridge packet unmarshal failed", "peer", addr, "err", perr)
 				continue
 			}
 			select {
@@ -258,14 +327,14 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		case servicenode.CmdSNRegister:
 			sn, derr := servicenode.ParseServiceNode(msg.Payload)
 			if derr != nil {
-				xlog.Warn("servicenode: SNREGISTER parse error", "peer", addr, "err", derr)
+				xlog.Warn("servicenode: SNREGISTER parse failed", "peer", addr, "err", derr)
 				break
 			}
 			m.snReg.AddRegistration(sn)
 		case servicenode.CmdSNPing, servicenode.CmdSNListPing:
 			sn, derr := servicenode.ParseServiceNodePing(msg.Payload)
 			if derr != nil {
-				xlog.Warn("servicenode: SNPING/SNLISTPING parse error", "peer", addr, "cmd", msg.Command, "err", derr)
+				xlog.Warn("servicenode: SNPING/SNLISTPING parse failed", "peer", addr, "cmd", msg.Command, "err", derr)
 				break
 			}
 			m.snReg.AddPing(sn)
