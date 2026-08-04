@@ -8,13 +8,17 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"flag"
+	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"go-xbridge/api"
 	"go-xbridge/coins"
@@ -26,9 +30,12 @@ import (
 
 // fatalf logs an error at ERROR level with the given structured fields and
 // exits non-zero (slog has no Fatal). It mirrors the xlog.Error(msg, key,
-// value, ...) convention used across the daemon.
+// value, ...) convention used across the daemon. FlushAll runs first so
+// pending dedup summaries are not lost on the fatal path (os.Exit skips
+// defers).
 func fatalf(msg string, args ...any) {
 	xlog.Error(msg, args...)
+	xlog.FlushAll()
 	os.Exit(1)
 }
 
@@ -86,18 +93,19 @@ func main() {
 	// Set up file logging (stderr remains active). Default to
 	// <datadir>/xbridged.log unless -logfile overrides. An empty -logfile
 	// disables the file entirely.
+	var rw io.Closer
 	if *logFile != "" {
-		rw, err := xlog.SetFileLogger(*logFile, 10<<20, 2)
+		r, err := xlog.SetFileLogger(*logFile, 10<<20, 2)
 		if err != nil {
 			fatalf("log file: %v", err)
 		}
-		defer rw.Close()
+		rw = r
 	} else {
-		rw, err := xlog.SetFileLogger(filepath.Join(dataDir, "xbridged.log"), 10<<20, 2)
+		r, err := xlog.SetFileLogger(filepath.Join(dataDir, "xbridged.log"), 10<<20, 2)
 		if err != nil {
 			fatalf("log file: %v", err)
 		}
-		defer rw.Close()
+		rw = r
 	}
 
 	var magic [4]byte
@@ -173,11 +181,6 @@ func main() {
 		xlog.Warn("could not connect to explicit service node; continuing in read-only mode (order book will be empty)",
 			"node", *nodeAddr, "err", err)
 	}
-	defer func() {
-		if node != nil {
-			_ = node.Close()
-		}
-	}()
 
 	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
@@ -189,7 +192,30 @@ func main() {
 		xlog.Info("xbridged listening", "addr", *rpcAddr, "mode", "discovery",
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
-	if err := http.ListenAndServe(*rpcAddr, srv); err != nil {
-		fatalf("http server", "err", err)
+	// Finalization on SIGINT/SIGTERM. os.Exit skips defers, so shutdown steps
+	// must run explicitly here: stop the P2P node (peer conns / read-loops),
+	// flush pending dedup summaries, then close the log file.
+	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSig()
+
+	go func() {
+		if err := http.ListenAndServe(*rpcAddr, srv); err != nil {
+			fatalf("http server", "err", err)
+		}
+	}()
+
+	<-sigCtx.Done()
+	if node != nil {
+		if err := node.Close(); err != nil {
+			xlog.Warn("node close", "err", err)
+		}
 	}
+	xlog.FlushAll()
+	if rw != nil {
+		if err := rw.Close(); err != nil {
+			xlog.Error("log close", "err", err)
+		}
+	}
+	stopSig()
+	os.Exit(0)
 }
