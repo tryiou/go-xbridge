@@ -147,3 +147,11 @@ trInitialized / trCreated / trFinished / trCancelled / trDropped are set). Those
 two enum values are vestigial; deposits instead *gate* the progression. This port
 mirrors that: the `Session` tracks the deposit lifecycle on its own fields and
 calls `IncreaseStateCounter`, and does not set `trSigned`/`trCommited`.
+
+**Known divergences (MUST FIX, see [`AUDIT.md`](AUDIT.md)):** the deposit as
+built today locks exactly `Amount` without the `fee2` redeem margin and stamps a
+CLTV-enabling input sequence (`0xfffffffe`) — C++ locks `Amount + fee2` with
+`SEQUENCE_FINAL` and hard-rejects non-final deposit sequences (S1-B/S1-C), and
+time-field chains additionally omit `nTime` from the signing preimage (S1-D).
+This spec describes the port as built; the audit register is authoritative on
+C++ parity.

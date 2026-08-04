@@ -1,8 +1,9 @@
 # Coins — per-coin metadata, amounts, addresses
 
 `coins/` is the foundation the `swap` deposit/refund layer (and `wallet/`)
-builds on. It is **stdlib-only** (like `proto/`), so it stays portable and
-dependency-light. It covers the three things every chain interaction needs:
+builds on. It depends only on `btcd/btcec/v2` for ECDSA signing — the sole
+non-stdlib dependency (`proto/` remains stdlib-only). It covers the three
+things every chain interaction needs:
 
 1. **Coin metadata** (`coin.go`) — ticker, name, decimal precision, and the
    base58check version bytes / bech32 HRP that identify addresses on that chain.

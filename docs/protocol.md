@@ -314,31 +314,21 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
 
 ---
 
-## 6. Open questions / TODO for next phases
+## 6. Status
 
-1. **`version` handshake payload** (§1.3, §1.3.1) — ✅ DONE.
-2. **`NetMsgType::XBRIDGE` command string** — ✅ confirmed `"xbridge"` live.
-3. **uint256 byte order** — ✅ VERIFIED. Bitcoin internal LE order is preserved
-   verbatim on the wire (no reversal): C++ appends `blockHash.begin()` for 32
-   bytes (xbridgeapp.cpp:2082), and Go's `body_types.go` carries uint256 fields
-   byte-for-byte. Matches.
-4. **Per-coin transaction construction** — `src/xbridge/xbridgewalletconnector*`
-   + `xbitcointransaction*`: build/serialize each coin's deposit/refund tx and
-   parse addresses/amounts. UTXO coins share `xbitcointransaction`; Decred
-   (`xbridgesessiondcr`) is special.
-   - **Body field layouts: DONE (2026-07-15).** `proto/body_types.go` ports
-     every `XBridgeCommand`'s body 1:1 from the C++ writers
-     (`xbridgeapp.cpp` `sendPendingTransaction` for `xbcTransaction` (3);
-     `xbridgesession.cpp` for `xbcPendingTransaction` (4) and the swap
-     commands; `xbridgeapp.cpp` `acceptXBridgeTransaction` for
-     `xbcTransactionAccepting` (5)). The C++ header enum comments are STALE and
-     were deliberately NOT followed where they disagree with the real writers
-     (see the note at the top of `body_types.go`). `xbcTransaction` is decoded
-     end-to-end from a live captured packet in `proto/body_test.go`.
-5. **Wallet connector RPC** — ✅ DONE. `wallet/` implements the `Connector`
-   interface with `RPCConnector` (JSON-RPC to a Blocknet-core-compatible wallet,
-   incl. `signmessage`/`getrawtransaction` for BIP137 proofs and `OnConfirm*`
-   refund/payment) and `LocalConnector` (local signing). See `docs/wallet.md`.
-6. **API surface** — ✅ DONE. All 23 `dx*` commands from `rpcxbridge.cpp` are
-   ported 1:1 in `api/`; the three-party client driver (`api/swap.go`) runs the
-   Maker ⇄ Hub ⇄ Taker handshake. See `docs/api.md`.
+The questions that drove earlier phases are resolved and their records live in
+git history and [`STATUS.md`](STATUS.md):
+
+- `version` handshake payload (§1.3, §1.3.1) — ✅ DONE (live-verified).
+- `NetMsgType::XBRIDGE` command string — ✅ confirmed `"xbridge"` live.
+- uint256 byte order — ✅ VERIFIED. Bitcoin internal LE order is preserved
+  verbatim on the wire (no reversal).
+- Per-command body field layouts — ✅ DONE (2026-07-15), read 1:1 from the real
+  C++ writers; the C++ header enum comments are STALE and were deliberately NOT
+  followed where they disagree (see the note at the top of `proto/body_types.go`).
+- Wallet connector RPC — ✅ DONE (`wallet/`; see `docs/wallet.md`).
+- API surface — ✅ DONE (all 23 `dx*` commands; see `docs/api.md`).
+
+Open work (non-UTXO coin adapters, live-hub verification of the swap handshake)
+is tracked in [`STATUS.md`](STATUS.md) "Open items" and the divergence register
+in [`AUDIT.md`](AUDIT.md).

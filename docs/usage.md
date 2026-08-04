@@ -64,9 +64,11 @@ The same INI format the original core wallet reads. Two section kinds:
 | Key | Type | Meaning |
 |-----|------|---------|
 | `Title` | string | Human name (defaults to the section name). |
+| `Address` | string | Wallet/RPC bind address (optional). |
 | `Ip` / `Port` | string / int | Wallet/node JSON-RPC endpoint. |
 | `Username` / `Password` | string | Wallet RPC auth. |
 | `CreateTxMethod` | string | Selects the tx-construction path (e.g. `"BTC"`). Drives segwit/bech32 support in `coins/`. |
+| `CashAddrPrefix` | string | BCH CashAddr HRP (e.g. `bitcoincash`); empty for non-BCH coins. |
 | `AddressPrefix` / `ScriptPrefix` / `SecretPrefix` | int | base58check version bytes (P2PKH / P2SH / WIF) as decimals. |
 | `COIN` | uint64 | Base-unit multiplier (e.g. `100000000`); decimals are derived from its trailing zeros. |
 | `MinimumAmount` | uint64 | Minimum trade amount (base units). |
@@ -76,8 +78,8 @@ The same INI format the original core wallet reads. Two section kinds:
 | `Confirmations` | int | Required confirmations. |
 | `TxWithTimeField` | bool | Tx carries a time field. |
 | `LockCoinsSupported` / `GetNewKeySupported` / `ImportWithNoScanSupported` | bool | Wallet capability flags. |
-| `JSONVersion` | string | Wallet RPC JSON version (default `"1.0"`). |
-| `ContentType` | string | RPC `Content-Type` (default `"application/json"`). |
+| `JSONVersion` | string | Wallet RPC JSON version (default empty; empty omits the `"jsonrpc"` request field — set `"1.0"` for bitcoind/blocknetd-style wallets). |
+| `ContentType` | string | RPC `Content-Type` (default empty; empty leaves the header unset). |
 | `OmitJSONVersion` | bool | Drop the `"jsonrpc"` field from RPC requests (XLite-style wallets require this). |
 
 ### Sample (`xbridge.conf`)
@@ -176,8 +178,10 @@ magics and default ports are in
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
 | `-rpcaddr` | `:41414` | JSON-RPC listen address for the `dx*` API. |
+| `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
 | `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
 | `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
+| `-logfile` | `<datadir>/xbridged.log` | Log file path; pass `""` to disable file logging. |
 | `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
 
 ## Making a trade (walkthrough)

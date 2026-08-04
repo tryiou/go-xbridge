@@ -1,17 +1,14 @@
 # go-xbridge
 
 A portable, standalone **Go** reimplementation of the Blocknet **XBridge**
-atomic-swap engine. It is a **thin client**: it speaks the existing XBridge
-wire protocol to the live Blocknet service-node P2P network, so a user can trade
-by connecting their own (SPV) wallets — **without running `blocknetd`**.
-
-Service-node fees are paid by the user's connected **Blocknet SPV wallet**
-(via Blocknet core RPC); BLOCK is treated like any other coin through the
-wallet-connector abstraction.
+atomic-swap engine — a **thin client** that speaks the existing XBridge wire
+protocol to the live Blocknet service-node P2P network and trades through your
+own (SPV) wallets, **without running `blocknetd`**.
 
 > This is a from-scratch reimplementation, not a wrapper around `blocknetd`.
-> The wire contract lives in [`docs/protocol.md`](docs/protocol.md); how to
-> run and trade is in [`docs/usage.md`](docs/usage.md).
+> Repo context and contributor conventions live in [`CLAUDE.md`](CLAUDE.md);
+> the wire contract is in [`docs/protocol.md`](docs/protocol.md); how to run
+> and trade is in [`docs/usage.md`](docs/usage.md) — start there as a user.
 
 ## Build
 
@@ -47,7 +44,7 @@ table, and a make/take-order walkthrough are all in
 | [`docs/swap.md`](docs/swap.md) | The swap state machine + HTLC deposit layer (canonical spec). |
 | [`docs/coins.md`](docs/coins.md) | Per-coin metadata, amounts, address codec, tx construction. |
 | [`docs/wallet.md`](docs/wallet.md) | The wallet `Connector` contract (RPC + local). |
-| [`docs/audit-dx-equivalence.md`](docs/audit-dx-equivalence.md) | `dx*` RPC equivalence audit vs the C++ source. |
+| [`docs/AUDIT.md`](docs/AUDIT.md) | Consolidated audit register: C++↔Go fidelity, `dx*` equivalence matrix, security findings. |
 | [`docs/STATUS.md`](docs/STATUS.md) | Per-package implementation status and roadmap (contributor-facing, not required to use the app). |
 
 Contributor guidance lives in [`CLAUDE.md`](CLAUDE.md).
