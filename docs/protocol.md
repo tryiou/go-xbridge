@@ -73,7 +73,7 @@ Wire layout (`p2p/version.go` `Marshal`):
 
 ```
 version(4 LE) || services(8 LE) || timestamp(8 LE) ||
-addr_recv(30) || addr_from(30) || nonce(8 LE) ||
+addr_recv(26) || addr_from(26) || nonce(8 LE) ||
 user_agent(varstr) || start_height(4 LE) || relay(1) || fxrouter(1)
 ```
 
@@ -81,11 +81,11 @@ Field values (`p2p/version.go`):
 
 - `version` = `70713` (`BitcoinProtocolVersion`, from `src/version.h:12`).
 - `services` = `0` (thin client advertises no services).
-- `timestamp` = current unix seconds (`int64`).
-- `addr_recv` / `addr_from` = 30-byte CAddress (see §1.3.1). `addr_recv` is the
+- `timestamp` = current unix seconds (`int64`). This is the message-level
+  time; the embedded `addr_recv`/`addr_from` carry **no** per-addr `nTime`.
+- `addr_recv` / `addr_from` = 26-byte CAddress (see §1.3.1). `addr_recv` is the
   peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from` is a CAddress with
-  `nTime` stamped and services=0, but IP/port left zeroed (thin client advertises
-  no address of its own).
+  services=0 and IP/port left zeroed (thin client advertises no address of its own).
 - `nonce` = random `uint64`.
 - `user_agent` = `"/go-xbridge:0.1.0/"`.
 - `start_height` = `0` (thin client has no chain).
@@ -99,26 +99,27 @@ messages are ignored. A 30 s deadline bounds the exchange.
 
 #### 1.3.1 `net_addr` / CAddress layout
 
-Each addr field is a Bitcoin `CAddress`, 30 bytes:
+Each `version`-message addr field is the legacy 26-byte CAddress:
 
 ```
-nTime(4 LE) || services(8 LE) || ip(16) || port(2 BE)
+services(8 LE) || ip(16) || port(2 BE)
 ```
 
-- `nTime` is always written for `PROTOCOL_VERSION >= CADDR_TIME_VERSION (31402)`;
-  Blocknet's `PROTOCOL_VERSION` is 70713, so it is always present
-  (`src/protocol.h:379-381`, `src/net_processing.cpp:207-211`). `NewVersion`
-  stamps both addrs with the current unix seconds (`p2p/version.go`).
 - `ip` is 16 bytes; IPv4 is mapped into `::ffff:/96` (matches
   `CNetAddr::Serialize`).
 - `port` is **big-endian** (network byte order), unlike the rest of the frame.
+- **No per-addr `nTime`.** The 4-byte `nTime` belongs only to `addr`/`getaddr`
+  records (30-byte, see `p2p/addr.go`); the `version` message's time role
+  is filled by the message-level `timestamp` field above. Writing `nTime` into
+  the `version` addrs misaligns every following field and causes the peer to
+  drop the handshake.
 
-**VERIFIED:** the version/verack handshake was exercised against a live Blocknet
-4.4.1 service node (`coreproxy.airdns.org:42111`, magic `a1 a0 a2 a3`); the peer
-returned `proto=70713`, `ua="/Blocknet:4.4.1/"`, `relay=true`, and immediately
-began emitting `xbridge` messages (the `xbridge` command string is confirmed).
-The addr encoding was corrected to the 30-byte CAddress (incl. `nTime`) on
-2026-07-15 — see §1.3.1.
+**VERIFIED:** the version/verack handshake was exercised against a live
+Blocknet 4.4.1 service node (`coreproxy.airdns.org:42111`, magic `a1 a0 a2 a3`);
+the peer returned `proto=70713`, `ua="/Blocknet:4.4.1/"`, `relay=true`, and
+immediately began emitting `xbridge` messages (the `xbridge` command string is
+confirmed). The 26-byte (no-nTime) `version` CAddress layout is the form
+real service nodes accept.
 
 ---
 

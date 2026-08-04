@@ -42,18 +42,16 @@ type VersionMessage struct {
 	FXRouter bool
 }
 
-// NetAddr is a Bitcoin CAddress (nTime, services, IP, port). The `version`
-// message serializes addr_recv/addr_from as CAddress, and CAddress writes the
-// 4-byte nTime whenever the stream version is >= CADDR_TIME_VERSION (31402).
-// Blocknet's PROTOCOL_VERSION is 70713, so nTime is always present on the wire
-// (C++ src/protocol.h CAddress::SerializationOp, net_processing.cpp:207-211).
+// NetAddr is a Bitcoin net_addr (services, IP, port) without a timestamp.
+// The `version` message embeds addr_recv/addr_from as the legacy 26-byte
+// CAddress form (services(8) || ip(16) || port(2)); the nTime role is
+// filled by the message-level timestamp field, not by the embedded addrs.
+// (The 30-byte nTime-bearing form is used only in `addr`/`getaddr` records,
+// see p2p/addr.go — not here.)
 type NetAddr struct {
-	// Timestamp is the CAddress nTime field (unix seconds, serialized as a
-	// 4-byte LE uint32). C++ CAddress::Init() stamps it with GetTime().
-	Timestamp int64
-	Services  uint64
-	IP        net.IP
-	Port      uint16
+	Services uint64
+	IP       net.IP
+	Port     uint16
 }
 
 // ipTo16 returns the 16-byte serialization of an IP. IPv4 addresses are mapped
@@ -71,18 +69,15 @@ func ipTo16(ip net.IP) [16]byte {
 	return out
 }
 
-// marshalNetAddr serializes a CAddress:
-// nTime(4 LE) || services(8 LE) || ip(16) || port(2 BE) = 30 bytes.
-// nTime is the 4-byte LE uint32 timestamp CAddress writes for stream versions
-// >= CADDR_TIME_VERSION (always, for Blocknet's PROTOCOL_VERSION). Note the
-// port is big-endian (network byte order), unlike the rest of the frame.
+// marshalNetAddr serializes a net_addr: services(8 LE) || ip(16) || port(2 BE).
+// This is the 26-byte CAddress form used by the `version` message. The port is
+// big-endian (network byte order), unlike the rest of the frame (little-endian).
 func marshalNetAddr(a NetAddr) []byte {
-	buf := make([]byte, 30)
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(a.Timestamp))
-	binary.LittleEndian.PutUint64(buf[4:12], a.Services)
+	buf := make([]byte, 26)
+	binary.LittleEndian.PutUint64(buf[0:8], a.Services)
 	ip := ipTo16(a.IP)
-	copy(buf[12:28], ip[:])
-	binary.BigEndian.PutUint16(buf[28:30], a.Port)
+	copy(buf[8:24], ip[:])
+	binary.BigEndian.PutUint16(buf[24:26], a.Port)
 	return buf
 }
 
@@ -118,10 +113,11 @@ func marshalVarStr(s string) []byte {
 // Marshal serializes the version message to wire bytes:
 //
 //	version(4 LE) || services(8 LE) || timestamp(8 LE) ||
-//	addr_recv(30) || addr_from(30) || nonce(8 LE) ||
+//	addr_recv(26) || addr_from(26) || nonce(8 LE) ||
 //	user_agent(varstr) || start_height(4 LE) || relay(1) || fxrouter(1)
 //
-// Each addr is a CAddress: it leads with a 4-byte nTime (see marshalNetAddr).
+// Each addr is the 26-byte CAddress form (services || ip || port), no nTime;
+// the message-level timestamp above fills the time role.
 func (m *VersionMessage) Marshal() []byte {
 	buf := new(bytes.Buffer)
 	var f [8]byte
@@ -154,24 +150,18 @@ func (m *VersionMessage) Marshal() []byte {
 // NewVersion builds an outbound version message for a connection to remote.
 // remote may be nil (e.g. in tests), in which case addr_recv is left zeroed.
 func NewVersion(remote net.Addr) *VersionMessage {
-	// C++ CAddress::Init() stamps nTime with GetTime(); it is serialized as a
-	// 4-byte uint32, so stamp both addrs with the current unix seconds.
-	now := time.Now().Unix()
 	var addrRecv NetAddr
 	if remote != nil {
 		if tcp, ok := remote.(*net.TCPAddr); ok {
-			addrRecv = NetAddr{Timestamp: now, Services: ServiceNodeNone, IP: tcp.IP, Port: uint16(tcp.Port)}
+			addrRecv = NetAddr{Services: ServiceNodeNone, IP: tcp.IP, Port: uint16(tcp.Port)}
 		}
-	}
-	if addrRecv.Timestamp == 0 {
-		addrRecv.Timestamp = now
 	}
 	return &VersionMessage{
 		Version:     BitcoinProtocolVersion,
 		Services:    ServiceNodeNone,
 		Timestamp:   time.Now().Unix(),
 		AddrRecv:    addrRecv,
-		AddrFrom:    NetAddr{Timestamp: now},
+		AddrFrom:    NetAddr{},
 		Nonce:       rand.Uint64(),
 		UserAgent:   UserAgent,
 		StartHeight: 0, // thin client has no chain height
@@ -232,20 +222,18 @@ func UnmarshalVersion(b []byte) (*VersionMessage, error) {
 	return m, nil
 }
 
-// unmarshalNetAddr parses a 30-byte CAddress
-// (nTime(4 LE) || services(8 LE) || ip(16) || port(2 BE)).
+// unmarshalNetAddr parses a 26-byte net_addr (services || ip(16) || port(2 BE)).
 func unmarshalNetAddr(b []byte) (NetAddr, int, error) {
-	if len(b) < 30 {
+	if len(b) < 26 {
 		return NetAddr{}, 0, errors.New("p2p: net_addr too short")
 	}
 	a := NetAddr{}
-	a.Timestamp = int64(binary.LittleEndian.Uint32(b[0:4]))
-	a.Services = binary.LittleEndian.Uint64(b[4:12])
+	a.Services = binary.LittleEndian.Uint64(b[0:8])
 	var ip16 [16]byte
-	copy(ip16[:], b[12:28])
+	copy(ip16[:], b[8:24])
 	a.IP = netIPFrom16(ip16)
-	a.Port = binary.BigEndian.Uint16(b[28:30])
-	return a, 30, nil
+	a.Port = binary.BigEndian.Uint16(b[24:26])
+	return a, 26, nil
 }
 
 // netIPFrom16 converts a 16-byte address; IPv4-mapped (::ffff:a.b.c.d) becomes
