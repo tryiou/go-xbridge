@@ -8,8 +8,17 @@ import (
 	"net"
 	"time"
 
+	xlog "go-xbridge/log"
 	"go-xbridge/proto"
 )
+
+// dialDedup collapses repeated dial failures for the same address so a swarm
+// of unreachable peers does not bury the log. The first failure per address is
+// logged normally; repeats are suppressed and flushed as a periodic summary so
+// the underlying connectivity problem stays visible without the per-attempt spam.
+var dialDedup = xlog.NewDedupe(60*time.Second, func(addr string, total int, elapsed time.Duration) {
+	xlog.Debug("dial failures suppressed", "addr", addr, "count", total, "over", elapsed.Round(time.Second).String())
+})
 
 // handshakeTimeout bounds the version/verack exchange so a misbehaving peer
 // cannot hang Dial indefinitely.
@@ -33,6 +42,12 @@ type Conn struct {
 func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 	nc, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
+		// Dedupe.Event is internally synchronized and atomically reports the
+		// first occurrence, so concurrent Dial failures for the same address
+		// produce exactly one diagnostic log line.
+		if first := dialDedup.Event(addr); first {
+			xlog.Debug("dial failed", "addr", addr, "err", err)
+		}
 		return nil, err
 	}
 	return NewConn(nc, magic)
@@ -45,6 +60,7 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 func NewConn(nc net.Conn, magic [4]byte) (*Conn, error) {
 	c := &Conn{netConn: nc, magic: magic, reader: bufio.NewReader(nc)}
 	if err := c.handshake(); err != nil {
+		xlog.Debug("handshake failed", "addr", nc.RemoteAddr().String(), "err", err)
 		nc.Close()
 		return nil, err
 	}

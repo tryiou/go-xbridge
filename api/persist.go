@@ -190,7 +190,7 @@ func (n *Node) persist() {
 	n.persistMu.Lock()
 	defer n.persistMu.Unlock()
 	if err := saveSwaps(swapStatePath(n.cfg().DataDir), n); err != nil {
-		xlog.Warn("swap persist failed", "dir", n.cfg().DataDir, "err", err)
+		xlog.Error("swap persist failed", "dir", n.cfg().DataDir, "err", err)
 	}
 }
 

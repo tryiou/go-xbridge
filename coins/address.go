@@ -1,6 +1,10 @@
 package coins
 
-import "errors"
+import (
+	"errors"
+
+	xlog "go-xbridge/log"
+)
 
 // AddressKind enumerates the script/address types XBridge deposits use.
 type AddressKind int
@@ -74,6 +78,14 @@ func (a Address) String() string {
 // base58check (P2PKH/P2SH), native segwit (bech32/bech32m), and — for the
 // Bitcoin Cash family — CashAddr.
 func (c Coin) DecodeAddress(s string) (Address, error) {
+	a, err := c.decodeAddress(s)
+	if err != nil {
+		xlog.Debug("coins: address decode failed", "coin", c.Ticker, "addr", s, "err", err)
+	}
+	return a, err
+}
+
+func (c Coin) decodeAddress(s string) (Address, error) {
 	if s == "" {
 		return Address{}, errors.New("coins: empty address")
 	}

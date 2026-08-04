@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"time"
+
+	xlog "go-xbridge/log"
 )
 
 const (
@@ -93,6 +95,7 @@ func (p *Packet) Digest() [32]byte {
 // Unmarshal parses a full packet from wire bytes.
 func Unmarshal(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize {
+		xlog.Debug("proto: packet unmarshal failed", "err", "short header", "len", len(data), "min", HeaderSize)
 		return nil, errors.New("xbridge: data shorter than packet header")
 	}
 	p := &Packet{
@@ -108,9 +111,11 @@ func Unmarshal(data []byte) (*Packet, error) {
 	// fits the buffer using uint64 math so a near-max uint32 cannot wrap the
 	// comparison and slip a truncated/oversized body through.
 	if p.Size > MaxBodySize {
+		xlog.Debug("proto: packet unmarshal failed", "err", "declared body size too large", "size", p.Size, "max", MaxBodySize)
 		return nil, errors.New("xbridge: declared body size too large")
 	}
 	if uint64(len(data)) < uint64(HeaderSize)+uint64(p.Size) {
+		xlog.Debug("proto: packet unmarshal failed", "err", "body size exceeds data", "size", p.Size, "len", len(data))
 		return nil, errors.New("xbridge: declared body size exceeds data")
 	}
 	p.Body = make([]byte, p.Size)

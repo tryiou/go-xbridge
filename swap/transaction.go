@@ -1,6 +1,11 @@
 package swap
 
-import "time"
+import (
+	"encoding/hex"
+	"time"
+
+	xlog "go-xbridge/log"
+)
 
 // Addr is a 20-byte (uint160) address as carried on the XBridge wire
 // (proto "20-byte address" field). It is the public identity a participant
@@ -135,6 +140,7 @@ func (t *Transaction) TryJoin(o *Transaction) bool {
 // Ports Transaction::increaseStateCounter (xbridgetransaction.cpp:113-187).
 func (t *Transaction) IncreaseStateCounter(state State, from Addr) State {
 	if state != t.State {
+		xlog.Error("swap: state transition ignored", "current", t.State.String(), "got", state.String(), "from", hex.EncodeToString(from[:]))
 		return TrInvalid
 	}
 	switch state {
@@ -163,6 +169,7 @@ func (t *Transaction) IncreaseStateCounter(state State, from Addr) State {
 			t.reset()
 		}
 	default:
+		xlog.Error("swap: unhandled state transition", "state", state.String())
 		return TrInvalid
 	}
 	return t.State

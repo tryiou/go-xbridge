@@ -29,6 +29,12 @@ import (
 	"go-xbridge/p2p"
 )
 
+// walletServicesLog gates the per-poll "WalletServices" metric to at most once
+// per 60s, mirroring the dial/cancel dedupes: the live token set is
+// polled every few seconds, so without this it would log an identical
+// line on every dxGetNetworkTokens call.
+var walletServicesLog = xlog.NewDedupe(60*time.Second, nil)
+
 // P2P command names (src/protocol.cpp:45-49).
 const (
 	CmdSNRegister = "snr"  // SNREGISTER  -> ServiceNode
@@ -180,34 +186,27 @@ func ParseServiceNode(b []byte) (ServiceNode, error) {
 	sn := ServiceNode{}
 	var err error
 	if sn.PubKey, err = r.readCPubKey(); err != nil {
-		xlog.Warn("servicenode: SNREGISTER parse failed at pubkey", "err", err, "len", len(b))
 		return sn, err
 	}
 	if sn.Tier, err = r.readUint8(); err != nil {
-		xlog.Warn("servicenode: SNREGISTER parse failed at tier", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
 	if _, err = r.readFixed20(); err != nil { // paymentAddress (CKeyID, 20 raw bytes)
-		xlog.Warn("servicenode: SNREGISTER parse failed at paymentAddress", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
 	if err = r.skipCollateral(); err != nil {
-		xlog.Warn("servicenode: SNREGISTER parse failed at collateral", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
 	if _, err = r.readInt32(); err != nil { // bestBlock (int32)
-		xlog.Warn("servicenode: SNREGISTER parse failed at bestBlock", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
 	if _, err = r.readUint256(); err != nil { // bestBlockHash
-		xlog.Warn("servicenode: SNREGISTER parse failed at bestBlockHash", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
 	if _, err = r.readVarBytes(); err != nil { // signature
-		xlog.Warn("servicenode: SNREGISTER parse failed at signature", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
-	xlog.Info("servicenode: SNREGISTER parsed", "pubkey", hex33(sn.PubKey), "tier", sn.Tier)
+	xlog.Debug("servicenode: SNREGISTER parsed", "pubkey", hex33(sn.PubKey), "tier", sn.Tier)
 	return sn, nil
 }
 
@@ -219,32 +218,26 @@ func ParseServiceNodePing(b []byte) (ServiceNode, error) {
 	sn := ServiceNode{}
 	var err error
 	if _, err = r.readCPubKey(); err != nil { // 1. ping snodePubKey
-		xlog.Warn("servicenode: SNPING parse failed at pubkey", "err", err, "len", len(b))
 		return sn, err
 	}
 	if _, err = r.readUint32(); err != nil { // 2. bestBlock (uint32 in ping)
-		xlog.Warn("servicenode: SNPING parse failed at bestBlock", "err", err)
 		return sn, err
 	}
 	if _, err = r.readUint256(); err != nil { // 3. bestBlockHash
-		xlog.Warn("servicenode: SNPING parse failed at bestBlockHash", "err", err)
 		return sn, err
 	}
 	var pingTime uint32
 	if pingTime, err = r.readUint32(); err != nil { // 4. pingTime (uint32)
-		xlog.Warn("servicenode: SNPING parse failed at pingTime", "err", err)
 		return sn, err
 	}
 	var config string
 	if config, err = r.readVarStr(); err != nil { // 5. config (JSON varstr)
-		xlog.Warn("servicenode: SNPING parse failed at config", "err", err)
 		return sn, err
 	}
 	// 6. embedded ServiceNode (carries tier; the record the SN list is built
 	// from). parseConfig is applied to the ping's config string.
 	inner, err := parseInnerServiceNode(r)
 	if err != nil {
-		xlog.Warn("servicenode: SNPING parse failed at inner servicenode", "err", err)
 		return sn, err
 	}
 	sn.PubKey = inner.PubKey
@@ -253,10 +246,11 @@ func ParseServiceNodePing(b []byte) (ServiceNode, error) {
 	sn.Services = parseConfig(config, sn.Tier)
 	sn.PingTime = pingTime
 	if _, err = r.readVarBytes(); err != nil { // 7. signature (empty for SNPING)
-		xlog.Warn("servicenode: SNPING parse failed at signature", "pubkey", hex33(sn.PubKey), "err", err)
 		return sn, err
 	}
-	xlog.Info("servicenode: SNPING parsed", "pubkey", hex33(sn.PubKey), "tier", sn.Tier, "services", len(sn.Services))
+	// NOTE: the per-copy "SNPING parsed" log was removed — a single
+	// ping is relayed by every peer, so the parser fired once per copy.
+	// The logical ping is logged once (per genuine ping) by Registry.AddPing.
 	return sn, nil
 }
 
@@ -341,6 +335,7 @@ func hasNumeric(uv map[string]json.RawMessage, key string) bool {
 type entry struct {
 	services []string
 	seen     time.Time
+	pingTime uint32 // last pingTime seen, so relayed copies of one ping log once
 }
 
 // Registry is the in-memory servicenode store. It is safe for concurrent use.
@@ -371,7 +366,7 @@ func (r *Registry) AddRegistration(sn ServiceNode) {
 	if len(sn.Services) > 0 {
 		e.services = sn.Services
 	}
-	xlog.Info("servicenode: registration stored", "pubkey", hex33(k), "services", len(e.services), "seen", ok)
+	xlog.Debug("servicenode: registration stored", "pubkey", hex33(k), "services", len(e.services), "seen", ok)
 }
 
 // AddPing records a servicenode ping (SNPING / SNLISTPING). Both the token set
@@ -390,8 +385,16 @@ func (r *Registry) AddPing(sn ServiceNode) {
 	if len(sn.Services) > 0 {
 		e.services = sn.Services
 	}
-	e.seen = r.now()
-	xlog.Info("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
+	// A single ping is relayed by every peer we hold; only log when it is
+	// a genuinely new node or a newer ping than the one we last stored, so
+	// one logical ping produces one line instead of one per relayed copy.
+	if !ok || sn.PingTime > e.pingTime {
+		e.pingTime = sn.PingTime
+		e.seen = r.now()
+		xlog.Debug("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
+	} else {
+		e.seen = r.now()
+	}
 }
 
 const runningWindow = 5 * time.Minute
@@ -427,7 +430,9 @@ func (r *Registry) WalletServices() []string {
 			set[s] = true
 		}
 	}
-	xlog.Debug("servicenode: WalletServices", "known", len(r.nodes), "running", running, "tokens", len(set))
+	if walletServicesLog.Event("walletservices") {
+		xlog.Debug("servicenode: WalletServices", "known", len(r.nodes), "running", running, "tokens", len(set))
+	}
 	if len(set) == 0 {
 		return nil
 	}

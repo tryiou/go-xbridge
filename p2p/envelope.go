@@ -55,13 +55,14 @@ func DecodeXBridgePayload(payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	if off+n != len(payload) {
+		xlog.Debug("decode xbridge payload failed", "err", "length mismatch", "len", len(payload), "expected", off+n)
 		return nil, errors.New("p2p: xbridge envelope length mismatch")
 	}
 	if n < xbridgeEnvelopeSize {
+		xlog.Debug("decode xbridge payload failed", "err", "too small", "len", len(payload), "min", xbridgeEnvelopeSize)
 		return nil, errors.New("p2p: xbridge envelope too small")
 	}
 	packet := payload[off+xbridgeEnvelopeSize : off+n]
-	xlog.Debug("decode xbridge payload", "len", len(payload), "packetLen", len(packet))
 	return packet, nil
 }
 

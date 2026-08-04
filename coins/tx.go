@@ -8,6 +8,7 @@ import (
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	xlog "go-xbridge/log"
 )
 
 // SigHashAll is the only sighash type XBridge uses for deposit/refund/payment.
@@ -157,7 +158,11 @@ func (t *Tx) Serialize() []byte {
 // connector sets serializeWithTimeField. It mirrors Serialize: legacy inputs
 // carry only ScriptSig; segwit inputs additionally carry their Witness stack.
 func Deserialize(b []byte) (*Tx, error) {
-	return deserializeTx(b, false)
+	t, err := deserializeTx(b, false)
+	if err != nil {
+		xlog.Debug("coins: tx deserialize failed", "err", err, "len", len(b))
+	}
+	return t, err
 }
 
 // DeserializeWithTime parses wire bytes into a Tx. When hasTime is true it reads
@@ -167,7 +172,11 @@ func Deserialize(b []byte) (*Tx, error) {
 // The flag is supplied by the caller because the wire format is ambiguous: both
 // peers agree on serializeWithTimeField out-of-band from xbridge.conf.
 func DeserializeWithTime(b []byte, hasTime bool) (*Tx, error) {
-	return deserializeTx(b, hasTime)
+	t, err := deserializeTx(b, hasTime)
+	if err != nil {
+		xlog.Debug("coins: tx deserialize failed", "err", err, "len", len(b), "hasTime", hasTime)
+	}
+	return t, err
 }
 
 func deserializeTx(b []byte, hasTime bool) (*Tx, error) {

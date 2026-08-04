@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,43 @@ import (
 	"go-xbridge/proto"
 	"go-xbridge/wallet"
 )
+
+// cancelDedup collapses repeated "cancel for an order we do not track"
+// events. The same order cancel is rebroadcast by every peer that relays it, so
+// without collapsing a single order would emit one line per peer. The first
+// sighting per order is logged; repeats are suppressed and flushed as a
+// periodic summary so the underlying condition (orders we never held being
+// cancelled network-wide) stays visible without the per-peer spam.
+var cancelDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
+	xlog.Debug("cancel: order lookup failures suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+})
+
+// cancelBadSigDedup collapses repeated "bad packet signature" cancel rejections.
+// The same malformed cancel is rebroadcast by every relaying servicenode, so a
+// single bad order would emit one line per peer. The first sighting (per order)
+// is logged; repeats are summarized periodically so the anomaly stays visible
+// without spamming. Keyed on the order id, never on any specific currency.
+var cancelBadSigDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
+	xlog.Info("cancel: bad packet signature suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+})
+
+// unknownSwapDedup collapses repeated "swap packet for unknown order" DEBUG lines.
+// A swap handshake for an order we are not a party to is relayed by every servicenode
+// and rebroadcast over time, so a single unknown order would emit one line per copy.
+// The first sighting (per order) is logged; repeats are summarized periodically so
+// the condition stays visible without spamming. Keyed on the order id, never a coin.
+var unknownSwapDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
+	xlog.Debug("swap packet for unknown order suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+})
+
+// cancelNoConnectorDedup collapses repeated "no connector for currency" cancels.
+// Every order whose from-currency has no configured connector emits one line; the
+// currency (whatever it is, taken from the order at runtime) is the dedup key, so
+// distinct missing currencies are reported separately while a single missing
+// currency storm is summarized. No coin is hardcoded.
+var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, func(currency string, total int, elapsed time.Duration) {
+	xlog.Warn("cancel: no connector suppressed", "currency", currency, "count", total, "over", elapsed.Round(time.Second).String())
+})
 
 // Config tunes a Node.
 type Config struct {
@@ -167,13 +205,13 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 				if sn, derr := servicenode.ParseServiceNode(payload); derr == nil {
 					n.snReg.AddRegistration(sn)
 				} else {
-					xlog.Warn("servicenode: SNREGISTER parse error", "err", derr)
+					xlog.Warn("servicenode: SNREGISTER parse failed", "err", derr)
 				}
 			case servicenode.CmdSNPing, servicenode.CmdSNListPing:
 				if sn, derr := servicenode.ParseServiceNodePing(payload); derr == nil {
 					n.snReg.AddPing(sn)
 				} else {
-					xlog.Warn("servicenode: SNPING/SNLISTPING parse error", "err", derr)
+					xlog.Warn("servicenode: SNPING/SNLISTPING parse failed", "err", derr)
 				}
 			}
 		}
@@ -458,6 +496,22 @@ func (n *Node) refundWatcher() {
 
 // feed reads packets from the peer and stores orders.
 func (n *Node) feed() {
+	// Periodically emit an aggregated network-status snapshot so an operator
+	// can see peer/SN health and the live token set at a glance (the
+	// per-packet Debug stream is too noisy for that). Stops with the feed.
+	go func() {
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-n.stop:
+				return
+			case <-tick.C:
+				n.logNetworkStatus()
+			}
+		}
+	}()
+	var lastReadErr error
 	for {
 		select {
 		case <-n.stop:
@@ -466,6 +520,10 @@ func (n *Node) feed() {
 		}
 		pkt, peer, err := n.conn.ReadPacket()
 		if err != nil {
+			if !errors.Is(err, lastReadErr) {
+				xlog.Debug("peer read failed", "peer", peer, "err", err)
+				lastReadErr = err
+			}
 			select {
 			case <-n.stop:
 				return
@@ -473,9 +531,10 @@ func (n *Node) feed() {
 				continue
 			}
 		}
+		lastReadErr = nil
 		body, err := proto.DecodeBody(pkt.Command, pkt.Body)
 		if err != nil {
-			xlog.Debug("packet body decode skipped", "command", pkt.Command.String(), "err", err)
+			xlog.Warn("packet body decode skipped", "command", pkt.Command.String(), "err", err)
 			continue
 		}
 		// All traders verify the snode's packet signature against the pubkey
@@ -537,6 +596,27 @@ func (n *Node) feed() {
 	}
 }
 
+// logNetworkStatus emits a single aggregated snapshot of discovery health:
+// live peers, discovered addresses, known service nodes, and the union of
+// network tokens. It is the operator-visible counterpart to the per-packet
+// Debug stream, surfaced at Info so it shows at the default log level.
+func (n *Node) logNetworkStatus() {
+	peers, addrs, snodes := 0, 0, 0
+	if pm, ok := n.conn.(*discovery.PeerManager); ok {
+		peers = len(pm.Peers())
+		addrs = pm.AddrCount()
+		if reg := pm.ServiceNodes(); reg != nil {
+			snodes = reg.Count()
+		}
+	}
+	xlog.Info("network status",
+		"network", n.cfg().Network,
+		"peers", peers,
+		"addrs", addrs,
+		"servicenodes", snodes,
+		"tokens", strings.Join(n.NetworkTokens(), ","))
+}
+
 // NetworkTokens returns the union of tokens advertised by servicenodes on the
 // P2P network (C++ walletServices(), xbridgeapp.cpp:2758) with the locally
 // known tokens from xbridge.conf. The servicenode set is learned from
@@ -585,35 +665,38 @@ func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*
 	s := n.sessions[hexEncode(id[:])]
 	n.sessMu.Unlock()
 	if s == nil {
-		xlog.Debug("swap packet for unknown order", "order", hexEncode(id[:]))
+		if unknownSwapDedup.Event(hexEncode(id[:])) {
+			xlog.Debug("swap packet for unknown order", "order", hexEncode(id[:]))
+		}
 		return
 	}
 	if hub != ([20]byte{}) {
 		s.hub = hub
 	}
 	orderID := hexEncode(id[:])
-	xlog.Info("swap packet received", "order", orderID, "command", cmdName, "state", s.state.String())
+	swlog := xlog.With("order", orderID)
+	swlog.Info("swap packet received", "command", cmdName, "state", s.state.String())
 	// Defense in depth: a malformed/inbound packet must never crash the feed
 	// goroutine (which would terminate the whole process). Recover from any
 	// panic in the handler and log it; the swap is simply not progressed.
 	defer func() {
 		if r := recover(); r != nil {
-			xlog.Error("recovered panic dispatching swap", "order", orderID, "panic", r)
+			swlog.Error("recovered panic dispatching swap", "panic", r)
 		}
 	}()
 	cmd, body, err := fn(s)
 	if err != nil {
-		xlog.Error("swap handler error", "order", orderID, "err", err)
+		swlog.Error("swap handler error", "err", err)
 		return
 	}
 	if body == nil {
-		xlog.Debug("swap handler produced no response", "order", orderID)
+		swlog.Debug("swap handler produced no response")
 		return
 	}
 	if err := n.send(cmd, body, s.privKey[:]); err != nil {
-		xlog.Error("swap response send failed", "order", orderID, "command", cmd.String(), "err", err)
+		swlog.Error("swap response send failed", "command", cmd.String(), "err", err)
 	} else {
-		xlog.Info("swap response sent", "order", orderID, "command", cmd.String())
+		swlog.Info("swap response sent", "command", cmd.String())
 	}
 }
 
@@ -750,6 +833,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 
 	var id [32]byte
 	if _, err := rand.Read(id[:]); err != nil {
+		xlog.Error("MakeOrder: rng failure", "err", err)
 		return nil, makeError(errUnknown, "dxMakeOrder", "failed to generate order id")
 	}
 
@@ -1072,7 +1156,9 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	idHex := hexEncode(b.ID[:])
 	o := n.store.Get(idHex)
 	if o == nil {
-		xlog.Info("cancel: unknown order", "order", idHex)
+		if cancelDedup.Event(idHex) {
+			xlog.Debug("cancel: order lookup failed", "order", idHex)
+		}
 		return
 	}
 
@@ -1099,7 +1185,7 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 
 	// --- Non-exchange branch (C++ :3343-3428) ---
 	if o = n.store.Get(idHex); o == nil {
-		xlog.Info("cancel: unknown order", "order", idHex)
+		xlog.Info("cancel: order not found on recheck", "order", idHex)
 		return
 	}
 
@@ -1113,14 +1199,18 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	snOK, _ := n.signer.VerifyAgainst(pkt, o.SNodePubkey)
 	othOK, _ := n.signer.VerifyAgainst(pkt, o.OtherPubkey)
 	if !snOK && !othOK && !iCanceled {
-		xlog.Info("cancel: bad packet signature for cancelation request on order, not canceling", "order", idHex)
+		if cancelBadSigDedup.Event(idHex) {
+			xlog.Info("cancel: bad packet signature for cancelation request on order, not canceling", "order", idHex)
+		}
 		return
 	}
 
 	// Connector gate (C++ :3359-3364). Thin client: if the from-currency has
 	// no configured connector we cannot proceed, mirroring the C++ bail-out.
 	if _, e := n.connector(o.FromCurrency); e != nil {
-		xlog.Warn("cancel: no connector for currency, not canceling", "order", idHex, "currency", o.FromCurrency)
+		if cancelNoConnectorDedup.Event(o.FromCurrency) {
+			xlog.Warn("cancel: no connector for currency, not canceling", "order", idHex, "currency", o.FromCurrency)
+		}
 		return
 	}
 

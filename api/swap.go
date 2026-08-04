@@ -123,10 +123,12 @@ type SwapSession struct {
 func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [33]byte) {
 	xPub, err := crypto.NewPrivateKey()
 	if err != nil {
+		xlog.Error("swap: failed to generate secret", "order", hexEncode(o.ID[:]), "err", err)
 		return
 	}
 	xpk, err := crypto.CompressedPubKey(xPub)
 	if err != nil {
+		xlog.Error("swap: failed to derive public key", "order", hexEncode(o.ID[:]), "err", err)
 		return
 	}
 	s := &SwapSession{

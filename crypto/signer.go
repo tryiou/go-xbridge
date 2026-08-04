@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	secp_ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	xlog "go-xbridge/log"
 	"go-xbridge/proto"
 )
 
@@ -93,10 +94,12 @@ func (BtcSigner) Sign(p *proto.Packet, priv []byte) error {
 func (BtcSigner) Verify(p *proto.Packet) (bool, error) {
 	pub, err := btcec.ParsePubKey(p.Pubkey[:])
 	if err != nil {
+		xlog.Debug("crypto: verify failed parsing pubkey", "err", err)
 		return false, err
 	}
 	sig, err := compactParse(p.Signature[:])
 	if err != nil {
+		xlog.Debug("crypto: verify failed parsing signature", "err", err)
 		return false, err
 	}
 	d := p.Digest()
@@ -116,10 +119,12 @@ func (BtcSigner) VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error) 
 	}
 	pub, err := btcec.ParsePubKey(raw)
 	if err != nil {
+		xlog.Debug("crypto: verify failed parsing pubkey", "pubkey", pubkeyHex, "err", err)
 		return false, err
 	}
 	sig, err := compactParse(p.Signature[:])
 	if err != nil {
+		xlog.Debug("crypto: verify failed parsing signature", "pubkey", pubkeyHex, "err", err)
 		return false, err
 	}
 	d := p.Digest()

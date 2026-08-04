@@ -64,6 +64,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body := rpcRequest{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		xlog.Warn("rpc transport error", "code", -32700, "msg", "Parse error")
 		writeJSON(w, rpcResponse{
 			Result: nil,
 			Error:  &envelopeError{Code: -32700, Message: "Parse error"},
@@ -75,6 +76,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	handler := Lookup(body.Method)
 	if handler == nil {
+		xlog.Warn("rpc transport error", "code", -32601, "method", body.Method, "msg", "Method not found")
 		writeJSON(w, rpcResponse{
 			Result: nil,
 			Error:  &envelopeError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", body.Method)},
@@ -83,9 +85,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	xlog.Debug("rpc request", "method", body.Method)
 	result, rpcErr := handler(s.ctx, body.Params)
 	if rpcErr != nil {
 		// Business error: Blocknet returns it as the *result* object.
+		xlog.Warn("rpc error", "method", body.Method, "code", rpcErr.Code, "msg", rpcErr.Error)
 		writeJSON(w, rpcResponse{Result: rpcErr, Error: nil, ID: body.ID})
 		return
 	}
