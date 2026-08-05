@@ -349,12 +349,20 @@ func readVarInt(b []byte, pos *int) (int, error) {
 // HashForSigning computes the legacy SIGHASH_ALL digest for input idx, with that
 // input's scriptSig replaced by prevScript (the redeem/inner script) and all
 // other inputs blanked. This matches C++ SignatureHash(inner, tx, idx,
-// SIGHASH_ALL) for non-segwit transactions.
+// SIGHASH_ALL) for non-segwit transactions. When t.WithTime is set, the 4-byte
+// nTime is written immediately after nVersion, mirroring
+// CTransactionSignatureSerializer::Serialize (xbitcointransaction.h:265-269),
+// which serializes nTime when serializeWithTimeField is set.
 func (t *Tx) HashForSigning(idx int, prevScript []byte) [32]byte {
 	buf := make([]byte, 0, 256)
 	var v [4]byte
 	binary.LittleEndian.PutUint32(v[:], uint32(t.Version))
 	buf = append(buf, v[:]...)
+	if t.WithTime {
+		var tm [4]byte
+		binary.LittleEndian.PutUint32(tm[:], t.TxTime)
+		buf = append(buf, tm[:]...)
+	}
 	buf = append(buf, varInt(len(t.Inputs))...)
 	for i, in := range t.Inputs {
 		buf = append(buf, in.PrevOut.Hash[:]...)
