@@ -572,10 +572,14 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 		copy(change[:], a.Hash)
 	}
 	fee := estimateFee(cc, len(funding), 2)
+	// fee2 is the p2sh redeem margin C++ locks into the HTLC output on top of
+	// the order amount (minTxFee2(1,1), xbridgesession.cpp:2094/:2615); it is
+	// collected when the deposit is claimed or refunded.
+	fee2 := estimateFee(cc, 1, 1)
 	lockTime := s.computeLockTime(isMaker)
 	xlog.Debug("buildDeposit: plan", "order", hexEncode(s.id[:]), "isMaker", isMaker,
 		"cur", cur, "amount", amt, "lockTime", lockTime, "txVersion", s.txVersion(cur),
-		"utxos", len(funding), "fee", fee)
+		"utxos", len(funding), "fee", fee, "fee2", fee2)
 
 	hash := s.secretHash
 	if !isMaker {
@@ -590,7 +594,7 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 		LockTime:        lockTime,
 		TxVersion:       s.txVersion(cur),
 	}
-	tx, err := spec.BuildDepositTx(c, funding, change, fee)
+	tx, err := spec.BuildDepositTx(c, funding, change, fee, fee2)
 	if err != nil {
 		return "", "", err
 	}

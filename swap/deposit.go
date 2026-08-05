@@ -87,6 +87,12 @@ func (d *DepositSpec) P2SHScript() []byte {
 
 // BuildDepositTx builds the unsigned deposit transaction that locks Amount into
 // the P2SH HTLC, spending funding UTXOs and returning change to changeAddr.
+// fee is the deposit's own network fee (C++ minTxFee1); fee2 is the p2sh redeem
+// margin (C++ minTxFee2(1,1)) that is locked into the HTLC output on top of
+// Amount: C++ locks outAmount+fee2 (xbridgesession.cpp:2094 maker, :2615 taker)
+// and checkDepositTransaction requires depositP2SHAmount >= amount + 0.95*fee2
+// (xbridgewalletconnectorbtc.cpp:2183), so the redeem fee is collected when the
+// deposit is later claimed/refunded.
 // Deposit inputs carry SEQUENCE_FINAL (0xffffffff): C++ createRawTransaction
 // stamps SEQUENCE_FINAL on every input when cltv=true (xbridgerpc.cpp:367),
 // and checkDepositTransaction hard-rejects any deposit input whose sequence is
@@ -95,7 +101,7 @@ func (d *DepositSpec) P2SHScript() []byte {
 // enforced on the *refund spend*, whose single input correctly uses
 // SEQUENCE_FINAL-1 (C++ createRefundTransaction, xbridgewalletconnectorbtc.cpp:2464).
 // Legacy (P2PKH) change only — native segwit change is a follow-up.
-func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee uint64) (*coins.Tx, error) {
+func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee, fee2 uint64) (*coins.Tx, error) {
 	if len(funding) == 0 {
 		return nil, errors.New("swap: no funding UTXOs for deposit")
 	}
@@ -103,8 +109,8 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 	for _, u := range funding {
 		total += u.Amount
 	}
-	if total < d.Amount+fee {
-		return nil, errors.New("swap: funding insufficient for deposit + fee")
+	if total < d.Amount+fee+fee2 {
+		return nil, errors.New("swap: funding insufficient for deposit + fees")
 	}
 	// Transaction version is the per-coin <COIN>.TxVersion (C++ default 1). A
 	// zero/unset value falls back to 1 to match C++'s config default.
@@ -113,7 +119,8 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 		ver = 1
 	}
 	xlog.Debug("BuildDepositTx", "cur", d.Currency, "amount", d.Amount, "lockTime", d.LockTime,
-		"txVersion", ver, "funding", len(funding), "total", total, "fee", fee, "change", total-d.Amount-fee)
+		"txVersion", ver, "funding", len(funding), "total", total, "fee", fee, "fee2", fee2,
+		"change", total-d.Amount-fee-fee2)
 	tx := &coins.Tx{Version: int32(ver), LockTime: 0}
 	// Per-coin serializeWithTimeField quirk: stamp the 4-byte nTime after
 	// nVersion so the wire layout matches the counterparty's XBridge connector
@@ -132,8 +139,8 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 			Sequence: 0xffffffff, // SEQUENCE_FINAL (C++ createRawTransaction cltv=true)
 		})
 	}
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: d.Amount, ScriptPubKey: d.P2SHScript()})
-	if change := total - d.Amount - fee; change > 0 {
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: d.Amount + fee2, ScriptPubKey: d.P2SHScript()})
+	if change := total - d.Amount - fee - fee2; change > 0 {
 		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: change, ScriptPubKey: coins.BuildP2PKHScript(changeAddr)})
 	}
 	return tx, nil

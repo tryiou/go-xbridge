@@ -93,11 +93,13 @@ func (s *Session) AdoptCounterparty(secretHash [20]byte, lockTime uint32) {
 }
 
 // BuildLocalDepositTx constructs the unsigned local deposit tx from funding UTXOs.
-func (s *Session) BuildLocalDepositTx(c coins.Coin, funding []wallet.Utxo, change [20]byte, fee uint64) (*coins.Tx, error) {
+// fee is the deposit network fee (minTxFee1); fee2 is the p2sh redeem margin
+// (minTxFee2(1,1)) C++ locks into the HTLC output on top of the order amount.
+func (s *Session) BuildLocalDepositTx(c coins.Coin, funding []wallet.Utxo, change [20]byte, fee, fee2 uint64) (*coins.Tx, error) {
 	if s.Local == nil {
 		return nil, errors.New("swap: local deposit not created")
 	}
-	return s.Local.BuildDepositTx(c, funding, change, fee)
+	return s.Local.BuildDepositTx(c, funding, change, fee, fee2)
 }
 
 // ConfirmLocalDeposit / ConfirmOtherDeposit record on-chain confirmation of each

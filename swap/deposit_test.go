@@ -56,7 +56,7 @@ func TestDepositBuildAndSign(t *testing.T) {
 	}}
 
 	c := coins.Coin{Decimals: 8}
-	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0)
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRefundScriptSig(t *testing.T) {
 		ScriptPubKey: hex.EncodeToString(fundScript),
 	}}
 	c := coins.Coin{Decimals: 8}
-	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0)
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
@@ -285,5 +285,51 @@ func TestPaymentScriptSig(t *testing.T) {
 	// The secret-is-xPubKey invariant the claim relies on.
 	if got := coins.KeyID(xPubKey[:]); got != secretHash {
 		t.Error("HASH160(xPubKey) != secretHash (secret-is-xPubKey invariant broken)")
+	}
+}
+
+// TestDepositLocksAmountPlusFee2 verifies S1-C: the HTLC deposit output locks
+// Amount + fee2 (the p2sh redeem margin), matching C++ outAmount+fee2
+// (xbridgesession.cpp:2094 maker, :2615 taker). checkDepositTransaction
+// requires depositP2SHAmount >= amount + 0.95*fee2
+// (xbridgewalletconnectorbtc.cpp:2183); locking Amount+fee2 exceeds that band.
+func TestDepositLocksAmountPlusFee2(t *testing.T) {
+	localPub, _ := randKey(t)
+	otherPub, _ := randKey(t)
+
+	spec := &DepositSpec{
+		Currency:        "BTC",
+		Amount:          1_000_000,
+		DepositorPub:    localPub,
+		CounterpartyPub: otherPub,
+		LockTime:        600,
+	}
+	fundScript := coins.BuildP2PKHScript(coins.KeyID(localPub[:]))
+	funding := []wallet.Utxo{{
+		TxID:         "0000000000000000000000000000000000000000000000000000000000000001",
+		Vout:         0,
+		Amount:       1_100_000,
+		ScriptPubKey: hex.EncodeToString(fundScript),
+	}}
+	c := coins.Coin{Decimals: 8}
+	fee := uint64(1000)
+	fee2 := uint64(250)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), fee, fee2)
+	if err != nil {
+		t.Fatalf("BuildDepositTx: %v", err)
+	}
+	// The P2SH HTLC output must carry Amount + fee2.
+	if got := tx.Outputs[0].Value; got != spec.Amount+fee2 {
+		t.Fatalf("deposit P2SH value = %d, want %d (Amount+fee2)", got, spec.Amount+fee2)
+	}
+	// Change is the remainder after Amount + fee + fee2.
+	if got := tx.Outputs[1].Value; got != 1_100_000-spec.Amount-fee-fee2 {
+		t.Errorf("change = %d, want %d", got, 1_100_000-spec.Amount-fee-fee2)
+	}
+	// C++ acceptance band: depositP2SHAmount >= amount + 0.95*fee2.
+	deposit := tx.Outputs[0].Value
+	minAccepted := uint64(float64(fee2) * 0.95)
+	if deposit < spec.Amount+minAccepted {
+		t.Errorf("deposit %d < amount + 0.95*fee2 (%d)", deposit, spec.Amount+minAccepted)
 	}
 }
