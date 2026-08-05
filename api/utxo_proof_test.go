@@ -46,24 +46,26 @@ func TestBuildUtxoProofs(t *testing.T) {
 	}
 }
 
-// TestUtxoChallengeMatchesCpp confirms utxoChallenge produces exactly the
-// C++ UtxoEntry::toString() form "txid:vout:amount:address"
-// (xbridgewalletconnector.cpp:28), which C++ signs/verifies via
-// conn->signMessage(entry.address, entry.toString(), sig). A mismatch here
-// makes a Go order's proof unverifiable by a C++ node and vice versa.
+// TestUtxoChallengeMatchesCpp confirms utxoChallenge reproduces the C++
+// UtxoEntry::toString() form "txid:vout:amount:address" byte-for-byte, with the
+// amount as the whole-coin double the wallet reports (listunspent "value")
+// streamed with std::ostringstream default formatting (defaultfloat, precision
+// 6, i.e. %g). C++ signs/verifies via conn->signMessage(entry.address,
+// entry.toString(), sig); a mismatch makes a Go order's proof unverifiable by a
+// C++ node and vice versa.
 func TestUtxoChallengeMatchesCpp(t *testing.T) {
 	const (
 		txid    = "1abc2def3abc4def5abc6def7abc8def9abc0def1abc2def3abc4def5abc6d"
 		vout    = uint32(0)
-		amount  = uint64(123456789)
+		amount  = float64(3.2621178) // whole-coin; %g(6) -> "3.26212"
 		address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
 	)
 	got := utxoChallenge(txid, vout, amount, address)
-	want := "1abc2def3abc4def5abc6def7abc8def9abc0def1abc2def3abc4def5abc6d:0:123456789:1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+	want := "1abc2def3abc4def5abc6def7abc8def9abc0def1abc2def3abc4def5abc6d:0:3.26212:1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
 	if got != want {
 		t.Fatalf("utxoChallenge = %q, want %q", got, want)
 	}
-	// A C++-shaped challenge must verify round-trip under the real signer.
+	// The challenge must verify round-trip under the real signer.
 	ctx := newWalletTestCtx()
 	conn := ctx.Node.cfg().Connectors["BTC"]
 	sig, err := conn.SignMessage(btcAddr, got)
@@ -75,12 +77,44 @@ func TestUtxoChallengeMatchesCpp(t *testing.T) {
 	}
 }
 
+// TestWholeCoinOstreamMatchesCppStream pins wholeCoinOstream against strings
+// produced by the real C++ writer: a fresh std::ostringstream streaming the
+// UtxoEntry.amount double with default formatting (defaultfloat, precision 6)
+// in UtxoEntry::toString(). The golden values below are the exact g++ (libstdc++)
+// output for these amounts; wholeCoinOstream must match byte-for-byte.
+func TestWholeCoinOstreamMatchesCppStream(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{1.0, "1"},
+		{0.5, "0.5"},
+		{0.0001, "0.0001"},
+		{3.2621178, "3.26212"},
+		{1234.56789, "1234.57"},
+		{0.000001, "1e-06"},
+		{1234567.0, "1.23457e+06"},
+		{0.0, "0"},
+		{0.123456789, "0.123457"},
+		{2.0, "2"},
+		{100000000.0, "1e+08"},
+		{0.29, "0.29"},
+		{1.2345, "1.2345"},
+		{5460.0, "5460"},
+	}
+	for _, c := range cases {
+		if got := wholeCoinOstream(c.in); got != c.want {
+			t.Errorf("wholeCoinOstream(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestVerifyUtxoProofTampered confirms a tampered (wrong-length) proof fails
 // verification: a valid 65-byte proof verifies, a truncated one does not.
 func TestVerifyUtxoProofTampered(t *testing.T) {
 	ctx := newWalletTestCtx()
 	conn := ctx.Node.cfg().Connectors["BTC"]
-	challenge := "1abc2def3abc4def:0:100000000:1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+	challenge := "1abc2def3abc4def:0:1:1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
 	good, err := conn.SignMessage(btcAddr, challenge)
 	if err != nil {
 		t.Fatalf("SignMessage: %v", err)

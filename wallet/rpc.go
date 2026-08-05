@@ -244,6 +244,7 @@ func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
 			Vout:          u.Vout,
 			Address:       u.Address,
 			Amount:        amt,
+			Value:         u.Amount,
 			ScriptPubKey:  u.ScriptPubKey,
 			Confirmations: confs,
 		})

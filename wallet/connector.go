@@ -53,8 +53,9 @@ type Utxo struct {
 	TxID          string // prevout txid (hex, display order)
 	Vout          uint32
 	Address       string
-	Amount        uint64 // base units
-	ScriptPubKey  string // hex of the output's script
+	Amount        uint64  // base units
+	Value         float64 // whole-coin value exactly as the wallet returned it (listunspent "value"); used to reproduce C++ UtxoEntry::toString() in ownership proofs
+	ScriptPubKey  string  // hex of the output's script
 	Confirmations int
 }
 

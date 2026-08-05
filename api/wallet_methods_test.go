@@ -88,7 +88,7 @@ func newWalletTestCtx() *HandlerCtx {
 					// 1 BTC exact. C++ dxGetTokenBalances sums native satoshis as a double
 					// and renders printf("%.6f", 1.0) = "1.000000" (no +1/COIN; the value
 					// is already a whole-coin double). formatBalanceNative reproduces this.
-					{TxID: "0000000000000000000000000000000000000000000000000000000000000000", Vout: 0, Amount: 100000000, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+					{TxID: "0000000000000000000000000000000000000000000000000000000000000000", Vout: 0, Amount: 100000000, Value: 1.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 				},
 			},
 		},

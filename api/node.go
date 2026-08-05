@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -376,21 +377,33 @@ func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte) {
 	return height, hash
 }
 
-// utxoChallenge builds the message an order UTXO is signed over, matching
-// C++ xbridge::wallet::UtxoEntry::toString(): "txid:vout:amount:address"
-// (xbridgewalletconnector.cpp:28). C++ signs/verifies it via
-// conn->signMessage(entry.address, entry.toString(), sig) and
-// conn->verifyMessage(entry.address, entry.toString(), sig)
-// (xbridgeapp.cpp:1691/1896/2312, xbridgesession.cpp:550/1123). The txid is the
-// raw display hex and amount is in base units, exactly as C++ emits.
-func utxoChallenge(txid string, vout uint32, amount uint64, address string) string {
-	return fmt.Sprintf("%s:%d:%d:%s", txid, vout, amount, address)
+// wholeCoinOstream renders a whole-coin amount the way C++ does when streaming
+// the UtxoEntry.amount double into a default-constructed std::ostringstream
+// (defaultfloat, precision 6) in UtxoEntry::toString(). That is printf %g at 6
+// significant digits: trailing zeros stripped, scientific notation when the
+// decimal exponent is < -4 or >= 6. strconv.FormatFloat(v, 'g', 6, 64) is
+// byte-identical to libstdc++ ostream output for these values.
+func wholeCoinOstream(v float64) string {
+	return strconv.FormatFloat(v, 'g', 6, 64)
+}
+
+// utxoChallenge builds the message an order UTXO is signed over, matching C++
+// xbridge::wallet::UtxoEntry::toString() byte-for-byte:
+// "txid:vout:amount:address" (xbridgewalletconnector.cpp:25-30), which C++
+// signs/verifies via conn->signMessage(entry.address, entry.toString(), sig)
+// and conn->verifyMessage(...) (xbridgeapp.cpp:1691/1896/2312,
+// xbridgesession.cpp:550/1123). The txid is the raw display hex. The amount is
+// the whole-coin double the wallet reported for the output (listunspent
+// "value"/getTxOut "value"); both signer and verifier resolve it locally, so
+// the strings must be identical for the same confirmed UTXO.
+func utxoChallenge(txid string, vout uint32, amount float64, address string) string {
+	return txid + ":" + strconv.FormatUint(uint64(vout), 10) + ":" + wholeCoinOstream(amount) + ":" + address
 }
 
 // buildUtxoProofs attaches a BIP137 ownership proof to each spendable UTXO,
 // producing the UtxoEntry list carried in order/pending/accepting bodies. Each
-// proof is signmessage(address, "<txid>:<vout>"); the counterparty verifies it
-// against the UTXO's address via VerifyMessage.
+// proof is signmessage(address, UtxoEntry::toString()); the counterparty
+// verifies it against the UTXO's address via VerifyMessage.
 func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) ([]proto.UtxoEntry, error) {
 	out := make([]proto.UtxoEntry, 0, len(utxos))
 	for _, u := range utxos {
@@ -406,7 +419,7 @@ func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) (
 		if !ok {
 			return nil, fmt.Errorf("api: utxo address %s has no id", u.Address)
 		}
-		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout, u.Amount, u.Address))
+		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout, u.Value, u.Address))
 		if err != nil {
 			return nil, err
 		}

@@ -38,13 +38,13 @@ The `dx*` JSON-RPC surface is largely at parity (error codes, dates, amounts,
 status strings, envelope) but the "all 23 remediated" claim is **overstated** —
 several response/behavior divergences remain (see the matrix). The swap **state
 machine** (join, two-confirmation gate, drift check, locktimes, HTLC script
-bytes) is faithful, but the **deposit construction path has four S1 interop
+bytes) is faithful, but the **deposit construction path has three S1 interop
 breakers** that, as built, would cause a C++ counterparty/hub to reject a
 Go-created order or deposit. Separately, production readiness is blocked by an
 unauthenticated, all-interfaces RPC and two untested data races.
 
 **Bottom line:** the port can **connect** to the live network (wire-faithful),
-but **cannot yet trade** with C++ peers (S1 deposit/proof defects), and is not
+but **cannot yet trade** with C++ peers (S1 deposit defects), and is not
 production-safe until the auth + concurrency issues are fixed.
 
 ## Per-area verdicts
@@ -67,17 +67,7 @@ production-safe until the auth + concurrency issues are fixed.
 
 ### S1 — Wire / interop-breaking (MUST FIX)
 
-**S1-A. UTXO ownership-proof challenge string differs (base units vs whole-coin).**
-- Go: `api/node.go:386-388` `utxoChallenge` formats
-  `"<txid>:<vout>:<amount>:<address>"` with **base-unit** `uint64` amount.
-- C++: `xbridgewalletconnector.cpp:25-30` `UtxoEntry::toString()` streams a
-  **whole-coin `double`** (`xbridgewallet.h:40`, from `listunspent` "value").
-- Impact: for 1 BTC Go signs `…:100000000:…`, C++ signs `…:1:…`. The proof is
-  verified at accept (`xbridgesession.cpp:550/1123`), so a Go-created order's
-  UTXO proofs fail verification on a C++ node and vice-versa. **Refutes the prior
-  "P1 fixed" claim** (`api/utxo_proof_test.go` even asserts the base-unit form).
-- Fix: reproduce C++'s whole-coin `double` + `ostringstream` default formatting
-  in the challenge string; update the test vector.
+**S1-A. UTXO ownership-proof challenge string differs (base units vs whole-coin).** — **FIXED** (see C13). Go now formats the whole-coin `double` the wallet reports (listunspent `"value"`) with `strconv.FormatFloat(v, 'g', 6, 64)`, byte-identical to C++ `UtxoEntry::toString()`'s default `ostringstream` (defaultfloat, precision 6); golden vectors generated from the real g++ output are asserted in `TestWholeCoinOstreamMatchesCppStream`.
 
 **S1-B. Deposit input sequence.** Go `swap/deposit.go:128` sets
 `Sequence: 0xfffffffe` on deposit inputs (CLTV-enabling). C++ builds deposits
@@ -102,7 +92,7 @@ Go `coins/tx.go:353-392` `HashForSigning` never serializes `TxTime` even though
 chain the refund/claim signature Go computes is over the wrong preimage and is
 rejected. Default coins (BTC/LTC, flag off) unaffected.
 
-> **S1-A…D together:** a Go participant cannot complete a swap against a C++
+> **S1-B…D together:** a Go participant cannot complete a swap against a C++
 > peer as built — orders are rejected on the proof, deposits are rejected on
 > sequence + value, and time-field chains additionally get invalid signatures.
 
@@ -270,6 +260,12 @@ mismatch (row note). `TIER3` = intentionally divergent thin-client limit
 - **C11 — empty order-book arrays** as `[]` (default-constructed `Array`).
 - **C12 — server robustness** — panic-safe RPC envelope, rotating file logging,
   datadir pre-create.
+- **C13 — UTXO ownership-proof challenge = C++ `UtxoEntry::toString()`**
+  (S1-A). `wallet.Utxo.Value` preserves the whole-coin `listunspent` `"value"`
+  double; `api.utxoChallenge` streams it via `wholeCoinOstream`
+  (`strconv.FormatFloat(v, 'g', 6, 64)` = default `ostringstream`, precision 6),
+  byte-identical to the C++ writers; golden vectors from real g++ output are
+  asserted in `TestWholeCoinOstreamMatchesCppStream`.
 
 ## Tier 3 — architectural limits (thin-client, cannot fully match C++)
 
@@ -315,8 +311,9 @@ the `dx*` matrix above point at the same section.
   `CADDR_TIME_VERSION` 31402) on both send (`net_processing.cpp:210`) and receive
   (`net.cpp:569`), so no per-addr `nTime` is written. `protocol.md` §1.3.1 is the
   accurate record; the 30-byte form applies only to `addr`/`getaddr` records.
-- **P1 (old) — UTXO ownership-proof challenge string "fixed".** **REFUTED** by
-  S1-A: Go still signs base units where C++ signs whole-coin.
+- **P1 (old) — UTXO ownership-proof challenge string "fixed".** The prior
+  "fixed" claim was **REFUTED** by S1-A (Go signed base units where C++ signs
+  whole-coin); S1-A is now **actually fixed** — see C13.
 
 ### Deliberate thin-client items (explicitly NOT bugs)
 
@@ -365,7 +362,7 @@ watcher/reload paths are untested).
 - Byte-level capture of `OrderBody`/`AcceptingBody`/`CancelBody` UTXO-entry
   encoding vs a live C++ node (currently validated on one captured packet).
 - Cross-check `p2p/seeds.go` fixed-IP/DNS seeds against `chainparamsseeds.h`.
-- Confirm S1-A/B/C against a real C++ hub (`checkDepositTransaction` behavior
+- Confirm S1-B/C against a real C++ hub (`checkDepositTransaction` behavior
   with a live deposit).
 
 ## Ratings (2026-08 audit)
@@ -375,7 +372,7 @@ watcher/reload paths are untested).
 | Wire protocol & transport fidelity | 9 / 10 |
 | RPC / `dx*` surface parity | 7 / 10 |
 | Swap state machine (machine/scripts) | 8 / 10 |
-| Swap deposit/execution path | 6 / 10 (S1-A…D) |
+| Swap deposit/execution path | 6 / 10 (S1-B…D) |
 | Config / coins / crypto / wallet | 7 / 10 |
 | Code quality & security (production-readiness) | 6 / 10 |
 | Docs & prior-audit accuracy | 5 / 10 |
@@ -383,17 +380,16 @@ watcher/reload paths are untested).
 
 ## Priority remediation order
 
-1. **S1-A** proof string (whole-coin double) + fix `utxo_proof_test.go`.
-2. **S1-B/C** deposit sequence `0xffffffff`, deposit value `Amount + fee2`,
+1. **S1-B/C** deposit sequence `0xffffffff`, deposit value `Amount + fee2`,
    collect the redeem margin on claim/refund.
-3. **S1-D** include `nTime` in `HashForSigning` when `WithTime`.
-4. **F1/F2** bind RPC to loopback + auth; authenticate hub-originated swap
+2. **S1-D** include `nTime` in `HashForSigning` when `WithTime`.
+3. **F1/F2** bind RPC to loopback + auth; authenticate hub-originated swap
    packets; never let a forged `Finished` disable the refund watcher.
-5. **F3/F4** session-lock scope + coin-registry `sync.RWMutex`/atomic pointer;
+4. **F3/F4** session-lock scope + coin-registry `sync.RWMutex`/atomic pointer;
    add tests that run the watcher and hot-reload paths.
-6. **S2-A/B/C** order-book detail-4 nesting, partial-chain not-found,
+5. **S2-A/B/C** order-book detail-4 nesting, partial-chain not-found,
    `dxSplitInputs` utxo schema.
-7. **S2-D** wire the expiry sweep to a timer using the correct
+6. **S2-D** wire the expiry sweep to a timer using the correct
    `IsExpiredByBlockNumber`.
-8. **Docs** — this register + `usage.md`/`wallet.md`/`swap.md` resync, and
+7. **Docs** — this register + `usage.md`/`wallet.md`/`swap.md` resync, and
    `p2p/seeds.go` cross-check.
