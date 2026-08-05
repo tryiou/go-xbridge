@@ -63,6 +63,13 @@ func TestDepositBuildAndSign(t *testing.T) {
 	if len(tx.Outputs) != 2 {
 		t.Fatalf("want 2 outputs (deposit + change), got %d", len(tx.Outputs))
 	}
+	// Deposit inputs must be SEQUENCE_FINAL (0xffffffff): C++ createRawTransaction
+	// stamps SEQUENCE_FINAL on every input when cltv=true (xbridgerpc.cpp:367) and
+	// checkDepositTransaction hard-rejects anything else
+	// (xbridgewalletconnectorbtc.cpp:2076-2080).
+	if tx.Inputs[0].Sequence != 0xffffffff {
+		t.Errorf("deposit input sequence %#x != 0xffffffff (SEQUENCE_FINAL)", tx.Inputs[0].Sequence)
+	}
 	// Deposit output is the P2SH HTLC.
 	if got := hex.EncodeToString(tx.Outputs[0].ScriptPubKey); got[:2] != "a9" {
 		t.Errorf("deposit output is not P2SH (OP_HASH160): %s", got)

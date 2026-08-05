@@ -87,9 +87,13 @@ func (d *DepositSpec) P2SHScript() []byte {
 
 // BuildDepositTx builds the unsigned deposit transaction that locks Amount into
 // the P2SH HTLC, spending funding UTXOs and returning change to changeAddr.
-// Input sequence is set below 0xffffffff so the CLTV refund branch is
-// spendable. The deposit tx itself has LockTime 0 so it confirms immediately;
-// the CLTV (d.LockTime) is enforced on the *refund spend*, not the deposit.
+// Deposit inputs carry SEQUENCE_FINAL (0xffffffff): C++ createRawTransaction
+// stamps SEQUENCE_FINAL on every input when cltv=true (xbridgerpc.cpp:367),
+// and checkDepositTransaction hard-rejects any deposit input whose sequence is
+// not SEQUENCE_FINAL (xbridgewalletconnectorbtc.cpp:2076-2080). The deposit tx
+// itself has LockTime 0 so it confirms immediately; the CLTV (d.LockTime) is
+// enforced on the *refund spend*, whose single input correctly uses
+// SEQUENCE_FINAL-1 (C++ createRefundTransaction, xbridgewalletconnectorbtc.cpp:2464).
 // Legacy (P2PKH) change only — native segwit change is a follow-up.
 func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee uint64) (*coins.Tx, error) {
 	if len(funding) == 0 {
@@ -125,7 +129,7 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 		}
 		tx.Inputs = append(tx.Inputs, coins.TxIn{
 			PrevOut:  coins.OutPoint{Hash: h, Index: u.Vout},
-			Sequence: 0xfffffffe, // < 0xffffffff to enable CLTV
+			Sequence: 0xffffffff, // SEQUENCE_FINAL (C++ createRawTransaction cltv=true)
 		})
 	}
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: d.Amount, ScriptPubKey: d.P2SHScript()})
