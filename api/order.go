@@ -10,7 +10,9 @@
 // live Blocknet service-node P2P network. See docs/protocol.md.
 package api
 
-import "go-xbridge/proto"
+import (
+	"go-xbridge/proto"
+)
 
 // Order is the internal normalized model of a live XBridge order. It carries
 // everything required to render every dx* order response (dxGetOrders,
@@ -46,8 +48,13 @@ type Order struct {
 	RefundTx       string   // refund txid, for dxCancelOrder ("" when no deposit)
 	BinTxId        string   // our HTLC deposit txid (dxPartialOrderChainDetails p2sh_deposits)
 	OBinTxId       string   // counterparty HTLC deposit txid (p2sh_deposits_counterparty)
-	Utxos          []proto.UtxoEntry
-	Mine           bool // true if created locally by this node
+	// PrepTx is the partial-order prep/split transaction id (display hex) built
+	// by an autoSplit make. C++ TransactionDescr::orderPrepTx; the order stays
+	// pending ("open") until the split confirms and the lifecycle broadcasts it.
+	// Empty for exact/non-partial orders.
+	PrepTx string
+	Utxos  []proto.UtxoEntry
+	Mine   bool // true if created locally by this node
 
 	// --- cancel/reject + fidelity fields (mirror xbridge::TransactionDescr) ---
 	// SNodePubkey is C++ sPubKey: the servicenode pubkey carried in the
@@ -55,6 +62,12 @@ type Order struct {
 	// (xbridgesession.cpp:722,811). For observed orders it is also the maker
 	// display key (MakerPubkey). It is set for every order we ingest.
 	SNodePubkey string
+	// HubAddress is C++ hubAddress: the chosen coordinator servicenode's address
+	// (GetID(sPubKey), xbridgetransactiondescr.h:656-663). For broadcast
+	// (cmd-4) orders it is the HubAddress field of the body; the maker's SEND
+	// carries it only in the transport envelope. The invariant
+	// HubAddress == GetID(SNodePubkey) gates taker-side acceptance.
+	HubAddress [20]byte
 	// OtherPubkey is C++ oPubKey: the counterparty's per-trade M pubkey,
 	// learned from the CreateA/B body during the swap handshake.
 	OtherPubkey string
@@ -133,6 +146,7 @@ func normalizeFromPendingBody(b *proto.PendingTransactionBody, maker string) *Or
 		Status:         "open",
 		MakerPubkey:    maker, // display key = snode header for observed orders
 		SNodePubkey:    maker, // C++ sPubKey = pkt.Pubkey
+		HubAddress:     b.HubAddress,
 	}
 }
 

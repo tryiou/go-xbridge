@@ -363,9 +363,12 @@ func (m *PeerManager) ReadPacket() (pkt *proto.Packet, peer string, err error) {
 	}
 }
 
-// WritePacket broadcasts an XBridge packet to all live peers. It returns an
-// error if there are no connected peers, or the last send error seen.
-func (m *PeerManager) WritePacket(p *proto.Packet) error {
+// WritePacket sends an XBridge packet to all live peers. The destination is
+// carried in the envelope: a zero dest broadcasts, a non-zero dest reaches only
+// the addressed node via C++ onMessageReceived (relaying is done by the P2P
+// network, mirroring App::Impl::onSend's ForEachNode fan-out, xbridgeapp.cpp:606).
+// It returns an error if there are no connected peers, or the last send error seen.
+func (m *PeerManager) WritePacket(p *proto.Packet, dest [20]byte) error {
 	m.mu.Lock()
 	conns := make([]*p2p.Conn, 0, len(m.peers))
 	for _, c := range m.peers {
@@ -379,7 +382,7 @@ func (m *PeerManager) WritePacket(p *proto.Packet) error {
 	}
 	var lastErr error
 	for _, c := range conns {
-		if err := c.WritePacket(p); err != nil {
+		if err := c.WritePacket(p, dest); err != nil {
 			lastErr = err
 		}
 	}

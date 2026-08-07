@@ -159,10 +159,13 @@ func (c *Conn) ReadPacket() (*proto.Packet, string, error) {
 }
 
 // WritePacket sends an XBridge packet as a `xbridge` P2P message, wrapping it
-// in the transport envelope (varint length + 20-byte broadcast addr + 8-byte
-// timestamp) expected by service nodes.
-func (c *Conn) WritePacket(p *proto.Packet) error {
-	payload := encodeXBridgePayload(p.Marshal())
+// in the transport envelope (varint length + 20-byte destination addr + 8-byte
+// timestamp) expected by service nodes. A zero dest broadcasts; a non-zero dest
+// addresses the packet to a specific node's keyId (C++ App::Impl::onSend,
+// xbridgeapp.cpp:595, and the onMessageReceived / onBroadcastReceived split in
+// net_processing.cpp:2896-2899).
+func (c *Conn) WritePacket(p *proto.Packet, dest [20]byte) error {
+	payload := encodeXBridgePayload(p.Marshal(), dest)
 	msg := &Message{
 		Magic:    c.magic,
 		Command:  XBridgeNetCommand,

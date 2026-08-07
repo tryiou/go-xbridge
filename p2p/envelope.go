@@ -26,11 +26,13 @@ const (
 )
 
 // encodeXBridgePayload wraps raw XBridgePacket bytes in the transport envelope
-// (varint length + 20-byte broadcast address + 8-byte timestamp) ready to be
-// used as the payload of an "xbridge" P2P message.
-func encodeXBridgePayload(packet []byte) []byte {
+// (varint length + 20-byte destination address + 8-byte timestamp) ready to be
+// used as the payload of an "xbridge" P2P message. A zero dest address is the
+// broadcast form; a non-zero dest addresses the packet to a specific node's
+// keyId (C++ App::Impl::onSend, xbridgeapp.cpp:595-616).
+func encodeXBridgePayload(packet []byte, dest [20]byte) []byte {
 	env := make([]byte, 0, xbridgeEnvelopeSize+len(packet))
-	env = append(env, make([]byte, xbridgeAddrSize)...) // broadcast (zero dest addr)
+	env = append(env, dest[:]...)
 	var ts [xbridgeTimestampSize]byte
 	// C++ stamps this 8-byte field in MICROSECONDS (timeToInt =
 	// total_microseconds(), xutil.cpp:280) and includes it in the SHA256-signed

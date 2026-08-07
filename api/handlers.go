@@ -1,19 +1,35 @@
 package api
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"go-xbridge/coins"
 	"go-xbridge/config"
 	discovery "go-xbridge/p2p/discovery"
+	"go-xbridge/swap"
 	"go-xbridge/wallet"
 )
+
+// xfloat is a float64 that always serializes with a decimal point in JSON,
+// matching C++ UniValue(double) behavior (e.g. 0.0 not 0).
+type xfloat float64
+
+func (f xfloat) MarshalJSON() ([]byte, error) {
+	s := strconv.FormatFloat(float64(f), 'f', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return []byte(s), nil
+}
 
 // fillOut is one entry of dxGetOrderFills' recent-fills list. Mirrors C++'s
 // 12-field object (id, time, maker, maker_size, taker, taker_size, order_type,
@@ -96,13 +112,17 @@ func (h *HandlerCtx) dxGetOrders(params []json.RawMessage) (interface{}, *rpcErr
 				continue
 			}
 		}
-		// Only show orders for assets we know about (mirrors the local-wallet
-		// filter in C++; a thin client without a wallet shows all known coins).
-		if !coins.Has(o.FromCurrency) {
-			continue
-		}
-		if !coins.Has(o.ToCurrency) {
-			continue
+		// Skip orders whose currencies have no wallet connector, unless
+		// ShowAllOrders (-dxnowallets) is set. Mirrors C++ rpcxbridge.cpp:432-446:
+		// connFrom/connTo are plain map lookups; the order is hidden when either
+		// is absent and the switch is off. Unlike the old coins.Has check, a coin
+		// is only "known" when a live connector is configured for it.
+		if !h.Config().ShowAllOrders {
+			_, eFrom := h.connector(o.FromCurrency)
+			_, eTo := h.connector(o.ToCurrency)
+			if eFrom != nil || eTo != nil {
+				continue
+			}
 		}
 		out = append(out, o.toListResult())
 	}
@@ -119,9 +139,15 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 		return nil, makeError(errInvalidParameters, "dxGetOrder", "(id)")
 	}
 	// C++ normalizes the id via uint256S (case-insensitive); Store keys are
-	// lowercased hex, so lowercase the input before lookup.
+	// the raw lowercase-hex wire bytes, so reverse the display order first.
 	id = strings.ToLower(id)
-	o := h.Store.Get(id)
+	key, err := orderIDKey(id)
+	if err != nil {
+		// uint256S(sid) yields a null id for an unparseable param; the null
+		// lookup misses, so C++ reports not-found (rpcxbridge.cpp:778-784).
+		return nil, makeError(errTxNotFound, "dxGetOrder", id)
+	}
+	o := h.Store.Get(key)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetOrder", id)
 	}
@@ -379,11 +405,11 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	}
 	id, _ := strParam(params, 0)
 	// C++ validates the id format up front (uint256S(sid).IsNull()).
-	if _, err := hex.DecodeString(id); err != nil || len(id) != 64 {
+	key, err := orderIDKey(id)
+	if err != nil {
 		return nil, makeError(errInvalidParameters, "dxCancelOrder", "Invalid order id ["+id+"]")
 	}
-	id = strings.ToLower(id)
-	o := h.Store.Get(id)
+	o := h.Store.Get(key)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxCancelOrder", id)
 	}
@@ -399,7 +425,7 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	if _, e := h.connector(o.ToCurrency); e != nil {
 		return nil, e
 	}
-	res, e := h.Node.CancelOrder(CancelOrderParams{ID: id})
+	res, e := h.Node.CancelOrder(CancelOrderParams{ID: key})
 	if e != nil {
 		return nil, e
 	}
@@ -455,7 +481,9 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	if end <= start {
 		return []interface{}{}, nil
 	}
-	numBuckets := (end - start) / granularity
+	alignedStart := (start / granularity) * granularity
+	alignedEnd := ((end + granularity - 1) / granularity) * granularity
+	numBuckets := (alignedEnd - alignedStart) / granularity
 
 	// C++ walk of the XSeries cache is replaced here by the thin client's local
 	// trade history (Store.Fills): OHLCV is aggregated from the fills this node
@@ -480,10 +508,10 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 			continue
 		}
 		ft := int64(f.Time / 1e6)
-		if ft < start || ft >= end {
+		if ft < alignedStart || ft >= alignedEnd {
 			continue
 		}
-		bi := (ft - start) / granularity
+		bi := (ft - alignedStart) / granularity
 		if bi < 0 || bi >= numBuckets {
 			continue
 		}
@@ -492,7 +520,7 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 
 	out := make([]interface{}, 0, numBuckets)
 	for i := int64(0); i < numBuckets; i++ {
-		bucketStart := start + i*granularity
+		bucketStart := alignedStart + i*granularity
 		bf := buckets[i].fills
 		// Chronological order so open=first, close=last.
 		sort.SliceStable(bf, func(i, j int) bool { return bf[i].Time < bf[j].Time })
@@ -518,7 +546,7 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 			volume += takerNum
 			ids = append(ids, f.ID)
 		}
-		row := []interface{}{iso8601(uint64(bucketStart) * 1e6), low, high, open, close, volume}
+		row := []interface{}{iso8601(uint64(bucketStart) * 1e6), xfloat(low), xfloat(high), xfloat(open), xfloat(close), xfloat(volume)}
 		if orderIDs {
 			row = append(row, ids)
 		}
@@ -533,72 +561,52 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 
 // obEntry is one matched order-book entry (ask or bid) with its computed price.
 type obEntry struct {
-	price    float64 // numeric price for sorting (ask=to/from, bid=from/to)
-	priceStr string  // 6-decimal rendered price
-	amount   uint64  // base-unit amount to render (ask=fromAmount, bid=toAmount)
-	id       string  // hex order id
+	price    float64  // numeric price for sorting (ask=to/from, bid=from/to)
+	priceStr string   // 6-decimal rendered price
+	amount   uint64   // base-unit amount to render (ask=fromAmount, bid=toAmount)
+	id       string   // hex order id in C++ display order (uint256::GetHex)
+	rawID    [32]byte // raw wire id, for C++'s id-sorted iteration order
 }
 
-// obPriceGroup is one aggregated price level (detail 2): an aggregated size and
-// the count of orders at that level across the full order book.
-type obPriceGroup struct {
-	priceStr string
-	sum      uint64
-	count    int
+// floatCompare mirrors C++ rpcxbridge.cpp floatCompare (Knuth 4.2.2 Eq 36):
+// relative-epsilon equality with std::numeric_limits<double>::epsilon().
+func floatCompare(a, b float64) bool {
+	const epsilon = 2.220446049250313e-16 // std::numeric_limits<double>::epsilon()
+	return (math.Abs(a-b)/math.Abs(a) <= epsilon) && (math.Abs(a-b)/math.Abs(b) <= epsilon)
 }
 
-// groupByPrice aggregates a price-sorted (descending) entry list into best-first
-// price levels. reverse=true (asks) yields lowest-price-first; reverse=false
-// (bids) yields highest-price-first. Prices are grouped by their 6-decimal
-// rendered string, matching C++'s floatCompare equality.
-func groupByPrice(list []obEntry, reverse bool) []obPriceGroup {
-	groups := []obPriceGroup{}
-	var cur *obPriceGroup
-	add := func(e obEntry) {
-		if cur == nil || cur.priceStr != e.priceStr {
-			if cur != nil {
-				groups = append(groups, *cur)
-			}
-			g := obPriceGroup{priceStr: e.priceStr, sum: e.amount, count: 1}
-			cur = &g
-		} else {
-			cur.sum += e.amount
-			cur.count++
-		}
-	}
-	if reverse {
-		for i := len(list) - 1; i >= 0; i-- {
-			add(list[i])
-		}
-	} else {
-		for i := 0; i < len(list); i++ {
-			add(list[i])
-		}
-	}
-	if cur != nil {
-		groups = append(groups, *cur)
-	}
-	return groups
-}
-
-func countAtPrice(list []obEntry, priceStr string) int {
+// countAtPrice returns the number of orders in the full side list whose price
+// is floatCompare-equal to price, matching C++'s std::count_if over the whole
+// asksList/bidsList (rpcxbridge.cpp:1673-1688, 1722-1740, 1808-1819).
+func countAtPrice(list []obEntry, price float64) int {
 	n := 0
 	for _, e := range list {
-		if e.priceStr == priceStr {
+		if floatCompare(e.price, price) {
 			n++
 		}
 	}
 	return n
 }
 
-func idsAtPrice(list []obEntry, priceStr string) []string {
-	seen := map[string]bool{}
-	ids := []string{}
+// idsAtPrice returns the ids of every order in the full side list that is
+// floatCompare-equal to the best entry's price: the best order's id first,
+// then the rest in ascending raw-id order — matching C++ detail 4
+// (rpcxbridge.cpp:1905-1926), which emits the best id then walks the
+// id-sorted TransactionMap for the remaining equal-price ids.
+func idsAtPrice(list []obEntry, best obEntry) []string {
+	ids := []string{best.id}
+	rest := []obEntry{}
 	for _, e := range list {
-		if e.priceStr == priceStr && !seen[e.id] {
-			seen[e.id] = true
-			ids = append(ids, e.id)
+		if e.rawID == best.rawID {
+			continue
 		}
+		if floatCompare(e.price, best.price) {
+			rest = append(rest, e)
+		}
+	}
+	sort.Slice(rest, func(i, j int) bool { return bytes.Compare(rest[i].rawID[:], rest[j].rawID[:]) < 0 })
+	for _, e := range rest {
+		ids = append(ids, e.id)
 	}
 	return ids
 }
@@ -647,12 +655,12 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 		if strings.EqualFold(o.FromCurrency, maker) && strings.EqualFold(o.ToCurrency, taker) {
 			// ask: from=maker (sold), to=taker; price = to/from (taker per maker)
 			p := float64(o.ToAmount) / float64(o.FromAmount)
-			asks = append(asks, obEntry{price: p, priceStr: formatXPrice(p), amount: o.FromAmount, id: hexEncode(o.ID[:])})
+			asks = append(asks, obEntry{price: p, priceStr: formatXPrice(p), amount: o.FromAmount, id: orderIDString(o.ID), rawID: o.ID})
 		}
 		if strings.EqualFold(o.FromCurrency, taker) && strings.EqualFold(o.ToCurrency, maker) {
 			// bid: from=taker, to=maker; priceBid = from/to (taker per maker)
 			p := float64(o.FromAmount) / float64(o.ToAmount)
-			bids = append(bids, obEntry{price: p, priceStr: formatXPrice(p), amount: o.ToAmount, id: hexEncode(o.ID[:])})
+			bids = append(bids, obEntry{price: p, priceStr: formatXPrice(p), amount: o.ToAmount, id: orderIDString(o.ID), rawID: o.ID})
 		}
 	}
 
@@ -673,45 +681,69 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 		// Best bid and ask only, with the count of orders at that best price.
 		if len(asks) > 0 {
 			best := asks[len(asks)-1] // lowest-price ask
-			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(asks, best.priceStr)})
+			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(asks, best.price)})
 		}
 		if len(bids) > 0 {
 			best := bids[0] // highest-price bid
-			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(bids, best.priceStr)})
+			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(bids, best.price)})
 		}
 	case 2:
-		// Aggregated top levels (per side), best-first, capped at maxOrders.
-		for _, g := range groupByPrice(asks, true) {
-			if len(res.Asks) >= maxOrders {
-				break
+		// Aggregated top levels (per side). Faithful port of C++ d2
+		// (rpcxbridge.cpp:1756-1833): iterate the best window (asks from
+		// asks_len-bound, bids from 0), emit one row per selected index with
+		// count_if over the FULL list, and skip equal-price neighbours with
+		// C++'s `while((++i < bound) && floatCompare(...))` — which advances i
+		// even when prices differ (so roughly every-other window entry is
+		// emitted) and merges equal prices only while i < bound.
+		bound := min(maxOrders, len(bids))
+		for i := 0; i < bound; {
+			bid := bids[i]
+			bidSize := bid.amount
+			bidCount := countAtPrice(bids, bid.price)
+			i++
+			for i < bound && floatCompare(bids[i].price, bid.price) {
+				bidSize += bids[i].amount
+				i++
 			}
-			res.Asks = append(res.Asks, []interface{}{g.priceStr, formatXAmount(g.sum), g.count})
+			i++
+			res.Bids = append(res.Bids, []interface{}{bid.priceStr, formatXAmount(bidSize), bidCount})
 		}
-		for _, g := range groupByPrice(bids, false) {
-			if len(res.Bids) >= maxOrders {
-				break
+		bound = min(maxOrders, len(asks))
+		for i := len(asks) - bound; i < len(asks); {
+			ask := asks[i]
+			askSize := ask.amount
+			askCount := countAtPrice(asks, ask.price)
+			i++
+			for i < bound && floatCompare(asks[i].price, ask.price) {
+				askSize += asks[i].amount
+				i++
 			}
-			res.Bids = append(res.Bids, []interface{}{g.priceStr, formatXAmount(g.sum), g.count})
+			i++
+			res.Asks = append(res.Asks, []interface{}{ask.priceStr, formatXAmount(askSize), askCount})
 		}
 	case 3:
 		// Full, non-aggregated, per side, capped at maxOrders, with order ids.
-		for i := len(asks) - 1; i >= 0 && len(res.Asks) < maxOrders; i-- {
-			e := asks[i]
-			res.Asks = append(res.Asks, []interface{}{e.priceStr, formatXAmount(e.amount), e.id})
-		}
-		for i := 0; i < len(bids) && len(res.Bids) < maxOrders; i++ {
+		// C++ iterates the best window (bids from 0, asks from asks_len-bound to
+		// asks_len-1), so asks are descending price within the best window.
+		bound := min(maxOrders, len(bids))
+		for i := 0; i < bound; i++ {
 			e := bids[i]
 			res.Bids = append(res.Bids, []interface{}{e.priceStr, formatXAmount(e.amount), e.id})
+		}
+		bound = min(maxOrders, len(asks))
+		for i := len(asks) - bound; i < len(asks); i++ {
+			e := asks[i]
+			res.Asks = append(res.Asks, []interface{}{e.priceStr, formatXAmount(e.amount), e.id})
 		}
 	case 4:
 		// Best bid and ask only, with the array of order ids at that price.
 		if len(asks) > 0 {
 			best := asks[len(asks)-1]
-			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(asks, best.priceStr)})
+			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(asks, best)})
 		}
 		if len(bids) > 0 {
 			best := bids[0]
-			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(bids, best.priceStr)})
+			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(bids, best)})
 		}
 	}
 	return res, nil
@@ -822,9 +854,14 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 	}
 	// C++ getPartialOrderChain resolves both ancestors and descendants; reuse the
 	// shared chain walker so this matches dxPartialOrderChainDetails.
-	chain := h.partialOrderChain(id)
+	// C++ validates the id up front (uint256S(order_id).IsNull() -> "bad order id").
+	key, err := orderIDKey(id)
+	if err != nil {
+		return nil, makeError(errInvalidParameters, "dxGetMyPartialOrderChain", "bad order id")
+	}
+	chain := h.partialOrderChain(key)
 	if len(chain) == 0 {
-		return nil, makeError(errTxNotFound, "dxGetMyPartialOrderChain", id)
+		return []interface{}{}, nil
 	}
 	out := make([]orderDetailResult, 0, len(chain))
 	for _, c := range chain {
@@ -896,11 +933,11 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "(order_id)")
 	}
 	// C++ validates the order id up front (uint256S(sid).IsNull()).
-	if _, err := hex.DecodeString(id); err != nil || len(id) != 64 {
+	key, err := orderIDKey(id)
+	if err != nil {
 		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "Invalid order id ["+id+"]")
 	}
-	id = strings.ToLower(id)
-	chain := h.partialOrderChain(id)
+	chain := h.partialOrderChain(key)
 	// C++ returns an empty object `{}` for an unknown / empty chain (not an error).
 	if len(chain) == 0 {
 		return map[string]interface{}{}, nil
@@ -932,7 +969,7 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 				totalOpen++
 			}
 		}
-		orderIDs = append(orderIDs, hexEncode(t.ID[:]))
+		orderIDs = append(orderIDs, orderIDString(t.ID))
 		// C++ pushes each order's deposit txids (binTxId / oBinTxId) into these
 		// arrays so a caller can see the on-chain HTLC deposits for the chain.
 		if t.BinTxId != "" {
@@ -943,7 +980,7 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		}
 	}
 	details := map[string]interface{}{
-		"first_order_id":             hexEncode(first.ID[:]),
+		"first_order_id":             orderIDString(first.ID),
 		"maker":                      first.FromCurrency,
 		"maker_address":              first.MakerAddress,
 		"taker":                      first.ToCurrency,
@@ -1013,15 +1050,26 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		}
 		return map[string]interface{}{"all_locked_utxo": all}, nil
 	}
-	o := h.Store.Get(id)
+	orderKey, err := orderIDKey(id)
+	if err != nil {
+		return nil, makeError(errInvalidParameters, "dxGetLockedUtxos", "Invalid order id ["+id+"]")
+	}
+	o := h.Store.Get(orderKey)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", id)
 	}
-	// Per-order locked utxos, keyed by the order's maker currency and restricted to
-	// UTXOs locked by THIS order (C++ keys the array by the order's currency).
+	// Per-order locked utxos. C++ keys the array by the transaction's state,
+	// never by which wallets happen to be connected (rpcxbridge.cpp:2674-2677):
+	// a pending transaction uses a_currency, an accepted one uses
+	// a_currency_and_b_currency. A maker's own created order counts as accepted
+	// — C++ keeps made orders in the transactions map (xbridgeapp.cpp:2034).
 	entries := make([]string, 0)
-	if conn, e := h.connector(o.FromCurrency); e == nil {
-		utxos, err := conn.ListUnspent(0)
+	key := o.FromCurrency
+	if stateOrdinal(o.Status) >= int(swap.DescrAccepting) {
+		key = o.FromCurrency + "_and_" + o.ToCurrency
+	}
+	if connFrom, e := h.connector(o.FromCurrency); e == nil {
+		utxos, err := connFrom.ListUnspent(0)
 		if err == nil {
 			c, cok := coins.Get(o.FromCurrency)
 			for _, u := range utxos {
@@ -1037,9 +1085,28 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 			}
 		}
 	}
+	// The order may also hold taker-currency UTXOs (accepted order); gather
+	// them into the same list, mirroring C++ Exchange::getUtxoItems.
+	if connTo, e := h.connector(o.ToCurrency); e == nil && o.ToCurrency != o.FromCurrency {
+		utxos, err := connTo.ListUnspent(0)
+		if err == nil {
+			c, cok := coins.Get(o.ToCurrency)
+			for _, u := range utxos {
+				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+				if byOrder[k] != id {
+					continue
+				}
+				amtStr := formatXAmount(u.Amount)
+				if cok {
+					amtStr = coins.FormatAmount(c, u.Amount)
+				}
+				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+amtStr+":"+u.Address)
+			}
+		}
+	}
 	return map[string]interface{}{
-		"id":           id,
-		o.FromCurrency: entries,
+		"id": id,
+		key:  entries,
 	}, nil
 }
 
@@ -1428,6 +1495,72 @@ func txidOfRawTx(rawHex string) (string, *rpcError) {
 		h[i], h[j] = h[j], h[i]
 	}
 	return hex.EncodeToString(h[:]), nil
+}
+
+// prepVout is one planned output of a partial-order prep (split) transaction.
+// It mirrors C++ createPartialTransaction's (address, amount) pair; every output
+// of a prep tx goes to the maker's from address (xbridgeapp.cpp:1799-1817).
+type prepVout struct {
+	addr   string
+	amount float64
+}
+
+// buildPrepTx builds, signs, and hashes the partial-order prep transaction the
+// way C++ createPartialTransaction does (xbridgewalletconnectorbtc.cpp:2594-2631,
+// via the generic createTransaction :2425-2453): a tx with the coin's configured
+// version spending the maker's non-exact vins into P2PKH outputs (vout =
+// amount*COIN, truncating) with the change clawed back into the fee when dust.
+// The returned txid is the REAL tx hash (double-SHA256 of the signed raw tx),
+// NOT the wallet's SendRawTransaction return — C++ derives orderPrepTx from
+// createPartialTransaction's txid (xbridgeapp.cpp:1844).
+func buildPrepTx(conn wallet.Connector, cc *config.CoinConf, coin coins.Coin, vins []wallet.Utxo, vouts []prepVout) (signedHex, txid string, rerr *rpcError) {
+	if len(vouts) == 0 {
+		return "", "", makeError(errInvalidParameters, "dxMakePartialOrder", "no prep outputs")
+	}
+	destScript, e := legacyOutputScript(coin, vouts[0].addr)
+	if e != nil {
+		return "", "", e
+	}
+	tx := &coins.Tx{Version: 1}
+	if cc != nil && cc.TxVersion != 0 {
+		tx.Version = int32(cc.TxVersion)
+	}
+	// C++ CTransaction(txWithTimeField) defaults nTime to time(nullptr)
+	// (xbitcointransaction.h:92) when the coin serializes the time field.
+	tx.WithTime = coin.TxWithTimeField
+	tx.TxTime = uint32(time.Now().Unix())
+	var prevTxs []wallet.PrevTx
+	for _, u := range vins {
+		hash, err := reverseTxidHex(u.TxID)
+		if err != nil {
+			return "", "", makeError(errInvalidParameters, "dxMakePartialOrder", "bad prep input txid: "+u.TxID)
+		}
+		tx.Inputs = append(tx.Inputs, coins.TxIn{
+			PrevOut:  coins.OutPoint{Hash: hash, Index: u.Vout},
+			Sequence: 0xffffffff,
+		})
+		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
+	}
+	scale := uint64(coinScale)
+	if cc != nil {
+		scale = cc.Coin
+	}
+	for _, vo := range vouts {
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: uint64(vo.amount * float64(scale)), ScriptPubKey: destScript})
+	}
+	unsigned := hex.EncodeToString(tx.Serialize())
+	signedHex, complete, err := conn.SignRawTransaction(unsigned, prevTxs)
+	if err != nil {
+		return "", "", makeError(errUnknown, "dxMakePartialOrder", err.Error())
+	}
+	if !complete {
+		return "", "", makeError(errUnknown, "dxMakePartialOrder", "signing incomplete (wallet missing keys?)")
+	}
+	txid, e = txidOfRawTx(signedHex)
+	if e != nil {
+		return "", "", e
+	}
+	return signedHex, txid, nil
 }
 
 // toXBridgeAmt converts a native-chain amount (coins.Coin.Decimals base units)

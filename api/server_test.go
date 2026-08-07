@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +31,7 @@ func TestDxGetOrderRoundTrip(t *testing.T) {
 	}
 	o := normalizeFromOrderBody(body, "pubkeyhex")
 	ctx.Store.Add(o)
-	idHex := hex.EncodeToString(o.ID[:])
+	idHex := dispID(o.ID)
 
 	res, err := ctx.dxGetOrder([]json.RawMessage{json.RawMessage(`"` + idHex + `"`)})
 	if err != nil {
@@ -68,7 +67,7 @@ func TestDxGetOrderCaseInsensitiveID(t *testing.T) {
 	}
 	o := normalizeFromOrderBody(body, "pubkeyhex")
 	ctx.Store.Add(o)
-	lower := hex.EncodeToString(o.ID[:]) // all lowercase
+	lower := dispID(o.ID) // display order, all lowercase
 	upper := strings.ToUpper(lower)
 	res, err := ctx.dxGetOrder([]json.RawMessage{json.RawMessage(`"` + upper + `"`)})
 	if err != nil {
@@ -131,4 +130,66 @@ func callRPC(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	return rec
+}
+
+// TestServerRPCAuth verifies F1: with -rpcuser/-rpcpassword configured, the
+// JSON-RPC server requires valid HTTP Basic credentials (401 + challenge
+// otherwise) and rejects with constant-time semantics; without credentials
+// configured, requests pass through unchanged (the loopback-default contract).
+func TestServerRPCAuth(t *testing.T) {
+	ctx := newTestCtx()
+	srv := NewServer(ctx)
+	srv.SetAuth("alice", "s3cret")
+
+	// Missing Authorization header -> 401 + WWW-Authenticate challenge.
+	rec := callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":1}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing creds status = %d, want 401", rec.Code)
+	}
+	if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Basic") {
+		t.Errorf("missing WWW-Authenticate challenge, got %q", rec.Header().Get("WWW-Authenticate"))
+	}
+
+	// Wrong password -> 401.
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"method":"dxGetOrder","params":[],"id":2}`))
+	req.SetBasicAuth("alice", "wrong")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status = %d, want 401", rec.Code)
+	}
+
+	// Correct credentials -> request proceeds (dxGetOrder returns a business
+	// error for missing id, not a 401).
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"method":"dxGetOrder","params":[],"id":3}`))
+	req.SetBasicAuth("alice", "s3cret")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("correct creds status = %d, want 200", rec.Code)
+	}
+	var env rpcResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error != nil || env.Result == nil {
+		t.Errorf("authenticated request should reach the handler: %+v", env)
+	}
+
+	// SetAuth with only one of user/pass disables auth (both required).
+	srv.SetAuth("alice", "")
+	rec = callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":4}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("partial creds should disable auth, status = %d", rec.Code)
+	}
+}
+
+// TestServerMaxBodyBytes verifies F10/S3: an oversized JSON-RPC body is rejected
+// by the http.MaxBytesReader gate rather than buffered/decoded unbounded.
+func TestServerMaxBodyBytes(t *testing.T) {
+	ctx := newTestCtx()
+	srv := NewServer(ctx)
+	big := strings.Repeat(" ", rpcMaxBodyBytes+1) // > 4 MiB
+	rec := callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":1}`+"\n"+big)
+	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, want 400/413 (MaxBytesReader)", rec.Code)
+	}
 }

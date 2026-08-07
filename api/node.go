@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sort"
@@ -74,6 +73,10 @@ type Config struct {
 	Connectors map[string]wallet.Connector
 	// ExchangeWallets is the local-wallet list from [Main].ExchangeWallets.
 	ExchangeWallets []string
+	// ShowAllOrders mirrors C++ settings().showAllOrders() / -dxnowallets:
+	// when true, dxGetOrders shows every order regardless of whether a wallet
+	// connector exists for its currencies (rpcxbridge.cpp:432-446).
+	ShowAllOrders bool
 	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
 	// Network is the Blocknet network to discover on: "mainnet" (default),
@@ -105,7 +108,10 @@ type Config struct {
 // is empty) satisfy it, so PeerManager is a drop-in replacement.
 type XConn interface {
 	ReadPacket() (pkt *proto.Packet, peer string, err error)
-	WritePacket(*proto.Packet) error
+	// WritePacket writes an XBridge packet. dest is the 20-byte envelope
+	// destination (zero == broadcast; non-zero == addressed to a node's keyId,
+	// C++ App::Impl::onSend / net_processing onMessageReceived).
+	WritePacket(*proto.Packet, [20]byte) error
 	Close() error
 }
 
@@ -302,6 +308,7 @@ func (n *Node) reloadConf() error {
 		Confs:            conf.Coins,
 		Connectors:       connectors,
 		ExchangeWallets:  conf.Main.ExchangeWallets,
+		ShowAllOrders:    conf.Main.ShowAllOrders,
 		NetworkTokens:    networkTokens,
 		Network:          n.cfg().Network,
 		AddNodes:         n.cfg().AddNodes,
@@ -400,6 +407,16 @@ func utxoChallenge(txid string, vout uint32, amount float64, address string) str
 	return txid + ":" + strconv.FormatUint(uint64(vout), 10) + ":" + wholeCoinOstream(amount) + ":" + address
 }
 
+// errBadSigLen reports a signmessage proof that is not the 65 bytes XBridge
+// requires (compact signature: 1 recovery byte + 64). The C++ writer rejects
+// such proofs with INVALID_SIGNATURE (xbridgeapp.cpp:1705).
+var errBadSigLen = errors.New("api: signature must be 65 bytes")
+
+// errBadAddr reports a selected utxo whose address cannot be decoded to the
+// 20-byte raw id XBridge requires. The C++ writer rejects such entries with
+// INVALID_ADDRESS (xbridgeapp.cpp:1710-1713).
+var errBadAddr = errors.New("api: utxo address is invalid")
+
 // buildUtxoProofs attaches a BIP137 ownership proof to each spendable UTXO,
 // producing the UtxoEntry list carried in order/pending/accepting bodies. Each
 // proof is signmessage(address, UtxoEntry::toString()); the counterparty
@@ -413,15 +430,18 @@ func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) (
 		}
 		a, err := c.DecodeAddress(u.Address)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", errBadAddr, err)
 		}
 		raw, ok := a.ID()
 		if !ok {
-			return nil, fmt.Errorf("api: utxo address %s has no id", u.Address)
+			return nil, fmt.Errorf("%w: %s has no id", errBadAddr, u.Address)
 		}
 		sig, err := conn.SignMessage(u.Address, utxoChallenge(u.TxID, u.Vout, u.Value, u.Address))
 		if err != nil {
 			return nil, err
+		}
+		if len(sig) != 65 {
+			return nil, errBadSigLen
 		}
 		var s [65]byte
 		copy(s[:], sig)
@@ -562,40 +582,36 @@ func (n *Node) feed() {
 		snode := hexEncode(pkt.Pubkey[:])
 		xlog.Debug("packet received", "command", pkt.Command.String(), "snode", snode, "peer", peer)
 		switch b := body.(type) {
-		case *proto.OrderBody:
-			o := normalizeFromOrderBody(b, snode)
-			n.store.Add(o)
 		case *proto.PendingTransactionBody:
-			o := normalizeFromPendingBody(b, snode)
-			n.store.Add(o)
+			n.ingestPending(b, snode)
 
 		// --- swap handshake (client side, hub-driven) ---
 		case *proto.HoldBody:
-			n.dispatchSwap(b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnHold(b)
 			})
 		case *proto.InitBody:
-			n.dispatchSwap(b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnInit(b)
 			})
 		case *proto.CreateABody:
-			n.dispatchSwap(b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnCreateA(b)
 			})
 		case *proto.CreateBBody:
-			n.dispatchSwap(b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnCreateB(b)
 			})
 		case *proto.ConfirmABody:
-			n.dispatchSwap(b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnConfirmA(b)
 			})
 		case *proto.ConfirmBBody:
-			n.dispatchSwap(b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnConfirmB(b)
 			})
 		case *proto.FinishedBody:
-			n.dispatchSwap(b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			n.dispatchSwap(pkt, b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 				return s.OnFinished(b)
 			})
 		case *proto.CancelBody:
@@ -607,6 +623,28 @@ func (n *Node) feed() {
 			n.onRemoteReject(pkt, b)
 		}
 	}
+}
+
+// ingestPending adds a hub order broadcast (xbcPendingTransaction) to the store.
+// Authenticity is provided by the feed's packet signature verification
+// (n.signer.Verify, verified against the header pubkey at C++
+// xbridgesession.cpp:736) — there is no GetID(hubAddress) invariant on the
+// wire: the 20-byte hub field is the broadcaster's per-session id (m_myid,
+// xbridgesession.cpp:182-183) used for routing, NOT GetID of the signing key,
+// so it is stored verbatim (OrderDescr: sPubKey = header key,
+// hubAddress = m_myId, xbridgesession.cpp:804-811). A relayed copy of a known
+// order is never re-created: C++ processPendingTransaction only refreshes the
+// timestamp of a known order (xbridgesession.cpp:753-788) — store.Add would
+// REPLACE it and drop the local Role/Mine/MakerKey, so the existing record is
+// preserved and bumped. A canceled order may be re-accepted via a rebroadcast
+// (falls through to a fresh pending entry).
+func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
+	o := normalizeFromPendingBody(b, snode)
+	if ex := n.store.Get(hexEncode(o.ID[:])); ex != nil && ex.Status != "canceled" {
+		ex.Updated = NowMicro()
+		return
+	}
+	n.store.Add(o)
 }
 
 // logNetworkStatus emits a single aggregated snapshot of discovery health:
@@ -670,10 +708,19 @@ type responseBody interface {
 
 // dispatchSwap routes a hub-originated handshake packet to the local session for
 // the given order id, runs the session handler, and (if it produced a response)
-// signs and broadcasts it. Packets for order ids we are not a party to are
-// ignored. The optional hub address is recorded on the session so responses are
-// addressed correctly.
-func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
+// signs and sends it addressed to the session's pinned hub. Packets for order
+// ids we are not a party to are ignored. The `hub` parameter (the address the
+// packet embeds) is intentionally ignored: the response destination is the hub
+// pinned at session creation, never learned from the packet.
+//
+// F2/S2-E (hub-key auth): every handshake packet is re-verified against the
+// session's TRUSTED hub key before dispatch — mirroring C++
+// xbridgesession.cpp:1364 packet->verify(xtx->sPubKey). The trusted key is
+// pinned at session creation for BOTH roles (maker: the hub chosen at make
+// time; taker: the order's SNodePubkey) — never learned from network packets.
+// A packet that fails verification is dropped and never reaches the handler, so
+// a forged Finished can never set csFinished and disable the refund watcher.
+func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
 	n.sessMu.Lock()
 	s := n.sessions[hexEncode(id[:])]
 	n.sessMu.Unlock()
@@ -683,11 +730,13 @@ func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*
 		}
 		return
 	}
-	if hub != ([20]byte{}) {
-		s.hub = hub
-	}
 	orderID := hexEncode(id[:])
 	swlog := xlog.With("order", orderID)
+	if !n.verifyHubPacket(pkt, s) {
+		xlog.Warn("swap packet dropped: hub signature not verified", "command", cmdName,
+			"state", s.state.String(), "snode", hexEncode(pkt.Pubkey[:]))
+		return
+	}
 	swlog.Info("swap packet received", "command", cmdName, "state", s.state.String())
 	// Defense in depth: a malformed/inbound packet must never crash the feed
 	// goroutine (which would terminate the whole process). Recover from any
@@ -706,16 +755,53 @@ func (n *Node) dispatchSwap(id [32]byte, hub [20]byte, cmdName string, fn func(*
 		swlog.Debug("swap handler produced no response")
 		return
 	}
-	if err := n.send(cmd, body, s.privKey[:]); err != nil {
+	if err := n.send(s.hub, cmd, body, s.privKey[:]); err != nil {
 		swlog.Error("swap response send failed", "command", cmd.String(), "err", err)
 	} else {
 		swlog.Info("swap response sent", "command", cmd.String())
 	}
 }
 
+// verifyHubPacket authenticates a hub-originated handshake packet against the
+// session's trusted hub key (F2/S2-E, C++ packet->verify(xtx->sPubKey)). The
+// trusted key is pinned at session creation for BOTH roles — the maker's chosen
+// servicenode, the taker's order SNodePubkey — never learned from network
+// packets. A packet signed by any other key is dropped before it reaches the
+// handler. The registry membership of the trusted hub is also re-checked,
+// mirroring C++ getSn on every handshake packet (xbridgesession.cpp:1384).
+func (n *Node) verifyHubPacket(pkt *proto.Packet, s *SwapSession) bool {
+	if s.hubKey == [33]byte{} {
+		return false // no trusted hub anchor -> cannot authenticate
+	}
+	if ok, _ := n.signer.VerifyAgainst(pkt, hexEncode(s.hubKey[:])); !ok {
+		return false // packet not signed by the trusted hub key
+	}
+	return n.hubRegistered(s.hubKey[:])
+}
+
+// hubRegistered reports whether the pubkey is a known servicenode, mirroring
+// C++ sn::ServiceNodeMgr::getSn (servicenodemgr.h:418-432): a plain snodes map
+// lookup with no running filter — findSn (:878-892) is snodes.count(pubkey).
+// It is STRICT: an empty registry refuses, exactly like C++ getSn returning
+// null for an unknown key. It backs the take gate (xbridgeapp.cpp:2179) and
+// the handshake packet gate (xbridgesession.cpp:1384), both of which only
+// reject when the node is null. The make path is deliberately different: hub
+// selection goes through Pick, which keeps C++'s running() filter
+// (findNodeWithService, xbridgeapp.cpp:2910), so a stale-but-known node can
+// be taken from but is never selected for a new make.
+func (n *Node) hubRegistered(pk []byte) bool {
+	reg := n.snReg
+	if reg == nil {
+		return false
+	}
+	var key [33]byte
+	copy(key[:], pk)
+	return reg.Known(key)
+}
+
 // send signs and broadcasts a handshake response packet with the swap's
 // per-trade M keypair (C++ xtx->mPrivKey).
-func (n *Node) send(cmd proto.XBridgeCommand, body responseBody, priv []byte) error {
+func (n *Node) send(dest [20]byte, cmd proto.XBridgeCommand, body responseBody, priv []byte) error {
 	if n.conn == nil {
 		return errors.New("api: not connected to a service node")
 	}
@@ -726,7 +812,7 @@ func (n *Node) send(cmd proto.XBridgeCommand, body responseBody, priv []byte) er
 	if err := n.signer.Sign(pkt, priv); err != nil {
 		return err
 	}
-	return n.conn.WritePacket(pkt)
+	return n.conn.WritePacket(pkt, dest)
 }
 
 // MakeOrderParams are the parsed dxMakeOrder / dxMakePartialOrder arguments.
@@ -811,6 +897,35 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if fromAmt == 0 || toAmt == 0 {
 		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The minimum supported size is "+formatXPrice(1.0/float64(coinScale)))
 	}
+	// C++ makeTransaction: findNodeWithService runs FIRST (xbridgeapp.cpp:1511),
+	// before connector/dust checks; no eligible hub fails the order with
+	// NO_SERVICE_NODE (:1515). Pick already filters to running, protocol-version
+	// matching servicenodes that advertise both currencies (subsuming the
+	// getSn re-check at :1518). The chosen hub is pinned for this order: its
+	// pubkey/address travel in the SEND envelope and on the Order record.
+	//
+	// Skipped in dry-run: Go's dxMakeOrder dry-run is a validation/preview
+	// extension (C++ has none) that broadcasts nothing and creates no session,
+	// so there is no hub to select or protect.
+	var hubKey [33]byte
+	var hubAddr [20]byte
+	if !p.DryRun {
+		reg := n.snReg
+		if reg == nil {
+			// No registry at all: the operator must connect to a service node
+			// (or run one) before any make can succeed (C++ :1515).
+			xlog.Warn("dxMakeOrder refused: no service-node registry (empty snReg)", "maker", p.Maker, "taker", p.Taker)
+			return nil, makeError(errNoServiceNode, "dxMakeOrder", p.Maker+"/"+p.Taker)
+		}
+		var ok bool
+		hubKey, ok = reg.Pick([]string{p.Maker, p.Taker})
+		if !ok {
+			xlog.Warn("dxMakeOrder refused: no running hub advertising both currencies", "maker", p.Maker, "taker", p.Taker)
+			return nil, makeError(errNoServiceNode, "dxMakeOrder", p.Maker+"/"+p.Taker)
+		}
+		hubAddr = coins.KeyID(hubKey[:])
+	}
+
 	// Per-currency connector (NO_SESSION) gate.
 	if _, e := n.connector(p.Maker); e != nil {
 		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
@@ -821,6 +936,12 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 
 	partial := false
 	minFrom := fromAmt
+	cc := n.cfg().Confs[p.Maker]
+	nativeCoin := uint64(coinScale)
+	if cc != nil {
+		nativeCoin = cc.Coin
+	}
+	var relayFee float64
 	if p.Type == "partial" {
 		partial = true
 		// C++ reads minimum_size at params[6] (required for partials). A
@@ -838,31 +959,114 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
 		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
-		relayFee, _ := n.relayFeeFor(p.Maker)
-		if cc := n.cfg().Confs[p.Maker]; cc != nil && minFrom < effectiveDust(cc, relayFee) {
+		relayFee, _ = n.relayFeeFor(p.Maker)
+		if cc != nil && minFrom < effectiveDust(cc, relayFee) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
 
-	var id [32]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		xlog.Error("MakeOrder: rng failure", "err", err)
-		return nil, makeError(errUnknown, "dxMakeOrder", "failed to generate order id")
+	// Partial-order prep plan (C++ xbridgeapp.cpp:1571-1604): how many split
+	// vouts the autoSplit prep tx will create, the per-vout fee, and whether a
+	// remainder vout is required. Computed only for partial orders; the autoSplit
+	// branch below consumes them.
+	partialUtxosRequiredForMinimum := 0
+	partialRemainderRequired := false
+	partialPerUtxoFees := uint64(0)
+	partialVoutsTotal := uint64(0)
+	partialRemainderVoutTotal := uint64(0)
+	partialRemainderIsDust := false
+	partialOrderVouts := 0
+	if partial {
+		partialUtxosRequiredForMinimum = int(fromAmt / minFrom)
+		if partialUtxosRequiredForMinimum >= maxPartialOrderUtxos {
+			partialUtxosRequiredForMinimum = maxPartialOrderUtxos - 1
+			partialRemainderRequired = true
+		} else if fromAmt%minFrom != 0 {
+			partialRemainderRequired = true
+		}
+		partialFee1 := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 3))
+		partialFee2 := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 1))
+		partialPerUtxoFees = partialFee1 + partialFee2
+		partialFees := uint64(partialUtxosRequiredForMinimum) * partialPerUtxoFees
+		if partialRemainderRequired {
+			partialFees += partialPerUtxoFees
+		}
+		partialSplitVoutsTotal := uint64(partialUtxosRequiredForMinimum) * minFrom
+		if fromAmt < partialSplitVoutsTotal {
+			return nil, makeError(errInsufficientFunds, "dxMakePartialOrder", "insufficient funds for partial order")
+		}
+		partialRemainderVoutTotal = fromAmt - partialSplitVoutsTotal
+		partialRemainderIsDust = isDustNative(xBridgeValueFromAmount(partialRemainderVoutTotal+partialPerUtxoFees), cc, relayFee, nativeCoin)
+		partialVoutsTotal = partialFees + partialSplitVoutsTotal
+		if partialRemainderRequired && !partialRemainderIsDust {
+			partialVoutsTotal += partialRemainderVoutTotal
+		}
+		partialOrderVouts = partialUtxosRequiredForMinimum
+		if partialRemainderRequired && !partialRemainderIsDust {
+			partialOrderVouts++
+		}
 	}
 
-	body := &proto.OrderBody{
-		ID:             id,
-		From:           fromID,
-		FromCurrency:   p.Maker,
-		FromAmount:     fromAmt,
-		To:             toID,
-		ToCurrency:     p.Taker,
-		ToAmount:       toAmt,
-		Created:        NowMicro(),
-		BlockHash:      n.currentBlockHash(),
-		PartialAllowed: partial,
-		MinFromAmount:  minFrom,
+	// Fetch the maker's spendable utxos, excluding those locked by other orders
+	// (C++ getAllLockedUtxos :1614) and, when use_all_funds is false, those not
+	// owned by the maker address (:1621-1627). getUnspent failure fails the order.
+	conn, _ := n.connector(p.Maker)
+	minConf := 0
+	if cc != nil {
+		minConf = cc.Confirmations
 	}
+	locked, _ := n.store.LockedUtxoInfo()
+	outputs, err := conn.ListUnspent(minConf)
+	if err != nil {
+		return nil, makeError(errInsufficientFunds, "dxMakeOrder", err.Error())
+	}
+	filtered := outputs[:0]
+	for _, u := range outputs {
+		if locked[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] {
+			continue
+		}
+		if !p.UseAllFunds && u.Address != p.MakerAddress {
+			continue
+		}
+		filtered = append(filtered, u)
+	}
+
+	// Select the funding utxos exactly as C++ does (:1636-1682).
+	var outputsForUse []wallet.Utxo
+	var utxoAmount, fees uint64
+	exactMatch := false
+	ok := false
+	if partial {
+		outputsForUse, utxoAmount, fees, exactMatch, ok = selectPartialUtxos(filtered, cc, fromAmt,
+			uint64(partialUtxosRequiredForMinimum), partialPerUtxoFees, partialOrderVouts+1, minFrom, partialRemainderVoutTotal)
+	} else {
+		outputsForUse, utxoAmount, _, ok = selectUtxos(p.MakerAddress, filtered, cc, fromAmt)
+	}
+	_, _ = utxoAmount, fees
+	if !ok {
+		return nil, makeError(errInsufficientFunds, "dxMakeOrder", "insufficient funds")
+	}
+
+	// Sign the selected utxos; an un-signable wallet, a wrong-length signature,
+	// or an undecodable address fails the order (C++ :1689-1715).
+	coin, _ := coins.Get(p.Maker)
+	proofs, err := buildUtxoProofs(conn, outputsForUse, coin)
+	if err != nil {
+		if errors.Is(err, errBadSigLen) {
+			return nil, makeError(errInvalidSignature, "dxMakeOrder", "incorrect signature length, need 65 bytes")
+		}
+		if errors.Is(err, errBadAddr) {
+			return nil, makeError(errInvalidAddress, "dxMakeOrder", err.Error())
+		}
+		return nil, makeError(errFundsNotSigned, "dxMakeOrder", err.Error())
+	}
+
+	// Capture the anti-replay context once and derive the deterministic order id
+	// (C++ :1726-1763): double-SHA256 over the from/to identity, amounts,
+	// timestamp, block hash, and the first selected utxo's signature.
+	ts := NowMicro()
+	bh := n.currentBlockHash()
+	id := sha256dOrderID(fromID, p.Maker, fromAmt, toID, p.Taker, toAmt, ts, bh, proofs[0].Signature[:])
 
 	// Generate the per-trade M keypair (C++ xtx->mPubKey/mPrivKey). It signs the
 	// make packet and becomes the HTLC DepositorPub; generated here so the
@@ -878,19 +1082,114 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
 	}
 
-	// Attach BIP137 ownership proofs for the maker's spendable UTXOs so a C++
-	// counterparty can verify we own the coins (best-effort: a wallet that
-	// cannot sign leaves Utxos empty rather than failing the order broadcast).
-	if c, e := n.connector(p.Maker); e == nil {
-		if cc := n.cfg().Confs[p.Maker]; cc != nil {
-			if utxos, e := c.ListUnspent(cc.Confirmations); e == nil && len(utxos) > 0 {
-				if coin, ok := coins.Get(p.Maker); ok {
-					if proofs, e := buildUtxoProofs(c, utxos, coin); e == nil {
-						body.Utxos = proofs
-					}
+	// autoSplit: a partial order whose selection is not an exact match of ideal
+	// utxos builds a split (prep) transaction so a taker can take a minimum
+	// slice, then re-signs and re-hashes the new utxo set (C++ :1783-1953). The
+	// order stays pending ("open") until the prep tx confirms.
+	pending := false
+	var prepTxID string
+	if partial {
+		if exactMatch {
+			if len(outputsForUse) > maxPartialOrderUtxos {
+				return nil, makeError(errInvalidAmount, "dxMakePartialOrder", "failed to create order, the maximum number of utxos on the order was exceeded")
+			}
+		} else if p.AutoSplit {
+			// a) Separate exact utxos; the rest become prep-tx inputs.
+			existing := outputsForUse[:0]
+			var vins []wallet.Utxo
+			vinsTotal := 0.0
+			remaining := partialUtxosRequiredForMinimum
+			voutsTotal := int64(partialVoutsTotal)
+			for _, vin := range outputsForUse {
+				if camount(vin) == minFrom+partialPerUtxoFees && remaining > 0 {
+					existing = append(existing, vin)
+					remaining--
+					voutsTotal -= int64(minFrom + partialPerUtxoFees)
+					continue
+				}
+				vinsTotal += vin.Value
+				vins = append(vins, vin)
+			}
+			// b) Plan the prep outputs: the remaining splits, the remainder vout
+			//    (if not dust), and the change (C++ :1799-1817).
+			var vouts []prepVout
+			for i := 0; i < remaining; i++ {
+				vouts = append(vouts, prepVout{p.MakerAddress, xBridgeValueFromAmount(minFrom + partialPerUtxoFees)})
+			}
+			if partialRemainderRequired && !partialRemainderIsDust {
+				vouts = append(vouts, prepVout{p.MakerAddress, xBridgeValueFromAmount(partialRemainderVoutTotal + partialPerUtxoFees)})
+			}
+			changeAmount := vinsTotal - xBridgeValueFromAmount(uint64(voutsTotal)) - minTxFeeWhole(cc, len(vins), len(vouts)+1)
+			if changeAmount < 2.220446049250313e-16 {
+				return nil, makeError(errInvalidAmount, "dxMakePartialOrder", "failed to create order, insufficient funds on partial order")
+			}
+			if !isDustNative(changeAmount, cc, relayFee, nativeCoin) {
+				vouts = append(vouts, prepVout{p.MakerAddress, changeAmount})
+			}
+			// c) Build, sign, and (unless dry-run) broadcast the prep tx; the
+			//    prep txid is the real tx hash, not the wallet's return (:1820-1844).
+			signedHex, txid, rerr := buildPrepTx(conn, cc, coin, vins, vouts)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if !p.DryRun {
+				if _, err := conn.SendRawTransaction(signedHex); err != nil {
+					return nil, makeError(errUnknown, "dxMakePartialOrder", err.Error())
 				}
 			}
+			prepTxID = txid
+			// d) Rebuild the used-utxo set: the exact utxos plus enough prep
+			//    outputs to cover the order (C++ :1846-1879).
+			used := existing
+			partialNew := int64(0)
+			for i, vo := range vouts {
+				if voutsTotal-partialNew <= 0 {
+					break
+				}
+				used = append(used, wallet.Utxo{
+					TxID: prepTxID, Vout: uint32(i), Address: p.MakerAddress,
+					Value: vo.amount, Amount: uint64(vo.amount * float64(nativeCoin)),
+				})
+				partialNew += int64(camount(used[len(used)-1]))
+			}
+			if len(used) > maxPartialOrderUtxos {
+				return nil, makeError(errInvalidAmount, "dxMakePartialOrder", "failed to create order, the maximum number of utxos on the order was exceeded")
+			}
+			if len(used) == 0 {
+				return nil, makeError(errInvalidPartialOrder, "dxMakePartialOrder", "failed to create order, cannot lock partial order utxos")
+			}
+			// e) Re-sign the final set and re-hash the id (:1881-1946).
+			finalProofs, err := buildUtxoProofs(conn, used, coin)
+			if err != nil {
+				if errors.Is(err, errBadSigLen) {
+					return nil, makeError(errInvalidSignature, "dxMakePartialOrder", "incorrect signature length, need 65 bytes")
+				}
+				if errors.Is(err, errBadAddr) {
+					return nil, makeError(errInvalidAddress, "dxMakePartialOrder", err.Error())
+				}
+				return nil, makeError(errFundsNotSigned, "dxMakePartialOrder", err.Error())
+			}
+			id = sha256dOrderID(fromID, p.Maker, fromAmt, toID, p.Taker, toAmt, ts, bh, finalProofs[0].Signature[:])
+			proofs = finalProofs
+			pending = true
 		}
+		// else: !autoSplit && !exactMatch — list immediately with the first id
+		// (C++ :1954-1958, repostOrderChange=true).
+	}
+
+	body := &proto.OrderBody{
+		ID:             id,
+		From:           fromID,
+		FromCurrency:   p.Maker,
+		FromAmount:     fromAmt,
+		To:             toID,
+		ToCurrency:     p.Taker,
+		ToAmount:       toAmt,
+		Created:        ts,
+		BlockHash:      bh,
+		PartialAllowed: partial,
+		MinFromAmount:  minFrom,
+		Utxos:          proofs,
 	}
 
 	pkt := proto.NewPacket(proto.XbcTransaction, body.Marshal())
@@ -900,16 +1199,12 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if p.DryRun {
 		xlog.Warn("MakeOrder dry run — order not broadcast", "maker", p.Maker, "taker", p.Taker, "makerSize", p.MakerSize, "takerSize", p.TakerSize)
 	}
-	if !p.DryRun {
-		if err := n.conn.WritePacket(pkt); err != nil {
-			return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
-		}
-	}
 
 	o := normalizeFromOrderBody(body, hexEncode(mPub[:]))
 	o.MakerAddress = p.MakerAddress
 	o.TakerAddress = p.TakerAddress
-	o.BlockID = hexEncode(body.BlockHash[:])
+	// C++ renders block_id via uint256::GetHex (reversed display order).
+	o.BlockID = orderIDString(body.BlockHash)
 	o.PartialRepost = p.Repost
 	o.Mine = true
 	// Local maker: set our per-trade M key and original currencies (C++
@@ -919,17 +1214,44 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.MakerKey = hexEncode(mPub[:])
 	o.OrigFromCurrency = p.Maker
 	o.OrigToCurrency = p.Taker
-	if p.Type == "partial" {
-		o.Status = "open"
+	if partial {
+		if pending {
+			// C++ setOrderPending(true): held until the prep tx confirms (:1949).
+			// trPending renders as "open"; the prep txid rides on the order.
+			o.Status = "open"
+			o.PrepTx = prepTxID
+		} else {
+			// Exact-match and non-autoSplit partials list immediately.
+			o.Status = "created"
+		}
 	} else {
 		o.Status = "created"
 	}
 	if !p.DryRun {
+		// C++ OrderDescr: sPubKey/hubAddress are the chosen servicenode, NOT
+		// the maker's own key (xbridgeapp.cpp:1734-1735). The header-signed
+		// pubkey is only used as the display MakerPubkey above. A dry-run order
+		// keeps the normalizer's display defaults.
+		o.SNodePubkey = hexEncode(hubKey[:])
+		o.HubAddress = hubAddr
 		n.store.Add(o)
-		// Begin driving the client-side deposit handshake for this order.
-		n.newMakerSession(o, p, mPrivArr, mPub)
-		// Persist the new local swap (incl. its per-trade M keypair) to disk.
-		n.persist()
+		if pending {
+			// Pending autoSplit orders are held locally until the prep tx
+			// confirms (C++ :2019 broadcast gate: only broadcast when
+			// !isOrderPending() || partialExactUtxoMatch). No SEND, no session.
+			n.persist()
+		} else {
+			// SEND is addressed to the chosen hub's envelope address (C++
+			// onSend(ptr->hubAddress, ...), xbridgeapp.cpp:2100). The hub relays
+			// it to counterparties as an xbcPendingTransaction broadcast.
+			if err := n.conn.WritePacket(pkt, hubAddr); err != nil {
+				return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
+			}
+			// Begin driving the client-side deposit handshake for this order.
+			n.newMakerSession(o, p, mPrivArr, mPub)
+			// Persist the new local swap (incl. its per-trade M keypair) to disk.
+			n.persist()
+		}
 	}
 	return o, nil
 }
@@ -956,7 +1278,13 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if p.FromAddress == p.ToAddress {
 		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The from_address and to_address cannot be the same: "+p.FromAddress)
 	}
-	o := n.store.Get(p.ID)
+	// C++ parses the id via uint256S (no format check here); an unparseable id
+	// yields a null id whose lookup misses, so report not-found.
+	key, kerr := orderIDKey(p.ID)
+	if kerr != nil {
+		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
+	}
+	o := n.store.Get(key)
 	if o == nil {
 		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
 	}
@@ -1004,10 +1332,28 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "Unable to accept your own order.")
 	}
 
+	// C++ acceptXBridgeTransaction (xbridgeapp.cpp:2168-2197): the order is
+	// refused with NO_SERVICE_NODE when its sPubKey is not a valid 33-byte
+	// servicenode key (:2168, decodePub33 yields a zero key) or when the key is
+	// not a known servicenode in the local registry (:2179, getSn null —
+	// membership only, no running filter). The session is pinned to that key
+	// for the whole swap, so a forged order cannot steer the taker's funds to
+	// a key we do not trust.
+	//
+	// Skipped in dry-run: the take is a Go-only validation/preview extension
+	// (nothing is broadcast and no session is created), so no hub is required.
+	if !p.DryRun {
+		hubKey := decodePub33(o.SNodePubkey)
+		if !n.hubRegistered(hubKey[:]) {
+			return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
+		}
+	}
+
 	fromH, fromHash := n.blockContext(o.ToCurrency)
 	toH, toHash := n.blockContext(o.FromCurrency)
 	acc := &proto.AcceptingBody{
 		ID:              o.ID,
+		HubAddress:      o.HubAddress,
 		From:            fromID,
 		FromCurrency:    o.ToCurrency,
 		FromAmount:      fromSize,
@@ -1040,7 +1386,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
 		return o.toTakeDryrunResult(fromSize, toSize), nil
 	}
-	if err := n.conn.WritePacket(pkt); err != nil {
+	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	o.Updated = NowMicro()
@@ -1084,7 +1430,9 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	}
 	o.Status = "canceled"
 	o.Updated = NowMicro()
-	n.store.RecordCancelled(p.ID, o.Created)
+	// C++ dxFlushCancelledOrders renders the flushed "id" as it.id.GetHex()
+	// (rpcxbridge.cpp:1483), i.e. display order, so record the display id.
+	n.store.RecordCancelled(orderIDString(o.ID), o.Created)
 	// Best-effort fund recovery: if a deposit was already broadcast, return it
 	// via the pre-signed CLTV refund rather than leaving it locked at the hub.
 	if o.RefundTx != "" {
@@ -1142,7 +1490,7 @@ func (n *Node) sendCancelTransaction(idHex string, reason uint32) *rpcError {
 	if err := n.signer.Sign(pkt, s.privKey[:]); err != nil {
 		return makeError(errUnknown, "dxCancelOrder", err.Error())
 	}
-	if err := n.conn.WritePacket(pkt); err != nil {
+	if err := n.conn.WritePacket(pkt, [20]byte{}); err != nil {
 		return makeError(errUnknown, "dxCancelOrder", err.Error())
 	}
 	return nil

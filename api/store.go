@@ -217,7 +217,7 @@ func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]strin
 		if isOrderTerminal(o.Status) {
 			continue
 		}
-		oid := hexEncode(o.ID[:])
+		oid := orderIDString(o.ID)
 		for _, u := range o.Utxos {
 			k := utxoEntryKey(u)
 			keys[k] = true

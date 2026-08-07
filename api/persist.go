@@ -49,15 +49,16 @@ type persistedSwap struct {
 	Status         string            `json:"status"`
 	Utxos          []proto.UtxoEntry `json:"utxos"`
 
-	SNodePubkey          string `json:"sNodePubkey"`
-	OtherPubkey          string `json:"otherPubkey"`
-	MakerKey             string `json:"makerKey"`
-	Reason               uint32 `json:"reason"`
-	Role                 byte   `json:"role"`
-	DepositSent          bool   `json:"depositSent"`
-	CounterpartyRedeemed bool   `json:"counterpartyRedeemed"`
-	OrigFromCurrency     string `json:"origFromCurrency"`
-	OrigToCurrency       string `json:"origToCurrency"`
+	SNodePubkey          string   `json:"sNodePubkey"`
+	HubAddress           [20]byte `json:"hubAddress"`
+	OtherPubkey          string   `json:"otherPubkey"`
+	MakerKey             string   `json:"makerKey"`
+	Reason               uint32   `json:"reason"`
+	Role                 byte     `json:"role"`
+	DepositSent          bool     `json:"depositSent"`
+	CounterpartyRedeemed bool     `json:"counterpartyRedeemed"`
+	OrigFromCurrency     string   `json:"origFromCurrency"`
+	OrigToCurrency       string   `json:"origToCurrency"`
 
 	SrcCur        string `json:"srcCur"`
 	DstCur        string `json:"dstCur"`
@@ -81,8 +82,9 @@ type persistedSwap struct {
 	TheirLockTime    uint32   `json:"theirLockTime"`
 	TheirSecretHash  [20]byte `json:"theirSecretHash"`
 
-	Hub   [20]byte    `json:"hub"`
-	State clientState `json:"state"`
+	Hub    [20]byte    `json:"hub"`
+	HubKey [33]byte    `json:"hubKey"`
+	State  clientState `json:"state"`
 }
 
 // swapFile is the on-disk envelope: a sha256 checksum of the swaps blob plus
@@ -226,6 +228,7 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 		Utxos:          o.Utxos,
 
 		SNodePubkey:          o.SNodePubkey,
+		HubAddress:           o.HubAddress,
 		OtherPubkey:          o.OtherPubkey,
 		MakerKey:             o.MakerKey,
 		Reason:               o.Reason,
@@ -253,6 +256,7 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 		TheirLockTime:        s.theirLockTime,
 		TheirSecretHash:      s.theirSecretHash,
 		Hub:                  s.hub,
+		HubKey:               s.hubKey,
 		State:                s.state,
 	}
 }
@@ -292,6 +296,7 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		Mine:           true,
 
 		SNodePubkey:          ps.SNodePubkey,
+		HubAddress:           ps.HubAddress,
 		OtherPubkey:          ps.OtherPubkey,
 		MakerKey:             ps.MakerKey,
 		Reason:               ps.Reason,
@@ -326,6 +331,7 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		theirLockTime:    ps.TheirLockTime,
 		theirSecretHash:  ps.TheirSecretHash,
 		hub:              ps.Hub,
+		hubKey:           ps.HubKey,
 		state:            ps.State,
 	}
 	n.sessions[hexEncode(ps.ID[:])] = s

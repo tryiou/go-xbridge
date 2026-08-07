@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -63,8 +64,34 @@ func resolveDataDir(dir string) string {
 	return filepath.Join(base, "xbridged")
 }
 
+// isLoopbackAddr reports whether an addr host:port string binds to a loopback
+// interface (localhost, 127.0.0.0/8, or ::1). An empty host (":41414") binds
+// all interfaces and is treated as non-loopback.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
 func main() {
-	rpcAddr := flag.String("rpcaddr", ":41414", "JSON-RPC listen address")
+	// RPC bind defaults to loopback only (F1), mirroring blocknetd's
+	// httpserver.cpp:308 loopback default. An explicit -rpcbind (host:port) is
+	// required to expose the JSON-RPC surface beyond localhost.
+	rpcBind := flag.String("rpcbind", "127.0.0.1:41414", "JSON-RPC listen address (host:port); defaults to loopback, set explicitly to bind elsewhere")
+	// RPC auth (F1): enforced only when BOTH -rpcuser and -rpcpassword are set
+	// (no cookie fallback). Unauthenticated RPC is safe only because the
+	// default bind is loopback; a non-loopback bind with no auth logs a warning.
+	rpcUser := flag.String("rpcuser", "", "RPC Basic auth username (requires -rpcpassword)")
+	rpcPass := flag.String("rpcpassword", "", "RPC Basic auth password (requires -rpcuser)")
 	network := flag.String("network", "mainnet", "Blocknet network to discover on: mainnet|testnet|staging (ignored if -node is set)")
 	nodeAddr := flag.String("node", "", "explicit Blocknet service-node P2P address (host:port); empty enables network discovery")
 	addNode := flag.String("addnode", "", "comma-separated explicit peer addresses (host:port) to add to discovered peers")
@@ -184,12 +211,22 @@ func main() {
 
 	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
+	// F1: RPC auth is enforced only when both -rpcuser and -rpcpassword are
+	// provided (no cookie fallback). Either alone is ignored.
+	if *rpcUser != "" && *rpcPass != "" {
+		srv.SetAuth(*rpcUser, *rpcPass)
+	} else if !isLoopbackAddr(*rpcBind) {
+		// Unauthenticated RPC bound beyond loopback is not safe to expose
+		// (mirrors blocknetd's warning for RPC without auth).
+		xlog.Warn("RPC without authentication is not safe to expose",
+			"rpcbind", *rpcBind, "hint", "set -rpcuser and -rpcpassword")
+	}
 
 	if *nodeAddr != "" {
-		xlog.Info("xbridged listening", "addr", *rpcAddr, "mode", "explicit",
+		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "explicit",
 			"node", *nodeAddr, "network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	} else {
-		xlog.Info("xbridged listening", "addr", *rpcAddr, "mode", "discovery",
+		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "discovery",
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
 	// Finalization on SIGINT/SIGTERM. os.Exit skips defers, so shutdown steps
@@ -199,7 +236,7 @@ func main() {
 	defer stopSig()
 
 	go func() {
-		if err := http.ListenAndServe(*rpcAddr, srv); err != nil {
+		if err := http.ListenAndServe(*rpcBind, srv); err != nil {
 			fatalf("http server", "err", err)
 		}
 	}()

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"go-xbridge/coins"
+	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
 )
 
@@ -16,8 +18,8 @@ type fakeXConn struct{}
 func (fakeXConn) ReadPacket() (*proto.Packet, string, error) {
 	return nil, "", io.EOF
 }
-func (fakeXConn) WritePacket(*proto.Packet) error { return nil }
-func (fakeXConn) Close() error                    { return nil }
+func (fakeXConn) WritePacket(*proto.Packet, [20]byte) error { return nil }
+func (fakeXConn) Close() error                              { return nil }
 
 // btcAddr2 is a second valid BTC P2PKH address, used as a distinct
 // from/to address so dxTakeOrder's "addresses must differ" check passes.
@@ -83,7 +85,7 @@ func TestDxPartialOrderChainDetailsDeposits(t *testing.T) {
 	o := seedOrder(ctx) // BTC/BTC, open
 	o.BinTxId = "aa" + strings.Repeat("0", 62)
 	o.OBinTxId = "bb" + strings.Repeat("0", 62)
-	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(hexEncode(o.ID[:]))})
+	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
@@ -104,15 +106,29 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	ctx := newWalletTestCtx()
 	ctx.Node.conn = fakeXConn{}
 	ctx.Node.sessions = make(map[string]*SwapSession)
+	// A takeable order must have a hub that is a known servicenode;
+	// dxTakeOrder refuses unregistered hubs with NO_SERVICE_NODE (C++
+	// acceptXBridgeTransaction, getSn). Seed the registry with the hub.
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 0x5a
+	hubPub := mustPub(t, hubPriv)
+	reg := servicenode.NewRegistry()
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion,
+	})
+	ctx.Node.snReg = reg
 	o := &Order{
 		ID:           [32]byte{0x07},
 		Type:         OrderTypeMaker,
 		FromCurrency: "BTC", FromAmount: 1500000, // maker size 1.5
 		ToCurrency: "BTC", ToAmount: 300000, // 0.3
-		Status: "open", Mine: false,
+		Status:      "open",
+		Mine:        false,
+		SNodePubkey: hexPub(t, hubPriv),
+		HubAddress:  coins.KeyID(hubPub[:]),
 	}
 	ctx.Store.Add(o)
-	id := hexEncode(o.ID[:])
+	id := dispID(o.ID)
 
 	// Amount omitted -> full take. After the maker/taker swap, result.Maker is the
 	// order's ToCurrency and MakerSize is the full ToAmount.
@@ -146,7 +162,7 @@ func TestDxLockedUtxoExclusion(t *testing.T) {
 	o := seedOrder(ctx)
 	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order.
 	o.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
-	id := hexEncode(o.ID[:])
+	id := dispID(o.ID)
 
 	// dxGetLockedUtxos("") reports the locked utxo.
 	res, err := ctx.dxGetLockedUtxos(nil)

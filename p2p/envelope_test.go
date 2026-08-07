@@ -58,7 +58,7 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	copy(pkt[proto.PubkeyOffset:proto.PubkeyOffset+33], []byte{0x02})
 	copy(pkt[proto.SigOffset:proto.SigOffset+64], []byte{0x03})
 
-	enveloped := encodeXBridgePayload(pkt)
+	enveloped := encodeXBridgePayload(pkt, [20]byte{})
 	// The enveloped payload must start with a CompactSize varint whose value is
 	// 28 + len(pkt) = 257 (so the 0xfd 2-byte form). Decode it back to confirm.
 	n, off, err := readVarInt(enveloped, 0)
@@ -86,6 +86,39 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEnvelopeDestination verifies the addressed envelope form: a non-zero dest
+// address is written verbatim after the varint and does not affect decoding.
+// C++ routes non-zero-addr packets to onMessageReceived and zero-addr packets to
+// onBroadcastReceived (net_processing.cpp:2896-2899), so this byte is what
+// selects hub delivery for the maker SEND / Accepting / handshake replies.
+func TestEnvelopeDestination(t *testing.T) {
+	pkt := make([]byte, proto.HeaderSize+16)
+	var dest [20]byte
+	copy(dest[:], []byte{0xaa, 0xbb, 0xcc})
+
+	env := encodeXBridgePayload(pkt, dest)
+	n, off, err := readVarInt(env, 0)
+	if err != nil {
+		t.Fatalf("readVarInt: %v", err)
+	}
+	if n != 28+len(pkt) {
+		t.Fatalf("varint = %d, want %d", n, 28+len(pkt))
+	}
+	destStart := off
+	for i := 0; i < 20; i++ {
+		if env[destStart+i] != dest[i] {
+			t.Fatalf("envelope dest addr byte %d = %#x, want %#x", i, env[destStart+i], dest[i])
+		}
+	}
+	got, err := DecodeXBridgePayload(env)
+	if err != nil {
+		t.Fatalf("DecodeXBridgePayload: %v", err)
+	}
+	if string(got) != string(pkt) {
+		t.Errorf("round-trip mismatch: got %d bytes, want %d", len(got), len(pkt))
+	}
+}
+
 func TestEnvelopeLengthMismatch(t *testing.T) {
 	// Payload shorter than the declared varint length must error.
 	bad := append([]byte{0x05}, make([]byte, 3)...) // claims 5 bytes, only 3
@@ -101,7 +134,7 @@ func TestEnvelopeTimestampUnit(t *testing.T) {
 	// (2026-ish ≈ 1.7e15); millisecond scale would be ≈ 1.7e12. Asserting the
 	// microsecond scale rules out the prior millisecond regression.
 	pkt := make([]byte, proto.HeaderSize) // any packet body works for this check
-	env := encodeXBridgePayload(pkt)
+	env := encodeXBridgePayload(pkt, [20]byte{})
 
 	n, off, err := readVarInt(env, 0)
 	if err != nil {

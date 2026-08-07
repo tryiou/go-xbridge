@@ -10,6 +10,7 @@ import (
 	"go-xbridge/coins"
 	"go-xbridge/config"
 	"go-xbridge/crypto"
+	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
 	"go-xbridge/wallet"
 )
@@ -86,21 +87,24 @@ func TestNodeRefreshBlockNoConnector(t *testing.T) {
 	}
 }
 
-// captureXConn is a test XConn that records every packet written to it. Its
-// ReadPacket blocks forever (returns io.EOF) so a dispatch test cannot
-// accidentally consume real input; we only care about the outbound direction.
+// captureXConn is a test XConn that records every packet written to it (and its
+// envelope destination address). Its ReadPacket blocks forever (returns io.EOF)
+// so a dispatch test cannot accidentally consume real input; we only care about
+// the outbound direction.
 type captureXConn struct {
 	mu      sync.Mutex
 	written []*proto.Packet
+	dests   [][20]byte
 }
 
 func (c *captureXConn) ReadPacket() (*proto.Packet, string, error) {
 	return nil, "", io.EOF
 }
-func (c *captureXConn) WritePacket(p *proto.Packet) error {
+func (c *captureXConn) WritePacket(p *proto.Packet, dest [20]byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.written = append(c.written, p)
+	c.dests = append(c.dests, dest)
 	return nil
 }
 func (c *captureXConn) Close() error { return nil }
@@ -109,6 +113,13 @@ func (c *captureXConn) snapshot() []*proto.Packet {
 	defer c.mu.Unlock()
 	out := make([]*proto.Packet, len(c.written))
 	copy(out, c.written)
+	return out
+}
+func (c *captureXConn) snapshotDests() [][20]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][20]byte, len(c.dests))
+	copy(out, c.dests)
 	return out
 }
 
@@ -129,15 +140,29 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The hub servicenode is chosen at make time and pinned on the session; the
+	// order must carry the consistent hub anchor for the maker to pin it.
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 2
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var id [32]byte
 	copy(id[:], []byte("order-id-order-id-order-id-0")) // 32 bytes exactly
-	var hub [20]byte
-	hub[0] = 0xaa
 
 	cfg := &Config{
 		Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}},
 	}
 	n := &Node{config: cfg, signer: crypto.NewBtcSigner(), stop: make(chan struct{}), sessions: map[string]*SwapSession{}}
+	// STRICT hubRegistered (C++ getSn): the pinned hub must be a known
+	// servicenode or the honest Hold would be dropped.
+	reg := servicenode.NewRegistry()
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion,
+	})
+	n.snReg = reg
 
 	o := &Order{
 		ID:           id,
@@ -145,14 +170,23 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 		ToCurrency:   "LTC",
 		FromAmount:   100000000,
 		ToAmount:     200000000,
+		SNodePubkey:  hexPub(t, hubPriv),
+		HubAddress:   coins.KeyID(hubPub[:]),
 	}
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
 
 	cc := &captureXConn{}
 	n.conn = cc
 
+	// The inbound Hold must be signed by the session's pinned hub key (pinned at
+	// newMakerSession from the order's SNodePubkey, F2/S2-E).
+	hubPkt := proto.NewPacket(proto.XbcTransactionHold, (&proto.HoldBody{}).Marshal())
+	if err := crypto.NewBtcSigner().Sign(hubPkt, hubPriv); err != nil {
+		t.Fatal(err)
+	}
+
 	// OnHold drives the maker's response to a hub xbcTransactionHold.
-	n.dispatchSwap(id, hub, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	n.dispatchSwap(hubPkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		return s.OnHold(&proto.HoldBody{})
 	})
 
@@ -170,6 +204,11 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("outbound packet signature did not verify")
+	}
+	// The reply must be addressed to the pinned hub, not broadcast.
+	dests := cc.snapshotDests()
+	if len(dests) != 1 || dests[0] != o.HubAddress {
+		t.Fatalf("reply destination = %x, want pinned hub %x", dests[0], o.HubAddress)
 	}
 }
 

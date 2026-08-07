@@ -113,8 +113,9 @@ type SwapSession struct {
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
 
-	hub   [20]byte // service-node address, learned from inbound packets
-	state clientState
+	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
+	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (F2/S2-E)
+	state  clientState
 }
 
 // newMakerSession registers the client-side maker for a freshly created order and
@@ -147,6 +148,13 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [
 		secretHash:    coins.KeyID(xpk[:]),
 		state:         csMaker,
 	}
+	// F2/S2-E: the maker's trusted hub key is the servicenode chosen at make
+	// time (C++ xtx->sPubKey = findNodeWithService result). It is pinned HERE,
+	// at session creation — never learned from network packets — so every hub
+	// handshake packet (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified
+	// against it; a forged Finished can never disable the refund watcher.
+	s.hub = o.HubAddress
+	s.hubKey = decodePub33(o.SNodePubkey)
 	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
 	n.sessMu.Unlock()
@@ -172,11 +180,21 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 		pubKey:        pub,
 		state:         csTaker,
 	}
+	// F2/S2-E: the taker's trusted hub key is the servicenode that broadcast
+	// the order (C++ xtx->sPubKey = the SN whose header signed the order). It is
+	// pinned HERE, at session creation, so every hub handshake packet
+	// (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified against it — a
+	// forged Finished can never disable the refund watcher. An order without a
+	// known SNodePubkey cannot be authenticated and stays unpinned, causing
+	// dispatchSwap to drop all hub packets for it.
+	s.hubKey = decodePub33(o.SNodePubkey)
+	s.hub = o.HubAddress
 	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
 	n.sessMu.Unlock()
 	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "taker",
-		"srcCur", o.ToCurrency, "srcAmt", o.ToAmount, "dstCur", o.FromCurrency, "dstAmt", o.FromAmount)
+		"srcCur", o.ToCurrency, "srcAmt", o.ToAmount, "dstCur", o.FromCurrency, "dstAmt", o.FromAmount,
+		"hubKeyPinned", s.hubKey != [33]byte{})
 }
 
 // ---------------------------------------------------------------------------
@@ -842,6 +860,22 @@ func secretFromScriptSig(script []byte, hx [20]byte) ([33]byte, bool) {
 		i += n
 	}
 	return secret, false
+}
+
+// decodePub33 decodes a 33-byte compressed pubkey hex into a fixed array,
+// returning the zero value when the string is empty, malformed, or the wrong
+// length. It is used to materialize a session's trusted hub key (F2/S2-E).
+func decodePub33(s string) [33]byte {
+	var out [33]byte
+	if s == "" {
+		return out
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 33 {
+		return [33]byte{}
+	}
+	copy(out[:], b)
+	return out
 }
 
 // txIDFromHex returns the display-order txid of a serialized tx (used to label

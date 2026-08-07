@@ -22,6 +22,10 @@ func jstr(s string) json.RawMessage {
 	return json.RawMessage([]byte(`"` + s + `"`))
 }
 
+// dispID renders a raw order id the way the dx* RPCs display it (C++
+// uint256::GetHex order). Tests use it for RPC inputs and to assert echoed ids.
+func dispID(id [32]byte) string { return orderIDString(id) }
+
 // seedOrder adds a BTC/BTC order (both currencies known to the test
 // conf) to the store, returning it. From==To is fine for exercising
 // the store-read paths (dxGetOrders / dxGetOrder / dxGetMyOrders /
@@ -69,15 +73,52 @@ func TestDxGetOrdersRead(t *testing.T) {
 	}
 }
 
+// TestDxGetOrdersShowAllGate locks in C++'s dxGetOrders wallet filter
+// (rpcxbridge.cpp:432-446): an order whose currencies have no wallet connector
+// is hidden unless showAllOrders (-dxnowallets) is set. The connector lookup is
+// a plain map check — a coin present in the conf but without a live connector
+// still counts as "no wallet".
+func TestDxGetOrdersShowAllGate(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := &Order{
+		ID:           [32]byte{0x09},
+		FromCurrency: "NOPE",
+		FromAmount:   1000000,
+		ToCurrency:   "NOPE",
+		ToAmount:     200000,
+		Status:       "open",
+	}
+	ctx.Store.Add(o)
+
+	// Hidden by default: no NOPE connector.
+	res, err := ctx.dxGetOrders(nil)
+	if err != nil {
+		t.Fatalf("dxGetOrders: %v", err)
+	}
+	if arr, ok := res.([]orderListResult); !ok || len(arr) != 0 {
+		t.Fatalf("dxGetOrders (no connector) = %v (%T), want empty", res, res)
+	}
+
+	// Shown with ShowAllOrders.
+	ctx.Node.config.ShowAllOrders = true
+	res, err = ctx.dxGetOrders(nil)
+	if err != nil {
+		t.Fatalf("dxGetOrders: %v", err)
+	}
+	if arr, ok := res.([]orderListResult); !ok || len(arr) != 1 {
+		t.Fatalf("dxGetOrders (ShowAllOrders) = %v (%T), want 1", res, res)
+	}
+}
+
 func TestDxGetOrderRead(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx)
 
-	res, err := ctx.dxGetOrder([]json.RawMessage{jstr(hexEncode(o.ID[:]))})
+	res, err := ctx.dxGetOrder([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
 		t.Fatalf("dxGetOrder: %v", err)
 	}
-	if r, ok := res.(orderListResult); !ok || r.ID != hexEncode(o.ID[:]) {
+	if r, ok := res.(orderListResult); !ok || r.ID != dispID(o.ID) {
 		t.Fatalf("dxGetOrder = %v (%T)", res, res)
 	}
 
@@ -166,12 +207,14 @@ func TestDxGetOrderBookRead(t *testing.T) {
 }
 
 // TestDxGetOrderBookDetailLevels is a C++-derived known-answer test (KAT) that
-// locks in the four detail-level element shapes emitted by dxGetOrderBook,
-// matching rpcxbridge.cpp exactly:
+// locks in the four detail-level element shapes and ordering emitted by
+// dxGetOrderBook, matching rpcxbridge.cpp exactly:
 //
 //	level 1 (best only):       [price, size, count]            (rpcxbridge.cpp:1697-99)
-//	level 2 (aggregated top):  [price, sum,  count]
-//	level 3 (full, capped):    [price, amount, id]
+//	level 2 (aggregated top):  [price, sum,  count]  — asks descending (worst→best),
+//	                            emitting ~every-other window entry via C++'s
+//	                            `while((++i < bound) && floatCompare(...))` skip
+//	level 3 (full, capped):    [price, amount, id]   — asks descending (worst→best)
 //	level 4 (best + ids):      [price, amount, [ids]]
 //
 // This also cements the refuted audit-D1 claim: detail 1 is [price,size,count]
@@ -235,10 +278,23 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 				t.Errorf("detail1 ask[2] (count) not int: %T", ob.Asks[0][2])
 			}
 		case 2:
-			wantLen(ob.Asks, 2) // two distinct ask prices
-			wantLen(ob.Bids, 2)
+			// C++ d2 (rpcxbridge.cpp:1763-1833): asks window starts at index
+			// asks_len-bound (0 when bound==len), i.e. the worst ask 0.2, not
+			// the best; bids window starts at index 0, the best bid, but
+			// priceBid = from/to so the seeded best bid is 0.2. The
+			// `while((++i < bound) && floatCompare(...))` advances i past the
+			// differing price without merging, so each side emits exactly ONE
+			// row: [0.200000, ...] for both asks and bids.
+			wantLen(ob.Asks, 1)
+			wantLen(ob.Bids, 1)
 			if len(ob.Asks[0]) != 3 {
 				t.Errorf("detail2 ask len = %d, want 3", len(ob.Asks[0]))
+			}
+			if ob.Asks[0][0] != "0.200000" {
+				t.Errorf("detail2 asks[0] price = %v, want 0.200000", ob.Asks[0][0])
+			}
+			if ob.Bids[0][0] != "0.200000" {
+				t.Errorf("detail2 bids[0] price = %v, want 0.200000", ob.Bids[0][0])
 			}
 		case 3:
 			wantLen(ob.Asks, 2)
@@ -248,6 +304,14 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 			}
 			if _, ok := ob.Asks[0][2].(string); !ok {
 				t.Errorf("detail3 ask[2] (id) not string: %T", ob.Asks[0][2])
+			}
+			// C++ returns asks descending (worst→best), so the first
+			// ask must be the worse (higher) price.
+			if ob.Asks[0][0] != "0.200000" {
+				t.Errorf("detail3 asks[0] price = %v, want 0.200000", ob.Asks[0][0])
+			}
+			if ob.Asks[1][0] != "0.100000" {
+				t.Errorf("detail3 asks[1] price = %v, want 0.100000", ob.Asks[1][0])
 			}
 		case 4:
 			wantLen(ob.Asks, 1)
@@ -263,6 +327,90 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestDxGetOrderBookD2WindowAndMerge locks in C++ detail-2 behavior when the
+// order counts exceed maxOrders (rpcxbridge.cpp:1763-1833):
+//   - the asks window is [asks_len-bound, asks_len) (worst asks first),
+//   - equal-priced window entries merge into one [price, sum, count] row,
+//   - the `while((++i < bound) && floatCompare(...))` skip makes the iteration
+//     every-other: a window price that differs from the emitted row's price is
+//     consumed by the loop, so its own row is never emitted.
+//
+// Seeded asks (BTC->LTC, from=1.5M): prices {0.4,0.3,0.2,0.2,0.15,0.1} sorted
+// descending; asks window with maxOrders=4 is indices 2..5 = {0.2,0.2,0.15,0.1}:
+//
+//	index 2 emits [0.200000, 3.000000, 2] (merges index 3, the while-skip
+//	consumes index 4's 0.15 row without emitting it), index 5 emits
+//	[0.100000, 1.500000, 1].
+//
+// Seeded bids (LTC->BTC, from=300k): prices {0.2,0.2,0.15,0.1,0.05,0.01} sorted
+// descending; bids window is indices 0..3 = {0.2,0.2,0.15,0.1}:
+//
+//	index 0 emits [0.200000, 3.000000, 2] (merges index 1, the while-skip
+//	consumes index 2's 0.15 row), index 3 emits [0.100000, 3.000000, 1].
+func TestDxGetOrderBookD2WindowAndMerge(t *testing.T) {
+	ctx := newWalletTestCtx()
+
+	seed := func(from, to string, fAmt, tAmt uint64) {
+		ctx.Store.Add(&Order{
+			ID:           [32]byte{byte(len(ctx.Store.List()) + 1)},
+			Type:         OrderTypeMaker,
+			FromCurrency: from,
+			FromAmount:   fAmt,
+			ToCurrency:   to,
+			ToAmount:     tAmt,
+			Status:       "open",
+		})
+	}
+	// Asks BTC->LTC (price = to/from = to/1.5M).
+	seed("BTC", "LTC", 1_500_000, 600_000) // 0.4
+	seed("BTC", "LTC", 1_500_000, 450_000) // 0.3
+	seed("BTC", "LTC", 1_500_000, 300_000) // 0.2
+	seed("BTC", "LTC", 1_500_000, 300_000) // 0.2 (merge)
+	seed("BTC", "LTC", 1_500_000, 225_000) // 0.15 (skipped by while)
+	seed("BTC", "LTC", 1_500_000, 150_000) // 0.1
+	// Bids LTC->BTC (price = to/from = to/300k).
+	seed("LTC", "BTC", 300_000, 1_500_000)  // 0.2
+	seed("LTC", "BTC", 300_000, 1_500_000)  // 0.2 (merge)
+	seed("LTC", "BTC", 300_000, 2_000_000)  // 0.15 (skipped by while)
+	seed("LTC", "BTC", 300_000, 3_000_000)  // 0.1
+	seed("LTC", "BTC", 300_000, 6_000_000)  // 0.05
+	seed("LTC", "BTC", 300_000, 30_000_000) // 0.01
+
+	res, err := ctx.dxGetOrderBook([]json.RawMessage{
+		jstr("2"), jstr("BTC"), jstr("LTC"), json.RawMessage("4"),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderBook detail 2: %v", err)
+	}
+	ob := res.(orderBookResult)
+
+	wantRows := func(side string, got [][]interface{}, want [][3]interface{}) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("detail2 %s len = %d, want %d (%v)", side, len(got), len(want), got)
+		}
+		for i, w := range want {
+			if len(got[i]) != 3 {
+				t.Fatalf("detail2 %s[%d] len = %d, want 3", side, i, len(got[i]))
+			}
+			for j := 0; j < 3; j++ {
+				if got[i][j] != w[j] {
+					t.Errorf("detail2 %s[%d][%d] = %v, want %v", side, i, j, got[i][j], w[j])
+				}
+			}
+		}
+	}
+
+	wantRows("asks", ob.Asks, [][3]interface{}{
+		{"0.200000", "3.000000", 2},
+		{"0.100000", "1.500000", 1},
+	})
+	wantRows("bids", ob.Bids, [][3]interface{}{
+		{"0.200000", "3.000000", 2},
+		{"0.100000", "3.000000", 1},
+	})
 }
 
 func TestDxGetOrderFillsRead(t *testing.T) {
@@ -296,7 +444,7 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 
 	// id -> object keyed by id and the order's currency (empty utxo list).
 	ctx.Store.Lock(o)
-	id := hexEncode(o.ID[:])
+	id := dispID(o.ID)
 	res, _ = ctx.dxGetLockedUtxos([]json.RawMessage{jstr(id)})
 	m, ok = res.(map[string]interface{})
 	if !ok {
@@ -318,11 +466,67 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 	if !ok || len(m["flushedOrders"].([]map[string]interface{})) != 0 {
 		t.Fatalf("dxFlushCancelledOrders (empty) = %v", res)
 	}
-	ctx.Store.RecordCancelled(hexEncode(o.ID[:]), 5)
+	ctx.Store.RecordCancelled(dispID(o.ID), 5)
 	res, _ = ctx.dxFlushCancelledOrders(nil)
 	m, _ = res.(map[string]interface{})
 	if len(m["flushedOrders"].([]map[string]interface{})) != 1 {
 		t.Fatalf("dxFlushCancelledOrders (recorded) = %v", res)
+	}
+}
+
+// TestDxGetLockedUtxosKeyByState verifies dxGetLockedUtxos keys the per-order
+// array by the transaction's state (C++ rpcxbridge.cpp:2674-2677), never by
+// which wallets happen to be connected: an open broadcast order is keyed by
+// the maker currency alone, an accepted (created) order by maker_and_taker —
+// with the same result whether or not the taker wallet is connected.
+func TestDxGetLockedUtxosKeyByState(t *testing.T) {
+	ctx := newWalletTestCtx()
+
+	add := func(seed byte, status string) (string, *Order) {
+		id := [32]byte{seed}
+		o := &Order{
+			ID: id, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1500000,
+			ToCurrency: "SYS", ToAmount: 300000, Created: 1, Updated: 1,
+			Status: status, Mine: true,
+		}
+		ctx.Store.Add(o)
+		return dispID(id), o
+	}
+
+	lockedKey := func(id string) string {
+		res, rerr := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(id)})
+		if rerr != nil {
+			t.Fatalf("dxGetLockedUtxos(%s) = %v", id, rerr)
+		}
+		m, ok := res.(map[string]interface{})
+		if !ok {
+			t.Fatalf("dxGetLockedUtxos(%s) = %T", id, res)
+		}
+		for k := range m {
+			if k != "id" {
+				return k
+			}
+		}
+		return ""
+	}
+
+	// Accepted (created) order with only the maker wallet connected: must still
+	// use the dual key (old code fell back to the maker currency here).
+	createdID, _ := add(0x11, "created")
+	if k := lockedKey(createdID); k != "BTC_and_SYS" {
+		t.Fatalf("accepted order (no taker wallet) key = %q, want BTC_and_SYS", k)
+	}
+
+	// Now connect the taker wallet: the open order must STILL be single-keyed
+	// (old code switched to the dual key purely on connector presence), and the
+	// created order must keep the dual key.
+	ctx.Node.config.Connectors["SYS"] = &stubConn{ticker: "SYS", addr: btcAddr}
+	openID, _ := add(0x12, "open")
+	if k := lockedKey(openID); k != "BTC" {
+		t.Fatalf("open order (taker wallet connected) key = %q, want BTC", k)
+	}
+	if k := lockedKey(createdID); k != "BTC_and_SYS" {
+		t.Fatalf("accepted order (taker wallet connected) key = %q, want BTC_and_SYS", k)
 	}
 }
 
@@ -348,7 +552,7 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 			t.Fatalf("bucket = %v (%T), want 6 fields", b, b)
 		}
 		for _, v := range row[1:6] {
-			if f, ok := v.(float64); !ok || f != 0 {
+			if f, ok := v.(xfloat); !ok || f != 0 {
 				t.Errorf("bucket field = %v, want 0", v)
 			}
 		}
@@ -380,7 +584,9 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 // TestDxGetOrderHistoryBuckets verifies the OHLCV aggregation over local fills:
 // open/high/low/close from the taker/maker price ratio, volume = sum of taker
 // size, zero-filled empty slices, and the trailing order-id array when
-// order_ids=true.
+// order_ids=true. The time window is aligned to granularity boundaries
+// (matching C++ XSeries behavior), so the effective window may be wider
+// than the raw [start, end) range.
 func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	ctx := newWalletTestCtx()
 	const xEarly = int64(1519516800)
@@ -392,8 +598,15 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	// A fill outside the pair (should be ignored).
 	ctx.Store.AddFill(fillEntry{ID: "zzz", Time: uint64(xEarly+1035) * 1e6, Maker: "SYS", Taker: "LTC", MakerSize: "1.0", TakerSize: "1.0"})
 
-	// range [xEarly+1000, xEarly+1180) granularity 60 -> 3 buckets; bucket0 has
-	// 2 fills, bucket1 has 1, bucket2 empty. Start >= XSeries earliest per C++.
+	// range [xEarly+1000, xEarly+1180) granularity 60.
+	// C++ aligns start down and end up to granularity boundaries:
+	//   alignedStart = xEarly+1000 rounded down to 60s = xEarly+960
+	//   alignedEnd   = xEarly+1180 rounded up   to 60s = xEarly+1200
+	//   numBuckets = (xEarly+1200 - (xEarly+960)) / 60 = 4.
+	// bucket0 (xEarly+960..xEarly+1020): empty
+	// bucket1 (xEarly+1020..xEarly+1080): aaa (price=2.0), bbb (price=4.0)
+	// bucket2 (xEarly+1080..xEarly+1140): ccc (price=1.0)
+	// bucket3 (xEarly+1140..xEarly+1200): empty
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
 		jstr("BTC"), jstr("LTC"), jstr(strconv.FormatInt(xEarly+1000, 10)), jstr(strconv.FormatInt(xEarly+1180, 10)), jstr("60"),
 		json.RawMessage("true"), jstr("false"),
@@ -402,29 +615,36 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 		t.Fatalf("dxGetOrderHistory: %v", err)
 	}
 	arr, ok := res.([]interface{})
-	if !ok || len(arr) != 3 {
-		t.Fatalf("dxGetOrderHistory = %v (%T), want 3 buckets", res, res)
+	if !ok || len(arr) != 4 {
+		t.Fatalf("dxGetOrderHistory = %v (%T), want 4 buckets", res, res)
 	}
-	// bucket0: open=2.0, high=4.0, low=2.0, close=4.0, volume=6.0
+	// bucket0: zero-filled.
 	b0 := arr[0].([]interface{})
-	if b0[3].(float64) != 2.0 || b0[2].(float64) != 4.0 || b0[1].(float64) != 2.0 || b0[4].(float64) != 4.0 || b0[5].(float64) != 6.0 {
-		t.Errorf("bucket0 = %v, want [_,2,4,2,4,6]", b0)
+	for _, v := range b0[1:6] {
+		if v.(xfloat) != 0 {
+			t.Errorf("bucket0 field = %v, want 0", v)
+		}
 	}
-	// bucket0 trailing order-id array.
-	ids0 := b0[6].([]string)
-	if len(ids0) != 2 || ids0[0] != "aaa" || ids0[1] != "bbb" {
-		t.Errorf("bucket0 ids = %v, want [aaa,bbb]", ids0)
-	}
-	// bucket1: price = 2.0/2.0 = 1.0 (open=high=low=close), volume=2.0
+	// bucket1: open=2.0, high=4.0, low=2.0, close=4.0, volume=6.0
 	b1 := arr[1].([]interface{})
-	if b1[1].(float64) != 1.0 || b1[2].(float64) != 1.0 || b1[3].(float64) != 1.0 || b1[4].(float64) != 1.0 || b1[5].(float64) != 2.0 {
-		t.Errorf("bucket1 = %v, want [_,1,1,1,1,2]", b1)
+	if b1[3].(xfloat) != 2.0 || b1[2].(xfloat) != 4.0 || b1[1].(xfloat) != 2.0 || b1[4].(xfloat) != 4.0 || b1[5].(xfloat) != 6.0 {
+		t.Errorf("bucket1 = %v, want [_,2,4,2,4,6]", b1)
 	}
-	// bucket2: zero-filled.
+	// bucket1 trailing order-id array.
+	ids1 := b1[6].([]string)
+	if len(ids1) != 2 || ids1[0] != "aaa" || ids1[1] != "bbb" {
+		t.Errorf("bucket1 ids = %v, want [aaa,bbb]", ids1)
+	}
+	// bucket2: price = 2.0/2.0 = 1.0 (open=high=low=close), volume=2.0
 	b2 := arr[2].([]interface{})
-	for _, v := range b2[1:6] {
-		if v.(float64) != 0 {
-			t.Errorf("bucket2 field = %v, want 0", v)
+	if b2[1].(xfloat) != 1.0 || b2[2].(xfloat) != 1.0 || b2[3].(xfloat) != 1.0 || b2[4].(xfloat) != 1.0 || b2[5].(xfloat) != 2.0 {
+		t.Errorf("bucket2 = %v, want [_,1,1,1,1,2]", b2)
+	}
+	// bucket3: zero-filled.
+	b3 := arr[3].([]interface{})
+	for _, v := range b3[1:6] {
+		if v.(xfloat) != 0 {
+			t.Errorf("bucket3 field = %v, want 0", v)
 		}
 	}
 }
@@ -465,7 +685,7 @@ func TestDxPartialChainRead(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx)
 
-	res, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr(hexEncode(o.ID[:]))})
+	res, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
 		t.Fatalf("dxGetMyPartialOrderChain: %v", err)
 	}
@@ -473,7 +693,7 @@ func TestDxPartialChainRead(t *testing.T) {
 		t.Fatalf("dxGetMyPartialOrderChain = %v (%T)", res, res)
 	}
 
-	res, err = ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(hexEncode(o.ID[:]))})
+	res, err = ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
@@ -481,9 +701,13 @@ func TestDxPartialChainRead(t *testing.T) {
 		t.Fatalf("dxPartialOrderChainDetails = %v (%T)", res, res)
 	}
 
-	// Missing id -> error on both.
-	if _, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr("nope")}); err == nil {
-		t.Error("dxGetMyPartialOrderChain(missing) should error")
+	// Missing id -> empty array (C++ returns [] for a valid but unknown order;
+	// a malformed id is a uint256S null whose lookup also misses).
+	unknown := strings.Repeat("0", 64)
+	if res, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr(unknown)}); err != nil {
+		t.Errorf("dxGetMyPartialOrderChain(missing) should return empty array, got error: %v", err)
+	} else if arr, ok := res.([]interface{}); !ok || len(arr) != 0 {
+		t.Errorf("dxGetMyPartialOrderChain(missing) = %v (%T), want []", res, res)
 	}
 	if _, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr("nope")}); err == nil {
 		t.Error("dxPartialOrderChainDetails(missing) should error")
@@ -506,7 +730,7 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	ctx.Store.Add(parent)
 	ctx.Store.Add(child)
 
-	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(hexEncode(mid.ID[:]))})
+	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(dispID(mid.ID))})
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
@@ -514,14 +738,14 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	if !ok {
 		t.Fatalf("result = %v (%T)", res, res)
 	}
-	if m["first_order_id"] != hexEncode(parent.ID[:]) {
-		t.Errorf("first_order_id = %v, want %v", m["first_order_id"], hexEncode(parent.ID[:]))
+	if m["first_order_id"] != dispID(parent.ID) {
+		t.Errorf("first_order_id = %v, want %v", m["first_order_id"], dispID(parent.ID))
 	}
 	orders, ok := m["orders"].([]string)
 	if !ok || len(orders) != 3 {
 		t.Fatalf("orders = %v (%T), want 3 hex ids", m["orders"], m["orders"])
 	}
-	if orders[0] != hexEncode(parent.ID[:]) || orders[2] != hexEncode(child.ID[:]) {
+	if orders[0] != dispID(parent.ID) || orders[2] != dispID(child.ID) {
 		t.Errorf("orders not root-first: %v", orders)
 	}
 	if m["total_orders_open"] != 1 || m["total_orders_finished"] != 1 || m["total_orders_canceled"] != 1 {
@@ -586,7 +810,7 @@ func TestDxCancelOrderGuards(t *testing.T) {
 	// Unknown but well-formed id -> TRANSACTION_NOT_FOUND.
 	var missingID [32]byte
 	missingID[0] = 0x55
-	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(hexEncode(missingID[:]))}); err == nil || err.Code != errTxNotFound {
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(missingID))}); err == nil || err.Code != errTxNotFound {
 		t.Errorf("dxCancelOrder(unknown) = %+v, want TRANSACTION_NOT_FOUND", err)
 	}
 	// Malformed id -> INVALID_PARAMETERS.
@@ -595,7 +819,7 @@ func TestDxCancelOrderGuards(t *testing.T) {
 	}
 	// In-process order (created) cannot be cancelled.
 	o.Status = "created"
-	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(hexEncode(o.ID[:]))}); err == nil || err.Code != errInvalidState {
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))}); err == nil || err.Code != errInvalidState {
 		t.Errorf("dxCancelOrder(created) = %+v, want INVALID_STATE", err)
 	}
 }
@@ -612,7 +836,7 @@ func TestDxCancelOrderNoLiveSession(t *testing.T) {
 	ctx.Node.sessions = map[string]*SwapSession{} // open order in store, no live swap session
 	o := seedOrder(ctx)                           // status "open", cancelable by state
 
-	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(hexEncode(o.ID[:]))}); err == nil || err.Code != errBadRequest {
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))}); err == nil || err.Code != errBadRequest {
 		t.Errorf("dxCancelOrder(no live session) = %+v, want BAD_REQUEST (no active session for order)", err)
 	}
 }

@@ -408,12 +408,13 @@ func orderTypeString(partial bool) string {
 }
 
 // parentIDString renders a parent order id, or "" when there is none. Mirrors
-// parseParentId (returns "" when null).
+// parseParentId (returns "" when null); the id is rendered in C++ display
+// order (GetHex).
 func parentIDString(id [32]byte) string {
 	if isZeroID(id) {
 		return ""
 	}
-	return hexEncode(id[:])
+	return orderIDString(id)
 }
 
 // statusString maps an internal order status to the C++ TransactionDescr::
@@ -483,5 +484,45 @@ func isZeroID(id [32]byte) bool {
 
 func hexEncode(b []byte) string { return hex.EncodeToString(b) }
 
-// orderIDString renders a 32-byte order id as hex (matches uint256::GetHex).
-func orderIDString(id [32]byte) string { return hexEncode(id[:]) }
+// orderIDString renders a 32-byte order id the way C++ displays it
+// (uint256::GetHex): the internal little-endian bytes are reversed so the hex
+// string's leading byte is the highest-order byte of the uint256. go-xbridge
+// keeps order ids as raw wire bytes internally and reverses only when
+// rendering.
+func orderIDString(id [32]byte) string {
+	var r [32]byte
+	for i := 0; i < 32; i++ {
+		r[31-i] = id[i]
+	}
+	return hexEncode(r[:])
+}
+
+// parseOrderID converts a display-hex order id (uint256::GetHex order, as
+// returned by the dx* RPCs) back into the 32-byte internal representation used
+// as the Store key. Malformed ids (wrong length or non-hex) error, mirroring
+// the C++ uint256S validation in dxCancelOrder/dxPartialOrderChainDetails.
+func parseOrderID(s string) ([32]byte, error) {
+	var id [32]byte
+	if len(s) != 64 {
+		return id, errors.New("api: order id must be 64 hex chars")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return id, errors.New("api: invalid order id hex")
+	}
+	for i, v := range b {
+		id[31-i] = v
+	}
+	return id, nil
+}
+
+// orderIDKey converts a display-hex order id param into the raw lowercase-hex
+// Store key. Callers wrap the returned error with their own rpcError name and
+// message. (Distinct from store.orderKey, which renders a raw [32]byte id.)
+func orderIDKey(id string) (string, error) {
+	raw, err := parseOrderID(id)
+	if err != nil {
+		return "", err
+	}
+	return hexEncode(raw[:]), nil
+}

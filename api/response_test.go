@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/hex"
 	"testing"
 	"time"
 
@@ -137,8 +136,9 @@ func TestOrderTypeAndParent(t *testing.T) {
 		t.Error("parentIDString(zero) should be empty")
 	}
 	id := [32]byte{0xab}
-	if parentIDString(id) != hex.EncodeToString(id[:]) {
-		t.Error("parentIDString(nonzero) should be hex")
+	// C++ uint256::GetHex renders reversed display order (orderIDString).
+	if parentIDString(id) != orderIDString(id) {
+		t.Errorf("parentIDString(nonzero) should match orderIDString (reversed hex), got %q", parentIDString(id))
 	}
 }
 

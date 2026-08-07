@@ -3,6 +3,7 @@ package api
 import (
 	"testing"
 
+	"go-xbridge/coins"
 	"go-xbridge/crypto"
 )
 
@@ -36,6 +37,9 @@ func TestPersistRoundTrip(t *testing.T) {
 
 	var id [32]byte
 	copy(id[:], []byte("persist-round-trip-order-id00")) // 32 bytes
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 0x7c
+	hubPub := mustPub(t, hubPriv)
 	o := &Order{
 		ID:           id,
 		FromCurrency: "BTC",
@@ -43,6 +47,8 @@ func TestPersistRoundTrip(t *testing.T) {
 		FromAmount:   1e8,
 		ToAmount:     2e8,
 		Mine:         true,
+		SNodePubkey:  hexPub(t, hubPriv),
+		HubAddress:   coins.KeyID(hubPub[:]),
 	}
 	n.store.Add(o)
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
@@ -71,6 +77,22 @@ func TestPersistRoundTrip(t *testing.T) {
 	}
 	if got.SrcCur != "BTC" || got.DstCur != "LTC" || got.SrcAmt != 1e8 || got.DstAmt != 2e8 {
 		t.Errorf("amount/currency fields did not round-trip: %+v", got)
+	}
+	// The hub anchor (SNodePubkey/HubAddress) must survive the round-trip.
+	if got.SNodePubkey != o.SNodePubkey || got.HubAddress != o.HubAddress {
+		t.Errorf("hub anchor did not round-trip: got %q/%x want %q/%x",
+			got.SNodePubkey, got.HubAddress, o.SNodePubkey, o.HubAddress)
+	}
+
+	// restoreSwap must reconstruct the order with the same hub anchor.
+	n2 := newPersistNode(t, dir)
+	n2.sessMu.Lock()
+	n2.restoreSwap(got)
+	n2.sessMu.Unlock()
+	if ro := n2.store.Get(hexEncode(id[:])); ro == nil {
+		t.Fatal("restoreSwap did not re-add the order")
+	} else if ro.SNodePubkey != o.SNodePubkey || ro.HubAddress != o.HubAddress {
+		t.Errorf("restored order hub anchor lost: got %q/%x", ro.SNodePubkey, ro.HubAddress)
 	}
 }
 
