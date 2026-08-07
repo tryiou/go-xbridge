@@ -1,37 +1,26 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file gives coding agents (and contributors) the rules for working in this
+repository. End users should read [`README.md`](README.md); the full contributor
+guide (package-by-package architecture, build/test/verify, conventions) is
+[`docs/architecture.md`](docs/architecture.md); the C++↔Go parity register is
+[`docs/audit.md`](docs/audit.md).
 
-## Overview
+## What this is
 
 `go-xbridge` is a **portable, standalone Go reimplementation** of the Blocknet
-**XBridge** atomic-swap engine. It is a **thin client**: it speaks the existing
-XBridge wire protocol to the live Blocknet service-node P2P network, so a user can
-trade by connecting their own (SPV) wallets — **without running `blocknetd`**.
+**XBridge** atomic-swap engine — a **thin client** that speaks the existing
+XBridge wire protocol to the live Blocknet service-node P2P network, trading
+through the user's own (SPV) wallets **without running `blocknetd`**. It is a
+from-scratch port, **not** a wrapper. The wire contract is the source of truth
+(`docs/protocol.md`); the C++ reference is the upstream Blocknet Core XBridge
+source (`src/xbridge/`), where header-comment enums are frequently **stale** —
+trust the actual C++ writers, not the comments.
 
-This is a from-scratch reimplementation, **not** a wrapper around `blocknetd`. The
-wire contract is the source of truth and is documented in [`docs/protocol.md`](docs/protocol.md).
-The C++ reference lives in the separate `blocknet_core` repo (`src/xbridge/`); its
-header-comment enum values are frequently **stale** — trust the actual C++ writers
-under `src/xbridge/`, not the comments.
-
-Repo history: standalone git repo (branch `main`), extracted from `blocknet_core`
-via `git filter-branch --subdirectory-filter go-xbridge`. Commit subjects are
-unchanged but **SHA-1s differ from any pre-extraction references**.
-
-## Layout
-
-- `api/` — 1:1 port of blocknetd's `dx*` JSON-RPC surface (drop-in for dapps).
-- `p2p/` — Bitcoin-style P2P framing, `version`/`verack` handshake, XBridge
-  transport envelope (`encodeXBridgePayload`/`DecodeXBridgePayload`).
-- `proto/` — XBridge packet header/body codec + per-`XBridgeCommand` body layouts.
-- `crypto/` — secp256k1 compact ECDSA signer (`BtcSigner`).
-- `coins/` — per-coin model; **all coin definitions come from `xbridge.conf`**.
-- `wallet/` — RPC connector + local signer to the connected SPV wallet.
-- `config/` — read-only INI loader mirroring `xbridgeapp.cpp::createConf()`.
-- `swap/` — `Transaction` state machine + HTLC deposit layer.
-- `cmd/xbridged` — the daemon; flags include `-conf` (default
-  `<home>/.blocknet/xbridge.conf`, fatal if missing) and `-node`.
+Repo history: standalone git repo (branch `main`, remote `origin`). It was
+written from scratch as a Go port of the C++ XBridge engine (`src/xbridge/`),
+**not** extracted from that repo — the root commit is the original
+Go scaffold.
 
 ## Build, test, verify
 
@@ -43,24 +32,29 @@ go test ./...           # unit tests
 
 Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
 
-## Conventions & hard rules
+## Hard rules
 
 - **Nothing is hardcoded.** Every coin connector (incl. BLOCK and BTC) is defined
-  **entirely** by its `[TICKER]` section in `xbridge.conf`; the library only READS
-  it (never creates or auto-runs `createConf`). Mirroring core-wallet XBridge
-  behavior exactly is the goal (A1 session rule).
+  **entirely** by its `[TICKER]` section in `xbridge.conf`; the library only
+  READS it (never creates or auto-runs `createConf`). Mirroring core-wallet
+  XBridge behavior exactly is the goal.
 - **Fidelity over shortcuts.** Ports must be byte-for-byte 1:1 with the C++ wire
-  contract. Validate against live captured packets and the C++ writers, not comments.
+  contract. Validate against live captured packets and the C++ writers, not
+  comments. Run the parity gate (`make parity`) after touching the port or C++
+  XBridge.
 - **Separate concerns in commits** — logic / style (gofmt) / refactor kept apart.
 - Run `gofmt` before committing.
 - Amounts are base units of `COIN = 1_000_000`; `dx*` amounts display as
-  **6-decimal** fixed strings (matches C++ `setprecision(
-  xBridgeSignificantDigits(COIN))` = `setprecision(6)`).
+  **6-decimal** fixed strings (matches C++ `setprecision(6)`).
 
-## Status & repo policy
+## Git policy
 
-- **Local-only:** no git remote is configured. Do **not** push or open a PR unless
-  the user explicitly asks. To push later:
-  `git remote add origin <url> && git push -u origin main`.
-- Verification of network behavior uses the **live** Blocknet service-node P2P port
-  (e.g. `coreproxy.airdns.org:42111`);
+Local repo (remote `origin` configured). Do **not** push or open a PR unless the
+user explicitly asks. Commit subjects follow the repo's existing `type(scope)`
+style.
+
+## Verification of network behavior
+
+Uses the **live** Blocknet service-node P2P port (e.g.
+`coreproxy.airdns.org:42111`) — `cmd/liveprobe` for ad-hoc checks, `-node` to
+pin a peer.

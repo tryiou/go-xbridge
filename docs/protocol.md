@@ -51,7 +51,7 @@ XBRIDGE handling):
 ```
 varint(28 + packetLen)        // Bitcoin CompactSize length of the rest
 [ 20 bytes ] destination address (uint160); 20 zero bytes == broadcast
-[  8 bytes ] uint64 LE timestamp (ms since Unix epoch, set by the sender)
+[  8 bytes ] uint64 LE timestamp (microseconds since Unix epoch, set by the sender)
 [  packet  ] the XBridgePacket (129-byte header + body, section 2)
 ```
 
@@ -60,6 +60,12 @@ make (`xbcTransaction`), the taker's accept (`xbcTransactionAccepting`) and ever
 handshake reply addressed to the order's hub servicenode, so the C++ hub can
 route the trade. `20 zero bytes == broadcast` is used only where a true broadcast
 is intended.
+
+The 8-byte envelope timestamp is in **microseconds** (`time.Now().UnixMicro()`),
+matching C++ `timeToInt` (`xutil.cpp:280` `total_microseconds()`); it is included
+in the SHA256-signed envelope, so a millisecond value would be a 1000x wire
+divergence that fails every counterparty signature check. (The packet header's
+own 4-byte `timestamp`, §2.1, is **seconds**.)
 
 `varint` is a Bitcoin CompactSize integer. On send, `p2p/conn.go` builds this
 envelope via `encodeXBridgePayload`; on receive, `DecodeXBridgePayload` strips
@@ -193,7 +199,7 @@ intentional — historical.)
 | 12 | `xbcTransactionCreateB` | B creates deposit tx |
 | 13 | `xbcTransactionCreatedB`| B created (hub→A): deposit id |
 | 18 | `xbcTransactionConfirmA`| A confirms B's deposit |
-| 19 | `xbcTransactionConfirmedA` | A confirmed: x pubkey |
+| 19 | `xbcTransactionConfirmedA` | A confirmed (hub→A): A's pay tx id |
 | 20 | `xbcTransactionConfirmB`| B confirms A's deposit |
 | 21 | `xbcTransactionConfirmedB` | B confirmed |
 | 22 | `xbcTransactionCancel`  | cancel (uint256 id, uint32 reason) |
@@ -217,7 +223,8 @@ trNew -> trJoined -> trHold -> trInitialized -> trCreated -> trSigned
 
 (`trSigned` / `trCommited` are vestigial — C++ never assigns them during the
 two-confirmation gate; the progression walks trJoined → trHold → trInitialized
-→ trCreated → trFinished via `IncreaseStateCounter`. See `docs/swap.md` §2.)
+→ trCreated → trFinished via `IncreaseStateCounter`. See
+`docs/architecture.md` "swap/".)
 ```
 
 High-level flow (hub = the **service node**; note this is *not* the maker — the
@@ -278,7 +285,7 @@ and `src/test/bswap_tests.cpp` as the acceptance oracle.
 
 ### 4.1 Swap command body layouts (authoritative — CORRECTED 2026-07-15)
 
-These are the exact on-the-wire field orders for the 8 swap commands. They were
+These are the exact on-the-wire field orders for the 13 swap commands. They were
 read from the **real C++ writers** (`xbridgeapp.cpp` / `xbridgesession.cpp`),
 **not** from the `xbridgepacket.h` enum comments, which are STALE and must NOT
 be trusted. The most important correction: the `Create*` / `Created*` /
@@ -288,7 +295,7 @@ be trusted. The most important correction: the `Create*` / `Created*` /
 
 | Cmd | Name | Field order |
 |-----|------|-------------|
-| 6  | `xbcTransactionHold`       | Hub ‖ ID |
+| 6  | `xbcTransactionHold`       | Hub ‖ ID ‖ FromAmount ‖ ToAmount |
 | 7  | `xbcTransactionHoldApply`  | Hub ‖ Client ‖ ID |
 | 8  | `xbcTransactionInit`       | Client ‖ Hub ‖ ID ‖ FromAddr ‖ FromCur ‖ FromAmt ‖ ToAddr ‖ ToCur ‖ ToAmt |
 | 9  | `xbcTransactionInitialized`| Hub ‖ Client ‖ ID |
@@ -325,6 +332,43 @@ Notes:
   spends A's deposit. This is implemented in `api/swap.go` (`TestSwapHandshake`
   in `api/swap_test.go` drives it end-to-end with fake connectors).
 
+### 4.2 Non-swap body layouts (order broadcast, accept, cancel)
+
+The order/accept lifecycle and cancellation use their own bodies (read from the
+same real C++ writers as §4.1). Field encoding is per §2.2.
+
+| Cmd | Name | Field order |
+|-----|------|-------------|
+| 3  | `xbcTransaction`          | ID ‖ From(addr) ‖ FromCurrency ‖ FromAmount ‖ To(addr) ‖ ToCurrency ‖ ToAmount ‖ Created ‖ BlockHash ‖ PartialAllowed(uint16 0/1) ‖ MinFromAmount ‖ Utxos |
+| 4  | `xbcPendingTransaction`   | ID ‖ FromCurrency ‖ FromAmount ‖ ToCurrency ‖ ToAmount ‖ HubAddress ‖ Created ‖ BlockHash ‖ PartialAllowed(uint16 0/1) ‖ MinFromAmount* |
+| 5  | `xbcTransactionAccepting` | HubAddress ‖ ID ‖ ServiceNodeFeeTx(uint32-len ‖ bytes) ‖ From ‖ FromCurrency ‖ FromAmount ‖ FromBlockHeight ‖ FromBlockHash(8) ‖ To ‖ ToCurrency ‖ ToAmount ‖ ToBlockHeight ‖ ToBlockHash(8) ‖ Utxos |
+| 22 | `xbcTransactionCancel`    | ID ‖ Reason |
+| 26 | `xbcTransactionReject`    | ID ‖ Reason |
+
+Notes:
+
+- **`Utxos`** is a `uint32` LE count followed by that many 121-byte entries. Each
+  `UtxoEntry` is `TxID(32) ‖ Vout(4) ‖ RawAddress(20) ‖ Signature(65)` — the
+  signature is 65 bytes (1 recovery byte + 64) in `signmessage` format, and
+  `RawAddress` is the 20-byte `toXAddr` payload (**not** the base58 address; the
+  version byte is stripped, matching C++). See `proto/body_types.go:36-69`.
+- **`BlockHash`** (3, 4) is the full 32-byte block hash, Bitcoin internal LE
+  order; `FromBlockHash`/`ToBlockHash` (5) are only the **first 8 bytes**.
+- **`ServiceNodeFeeTx`** (5) is a variable-length byte array **prefixed by its
+  own `uint32` length** (the one field in the protocol that is length-prefixed
+  rather than fixed-width/terminated).
+- **`MinFromAmount`\*** (4) is **optional**: present only in writers that
+  advertise a minimum partial amount. Of C++'s two cmd-4 writers, the broadcast
+  writer omits it (`xbridgesession.cpp:3626`) while `sendTransaction` always
+  includes it (`:3666`). Go's `Marshal` always writes it (`proto/body_types.go:204`)
+  but Go only receives cmd 4, never sends it, so readers tolerate its absence
+  (`proto/body_types.go:255-262`).
+- **`Created`** (3, 4) is the order creation time (unix seconds).
+- `xbcXChatMessage` (2) carries a raw serialized Bitcoin P2P message as its
+  entire body (no inner structure); `xbcServicesPing` (50) is a sequence of
+  null-terminated service-name strings (typed in Go but no C++ live writer — see
+  `docs/architecture.md`).
+
 ---
 
 ## 5. Signing
@@ -343,22 +387,3 @@ Implemented as `proto.Packet.Digest()` (stdlib SHA256) +
 `crypto.Signer` (btcec/v2 — see `crypto/signer.go` for the exact recipe).
 
 ---
-
-## 6. Status
-
-The questions that drove earlier phases are resolved and their records live in
-git history and [`STATUS.md`](STATUS.md):
-
-- `version` handshake payload (§1.3, §1.3.1) — ✅ DONE (live-verified).
-- `NetMsgType::XBRIDGE` command string — ✅ confirmed `"xbridge"` live.
-- uint256 byte order — ✅ VERIFIED. Bitcoin internal LE order is preserved
-  verbatim on the wire (no reversal).
-- Per-command body field layouts — ✅ DONE (2026-07-15), read 1:1 from the real
-  C++ writers; the C++ header enum comments are STALE and were deliberately NOT
-  followed where they disagree (see the note at the top of `proto/body_types.go`).
-- Wallet connector RPC — ✅ DONE (`wallet/`; see `docs/wallet.md`).
-- API surface — ✅ DONE (all 23 `dx*` commands; see `docs/api.md`).
-
-Open work (non-UTXO coin adapters, live-hub verification of the swap handshake)
-is tracked in [`STATUS.md`](STATUS.md) "Open items" and the divergence register
-in [`AUDIT.md`](AUDIT.md).

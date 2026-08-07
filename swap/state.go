@@ -1,7 +1,8 @@
 // Package swap is a Go port of the XBridge atomic-swap state machine
 // (src/xbridge/xbridgetransaction.{h,cpp}). It models the two-party
 // Transaction lifecycle: order join, the two-confirmation state progression,
-// and terminal/cancellation paths. See docs/swap.md for the canonical spec.
+// and terminal/cancellation paths. See docs/architecture.md for the canonical
+// spec.
 package swap
 
 import "fmt"

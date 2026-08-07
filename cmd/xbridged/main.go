@@ -92,7 +92,7 @@ func main() {
 	// default bind is loopback; a non-loopback bind with no auth logs a warning.
 	rpcUser := flag.String("rpcuser", "", "RPC Basic auth username (requires -rpcpassword)")
 	rpcPass := flag.String("rpcpassword", "", "RPC Basic auth password (requires -rpcuser)")
-	network := flag.String("network", "mainnet", "Blocknet network to discover on: mainnet|testnet|staging (ignored if -node is set)")
+	network := flag.String("network", "mainnet", "Blocknet network to discover on and select the P2P magic from: mainnet|testnet|staging (-magic overrides the magic)")
 	nodeAddr := flag.String("node", "", "explicit Blocknet service-node P2P address (host:port); empty enables network discovery")
 	addNode := flag.String("addnode", "", "comma-separated explicit peer addresses (host:port) to add to discovered peers")
 	confPath := flag.String("conf", defaultConfPath(), "path to xbridge.conf (read-only; never created)")

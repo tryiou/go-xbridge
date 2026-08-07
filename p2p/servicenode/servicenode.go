@@ -402,7 +402,7 @@ func NewRegistry() *Registry {
 // carries no config on the wire (servicenode.h:354-367), so version/services
 // reset to 0/empty and the node fails the Pick gate. isValid requires the SPV
 // tier (servicenode.h:409-410) and a fully valid pubkey (:405-406);
-// collateral/sig/block checks need a full chain index (see docs/AUDIT.md). A
+// collateral/sig/block checks need a full chain index (see docs/audit.md). A
 // fresh snode's pingtime is 0 (not serialized, servicenode.h:354-367), so the
 // node is not running() until its next ping.
 func (r *Registry) AddRegistration(sn ServiceNode) {
