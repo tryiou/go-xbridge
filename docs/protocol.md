@@ -55,6 +55,12 @@ varint(28 + packetLen)        // Bitcoin CompactSize length of the rest
 [  packet  ] the XBridgePacket (129-byte header + body, section 2)
 ```
 
+The destination field is how the hub is addressed: go-xbridge sends the order
+make (`xbcTransaction`), the taker's accept (`xbcTransactionAccepting`) and every
+handshake reply addressed to the order's hub servicenode, so the C++ hub can
+route the trade. `20 zero bytes == broadcast` is used only where a true broadcast
+is intended.
+
 `varint` is a Bitcoin CompactSize integer. On send, `p2p/conn.go` builds this
 envelope via `encodeXBridgePayload`; on receive, `DecodeXBridgePayload` strips
 the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
@@ -220,7 +226,7 @@ handshake. clients A and B are the two traders):
 
 ```
 A (maker)                       hub                     B (taker)
-xbcTransaction --------------------->  (order broadcast via xbcPendingTransaction)
+xbcTransaction --------------------->  (hub relays + broadcasts xbcPendingTransaction)
                                  xbcPendingTransaction ---->
 xbcTransactionAccepting <--------- (B accepts) ----------------- xbcTransaction
 xbcTransactionHold <-----------> xbcTransactionHoldApply
@@ -231,6 +237,30 @@ xbcTransactionConfirmA ----> xbcTransactionConfirmedA
                               xbcTransactionConfirmB <---- xbcTransactionConfirmedB
 xbcTransactionFinished
 ```
+
+Addressing and trust model (client side):
+
+- Every outbound packet (make `xbcTransaction`, accept
+  `xbcTransactionAccepting`, and each handshake reply) is envelope-addressed to
+  the order's hub — the 20-byte `destination` (§1.2). Clients pick the hub at
+  `MakeOrder` (`findNodeWithService`) and record it as `Order.SNodePubkey` +
+  `Order.HubAddress`; a taker adopts the hub from the order it takes.
+- Clients bind handlers for **only** `xbcPendingTransaction` and the hub-driven
+  handshake commands; an inbound `xbcTransaction` (cmd-3, server-side command)
+  has no client handler and is ignored (C++ `xbridgesession.cpp:184-198`).
+- Inbound handshake packets are re-verified against the order's trusted hub key
+  (C++ `packet->verify(xtx->sPubKey)`, `xbridgesession.cpp:1364`) plus the
+  registry `getSn` check (`:1384`), so a forged `Finished` can never disable the
+  refund watcher. `xbcPendingTransaction` (cmd-4) is authenticated by the packet
+  signature against its header pubkey (C++ `packet->verify(spubkey)`,
+  `:736`) — the 20-byte "hub" field is the broadcaster's per-session id
+  (`m_myid`, `xbridgesession.cpp:182-183`), a routing handle stored verbatim,
+  **not** `GetID` of the signing key — and a relayed copy never re-orders a
+  known order (`processPendingTransaction`, `xbridgesession.cpp:725,753-788`).
+  Orders for any currency pair are ingested so the client can watch them;
+  taking is gated on the order's `SNodePubkey` being a known, running
+  servicenode in the local registry (C++ `acceptXBridgeTransaction` getSn,
+  `xbridgeapp.cpp:2165-2197`).
 
 Timing constants (`xbridgetransaction.h:54-67`):
 

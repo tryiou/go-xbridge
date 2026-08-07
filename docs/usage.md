@@ -177,7 +177,8 @@ magics and default ports are in
 | `-addnode` | `""` | Comma-separated peer addresses added to the discovered set. |
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
-| `-rpcaddr` | `:41414` | JSON-RPC listen address for the `dx*` API. |
+| `-rpcbind` | `127.0.0.1:41414` | JSON-RPC listen address `host:port` for the `dx*` API. Defaults to **loopback only**; set explicitly to bind elsewhere. |
+| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth for RPC. Enforced only when **both** are set (no cookie fallback); a non-loopback `-rpcbind` without auth logs a warning. |
 | `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
 | `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
 | `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
@@ -187,11 +188,13 @@ magics and default ports are in
 ## Making a trade (walkthrough)
 
 The `dx*` names below are **JSON-RPC methods, not shell commands** — you call
-them over HTTP against `xbridged`'s `-rpcaddr` (default `:41414`), exactly like
-bitcoind's RPC. Params are **positional** (a JSON array). For example:
+them over HTTP against `xbridged`'s `-rpcbind` (default `127.0.0.1:41414`),
+exactly like bitcoind's RPC. Params are **positional** (a JSON array). For
+example:
 
 ```sh
-curl -s http://127.0.0.1:41414 \
+# With -rpcuser/-rpcpassword configured, pass HTTP Basic credentials:
+curl -s -u user:password http://127.0.0.1:41414 \
   -H 'content-type: application/json' \
   -d '{"method":"dxGetOrderBook","params":[1,"BTC","BLOCK"],"id":1}'
 ```
@@ -224,7 +227,11 @@ Steps (params shown positionally — wrap them in the `"params"` array as above)
     the HTLC deposit pubkey. No operator key is configured. The client driver
     (`api/swap.go`) runs the Maker ⇄ ServiceNode ⇄ Taker handshake: it
     builds/broadcasts the HTLC deposits and claims/refunds as the hub advances
-    the state.
+    the state. Every outbound packet is envelope-addressed to the trade's hub
+    (chosen at `dxMakeOrder`; `dxTakeOrder` adopts the order's hub), and every
+    inbound handshake packet is re-verified against that hub's pinned key — a
+    forged packet can never disable the auto-refund watcher. An order with no
+    trusted hub cannot be taken (`NO_SERVICE_NODE`).
  5. **Cancel** an open order: `dxCancelOrder <order_id>`.
 
 Full field/param contracts for every `dx*` command (positional params, response

@@ -47,6 +47,19 @@
    driver (`api/swap.go`) runs the full Maker ⇄ ServiceNode ⇄ Taker handshake
    against in-memory connectors; remaining: live-hub verification over `p2p` and
    non-UTXO adapters (DCR/PART).
+6. ✅ **Security hardening (F1/F2/F10, 2026).** RPC binds to loopback by default
+   (`-rpcbind`, mirroring blocknetd's `httpserver.cpp:308` loopback default) with
+   optional HTTP Basic auth enforced when `-rpcuser` + `-rpcpassword` are both
+   configured (constant-time compare, no cookie fallback); RPC request bodies are
+   capped at 4 MiB (`http.MaxBytesReader`). Swap-handshake inbound packets
+   (Hold/Init/CreateA/B/ConfirmA/B/Finished) are re-verified against the trusted
+   hub key pinned at session creation — the servicenode chosen by `MakeOrder` for
+   the maker, `Order.SNodePubkey` for the taker — plus its registry membership
+   (C++ `packet->verify(xtx->sPubKey)` (`xbridgesession.cpp:1364`) + `getSn`
+   (`:1384`)); an order with no self-consistent hub anchor is refused
+   (`NO_SERVICE_NODE`) and cmd-3 broadcasts are ignored (client binds no handler),
+   so a forged `Finished` can never disable the auto-refund watcher. See
+   [`AUDIT.md`](AUDIT.md) F1/F2/F10/S2-E.
 
 ## Open items
 

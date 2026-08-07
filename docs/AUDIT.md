@@ -129,11 +129,40 @@ coins (BTC/LTC, flag off) unaffected.
   `csFinished`, **disabling the auto-refund safety-net** (`api/swap.go:473`).
   Cancel/reject are correctly re-verified against trusted keys
   (`api/node.go:1172-1206`).
+  **FIXED (2026):** `dispatchSwap` re-verifies every handshake packet against a
+  trusted hub key (C++ `packet->verify(xtx->sPubKey)`, `xbridgesession.cpp:1364`)
+  and its registry membership (C++ `getSn`, `:1384`). The trusted key is pinned at
+  session creation for **both** roles — the maker pins the servicenode chosen by
+  `findNodeWithService` at `MakeOrder` (C++ `xbridgeapp.cpp:1511,1734`), the taker
+  pins the order's `SNodePubkey` — never learned from network packets, so there is
+  **no TOFU**. An order whose hub is not a known, running servicenode is refused
+  (`NO_SERVICE_NODE`, C++ `acceptXBridgeTransaction`, `xbridgeapp.cpp:2168-2192`),
+  a fed cmd-3 is dropped (clients bind no handler for it), and
+  `xbcPendingTransaction` (cmd-4) is authenticated by its signature against the
+  header pubkey (C++ `packet->verify(spubkey)`, `xbridgesession.cpp:736`) and
+  never re-creates a known order (C++ `processPendingTransaction`,
+  `xbridgesession.cpp:725,753-788`); the 20-byte cmd-4 "hub" field is the
+  broadcaster's per-session id (`m_myid`, `:182-183`) stored verbatim as a
+  routing handle, not `GetID` of the signing key. A forged `Finished` is dropped
+  before it reaches `OnFinished`, so `csFinished` cannot be set by a non-hub
+  peer. The pinned key persists across restarts (`api/persist.go`).
+  **Residual:** `hubRegistered` is strict (C++ `getSn` null): with an empty
+  registry — explicit `-node` mode with no `SNPING` seen — no key is a known
+  running servicenode, so takes and handshake dispatches are refused until the
+  hub's `SNPING` lands; `dxMakeOrder` similarly fails `NO_SERVICE_NODE` with a
+  warning (C++ `findNodeWithService`, `xbridgeapp.cpp:1511-1515`) until an
+  eligible hub is seen. Each swap reaches a trusted hub by delivery; only a hub
+  key matching the original is ever advanced. The hub gate is enforced on real
+  makes/takes; Go's `dxMakeOrder`/`dxTakeOrder` dry-run previews (a Go-only
+  extension, C++ has none — they render values and broadcast nothing) skip the
+  gate.
 - **S2-F. Data race on live `SwapSession` fields.** Handlers mutate `state`,
   `ourDepositTxID`, `refundHex`, etc. on the feed goroutine **without** `sessMu`
   (`api/swap.go:545-636`, lock released at `api/node.go:664-666`) while the
   refund-watcher (`api/swap.go:469-494`) and persist read under it. Untested by
-  `-race` (watcher never runs in tests).
+  `-race` (watcher never runs in tests). `ingestPending` (`api/node.go:627`)
+  mutates `ex.Updated` on the same goroutine via `Store.Get` — same accepted
+  pattern.
 - **S2-G. Data race on the package-global `coins.Coins` map on hot-reload.**
   `coins.InitFromConf` reassigns the map (`coins/coin.go:62-72`) without
   synchronization, invoked by `dxLoadXBridgeConf → reloadConf` (`api/node.go:280`)
@@ -351,15 +380,15 @@ the `dx*` matrix above point at the same section.
 
 | # | Finding | Severity |
 |---|---|---|
-| F1 | **Unauthenticated, network-exposed RPC.** `cmd/xbridged/main.go:67` defaults `-rpcaddr` to `:41414` (all interfaces); `api/server.go:47-97` has no auth. Any host can call `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` and drive connected wallets. Upstream blocknetd is auth-gated. | S1-security |
-| F2 | Swap-handshake packets verified only against self-asserted pubkey, not a trusted hub key → forged `CreateA/B` deposits and forged `Finished` disables the auto-refund watcher (S2-E). | S2 |
+| F1 | **Unauthenticated, network-exposed RPC.** `cmd/xbridged/main.go:67` defaulted `-rpcaddr` to `:41414` (all interfaces) with no auth. Any host could call `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` and drive connected wallets. **FIXED (2026):** bind defaults to loopback `127.0.0.1:41414` (override with `-rpcbind`); HTTP Basic auth is enforced when `-rpcuser` + `-rpcpassword` are both set (constant-time compare, `401` + `WWW-Authenticate`), no cookie fallback; non-loopback bind without auth logs a warning. | S1-security |
+| F2 | Swap-handshake packets verified only against self-asserted pubkey, not a trusted hub key → forged `CreateA/B` deposits and forged `Finished` disables the auto-refund watcher (S2-E). **FIXED (2026):** see S2-E — every handshake packet is re-verified against the session's hub key pinned at creation (maker: the hub chosen at `MakeOrder`; taker: the order's `SNodePubkey`) plus its registry membership. | S2 |
 | F3 | Data race on `SwapSession` fields (S2-F). | S2 |
 | F4 | Data race on global `coins.Coins` map on hot-reload (S2-G). | S2 |
 | F5/F9 | `sessions` / `Store.fills` / `Store.history` grow without bound (memory + persisted JSON). | S3 |
 | F6 | `sessMu` held across wallet RPC I/O in `checkRefunds` (stalls packet dispatch up to 30 s). | S3 |
 | F7 | Inbound order UTXO ownership proofs are never verified before the order is put on the book. | S3 |
 | F8 | Segwit/BIP143 signing is dead code w.r.t. the daemon; bech32 destinations re-encoded as legacy P2PKH. | S3 |
-| F10 | HTTP RPC has no request-body size limit. | S3 |
+| F10 | HTTP RPC has no request-body size limit. **FIXED (2026):** `ServeHTTP` reads through `http.MaxBytesReader` (4 MiB cap) → `413`. | S3 |
 | F11–F14 | Vestigial `Server.verify`, unused `coins.MustGet`, tested-but-unreferenced `swap` package, `LocalConnector.SignMessage`/`VerifyMessage` unsupported (test-only). | S4 |
 
 **Attacker model:** inbound signature verification *is* enforced before state
@@ -394,14 +423,22 @@ watcher/reload paths are untested).
 | Swap state machine (machine/scripts) | 8 / 10 |
 | Swap deposit/execution path | 9 / 10 (S1-A…D fixed) |
 | Config / coins / crypto / wallet | 7 / 10 |
-| Code quality & security (production-readiness) | 6 / 10 |
+| Code quality & security (production-readiness) | 7 / 10 (F1/F2/F10 fixed) |
 | Docs & prior-audit accuracy | 5 / 10 |
 | **Readiness to trade live vs C++ network** | **5 / 10** |
 
 ## Priority remediation order
 
-1. **F1/F2** bind RPC to loopback + auth; authenticate hub-originated swap
-   packets; never let a forged `Finished` disable the refund watcher.
+1. **DONE — F1/F2/F10**: RPC bound to loopback by default with optional HTTP
+   Basic auth (`-rpcbind` / `-rpcuser` / `-rpcpassword`); hub-originated swap
+   packets re-verified against the trusted hub key pinned at session creation
+   (`MakeOrder`-chosen for the maker, `Order.SNodePubkey` for the taker) plus its
+   registry membership, so a forged `Finished` can never disable the refund
+   watcher; RPC body size capped. Residual S2-E risk: `hubRegistered` is strict
+   (C++ `getSn` null) — in explicit `-node` mode (empty servicenode registry) no
+   key is a known running servicenode, so takes and handshake dispatches are
+   refused until the hub's `SNPING` lands; an unregistered peer can never take
+   over a session.
 2. **F3/F4** session-lock scope + coin-registry `sync.RWMutex`/atomic pointer;
    add tests that run the watcher and hot-reload paths.
 3. **S2-A/B/C** order-book detail-4 nesting, partial-chain not-found,
