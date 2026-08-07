@@ -1,32 +1,29 @@
 // Package servicenode ports the Blocknet C++ servicenode P2P message handling
-// used by a thin XBridge client to learn the network's token set.
-//
-// Reference (blocknet_core):
-//   - src/servicenode/servicenode.h  ServiceNode::SerializationOp (355-367),
-//     ServiceNodePing::SerializationOp (683-694), ServiceNode::parseConfig
-//     (485-561), ServiceNode::running() (244).
-//   - src/xbridge/xbridgeapp.cpp       App::walletServices() (2758).
-//   - src/protocol.cpp                 command names snr/snp/snl/snlp (45-49).
-//
-// A stock XBridge wallet does NOT send SNLIST (only XRouter does,
-// src/xrouter/xrouterpeermgr.cpp:536). It learns the servicenode set from
+// used by a thin XBridge client to learn the network's token set. A stock
+// XBridge wallet does not send SNLIST (only XRouter does,
+// src/xrouter/xrouterpeermgr.cpp:536); it learns the servicenode set from
 // relayed SNPING / SNREGISTER / SNLISTPING messages
-// (src/net_processing.cpp:2976-2981 relays SNPING to all peers). This package
-// parses exactly those incoming messages and derives the network token union via
-// the same logic as walletServices(): keep only SPV-tier xbridge tokens matching
-// ^[^:]+$, exclude the xr/xrs XRouter services, and only include servicenodes
-// whose last ping is < 5 minutes old (running()).
+// (src/net_processing.cpp:2976-2981). This package parses exactly those and
+// derives the network token union the way walletServices() does (xbridgeapp.cpp:
+// 2758): SPV-tier xbridge tokens only, matching ^[^:]+$, excluding xr/xrs, from
+// servicenodes pinged < 5 minutes ago (running(), servicenode.h:244).
 package servicenode
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"math/rand"
 	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
+	"go-xbridge/crypto"
 	xlog "go-xbridge/log"
 	"go-xbridge/p2p"
+	"go-xbridge/proto"
 )
 
 // walletServicesLog gates the per-poll "WalletServices" metric to at most once
@@ -52,14 +49,20 @@ var walletTokenRe = regexp.MustCompile(`^[^:]+$`)
 var xrExclude = map[string]bool{"xr": true, "xrs": true}
 
 // ServiceNode is the parsed servicenode record. Only the fields needed to derive
-// the network token set are retained. For pings, PingTime is the peer-reported
-// ping timestamp (seconds); 0 means unset (registry falls back to ingest time).
+// the network token set are retained. For pings, PingTime is the raw
+// peer-reported ping timestamp (seconds); the registry clamps it like C++
+// updatePing (servicenode.h:254-260) before gating running().
 type ServiceNode struct {
 	PubKey   [33]byte
 	Tier     uint8
 	Config   string // raw JSON config (carries the xbridge token array)
 	Services []string
 	PingTime uint32
+
+	// XBridgeVersion is the SN's advertised xbridgeversion from its config
+	// (servicenode.h:542-546). Hub selection gates on it matching
+	// XBRIDGE_PROTOCOL_VERSION (xbridgeapp.cpp:2910).
+	XBridgeVersion uint32
 }
 
 const (
@@ -217,7 +220,8 @@ func ParseServiceNodePing(b []byte) (ServiceNode, error) {
 	r := &reader{b: b}
 	sn := ServiceNode{}
 	var err error
-	if _, err = r.readCPubKey(); err != nil { // 1. ping snodePubKey
+	var outerPubkey [33]byte
+	if outerPubkey, err = r.readCPubKey(); err != nil { // 1. ping snodePubKey
 		return sn, err
 	}
 	if _, err = r.readUint32(); err != nil { // 2. bestBlock (uint32 in ping)
@@ -240,13 +244,31 @@ func ParseServiceNodePing(b []byte) (ServiceNode, error) {
 	if err != nil {
 		return sn, err
 	}
+	// isValid (servicenode.h:791): the outer pubkey must be fully valid and
+	// match the embedded snode pubkey.
+	if !validCPubKey(outerPubkey) || outerPubkey != inner.PubKey {
+		return sn, errPubkeyMismatch
+	}
 	sn.PubKey = inner.PubKey
 	sn.Tier = inner.Tier
 	sn.Config = config
-	sn.Services = parseConfig(config, sn.Tier)
+	sn.Services, sn.XBridgeVersion = parseConfig(config, sn.Tier)
 	sn.PingTime = pingTime
-	if _, err = r.readVarBytes(); err != nil { // 7. signature (empty for SNPING)
+	sigStart := r.pos
+	signature, err := r.readVarBytes() // 7. ping signature
+	if err != nil {
 		return sn, err
+	}
+	// isValid (servicenode.h:810-815): recover the signer from the compact
+	// signature over sigHash() (servicenode.h:748-752) and require it to match
+	// the outer pubkey. b[:sigStart] is exactly the serialized sigHash fields.
+	// RecoverCompact serializes per the header's compression bit
+	// (pubkey.cpp:199-205): an uncompressed header yields a 65-byte key that
+	// never equals the 33-byte compressed snodePubKey, so it is rejected here.
+	hash := crypto.DoubleSHA256(b[:sigStart])
+	pub, err := crypto.RecoverCompact(signature, hash[:])
+	if err != nil || !bytes.Equal(pub, outerPubkey[:]) {
+		return sn, errBadSignature
 	}
 	// NOTE: the per-copy "SNPING parsed" log was removed — a single
 	// ping is relayed by every peer, so the parser fired once per copy.
@@ -286,127 +308,224 @@ func parseInnerServiceNode(r *reader) (ServiceNode, error) {
 }
 
 // parseConfig mirrors ServiceNode::parseConfig (servicenode.h:485-561): require
-// valid JSON, numeric xbridgeversion + xrouterversion, and (only for SPV tier)
-// collect the xbridge array. Non-SPV tiers yield no wallet services — matching
-// C++ ("xbridge only supports SPV nodes").
-func parseConfig(config string, tier uint8) []string {
+// valid JSON, strict numeric xbridgeversion + xrouterversion (both via
+// get_int(), so float/exponent/out-of-int32 forms abort the parse exactly like
+// C++). A bad xrouterversion aborts after xbridgeversion was assigned, so the
+// parsed version is retained with no services (servicenode.h:546,550-551) —
+// such an entry passes the version gate but fails the services gate. Only SPV
+// tiers collect the xbridge array.
+func parseConfig(config string, tier uint8) ([]string, uint32) {
 	if config == "" {
-		return nil
+		return nil, 0
 	}
 	var uv map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(config), &uv); err != nil {
 		xlog.Warn("servicenode: config JSON invalid", "err", err)
-		return nil
+		return nil, 0
 	}
-	if !hasNumeric(uv, "xbridgeversion") || !hasNumeric(uv, "xrouterversion") {
+	ver, ok := numericUint32(uv, "xbridgeversion")
+	if !ok {
 		xlog.Warn("servicenode: config missing numeric xbridgeversion/xrouterversion")
-		return nil
+		return nil, 0
+	}
+	if _, ok := numericUint32(uv, "xrouterversion"); !ok {
+		xlog.Warn("servicenode: config missing numeric xbridgeversion/xrouterversion")
+		// C++ returns false here AFTER assigning xbridgeversion (servicenode.h:
+		// 546, 550-551), so the parsed version is retained with no services.
+		return nil, ver
 	}
 	if tier != TierSPV {
 		xlog.Debug("servicenode: non-SPV tier ignored for wallet services", "tier", tier)
-		return nil
+		return nil, ver
 	}
 	raw, ok := uv["xbridge"]
 	if !ok {
-		return nil
+		return nil, ver
 	}
 	var arr []string
 	if err := json.Unmarshal(raw, &arr); err != nil {
 		xlog.Warn("servicenode: xbridge config array invalid", "err", err)
-		return nil
+		return nil, ver
 	}
-	return arr
+	return arr, ver
 }
 
-func hasNumeric(uv map[string]json.RawMessage, key string) bool {
+// numericUint32 mirrors UniValue::get_int() (univalue_get.cpp:104-112): a bare
+// int32 token only; floats/exponents/overflow and quoted strings throw, so
+// parseConfig keeps version 0 (servicenode.h:614-615).
+func numericUint32(uv map[string]json.RawMessage, key string) (uint32, bool) {
 	raw, ok := uv[key]
 	if !ok {
-		return false
+		return 0, false
+	}
+	t := bytes.TrimSpace(raw)
+	if len(t) > 0 && t[0] == '"' {
+		return 0, false // C++ get_int(): VNUM only, a quoted string throws
 	}
 	var n json.Number
 	if err := json.Unmarshal(raw, &n); err != nil {
-		return false
+		return 0, false
 	}
-	_, err := n.Float64()
-	return err == nil
+	i, err := strconv.ParseInt(string(n), 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(i), true
 }
 
 // entry is the registry record for one servicenode.
 type entry struct {
-	services []string
-	seen     time.Time
-	pingTime uint32 // last pingTime seen, so relayed copies of one ping log once
+	services       []string
+	xbridgeVersion uint32
+	pingTime       uint32 // last ping time, clamped like C++ updatePing (servicenode.h:254-260); 0 = never pinged
 }
 
 // Registry is the in-memory servicenode store. It is safe for concurrent use.
 type Registry struct {
 	mu    sync.RWMutex
 	nodes map[[33]byte]*entry
-	now   func() time.Time // overridable in tests
+	pings map[[33]byte]uint32 // last RAW reported pingTime, addPing gate (servicenodemgr.h:843-852)
+	now   func() time.Time    // overridable in tests
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		nodes: make(map[[33]byte]*entry),
+		pings: make(map[[33]byte]uint32),
 		now:   time.Now,
 	}
 }
 
-// AddRegistration records a servicenode learned via SNREGISTER.
+// AddRegistration records a servicenode learned via SNREGISTER. C++ addSn
+// replaces the entry wholesale (servicenodemgr.h:861-871); a registration
+// carries no config on the wire (servicenode.h:354-367), so version/services
+// reset to 0/empty and the node fails the Pick gate. isValid requires the SPV
+// tier (servicenode.h:409-410) and a fully valid pubkey (:405-406);
+// collateral/sig/block checks need a full chain index (see docs/AUDIT.md). A
+// fresh snode's pingtime is 0 (not serialized, servicenode.h:354-367), so the
+// node is not running() until its next ping.
 func (r *Registry) AddRegistration(sn ServiceNode) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if sn.Tier != TierSPV || !validCPubKey(sn.PubKey) {
+		return
+	}
 	k := sn.PubKey
 	e, ok := r.nodes[k]
 	if !ok {
 		e = &entry{}
 		r.nodes[k] = e
 	}
-	if len(sn.Services) > 0 {
-		e.services = sn.Services
-	}
+	e.services = sn.Services
+	e.xbridgeVersion = sn.XBridgeVersion
+	e.pingTime = 0
 	xlog.Debug("servicenode: registration stored", "pubkey", hex33(k), "services", len(e.services), "seen", ok)
 }
 
-// AddPing records a servicenode ping (SNPING / SNLISTPING). Both the token set
-// (from parseConfig) and the ingest time (drives running()) are updated. C++
-// ServiceNode::running() (servicenode.h:244) treats a node as running when its
-// last ping is < 5 minutes ago; we stamp local ingest time and gate on that.
+// AddPing records a servicenode ping (SNPING / SNLISTPING). C++ processPing
+// (servicenodemgr.h:177-194): only SPV-tier pings with a non-empty service list
+// pass isValid (servicenode.h:787,794-795) and reach addPing's strict-newer
+// gate (:843-852) then addSn's wholesale replace (:861-871, at :192) via
+// setConfig (servicenode.h:277-281). A ping failing isValid never creates a
+// node — C++ never knows it (:186-187). The stored pingtime is clamped like
+// updatePing (servicenode.h:254-260) and drives running() (:244-247).
 func (r *Registry) AddPing(sn ServiceNode) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := sn.PubKey
-	e, ok := r.nodes[k]
-	if !ok {
-		e = &entry{}
-		r.nodes[k] = e
+	if sn.Tier == TierSPV && len(sn.Services) > 0 && validCPubKey(sn.PubKey) {
+		// addPing gate compares the RAW reported pingTime against the last one
+		// for this pubkey (servicenodemgr.h:843-852); equal is rejected.
+		last, known := r.pings[k]
+		if !known || sn.PingTime > last {
+			r.pings[k] = sn.PingTime
+			e, ok := r.nodes[k]
+			if !ok {
+				e = &entry{}
+				r.nodes[k] = e
+			}
+			e.services = sn.Services
+			e.xbridgeVersion = sn.XBridgeVersion
+			e.pingTime = clampPingTime(sn.PingTime, r.now().Unix())
+			xlog.Debug("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
+		}
 	}
-	if len(sn.Services) > 0 {
-		e.services = sn.Services
+}
+
+// clampPingTime mirrors ServiceNode::updatePing (servicenode.h:254-260): a 0 or
+// future reported time falls back to the current time, else the reported time.
+func clampPingTime(reported uint32, now int64) uint32 {
+	if reported == 0 || int64(reported) > now {
+		return uint32(now)
 	}
-	// A single ping is relayed by every peer we hold; only log when it is
-	// a genuinely new node or a newer ping than the one we last stored, so
-	// one logical ping produces one line instead of one per relayed copy.
-	if !ok || sn.PingTime > e.pingTime {
-		e.pingTime = sn.PingTime
-		e.seen = r.now()
-		xlog.Debug("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
-	} else {
-		e.seen = r.now()
-	}
+	return reported
 }
 
 const runningWindow = 5 * time.Minute
 
 // running reports whether the servicenode was pinged within the 5-minute window
-// (mirrors ServiceNode::running(), servicenode.h:244).
+// (mirrors ServiceNode::running(), servicenode.h:244-247). The subtraction is
+// signed like C++ GetAdjustedTime() - pingtime, so a pingtime in the future
+// (clock skew) still counts as running.
 func (r *Registry) running(e *entry) bool {
 	if e == nil {
 		return false
 	}
-	age := r.now().Sub(e.seen)
-	return age < runningWindow
+	return r.now().Unix()-int64(e.pingTime) < int64(runningWindow/time.Second)
+}
+
+// Pick selects a hub servicenode for an order pair. It is the faithful port of
+// App::findNodeWithService → App::Impl::findShuffledNodesWithService
+// (xbridgeapp.cpp:2784-2793, 2901-2936): keep nodes whose advertised xbridge
+// version equals XBRIDGE_PROTOCOL_VERSION, that are running(), and whose service
+// list contains every requested currency; shuffle; return the first. An empty
+// result means no eligible hub (C++ sendXBridgeTransaction fails the order
+// with NO_SERVICE_NODE, xbridgeapp.cpp:1515). C++ also excludes a `notIn`
+// key set (:2910), omitted because Go's sole caller (api/node.go:921) passes
+// an empty set like sendXBridgeTransaction (:1507-1508); rebroadcast callers
+// (:3274, :3311) pass non-empty sets but are not ported here. The shuffle
+// uses Go's rand rather than C++'s seed-0 default_random_engine — the choice
+// has no wire effect.
+func (r *Registry) Pick(need []string) ([33]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var list [][33]byte
+	for k, e := range r.nodes {
+		if e.xbridgeVersion != proto.ProtocolVersion || !r.running(e) {
+			continue
+		}
+		// C++ searchCounter = requested_services.size() and a candidate is only
+		// pushed when --searchCounter == 0, so an empty request never pushes a
+		// node (xbridgeapp.cpp:2924-2930) and findNodeWithService returns false.
+		// containsAll would vacuously match, so reproduce the C++ no-push.
+		if len(need) == 0 || !containsAll(e.services, need) {
+			continue
+		}
+		list = append(list, k)
+	}
+	if len(list) == 0 {
+		return [33]byte{}, false
+	}
+	rand.Shuffle(len(list), func(i, j int) { list[i], list[j] = list[j], list[i] })
+	return list[0], true
+}
+
+// containsAll reports whether set contains every element of need.
+func containsAll(set, need []string) bool {
+	for _, want := range need {
+		found := false
+		for _, have := range set {
+			if have == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // WalletServices ports xbridgeapp.cpp:2758 App::walletServices(): for each
@@ -450,6 +569,27 @@ func (r *Registry) Count() int {
 	defer r.mu.RUnlock()
 	return len(r.nodes)
 }
+
+// Known reports whether a servicenode pubkey is present in the registry.
+func (r *Registry) Known(key [33]byte) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.nodes[key]
+	return ok
+}
+
+// validCPubKey mirrors CPubKey::IsFullyValid (servicenode.h:405,791): a 33-byte
+// compressed secp256k1 pubkey (prefix 02 or 03).
+func validCPubKey(pk [33]byte) bool {
+	return pk[0] == 0x02 || pk[0] == 0x03
+}
+
+var errPubkeyMismatch = errors.New("servicenode: ping outer pubkey invalid or not equal to embedded snode pubkey")
+
+var errBadSignature = errors.New("servicenode: ping signature does not match pubkey")
 
 type shortErr string
 

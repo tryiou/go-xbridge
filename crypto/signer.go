@@ -8,6 +8,7 @@ package crypto
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -155,4 +156,39 @@ func CompressedPubKey(priv []byte) ([33]byte, error) {
 	var p [33]byte
 	copy(p[:], key.PubKey().SerializeCompressed())
 	return p, nil
+}
+
+// DoubleSHA256 returns the Bitcoin double-SHA256 (SHA256d) of b. C++ service
+// node sigHashes are built with CHashWriter (servicenode.h:748-752), which is
+// SHA256d over the serialized fields.
+func DoubleSHA256(b []byte) [32]byte {
+	h := sha256.Sum256(b)
+	return sha256.Sum256(h[:])
+}
+
+// SignCompact returns the 65-byte recoverable compact ECDSA signature over
+// hash (header + r + s), matching C++ CKey::SignCompact. Service node pings
+// are signed this way (ServiceNodePing::sign, servicenode.h:769-771).
+func SignCompact(priv []byte, hash []byte) ([]byte, error) {
+	if len(priv) != 32 {
+		return nil, errors.New("crypto: private key must be 32 bytes")
+	}
+	key := secp256k1.PrivKeyFromBytes(priv)
+	return secp_ecdsa.SignCompact(key, hash, true), nil
+}
+
+// RecoverCompact recovers the pubkey that signed hash from a 65-byte compact
+// signature, serialized per the header's compression bit, matching C++
+// CPubKey::RecoverCompact (pubkey.cpp:199-205). An uncompressed header yields
+// a 65-byte key, which can never match the 33-byte compressed snodePubKey, so
+// such pings are rejected by the caller (servicenode.h:814).
+func RecoverCompact(sig, hash []byte) ([]byte, error) {
+	pub, wasCompressed, err := secp_ecdsa.RecoverCompact(sig, hash)
+	if err != nil {
+		return nil, err
+	}
+	if !wasCompressed {
+		return pub.SerializeUncompressed(), nil
+	}
+	return pub.SerializeCompressed(), nil
 }
