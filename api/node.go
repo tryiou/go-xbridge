@@ -642,8 +642,10 @@ func (n *Node) feed() {
 // (falls through to a fresh pending entry).
 func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
 	o := normalizeFromPendingBody(b, snode)
-	if ex := n.store.Get(hexEncode(o.ID[:])); ex != nil && ex.Status != "canceled" {
-		ex.Updated = NowMicro()
+	// A relayed copy of a known order only refreshes its timestamp (C++
+	// processPendingTransaction). Touch does the check-and-bump under the store
+	// lock, so a concurrent handler never reads a torn record.
+	if n.store.Touch(hexEncode(o.ID[:])) {
 		return
 	}
 	n.store.Add(o)
@@ -1401,6 +1403,8 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	o.MakerKey = hexEncode(tPub[:])
 	o.OrigFromCurrency = o.FromCurrency
 	o.OrigToCurrency = o.ToCurrency
+	// Publish the take's mutations to the book under the store lock.
+	n.store.Update(key, func(stored *Order) { *stored = *o })
 	// Begin driving the client-side deposit handshake for this taken order.
 	n.newTakerSession(o, p, tPrivArr, tPub)
 	// Persist the new local swap (incl. its per-trade M keypair) to disk.
@@ -1432,6 +1436,8 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	}
 	o.Status = "canceled"
 	o.Updated = NowMicro()
+	// Publish the cancel to the book under the store lock.
+	n.store.Update(p.ID, func(stored *Order) { *stored = *o })
 	// C++ dxFlushCancelledOrders renders the flushed "id" as it.id.GetHex()
 	// (rpcxbridge.cpp:1483), i.e. display order, so record the display id.
 	n.store.RecordCancelled(orderIDString(o.ID), o.Created)
@@ -1580,7 +1586,7 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	// If local order is still open/pending and WE didn't initiate the cancel,
 	// mark stale so it rebroadcasts on another servicenode (C++ :3379-3383).
 	if o.Mine && stateOrdinal(o.Status) <= 2 && !iCanceled {
-		n.markStale(o)
+		n.store.Update(idHex, n.markStale)
 		xlog.Info("cancel: cancel received, rebroadcasting order on another service node", "order", idHex)
 		return
 	} else if stateOrdinal(o.Status) < 6 { // no deposits yet (C++ :3384-3388)
@@ -1591,9 +1597,11 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		xlog.Info("cancel: already canceled", "order", idHex)
 		return
 	} else if !o.DepositSent { // cancel if deposit not sent (C++ :3392-3394)
-		o.Status = "canceled"
-		o.Reason = b.Reason
-		o.Updated = NowMicro()
+		n.store.Update(idHex, func(o *Order) {
+			o.Status = "canceled"
+			o.Reason = b.Reason
+			o.Updated = NowMicro()
+		})
 		xlog.Info("cancel: counterparty cancel request", "order", idHex)
 		n.persist()
 		return
@@ -1604,9 +1612,11 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 
 	// If no refund tx is defined, we cannot roll back (C++ :3400-3404).
 	if o.RefundTx == "" {
-		o.Status = "canceled"
-		o.Reason = b.Reason
-		o.Updated = NowMicro()
+		n.store.Update(idHex, func(o *Order) {
+			o.Status = "canceled"
+			o.Reason = b.Reason
+			o.Updated = NowMicro()
+		})
 		xlog.Info("cancel: could not find a refund transaction for order", "order", idHex)
 		n.persist()
 		return
@@ -1614,9 +1624,11 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 
 	// Rollback path (C++ :3406-3428).
 	n.store.RemovePendingPackets(idHex)
-	o.Status = "rolled back"
-	o.Reason = b.Reason
-	o.Updated = NowMicro()
+	n.store.Update(idHex, func(o *Order) {
+		o.Status = "rolled back"
+		o.Reason = b.Reason
+		o.Updated = NowMicro()
+	})
 	if o.RefundTx != "" {
 		if _, rerr := n.BroadcastRefund(idHex); rerr != nil {
 			xlog.Warn("cancel: rollback refund broadcast failed", "order", idHex, "err", rerr)
@@ -1647,15 +1659,20 @@ func (n *Node) onRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
 	if ok, _ := n.signer.VerifyAgainst(pkt, o.SNodePubkey); !ok {
 		return
 	}
-
-	o.Reason = b.Reason
+	n.store.Update(idHex, func(o *Order) {
+		o.Reason = b.Reason
+	})
 	xlog.Info("reject: order rejected by servicenode", "order", idHex)
 
-	// Restore state on rejection (C++ :3463-3482).
-	o.Status = "open" // trPending
+	// Restore state on rejection (C++ :3463-3482). All field rewrites happen
+	// under the store lock so a concurrent render never sees a torn order.
+	n.store.Update(idHex, func(o *Order) {
+		o.Reason = b.Reason
+		o.Status = "open" // trPending
+		o.clearUsedCoins()
+	})
 	n.onUnlockCoins(o)
 	n.onUnlockFeeUtxos(o)
-	o.clearUsedCoins()
 	n.store.RemovePendingPackets(idHex)
 	xlog.Info("reject: order restored to pending", "order", idHex)
 	n.persist()

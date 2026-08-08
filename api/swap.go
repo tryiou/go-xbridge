@@ -242,9 +242,9 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	s.theirPub = b.BPubKey
 	xlog.Info("CreateA: building deposit A", "order", hexEncode(s.id[:]), "counterparty", hexEncode(b.BPubKey[:]))
 	// Record the counterparty (taker) M pubkey on the order (C++ oPubKey).
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.OtherPubkey = hexEncode(b.BPubKey[:])
-	}
+	})
 	txid, refundHex, err := s.buildDeposit(true)
 	if err != nil {
 		return 0, nil, err
@@ -272,11 +272,11 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	s.theirDepositTxID = b.ADepositTxID
 	// Record the counterparty (maker) deposit txid on the order so
 	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.OBinTxId = b.ADepositTxID
 		// Record the counterparty (maker) M pubkey on the order (C++ oPubKey).
 		o.OtherPubkey = hexEncode(b.APubKey[:])
-	}
+	})
 	s.theirSecretHash = b.HashedSecret
 	s.theirLockTime = b.ALockTime
 	// Validate the counterparty (maker) A-deposit lockTime BEFORE we broadcast
@@ -324,9 +324,9 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	}
 	// Record the counterparty (taker) deposit txid on the order so
 	// dxPartialOrderChainDetails can emit p2sh_deposits_counterparty.
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.OBinTxId = b.BDepositTxID
-	}
+	})
 
 	xlog.Info("ConfirmA: redeeming taker deposit", "order", hexEncode(s.id[:]), "takerDeposit", b.BDepositTxID)
 	payHex, cur, err := s.redeemCounterparty(true)
@@ -345,9 +345,9 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.CounterpartyRedeemed = true
-	}
+	})
 	s.n.persist()
 	return proto.XbcTransactionConfirmedA, &proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
@@ -399,9 +399,9 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	s.state = csConfirmedB
 	xlog.Info("ConfirmB: payTx broadcast", "order", hexEncode(s.id[:]), "payTxID", payTxID)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.CounterpartyRedeemed = true
-	}
+	})
 	s.n.persist()
 	return proto.XbcTransactionConfirmedB, &proto.ConfirmedBBody{
 		HubAddress: s.hub, ID: s.id, BPayTxID: payTxID,
@@ -410,10 +410,10 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 
 // OnFinished (hub→both): the swap is complete on the hub; record the fill.
 func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, responseBody, error) {
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.Status = "completed"
 		o.Updated = NowMicro()
-	}
+	})
 	s.state = csFinished
 	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
 	s.n.persist()
@@ -637,10 +637,10 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	s.ourLockTime = lockTime
 	// Record our own deposit txid on the order so dxPartialOrderChainDetails can
 	// emit p2sh_deposits. DepositSent proxies C++ didSendDeposit().
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.BinTxId = txid
 		o.DepositSent = true
-	}
+	})
 
 	refundHex, err = s.buildRefundTx(spec, cur)
 	if err != nil {
@@ -651,9 +651,9 @@ func (s *SwapSession) buildDeposit(isMaker bool) (txid, refundHex string, err er
 	// `refund_tx` for an order whose deposit has been broadcast (C++ returns the
 	// empty string for orders cancelled before any deposit — which is still the
 	// case here, since buildDeposit only runs once a swap reaches the deposit step).
-	if o := s.n.store.Get(hexEncode(s.id[:])); o != nil {
+	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
 		o.RefundTx = refundHex
-	}
+	})
 	return txid, refundHex, nil
 }
 

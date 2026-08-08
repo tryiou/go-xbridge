@@ -12,6 +12,12 @@ import (
 // (xbcPendingTransaction / xbcTransaction broadcasts) and by locally created
 // orders, and is the backing data for the dxGet* read methods. It is safe for
 // concurrent use.
+//
+// Ownership model: the book's live *Order records are mutated ONLY through the
+// store's own methods (Add/Update/Touch/Remove/...), each under s.mu. Read
+// methods (Get/List/Mine/Locked/LockedUtxoInfo) return snapshot copies, so no
+// *Order pointer ever escapes for out-of-lock mutation — a reader can never
+// observe a torn order or race the writer.
 type Store struct {
 	mu        sync.RWMutex
 	orders    map[string]*Order
@@ -63,28 +69,63 @@ func NewStore() *Store {
 
 func orderKey(id [32]byte) string { return hexEncode(id[:]) }
 
-// Add inserts or replaces an order by id.
+// Add inserts or replaces an order by id. The caller transfers ownership of o
+// (the store keeps it as the live record); it must not be mutated afterward.
 func (s *Store) Add(o *Order) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.orders[orderKey(o.ID)] = o
 }
 
-// Get returns the order with the given hex id, or nil.
+// Get returns a snapshot copy of the order with the given hex id, or nil.
 func (s *Store) Get(idHex string) *Order {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.orders[idHex]
+	o := s.orders[idHex]
+	if o == nil {
+		return nil
+	}
+	return o.Copy()
 }
 
-// List returns all orders (unfiltered). Callers apply filtering (e.g. skip
-// cancelled/finished/expired older than 1 minute, as dxGetOrders does).
+// Update applies fn to the live order for idHex under the store lock and
+// reports whether the order existed. This is the ONLY way to mutate an order's
+// fields: the callback runs while the book lock is held, so a concurrent
+// reader snapshot can never observe a torn update. fn must not retain the
+// pointer.
+func (s *Store) Update(idHex string, fn func(*Order)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.orders[idHex]; o != nil {
+		fn(o)
+		return true
+	}
+	return false
+}
+
+// Touch refreshes the Updated timestamp of a live, non-canceled order (a
+// relayed broadcast of a known order — C++ processPendingTransaction only bumps
+// the timestamp). It reports whether a live non-canceled record was bumped;
+// callers fall through to Add when false (unknown, or canceled → re-acceptable).
+func (s *Store) Touch(idHex string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ex := s.orders[idHex]; ex != nil && ex.Status != "canceled" {
+		ex.Updated = NowMicro()
+		return true
+	}
+	return false
+}
+
+// List returns snapshot copies of all orders (unfiltered). Callers apply
+// filtering (e.g. skip cancelled/finished/expired older than 1 minute, as
+// dxGetOrders does).
 func (s *Store) List() []*Order {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Order, 0, len(s.orders))
 	for _, o := range s.orders {
-		out = append(out, o)
+		out = append(out, o.Copy())
 	}
 	return out
 }
@@ -130,14 +171,14 @@ func (s *Store) History() []historyEntry {
 // nothing to drop. It exists to mirror the call site verbatim.
 func (s *Store) RemovePendingPackets(idHex string) {}
 
-// Mine returns orders created locally by this node.
+// Mine returns snapshot copies of orders created locally by this node.
 func (s *Store) Mine() []*Order {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Order, 0)
 	for _, o := range s.orders {
 		if o.Mine {
-			out = append(out, o)
+			out = append(out, o.Copy())
 		}
 	}
 	return out
@@ -170,13 +211,13 @@ func (s *Store) Lock(o *Order) {
 	s.locked[orderKey(o.ID)] = o
 }
 
-// Locked returns currently locked orders.
+// Locked returns snapshot copies of currently locked orders.
 func (s *Store) Locked() []*Order {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Order, 0, len(s.locked))
 	for _, o := range s.locked {
-		out = append(out, o)
+		out = append(out, o.Copy())
 	}
 	return out
 }

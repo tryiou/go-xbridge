@@ -352,12 +352,14 @@ func TestIngestPending(t *testing.T) {
 	} else if ex.SNodePubkey != hubPubHex || ex.HubAddress != hubAddr {
 		t.Fatalf("ingested order lost snode/hub fields: %+v", ex)
 	}
-	ex.Role = 'B'
-	ex.Status = "accepting"
+	n2.store.Update(hexEncode(ordID[:]), func(o *Order) {
+		o.Role = 'B'
+		o.Status = "accepting"
+	})
 	n2.ingestPending(newBody(), hubPubHex)
 	after := n2.store.Get(hexEncode(ordID[:]))
-	if after != ex {
-		t.Fatal("relayed copy replaced the known order")
+	if after == nil {
+		t.Fatal("known order was lost after re-ingest")
 	}
 	if after.Role != 'B' || after.Status != "accepting" {
 		t.Fatalf("relayed copy clobbered the taken order: %+v", after)
@@ -365,10 +367,12 @@ func TestIngestPending(t *testing.T) {
 
 	// 3. A canceled order may be re-accepted via rebroadcast (re-created as a
 	//    fresh pending entry).
-	ex.Status = "canceled"
+	n2.store.Update(hexEncode(ordID[:]), func(o *Order) {
+		o.Status = "canceled"
+	})
 	n2.ingestPending(newBody(), hubPubHex)
 	after = n2.store.Get(hexEncode(ordID[:]))
-	if after == ex {
+	if after == nil {
 		t.Fatal("canceled order was not re-created by the rebroadcast")
 	}
 	if after.Status != "open" {

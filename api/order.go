@@ -150,6 +150,16 @@ func normalizeFromPendingBody(b *proto.PendingTransactionBody, maker string) *Or
 	}
 }
 
+// Copy returns a deep snapshot copy of the order. The store hands out copies
+// so a caller rendering an order can never mutate the book's live record (or
+// race the writer that owns it); mutations go through Store.Update instead.
+func (o *Order) Copy() *Order {
+	c := *o
+	c.Utxos = make([]proto.UtxoEntry, len(o.Utxos))
+	copy(c.Utxos, o.Utxos)
+	return &c
+}
+
 // toOrderBase renders the fields common to all order responses.
 func (o *Order) toOrderBase() orderBase {
 	return orderBase{
