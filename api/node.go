@@ -140,8 +140,35 @@ type Node struct {
 	// persist() calls from the feed, MakeOrder/TakeOrder/CancelOrder, and the
 	// refundWatcher. The actual read of sessions inside saveSwaps takes sessMu.
 	persistMu sync.Mutex
-	// tickCount counts refundWatcher ticks so we persist every Nth tick.
+	// tickCount counts engine-ticker ticks so we persist every Nth tick.
 	tickCount int
+
+	// engineRunning is true once start() has launched the engine goroutine.
+	// Node.submit runs commands inline on the caller when it is false (tests,
+	// or a node that never started) — the single-threaded behaviour the test
+	// suite relies on.
+	engineRunning atomic.Bool
+
+	// Engine channels: packets carries reader→engine traffic, cmds carries
+	// handler→engine commands, tasks carries engine→worker wallet RPCs, and
+	// results carries worker→engine outcomes. Buffers: packets drop-on-full
+	// (a busy engine drops inbound broadcasts, like C++ under load), cmds
+	// backpressure (never drop — a lost make/take/cancel is worse than a slow
+	// handler), tasks drop-on-full (fund-safe: the refund guard is cleared so
+	// the next sweep retries), results == engineWorkers (a result send can
+	// never block once the engine is gone).
+	packets chan inboundPacket
+	cmds    chan engineCmd
+	tasks   chan workTask
+	results chan workResult
+
+	// wg tracks the engine, reader, workers, blockLoop, and statusLoop so Close
+	// can join them all before returning.
+	wg sync.WaitGroup
+
+	// pendingRefunds is the engine-owned guard against double-enqueueing a
+	// refund broadcast for an order whose sweep task is already in flight.
+	pendingRefunds map[string]bool
 
 	// blockMu guards the cached anti-replay blockHash stamped on outgoing
 	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
@@ -189,11 +216,9 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		if ps, err := loadSwaps(swapStatePath(cfg.DataDir)); err != nil {
 			xlog.Warn("could not load persisted swaps; starting fresh", "dir", cfg.DataDir, "err", err)
 		} else if len(ps) > 0 {
-			n.sessMu.Lock()
 			for _, p := range ps {
 				n.restoreSwap(p)
 			}
-			n.sessMu.Unlock()
 			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", cfg.DataDir)
 		}
 	}
@@ -242,23 +267,8 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 		n.conn = pm
 		xlog.Info("network discovery started", "network", network, "targetPeers", 8)
 	}
-	go n.feed()
-	go n.blockLoop()
-	go n.refundWatcher()
+	n.start()
 	return n, nil
-}
-
-// Close stops the feed and closes the connection.
-func (n *Node) Close() error {
-	select {
-	case <-n.stop:
-	default:
-		close(n.stop)
-	}
-	if n.conn != nil {
-		return n.conn.Close()
-	}
-	return nil
 }
 
 // cfg returns the live configuration under a read lock. All config reads must
@@ -492,6 +502,7 @@ func (n *Node) currentBlockHash() [32]byte {
 
 // blockLoop keeps the cached block hash fresh.
 func (n *Node) blockLoop() {
+	defer n.wg.Done()
 	n.refreshBlock()
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -505,125 +516,59 @@ func (n *Node) blockLoop() {
 	}
 }
 
-// refundWatcher is the fund-safety safety net: it periodically scans live swap
-// sessions and auto-broadcasts any pre-signed CLTV refund whose deposit lockTime
-// has passed, so a stalled swap never leaves the local deposit permanently locked
-// at the hub. Each refund is broadcast at most once (guarded by SwapSession.
-// refundDone); the emergency escape hatch is Node.BroadcastRefund.
-func (n *Node) refundWatcher() {
-	t := time.NewTicker(refundCheckInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-n.stop:
-			return
-		case <-t.C:
-			n.checkRefunds()
-			// Mirror C++ saveOrders cadence: flush local swap state to disk
-			// periodically so a crash loses at most a few minutes of progress.
-			n.tickCount++
-			if n.tickCount%4 == 0 {
-				n.persist()
-			}
-		}
+// handlePacket routes a decoded, signature-verified packet to its handler on
+// the engine goroutine. It is the engine-side half of the former feed(): the
+// reader loop does the socket read + decode/verify, and the engine applies the
+// body type-switch here (onRemoteCancel also needs the raw pkt for
+// VerifyAgainst).
+func (n *Node) handlePacket(in inboundPacket) {
+	body, err := proto.DecodeBody(in.pkt.Command, in.pkt.Body)
+	if err != nil {
+		// The reader already verified the body parses; a failure here means the
+		// packet was mutated between reader and engine. Drop defensively.
+		xlog.Warn("engine packet body decode skipped", "command", in.pkt.Command.String(), "err", err)
+		return
 	}
-}
+	switch b := body.(type) {
+	case *proto.PendingTransactionBody:
+		n.ingestPending(b, in.snode)
 
-// feed reads packets from the peer and stores orders.
-func (n *Node) feed() {
-	// Periodically emit an aggregated network-status snapshot so an operator
-	// can see peer/SN health and the live token set at a glance (the
-	// per-packet Debug stream is too noisy for that). Stops with the feed.
-	go func() {
-		tick := time.NewTicker(60 * time.Second)
-		defer tick.Stop()
-		for {
-			select {
-			case <-n.stop:
-				return
-			case <-tick.C:
-				n.logNetworkStatus()
-			}
-		}
-	}()
-	var lastReadErr error
-	for {
-		select {
-		case <-n.stop:
-			return
-		default:
-		}
-		pkt, peer, err := n.conn.ReadPacket()
-		if err != nil {
-			if !errors.Is(err, lastReadErr) {
-				xlog.Debug("peer read failed", "peer", peer, "err", err)
-				lastReadErr = err
-			}
-			select {
-			case <-n.stop:
-				return
-			case <-time.After(200 * time.Millisecond):
-				continue
-			}
-		}
-		lastReadErr = nil
-		body, err := proto.DecodeBody(pkt.Command, pkt.Body)
-		if err != nil {
-			xlog.Warn("packet body decode skipped", "command", pkt.Command.String(), "err", err)
-			continue
-		}
-		// All traders verify the snode's packet signature against the pubkey
-		// in the packet header (C++ xbridgesession.cpp:736, verbatim). A
-		// bad signature means the packet was not signed by the claiming
-		// servicenode, so it is dropped regardless of command.
-		if ok, _ := n.signer.Verify(pkt); !ok {
-			snode := hexEncode(pkt.Pubkey[:])
-			xlog.Warn("bad snode packet signature", "command", pkt.Command.String(), "snode", snode, "peer", peer)
-			continue
-		}
-		snode := hexEncode(pkt.Pubkey[:])
-		xlog.Debug("packet received", "command", pkt.Command.String(), "snode", snode, "peer", peer)
-		switch b := body.(type) {
-		case *proto.PendingTransactionBody:
-			n.ingestPending(b, snode)
-
-		// --- swap handshake (client side, hub-driven) ---
-		case *proto.HoldBody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnHold(b)
-			})
-		case *proto.InitBody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnInit(b)
-			})
-		case *proto.CreateABody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnCreateA(b)
-			})
-		case *proto.CreateBBody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnCreateB(b)
-			})
-		case *proto.ConfirmABody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnConfirmA(b)
-			})
-		case *proto.ConfirmBBody:
-			n.dispatchSwap(pkt, b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnConfirmB(b)
-			})
-		case *proto.FinishedBody:
-			n.dispatchSwap(pkt, b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-				return s.OnFinished(b)
-			})
-		case *proto.CancelBody:
-			// Remote cancel (C++ processTransactionCancel). No session/hub
-			// needed; handled directly against the store.
-			n.onRemoteCancel(pkt, b)
-		case *proto.RejectBody:
-			// Remote reject (C++ processTransactionReject).
-			n.onRemoteReject(pkt, b)
-		}
+	// --- swap handshake (client side, hub-driven) ---
+	case *proto.HoldBody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnHold(b)
+		})
+	case *proto.InitBody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnInit(b)
+		})
+	case *proto.CreateABody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnCreateA(b)
+		})
+	case *proto.CreateBBody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnCreateB(b)
+		})
+	case *proto.ConfirmABody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnConfirmA(b)
+		})
+	case *proto.ConfirmBBody:
+		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnConfirmB(b)
+		})
+	case *proto.FinishedBody:
+		n.dispatchSwap(in.pkt, b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnFinished(b)
+		})
+	case *proto.CancelBody:
+		// Remote cancel (C++ processTransactionCancel). No session/hub
+		// needed; handled directly against the store.
+		n.onRemoteCancel(in.pkt, b)
+	case *proto.RejectBody:
+		// Remote reject (C++ processTransactionReject).
+		n.onRemoteReject(in.pkt, b)
 	}
 }
 
