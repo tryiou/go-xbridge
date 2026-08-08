@@ -86,9 +86,7 @@ func TestPersistRoundTrip(t *testing.T) {
 
 	// restoreSwap must reconstruct the order with the same hub anchor.
 	n2 := newPersistNode(t, dir)
-	n2.sessMu.Lock()
 	n2.restoreSwap(got)
-	n2.sessMu.Unlock()
 	if ro := n2.store.Get(hexEncode(id[:])); ro == nil {
 		t.Fatal("restoreSwap did not re-add the order")
 	} else if ro.SNodePubkey != o.SNodePubkey || ro.HubAddress != o.HubAddress {
@@ -135,11 +133,9 @@ func TestCancelAfterRestart(t *testing.T) {
 	if len(ps) != 1 {
 		t.Fatalf("loaded %d swaps, want 1", len(ps))
 	}
-	n2.sessMu.Lock()
 	for _, p := range ps {
 		n2.restoreSwap(p)
 	}
-	n2.sessMu.Unlock()
 
 	// CancelOrder needs a conn to write the packet; capture it.
 	cc := &captureXConn{}

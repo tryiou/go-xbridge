@@ -173,9 +173,10 @@ func (n *Node) engineLoop() {
 			n.safeRun(func() { r.task.apply(r.value, r.err) })
 		case <-t.C:
 			n.tickCount++
-			// Fund-safety sweep (was refundWatcher): auto-broadcast any
-			// pre-signed refund whose deposit lockTime has passed.
-			n.safeRun(func() { n.checkRefunds() })
+			// Fund-safety sweep: auto-broadcast any pre-signed refund whose
+			// deposit lockTime has passed. Engine-owned: workers do the wallet
+			// I/O; the engine applies the results.
+			n.safeRun(func() { n.scanRefunds() })
 			// Mirror C++ saveOrders cadence: flush local swap state to disk
 			// periodically so a crash loses at most a few minutes of progress.
 			if n.tickCount%4 == 0 {

@@ -155,9 +155,7 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [
 	// against it; a forged Finished can never disable the refund watcher.
 	s.hub = o.HubAddress
 	s.hubKey = decodePub33(o.SNodePubkey)
-	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
-	n.sessMu.Unlock()
 	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "maker",
 		"srcCur", o.FromCurrency, "srcAmt", o.FromAmount, "dstCur", o.ToCurrency, "dstAmt", o.ToAmount)
 }
@@ -189,9 +187,7 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 	// dispatchSwap to drop all hub packets for it.
 	s.hubKey = decodePub33(o.SNodePubkey)
 	s.hub = o.HubAddress
-	n.sessMu.Lock()
 	n.sessions[hexEncode(o.ID[:])] = s
-	n.sessMu.Unlock()
 	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "taker",
 		"srcCur", o.ToCurrency, "srcAmt", o.ToAmount, "dstCur", o.FromCurrency, "dstAmt", o.FromAmount,
 		"hubKeyPinned", s.hubKey != [33]byte{})
@@ -420,94 +416,180 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 	return 0, nil, nil
 }
 
-// broadcastRefund sends this session's pre-signed CLTV refund to its source
-// chain, returning the refund txid. The refund spends the deposit back to our
-// source address and is only valid after the deposit's lockTime, so calling it
-// is always fund-safe: it can never claim the counterparty's funds or double-
-// spend a legitimately claimed deposit. Caller must not hold n.sessMu (this does
-// wallet I/O, not session-state access).
-func (n *Node) broadcastRefund(s *SwapSession) (string, error) {
-	cur := s.srcCur
+// runRefundTask executes a refund broadcast for cur/refundHex. When checkLock
+// is set it only broadcasts once the chain is at/above lockTime (the sweep
+// path); otherwise it broadcasts immediately (the cancel/rollback/escape-hatch
+// paths, matching C++ force-refund semantics). Returns ("", nil) when the
+// refund is not yet due — the sweep retries on the next tick. Runs on a worker
+// goroutine; self-contained (all inputs captured by value).
+func (n *Node) runRefundTask(cur, refundHex string, lockTime uint32, checkLock bool) (string, error) {
 	conn := n.cfg().Connectors[cur]
 	if conn == nil {
 		return "", fmt.Errorf("api: no connector for %s", cur)
 	}
-	if s.refundHex == "" {
-		return "", fmt.Errorf("api: no refund available for order %s", hexEncode(s.id[:]))
+	if checkLock {
+		h, err := conn.GetBlockCount()
+		if err != nil || h < 1 {
+			return "", fmt.Errorf("api: getblockcount %s: %v", cur, err)
+		}
+		if uint32(h) < lockTime {
+			return "", nil // not yet refundable
+		}
 	}
-	txid, err := conn.SendRawTransaction(s.refundHex)
-	if err != nil {
-		xlog.Error("refund broadcast failed", "order", hexEncode(s.id[:]), "err", err)
-		return "", err
+	return conn.SendRawTransaction(refundHex)
+}
+
+// postRefundTask posts a refund broadcast to the worker pool (or runs it
+// synchronously in inline mode, when the engine is not started). The apply runs
+// on the engine: it clears the in-flight guard, invokes the optional done
+// callback, marks the session refundDone on success, and persists. A full task
+// queue drops the task (the broadcast is idempotent and the next sweep retries)
+// and clears the guard so that sweep can re-enqueue it.
+func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, checkLock bool, done func(txid string, err error)) bool {
+	task := workTask{
+		orderID: orderID,
+		run: func() (any, error) {
+			return n.runRefundTask(cur, refundHex, lockTime, checkLock)
+		},
+		apply: func(v any, err error) {
+			delete(n.pendingRefunds, orderID)
+			txid, _ := v.(string)
+			if done != nil {
+				done(txid, err)
+			}
+			if err != nil {
+				xlog.Warn("refund broadcast failed", "order", orderID, "err", err)
+				return
+			}
+			if txid == "" {
+				return // not yet refundable; the next sweep retries
+			}
+			xlog.Info("refund broadcast", "order", orderID, "txid", txid)
+			if s := n.sessions[orderID]; s != nil {
+				s.refundDone = true
+			}
+			n.persist()
+		},
 	}
-	xlog.Info("refund broadcast", "order", hexEncode(s.id[:]), "txid", txid)
-	return txid, nil
+	if !n.engineRunning.Load() {
+		v, err := safeTaskRun(task)
+		task.apply(v, err)
+		return true
+	}
+	select {
+	case n.tasks <- task:
+		return true
+	default:
+		delete(n.pendingRefunds, orderID)
+		xlog.Warn("refund task dropped, engine busy", "order", orderID)
+		return false
+	}
+}
+
+// scanRefunds sweeps all live sessions and auto-broadcasts any pre-signed
+// refund whose deposit lockTime has passed (the fund-safety safety net). Runs
+// on the engine goroutine; each eligible session posts a worker task guarded by
+// pendingRefunds so no order is ever double-enqueued. Inline mode (tests)
+// broadcasts synchronously.
+func (n *Node) scanRefunds() {
+	for id, s := range n.sessions {
+		if s.refundDone || s.refundHex == "" || s.state == csFinished || s.state < csCreatedA {
+			continue
+		}
+		if n.engineRunning.Load() {
+			// Started mode: guard against double-enqueue. Inline mode (tests)
+			// runs synchronously, so the guard is redundant there.
+			if n.pendingRefunds[id] {
+				continue
+			}
+			n.pendingRefunds[id] = true
+		}
+		n.postRefundTask(id, s.srcCur, s.refundHex, s.ourLockTime, true, nil)
+	}
+}
+
+// checkRefunds is the public entry point for the refund sweep. The engine
+// ticker drives scanRefunds directly; this wrapper exists for tests and
+// external callers and routes through submit so production stays engine-owned.
+func (n *Node) checkRefunds() {
+	n.submit(n.scanRefunds, false)
+}
+
+// enqueueRefund schedules a fund-recovery refund broadcast for orderID: the
+// live session's pre-signed refund when present, else the order's stored refund
+// hex (the escape-hatch fallback, trying each deposit chain). Fire-and-forget
+// from the engine (done == nil); the optional done callback receives the
+// outcome when it lands. Inline mode (tests) runs synchronously and invokes
+// done before returning.
+func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) {
+	if s := n.sessions[orderID]; s != nil && s.refundHex != "" {
+		n.postRefundTask(orderID, s.srcCur, s.refundHex, 0, false, done)
+		return
+	}
+	o := n.store.Get(orderID)
+	if o == nil || o.RefundTx == "" {
+		if done != nil {
+			done("", fmt.Errorf("api: no refund available for order %s", orderID))
+		}
+		return
+	}
+	cands := make([]string, 0, 2)
+	for _, cur := range []string{o.FromCurrency, o.ToCurrency} {
+		if cur != "" && n.cfg().Connectors[cur] != nil {
+			cands = append(cands, cur)
+		}
+	}
+	n.tryStoredRefund(orderID, o.RefundTx, cands, done)
+}
+
+// tryStoredRefund broadcasts an order's stored refund hex against each
+// candidate currency in order, stopping at the first success (C++ tries the
+// maker then taker deposit chains). Chained via callbacks so no currency is
+// ever double-broadcast.
+func (n *Node) tryStoredRefund(orderID, refundHex string, cands []string, done func(txid string, err error)) {
+	if len(cands) == 0 {
+		if done != nil {
+			done("", fmt.Errorf("api: could not broadcast stored refund for %s", orderID))
+		}
+		return
+	}
+	cur := cands[0]
+	n.postRefundTask(orderID, cur, refundHex, 0, false, func(txid string, err error) {
+		if err == nil && txid != "" {
+			if done != nil {
+				done(txid, nil)
+			}
+			return
+		}
+		n.tryStoredRefund(orderID, refundHex, cands[1:], done)
+	})
 }
 
 // BroadcastRefund is the manual escape hatch: it force-broadcasts the pre-signed
 // CLTV refund for an order (e.g. a swap has stalled and the deposit's lockTime
 // has passed), returning the deposit to the source address without waiting for
-// the background watcher. If a live session exists it uses that; otherwise it
-// falls back to the order's stored refund hex (trying both the maker and taker
-// deposit chains).
+// the background sweep. In started mode the broadcast runs on a worker and the
+// caller awaits its outcome; inline mode (tests) runs synchronously.
 func (n *Node) BroadcastRefund(orderID string) (string, error) {
-	n.sessMu.Lock()
-	s := n.sessions[orderID]
-	n.sessMu.Unlock()
-	if s != nil && s.refundHex != "" {
-		txid, err := n.broadcastRefund(s)
-		if err == nil {
-			s.refundDone = true
-		}
-		return txid, err
+	if !n.engineRunning.Load() {
+		var txid string
+		var rerr error
+		n.enqueueRefund(orderID, func(t string, e error) { txid, rerr = t, e })
+		return txid, rerr
 	}
-	if o := n.store.Get(orderID); o != nil && o.RefundTx != "" {
-		for _, cur := range []string{o.FromCurrency, o.ToCurrency} {
-			conn := n.cfg().Connectors[cur]
-			if conn == nil {
-				continue
-			}
-			txid, err := conn.SendRawTransaction(o.RefundTx)
-			if err != nil {
-				xlog.Warn("escape-hatch refund broadcast failed", "order", orderID, "cur", cur, "err", err)
-				continue
-			}
-			xlog.Info("escape-hatch refund broadcast", "order", orderID, "txid", txid)
-			return txid, nil
-		}
-		return "", fmt.Errorf("api: could not broadcast stored refund for %s", orderID)
+	type outcome struct {
+		txid string
+		err  error
 	}
-	return "", fmt.Errorf("api: no refund available for order %s", orderID)
-}
-
-// checkRefunds scans all live sessions and auto-broadcasts any pre-signed
-// refund whose deposit lockTime has passed (the fund-safety safety net). It is
-// invoked by the background refundWatcher and can be called directly (e.g. in
-// tests) to drive the check on demand. Caller must not hold n.sessMu.
-func (n *Node) checkRefunds() {
-	n.sessMu.Lock()
-	defer n.sessMu.Unlock()
-	for id, s := range n.sessions {
-		if s.refundDone || s.refundHex == "" || s.state == csFinished || s.state < csCreatedA {
-			continue
-		}
-		conn := n.cfg().Connectors[s.srcCur]
-		if conn == nil {
-			continue
-		}
-		h, err := conn.GetBlockCount()
-		if err != nil || h < 1 {
-			continue
-		}
-		if uint32(h) >= s.ourLockTime {
-			txid, berr := n.broadcastRefund(s)
-			if berr != nil {
-				xlog.Error("refund auto-broadcast failed", "order", id, "err", berr)
-				continue
-			}
-			s.refundDone = true
-			xlog.Info("refund auto-broadcast on lockTime expiry", "order", id, "txid", txid)
-		}
+	out := make(chan outcome, 1)
+	n.submit(func() {
+		n.enqueueRefund(orderID, func(t string, e error) { out <- outcome{t, e} })
+	}, false)
+	select {
+	case o := <-out:
+		return o.txid, o.err
+	case <-n.stop:
+		return "", fmt.Errorf("api: node closed during refund broadcast for %s", orderID)
 	}
 }
 

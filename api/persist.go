@@ -103,12 +103,12 @@ func swapStatePath(dir string) string {
 }
 
 // saveSwaps writes all local (Mine) swaps atomically. It snapshots the
-// sessions under sessMu, filters to those whose order is Mine (mirroring C++
+// engine-owned sessions, filters to those whose order is Mine (mirroring C++
 // saveOrders' isLocal() gate), then marshals + sha256s the blob and performs
 // an atomic temp-write / fsync / rename (C++ SerializeFileDB is atomic; this
-// mirrors that). The caller must hold persistMu.
+// mirrors that). The caller must be the engine goroutine (or a single-threaded
+// test): it reads n.sessions, which the engine alone owns.
 func saveSwaps(path string, n *Node) error {
-	n.sessMu.Lock()
 	ps := make([]persistedSwap, 0, len(n.sessions))
 	for id, s := range n.sessions {
 		o := n.store.Get(id)
@@ -117,7 +117,6 @@ func saveSwaps(path string, n *Node) error {
 		}
 		ps = append(ps, persistFromSession(s, o))
 	}
-	n.sessMu.Unlock()
 
 	blob, err := json.Marshal(ps)
 	if err != nil {
@@ -183,14 +182,13 @@ func loadSwaps(path string) ([]persistedSwap, error) {
 }
 
 // persist flushes local swap state to disk (no-op when DataDir is unset, the
-// previous behaviour). Safe to call from any goroutine; serializes against
-// concurrent persist() calls via persistMu.
+// previous behaviour). Runs on the engine goroutine only in production (tests
+// call it single-threaded), so no lock is needed: n.sessions is engine-owned
+// and the snapshot is consistent by construction.
 func (n *Node) persist() {
 	if n.cfg() == nil || n.cfg().DataDir == "" {
 		return
 	}
-	n.persistMu.Lock()
-	defer n.persistMu.Unlock()
 	if err := saveSwaps(swapStatePath(n.cfg().DataDir), n); err != nil {
 		xlog.Error("swap persist failed", "dir", n.cfg().DataDir, "err", err)
 	}
@@ -264,7 +262,8 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 // restoreSwap rebuilds an Order + SwapSession from a persisted record and
 // registers them on n (mirroring C++ loadOrders). Active swaps are re-driven by
 // dispatchSwap when the hub's packets arrive post-restart; cancelled/finished
-// ones stay inert but remain restorable. Caller should hold n.sessMu.
+// ones stay inert but remain restorable. The caller is the NewNode restore
+// block (single-threaded, before the engine starts).
 func (n *Node) restoreSwap(ps persistedSwap) {
 	o := &Order{
 		ID:             ps.ID,

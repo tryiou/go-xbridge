@@ -130,16 +130,12 @@ type Node struct {
 	signer crypto.Signer
 	stop   chan struct{}
 
-	// sessMu guards sessions, the set of in-flight swaps we are a party to
-	// (keyed by order-id hex). The live hub drives each one through its packet
-	// sequence; the local SwapSession responds and signs the on-chain ops.
-	sessMu   sync.Mutex
+	// sessions is the set of in-flight swaps we are a party to (keyed by
+	// order-id hex). The live hub drives each one through its packet sequence;
+	// the local SwapSession responds and signs the on-chain ops. Written only
+	// by the engine goroutine (and inline by tests, which never start it).
 	sessions map[string]*SwapSession
 
-	// persistMu serializes persistence to disk (saveSwaps) against concurrent
-	// persist() calls from the feed, MakeOrder/TakeOrder/CancelOrder, and the
-	// refundWatcher. The actual read of sessions inside saveSwaps takes sessMu.
-	persistMu sync.Mutex
 	// tickCount counts engine-ticker ticks so we persist every Nth tick.
 	tickCount int
 
@@ -535,40 +531,40 @@ func (n *Node) handlePacket(in inboundPacket) {
 
 	// --- swap handshake (client side, hub-driven) ---
 	case *proto.HoldBody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnHold(b)
 		})
 	case *proto.InitBody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "Init", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnInit(b)
 		})
 	case *proto.CreateABody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnCreateA(b)
 		})
 	case *proto.CreateBBody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "CreateB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnCreateB(b)
 		})
 	case *proto.ConfirmABody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "ConfirmA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnConfirmA(b)
 		})
 	case *proto.ConfirmBBody:
-		n.dispatchSwap(in.pkt, b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, b.HubAddress, "ConfirmB", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnConfirmB(b)
 		})
 	case *proto.FinishedBody:
-		n.dispatchSwap(in.pkt, b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		n.processSwap(in.pkt, b.ID, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			return s.OnFinished(b)
 		})
 	case *proto.CancelBody:
 		// Remote cancel (C++ processTransactionCancel). No session/hub
 		// needed; handled directly against the store.
-		n.onRemoteCancel(in.pkt, b)
+		n.handleRemoteCancel(in.pkt, b)
 	case *proto.RejectBody:
 		// Remote reject (C++ processTransactionReject).
-		n.onRemoteReject(in.pkt, b)
+		n.handleRemoteReject(in.pkt, b)
 	}
 }
 
@@ -656,11 +652,21 @@ type responseBody interface {
 }
 
 // dispatchSwap routes a hub-originated handshake packet to the local session for
-// the given order id, runs the session handler, and (if it produced a response)
-// signs and sends it addressed to the session's pinned hub. Packets for order
-// ids we are not a party to are ignored. The `hub` parameter (the address the
-// packet embeds) is intentionally ignored: the response destination is the hub
-// pinned at session creation, never learned from the packet.
+// the given order id and runs the session handler, submitting the work to the
+// engine goroutine (which owns sessions). Packets for order ids we are not a
+// party to are ignored. The `hub` parameter (the address the packet embeds) is
+// intentionally ignored: the response destination is the hub pinned at session
+// creation, never learned from the packet. When the engine is not started
+// (tests) the work runs inline on the caller.
+func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
+	n.submit(func() { n.processSwap(pkt, id, hub, cmdName, fn) }, false)
+}
+
+// processSwap is the engine-side body of dispatchSwap: it looks up the session
+// for the order id, re-verifies the packet against the session's trusted hub
+// key, runs the session handler, and (if it produced a response) signs and
+// sends it addressed to the session's pinned hub. Runs on the engine goroutine
+// (or inline when the engine is not started).
 //
 // F2/S2-E (hub-key auth): every handshake packet is re-verified against the
 // session's TRUSTED hub key before dispatch — mirroring C++
@@ -669,10 +675,8 @@ type responseBody interface {
 // time; taker: the order's SNodePubkey) — never learned from network packets.
 // A packet that fails verification is dropped and never reaches the handler, so
 // a forged Finished can never set csFinished and disable the refund watcher.
-func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
-	n.sessMu.Lock()
+func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
 	s := n.sessions[hexEncode(id[:])]
-	n.sessMu.Unlock()
 	if s == nil {
 		if unknownSwapDedup.Event(hexEncode(id[:])) {
 			xlog.Debug("swap packet for unknown order", "order", hexEncode(id[:]))
@@ -1183,23 +1187,32 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		// keeps the normalizer's display defaults.
 		o.SNodePubkey = hexEncode(hubKey[:])
 		o.HubAddress = hubAddr
-		n.store.Add(o)
-		if pending {
-			// Pending autoSplit orders are held locally until the prep tx
-			// confirms (C++ :2019 broadcast gate: only broadcast when
-			// !isOrderPending() || partialExactUtxoMatch). No SEND, no session.
-			n.persist()
-		} else {
+		// State mutation (store.Add, session registration, SEND, persist) runs
+		// on the engine goroutine, which owns the book and session maps.
+		var rerr *rpcError
+		n.submit(func() {
+			n.store.Add(o)
+			if pending {
+				// Pending autoSplit orders are held locally until the prep tx
+				// confirms (C++ :2019 broadcast gate: only broadcast when
+				// !isOrderPending() || partialExactUtxoMatch). No SEND, no session.
+				n.persist()
+				return
+			}
 			// SEND is addressed to the chosen hub's envelope address (C++
 			// onSend(ptr->hubAddress, ...), xbridgeapp.cpp:2100). The hub relays
 			// it to counterparties as an xbcPendingTransaction broadcast.
 			if err := n.conn.WritePacket(pkt, hubAddr); err != nil {
-				return nil, makeError(errUnknown, "dxMakeOrder", err.Error())
+				rerr = makeError(errUnknown, "dxMakeOrder", err.Error())
+				return
 			}
 			// Begin driving the client-side deposit handshake for this order.
 			n.newMakerSession(o, p, mPrivArr, mPub)
 			// Persist the new local swap (incl. its per-trade M keypair) to disk.
 			n.persist()
+		}, true)
+		if rerr != nil {
+			return nil, rerr
 		}
 	}
 	return o, nil
@@ -1338,23 +1351,48 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
-	o.Updated = NowMicro()
-	o.Status = "accepting"
-	// Local taker: set our per-trade M key and capture the original
-	// (maker-facing) currencies BEFORE the take reorients the order
-	// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
-	// On a reject these Orig* values restore the order to pending.
-	o.Role = 'B'
-	o.MakerKey = hexEncode(tPub[:])
-	o.OrigFromCurrency = o.FromCurrency
-	o.OrigToCurrency = o.ToCurrency
-	// Publish the take's mutations to the book under the store lock.
-	n.store.Update(key, func(stored *Order) { *stored = *o })
-	// Begin driving the client-side deposit handshake for this taken order.
-	n.newTakerSession(o, p, tPrivArr, tPub)
-	// Persist the new local swap (incl. its per-trade M keypair) to disk.
-	n.persist()
-	return o.toTakeResult(fromSize, toSize), nil
+	// State mutation (store update, session registration, persist) runs on the
+	// engine goroutine, which owns the book and session maps. The take applies
+	// a TARGETED store update (never *stored = *o) so a concurrent engine-side
+	// field update (e.g. a remote cancel) is not clobbered.
+	var result *Order
+	n.submit(func() {
+		// Authoritative re-check on the engine: the order may have been
+		// cancelled/removed since the HTTP snapshot.
+		if n.store.Get(key) == nil {
+			return
+		}
+		now := NowMicro()
+		makerKey := hexEncode(tPub[:])
+		// Local taker: set our per-trade M key and capture the original
+		// (maker-facing) currencies BEFORE the take reorients the order
+		// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
+		// On a reject these Orig* values restore the order to pending.
+		o.Updated = now
+		o.Status = "accepting"
+		o.Role = 'B'
+		o.MakerKey = makerKey
+		o.OrigFromCurrency = o.FromCurrency
+		o.OrigToCurrency = o.ToCurrency
+		// Publish the take's mutations to the book under the store lock.
+		n.store.Update(key, func(stored *Order) {
+			stored.Updated = now
+			stored.Status = "accepting"
+			stored.Role = 'B'
+			stored.MakerKey = makerKey
+			stored.OrigFromCurrency = o.FromCurrency
+			stored.OrigToCurrency = o.ToCurrency
+		})
+		// Begin driving the client-side deposit handshake for this taken order.
+		n.newTakerSession(o, p, tPrivArr, tPub)
+		// Persist the new local swap (incl. its per-trade M keypair) to disk.
+		n.persist()
+		result = n.store.Get(key)
+	}, true)
+	if result == nil {
+		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
+	}
+	return result.toTakeResult(fromSize, toSize), nil
 }
 
 // CancelOrderParams are the parsed dxCancelOrder arguments.
@@ -1373,30 +1411,47 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 		return nil, makeError(errTxNotFound, "dxCancelOrder", p.ID)
 	}
 	var reason uint32 = 0
-	// Cancel is signed with the trade's per-trade M keypair (C++ session
-	// sendCancelTransaction uses ptr->mPrivKey). Use the live session if we
-	// have one; otherwise there is no key to sign with.
-	if err := n.sendCancelTransaction(p.ID, reason); err != nil {
-		return nil, err
-	}
-	o.Status = "canceled"
-	o.Updated = NowMicro()
-	// Publish the cancel to the book under the store lock.
-	n.store.Update(p.ID, func(stored *Order) { *stored = *o })
-	// C++ dxFlushCancelledOrders renders the flushed "id" as it.id.GetHex()
-	// (rpcxbridge.cpp:1483), i.e. display order, so record the display id.
-	n.store.RecordCancelled(orderIDString(o.ID), o.Created)
-	// Best-effort fund recovery: if a deposit was already broadcast, return it
-	// via the pre-signed CLTV refund rather than leaving it locked at the hub.
-	if o.RefundTx != "" {
-		if _, rerr := n.BroadcastRefund(p.ID); rerr != nil {
-			xlog.Warn("dxCancelOrder refund broadcast failed", "order", p.ID, "err", rerr)
+	var rerr *rpcError
+	// State mutation (cancel packet, store update, refund, persist) runs on the
+	// engine goroutine, which owns the session and book maps.
+	n.submit(func() {
+		// Authoritative re-check on the engine: the order may have been
+		// cancelled/removed since the HTTP snapshot.
+		if n.store.Get(p.ID) == nil {
+			rerr = makeError(errTxNotFound, "dxCancelOrder", p.ID)
+			return
 		}
+		// Cancel is signed with the trade's per-trade M keypair (C++ session
+		// sendCancelTransaction uses ptr->mPrivKey). Use the live session if
+		// we have one; otherwise there is no key to sign with.
+		if e := n.sendCancelTransaction(p.ID, reason); e != nil {
+			rerr = e
+			return
+		}
+		now := NowMicro()
+		// Publish the cancel to the book under the store lock (targeted, so a
+		// concurrent engine-side field update is not clobbered).
+		n.store.Update(p.ID, func(stored *Order) {
+			stored.Status = "canceled"
+			stored.Updated = now
+		})
+		o.Status = "canceled"
+		o.Updated = now
+		// C++ dxFlushCancelledOrders renders the flushed "id" as it.id.GetHex()
+		// (rpcxbridge.cpp:1483), i.e. display order, so record the display id.
+		n.store.RecordCancelled(orderIDString(o.ID), o.Created)
+		// Best-effort fund recovery: if a deposit was already broadcast, return
+		// it via the pre-signed CLTV refund rather than leaving it locked at
+		// the hub. Fire-and-forget; outcomes are logged by the refund apply.
+		n.enqueueRefund(p.ID, nil)
+		// Persist the cancelled (and possibly refund-broadcast) state so it
+		// survives a restart (matches C++ saveOrders). Placed last so the
+		// refund guard is captured.
+		n.persist()
+	}, true)
+	if rerr != nil {
+		return nil, rerr
 	}
-	// Persist the cancelled (and possibly refund-broadcast) state so it survives
-	// a restart (matches C++ saveOrders). Placed last so the refund guard is
-	// captured.
-	n.persist()
 	return o, nil
 }
 
@@ -1416,10 +1471,8 @@ func (n *Node) ExchangeStarted() bool { return n.exchangeStarted.Load() }
 // sessionFor returns the live swap session for idHex, or nil. It mirrors C++
 // processTransactionCancel's pendingTransaction() then transaction() lookup: in
 // Go a single sessions map holds both, so a nil result means "no valid
-// transaction".
+// transaction". Engine-internal (n.sessions is engine-owned).
 func (n *Node) sessionFor(idHex string) *SwapSession {
-	n.sessMu.Lock()
-	defer n.sessMu.Unlock()
 	return n.sessions[idHex]
 }
 
@@ -1432,9 +1485,7 @@ func (n *Node) sendCancelTransaction(idHex string, reason uint32) *rpcError {
 	if n.conn == nil {
 		return makeError(errNoServiceNode, "dxCancelOrder", "")
 	}
-	n.sessMu.Lock()
 	s := n.sessions[idHex]
-	n.sessMu.Unlock()
 	if s == nil {
 		return makeError(errBadRequest, "dxCancelOrder", "no active session for order")
 	}
@@ -1463,10 +1514,17 @@ func (n *Node) markStale(o *Order) {
 func (n *Node) onUnlockCoins(o *Order)    {}
 func (n *Node) onUnlockFeeUtxos(o *Order) {}
 
-// onRemoteCancel ports C++ Session::Impl::processTransactionCancel
-// (xbridgesession.cpp:3288-3429) verbatim, including the Exchange branch and
-// the state-machine switch.
+// onRemoteCancel is the public entry point for a hub-originated cancel; it
+// submits the work to the engine goroutine (which owns the session and book
+// maps). handlePacket calls handleRemoteCancel directly.
 func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
+	n.submit(func() { n.handleRemoteCancel(pkt, b) }, false)
+}
+
+// handleRemoteCancel ports C++ Session::Impl::processTransactionCancel
+// (xbridgesession.cpp:3288-3429) verbatim, including the Exchange branch and
+// the state-machine switch. Runs on the engine goroutine.
+func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	idHex := hexEncode(b.ID[:])
 	o := n.store.Get(idHex)
 	if o == nil {
@@ -1575,19 +1633,24 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		o.Updated = NowMicro()
 	})
 	if o.RefundTx != "" {
-		if _, rerr := n.BroadcastRefund(idHex); rerr != nil {
-			xlog.Warn("cancel: rollback refund broadcast failed", "order", idHex, "err", rerr)
-			// C++ processLater; the background refundWatcher retries on locktime.
-		}
+		n.enqueueRefund(idHex, nil)
+		// C++ processLater; the background sweep retries on locktime.
 	}
 	xlog.Info("cancel: rollback initiated", "order", idHex)
 	n.persist()
 }
 
-// onRemoteReject ports C++ Session::Impl::processTransactionReject
-// (xbridgesession.cpp:3432-3485) verbatim. It restores the order to pending
-// (trPending / "open") and NEVER cancels it.
+// onRemoteReject is the public entry point for a hub-originated reject; it
+// submits the work to the engine goroutine. handlePacket calls
+// handleRemoteReject directly.
 func (n *Node) onRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
+	n.submit(func() { n.handleRemoteReject(pkt, b) }, false)
+}
+
+// handleRemoteReject ports C++ Session::Impl::processTransactionReject
+// (xbridgesession.cpp:3432-3485) verbatim. It restores the order to pending
+// (trPending / "open") and NEVER cancels it. Runs on the engine goroutine.
+func (n *Node) handleRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
 	idHex := hexEncode(b.ID[:])
 	o := n.store.Get(idHex)
 	if o == nil {
