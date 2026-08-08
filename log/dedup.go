@@ -28,8 +28,11 @@ type Dedupe struct {
 	quietFor  time.Duration
 	summarize func(key string, total int, elapsed time.Duration)
 
-	// stop is closed by Flush to terminate the lazy sweep goroutine.
-	stop chan struct{}
+	// stopCh is the live stop channel for the current sweep goroutine (nil when
+	// no sweep is running). It is recreated on each (re)start so a Flush never
+	// permanently disables later Events — dedup keeps summarizing after a
+	// shutdown-triggered flush.
+	stopCh chan struct{}
 	// sweepOnce guards lazy start of the sweep goroutine.
 	sweepOnce sync.Once
 	// sweepStarted reports whether the sweep goroutine is live (under mu).
@@ -66,7 +69,6 @@ func NewDedupe(quietFor time.Duration, summarize func(key string, total int, ela
 		m:         make(map[string]*bucket),
 		quietFor:  quietFor,
 		summarize: summarize,
-		stop:      make(chan struct{}),
 	}
 	regMu.Lock()
 	registry[d] = struct{}{}
@@ -126,17 +128,18 @@ func (d *Dedupe) startSweepLocked() {
 	if interval <= 0 {
 		interval = time.Second
 	}
-	go d.sweep(interval)
+	d.stopCh = make(chan struct{})
+	go d.sweep(d.stopCh, interval)
 }
 
 // sweep periodically emits summaries for buckets that have accumulated repeats
-// and evicts idle one-shot buckets. It returns when d.stop is closed.
-func (d *Dedupe) sweep(interval time.Duration) {
+// and evicts idle one-shot buckets. It returns when stopCh is closed.
+func (d *Dedupe) sweep(stopCh chan struct{}, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-d.stop:
+		case <-stopCh:
 			return
 		case <-ticker.C:
 			d.tick()
@@ -180,20 +183,22 @@ func (d *Dedupe) tick() {
 }
 
 // Flush forces any pending summary to be emitted (e.g. on shutdown) and stops
-// the sweep goroutine.
+// the sweep goroutine. It is idempotent (safe to call twice, and safe against
+// concurrent Event calls): a later Event restarts the sweeper on its own, so
+// dedup is not permanently muted by a shutdown-triggered flush.
 func (d *Dedupe) Flush() {
 	if d == nil {
 		return
 	}
-	if d.stop != nil {
-		regMu.Lock()
-		if _, ok := registry[d]; ok {
-			delete(registry, d)
-			close(d.stop)
-		}
-		regMu.Unlock()
-	}
+	regMu.Lock()
+	delete(registry, d)
+	regMu.Unlock()
 	d.mu.Lock()
+	if d.stopCh != nil {
+		close(d.stopCh)
+		d.stopCh = nil
+	}
+	d.sweepStarted = false
 	now := time.Now()
 	var pending []*pendingSummary
 	for key, b := range d.m {

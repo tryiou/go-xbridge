@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -36,6 +37,13 @@ type Conn struct {
 	// observe raw servicenode messages (snr/snp/snlp) that would otherwise
 	// be skipped by ReadPacket. Optional; nil means skip as before.
 	OnNonXBridge func(cmd string, payload []byte)
+
+	// writeMu serializes outbound frames. Multiple goroutines write to the
+	// same conn (the api feed/handlers, discovery read-loops), and the net
+	// package only guarantees atomicity of a single Write for TCP — not for
+	// every net.Conn transport (e.g. net.Pipe). Routing every write through
+	// this lock prevents frame interleaving and keeps ordering deterministic.
+	writeMu sync.Mutex
 }
 
 // Dial connects to a Blocknet peer and completes the handshake.
@@ -115,8 +123,7 @@ func (c *Conn) writeVersion() error {
 		Payload:  payload,
 		Checksum: Checksum(payload),
 	}
-	_, err := c.netConn.Write(msg.Marshal())
-	return err
+	return c.write(msg.Marshal())
 }
 
 func (c *Conn) writeVerack() error {
@@ -125,7 +132,15 @@ func (c *Conn) writeVerack() error {
 		Command:  "verack",
 		Checksum: Checksum(nil),
 	}
-	_, err := c.netConn.Write(msg.Marshal())
+	return c.write(msg.Marshal())
+}
+
+// write serializes buf to the wire under writeMu. Every outbound frame goes
+// through here so concurrent senders cannot interleave on the underlying conn.
+func (c *Conn) write(buf []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, err := c.netConn.Write(buf)
 	return err
 }
 
@@ -172,8 +187,7 @@ func (c *Conn) WritePacket(p *proto.Packet, dest [20]byte) error {
 		Payload:  payload,
 		Checksum: Checksum(payload),
 	}
-	_, err := c.netConn.Write(msg.Marshal())
-	return err
+	return c.write(msg.Marshal())
 }
 
 func (c *Conn) readMessage() (*Message, error) {
@@ -209,8 +223,7 @@ func (c *Conn) Close() error { return c.netConn.Close() }
 // WriteMessage sends a raw, already-constructed P2P message (any command).
 // Used by the discovery layer to exchange getaddr/addr/ping/pong directly.
 func (c *Conn) WriteMessage(m *Message) error {
-	_, err := c.netConn.Write(m.Marshal())
-	return err
+	return c.write(m.Marshal())
 }
 
 // SendCommand sends a P2P message with the given command name and payload.

@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"io"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"go-xbridge/api"
 	"go-xbridge/coins"
@@ -229,6 +231,9 @@ func main() {
 		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "discovery",
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
+	// httpSrv is kept by name so shutdown can drain in-flight RPC handlers
+	// (srv.Shutdown) instead of exiting under them.
+	httpSrv := &http.Server{Addr: *rpcBind, Handler: srv}
 	// Finalization on SIGINT/SIGTERM. os.Exit skips defers, so shutdown steps
 	// must run explicitly here: stop the P2P node (peer conns / read-loops),
 	// flush pending dedup summaries, then close the log file.
@@ -236,12 +241,20 @@ func main() {
 	defer stopSig()
 
 	go func() {
-		if err := http.ListenAndServe(*rpcBind, srv); err != nil {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatalf("http server", "err", err)
 		}
 	}()
 
 	<-sigCtx.Done()
+	// Drain in-flight RPC handlers before tearing down the node and logging: a
+	// handler mid-swap must not race node.Close() (peer conn teardown) or the
+	// log-file close that follows.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		xlog.Warn("http server shutdown", "err", err)
+	}
+	cancel()
 	if node != nil {
 		if err := node.Close(); err != nil {
 			xlog.Warn("node close", "err", err)

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -33,7 +34,7 @@ type RPCClient struct {
 	omitJSONVersion bool
 	contentType     string
 	http            *http.Client
-	nextID          int64
+	nextID          atomic.Int64
 	ticker          string
 }
 
@@ -76,8 +77,7 @@ func NewRPCClient(url, user, pass, jsonVersion, contentType string, omitJSONVers
 
 // Call invokes method with params and unmarshals the result into out.
 func (c *RPCClient) Call(method string, params []interface{}, out interface{}) error {
-	id := fmt.Sprintf("xbg-%d", c.nextID)
-	c.nextID++
+	id := fmt.Sprintf("xbg-%d", c.nextID.Add(1)-1)
 	xlog.Debug("rpc call", "coin", c.ticker, "method", method, "url", c.url)
 	// Wallet RPCs (XLite, Bitcoin Core) require "params" to be an array; a nil
 	// slice marshals to JSON null, which some wallets reject with an empty body

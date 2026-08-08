@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -165,8 +166,9 @@ type Node struct {
 	// only when this node runs the exchange/hub role. This thin client never
 	// does, so it defaults false; the cancel handler's exchange branch is
 	// therefore dead in production but ported verbatim for fidelity (and
-	// exercisable in tests via SetExchangeStarted).
-	exchangeStarted bool
+	// exercisable in tests via SetExchangeStarted). Atomic so a test flip
+	// cannot race the feed goroutine reading it in onRemoteCancel.
+	exchangeStarted atomic.Bool
 }
 
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
@@ -1455,10 +1457,10 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 // SetExchangeStarted toggles the exchange/hub role flag (C++ Exchange::instance()
 // .isStarted()). It exists so tests can exercise the cancel handler's exchange
 // branch; production never sets it (this is a thin client).
-func (n *Node) SetExchangeStarted(v bool) { n.exchangeStarted = v }
+func (n *Node) SetExchangeStarted(v bool) { n.exchangeStarted.Store(v) }
 
 // exchangeStarted mirrors C++ Exchange::instance().isStarted().
-func (n *Node) ExchangeStarted() bool { return n.exchangeStarted }
+func (n *Node) ExchangeStarted() bool { return n.exchangeStarted.Load() }
 
 // sessionFor returns the live swap session for idHex, or nil. It mirrors C++
 // processTransactionCancel's pendingTransaction() then transaction() lookup: in
@@ -1524,7 +1526,7 @@ func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	}
 
 	// --- Exchange branch (C++ :3316-3341) ---
-	if n.exchangeStarted {
+	if n.exchangeStarted.Load() {
 		s := n.sessionFor(idHex)
 		if s == nil {
 			xlog.Info("cancel: order not valid", "order", idHex)

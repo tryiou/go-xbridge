@@ -49,10 +49,15 @@ func NewRotatingWriter(path string, maxBytes int64, backups int) (*rotatingWrite
 	}, nil
 }
 
-// Write appends p, rotating first if doing so would exceed maxBytes.
+// Write appends p, rotating first if doing so would exceed maxBytes. A Write
+// after Close (e.g. a late log line racing daemon shutdown) is a no-op: the
+// bytes are dropped rather than dereferencing the now-nil file.
 func (w *rotatingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.f == nil {
+		return len(p), nil
+	}
 	if w.maxBytes > 0 && w.size+int64(len(p)) > w.maxBytes {
 		if err := w.rotateLocked(); err != nil {
 			return 0, err

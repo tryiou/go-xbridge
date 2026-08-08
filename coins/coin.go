@@ -2,6 +2,7 @@ package coins
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"go-xbridge/config"
 )
@@ -52,22 +53,32 @@ type Coin struct {
 // Family returns the chain family.
 func (c Coin) Family() FamilyKind { return c.family }
 
-// Coins is the runtime registry, populated entirely from xbridge.conf by
-// InitFromConf. It starts empty — there is no baked-in set.
-var Coins = map[string]Coin{}
+// registry is the runtime coin set, published atomically by InitFromConf.
+// Readers (Get/Has) dereference the pointer with no lock, so a
+// dxLoadXBridgeConf hot-reload can never race a concurrent lookup: a reader
+// sees either one consistent snapshot or the next, never a half-populated map
+// (which would abort the process with "concurrent map read and map write").
+var registry atomic.Pointer[map[string]Coin]
+
+func init() {
+	m := map[string]Coin{}
+	registry.Store(&m)
+}
 
 // InitFromConf populates the registry from parsed xbridge.conf sections. It
-// clears any previous contents first, so the registry always reflects exactly
-// the coins named in conf (nothing more, nothing less).
+// builds a fresh immutable map and publishes it atomically, so the registry
+// always reflects exactly the coins named in conf (nothing more, nothing less).
+// On error the previous registry is left untouched (last-good on failure).
 func InitFromConf(confs map[string]*config.CoinConf) error {
-	Coins = map[string]Coin{}
+	next := map[string]Coin{}
 	for ticker, c := range confs {
 		coin, err := FromConf(c)
 		if err != nil {
 			return err
 		}
-		Coins[ticker] = coin
+		next[ticker] = coin
 	}
+	registry.Store(&next)
 	return nil
 }
 
@@ -160,7 +171,7 @@ func bech32HRPFromMethod(m string) string {
 
 // Get returns the Coin for a ticker (case-insensitive), or false.
 func Get(ticker string) (Coin, bool) {
-	c, ok := Coins[normalizeTicker(ticker)]
+	c, ok := (*registry.Load())[normalizeTicker(ticker)]
 	return c, ok
 }
 
@@ -176,7 +187,7 @@ func MustGet(ticker string) Coin {
 
 // Has reports whether a ticker is registered.
 func Has(ticker string) bool {
-	_, ok := Coins[normalizeTicker(ticker)]
+	_, ok := (*registry.Load())[normalizeTicker(ticker)]
 	return ok
 }
 
