@@ -5,7 +5,7 @@ package api
 // This mirrors C++ BtcWalletConnector::acceptableLockTimeDrift
 // (xbridgewalletconnectorbtc.cpp:2331) and its xbridgesession.cpp:2464 call
 // site. C++ computes locktimes as BLOCK HEIGHTS (lockTime() == currentBlock +
-// target/blockTime), which is exactly what Go's SwapSession.computeLockTimeFor
+// target/blockTime), which is exactly what Go's swapCtx.computeLockTimeFor
 // does, so the arithmetic ports directly. The constants mirror
 // xbridgewallet.h / script.h.
 const (
@@ -39,9 +39,10 @@ func acceptableLockTimeDrift(ourLT, theirLT, blockTime uint32) bool {
 }
 
 // blockTimeFor returns the configured seconds-per-block for a coin (default 60).
-func (s *SwapSession) blockTimeFor(cur string) uint32 {
+// It runs on a worker in the two-phase handshake, so it reads config only.
+func (c swapCtx) blockTimeFor(cur string) uint32 {
 	bt := uint32(60)
-	if cc := s.conf(cur); cc != nil && cc.BlockTime > 0 {
+	if cc := c.conf(cur); cc != nil && cc.BlockTime > 0 {
 		bt = uint32(cc.BlockTime)
 	}
 	return bt

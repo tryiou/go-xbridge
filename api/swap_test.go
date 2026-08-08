@@ -132,6 +132,24 @@ func (f *fakeConnector) SendRawTransaction(txHex string) (string, error) {
 
 func (f *fakeConnector) GetRelayFee() (float64, error) { return 0.0001, nil }
 
+// broadcastSnapshot returns a copy of the recorded broadcasts under the lock,
+// so a started-engine test can observe worker RPCs from the test goroutine.
+func (f *fakeConnector) broadcastSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.broadcasts))
+	copy(out, f.broadcasts)
+	return out
+}
+
+// setRawTx seeds the connector's rawTx map under the lock (used to stand in for
+// the maker's payTx when driving ConfirmB in started mode).
+func (f *fakeConnector) setRawTx(txid, hexStr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rawTx[txid] = hexStr
+}
+
 func (f *fakeConnector) GetBlockCount() (int64, error) { return f.blockHeight, nil }
 
 func (f *fakeConnector) GetBlockHash(height int64) ([32]byte, error) { return [32]byte{}, nil }

@@ -691,6 +691,14 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 		return
 	}
 	swlog.Info("swap packet received", "command", cmdName, "state", s.state.String())
+	// Two-phase handshake: while a deposit/claim task for this session is in
+	// flight (await set), the hub sends the next packet only after our response,
+	// so any packet arriving now is a retransmit. Drop it rather than re-running
+	// stage 1, which would broadcast a second deposit.
+	if s.await {
+		swlog.Debug("swap packet dropped: handshake task in flight", "command", cmdName)
+		return
+	}
 	// Defense in depth: a malformed/inbound packet must never crash the feed
 	// goroutine (which would terminate the whole process). Recover from any
 	// panic in the handler and log it; the swap is simply not progressed.
