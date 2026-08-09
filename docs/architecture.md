@@ -34,7 +34,7 @@ construction) → `wallet` (RPC/local signing) → `swap` (state machine) → `a
 | `config/` | Read-only INI loader mirroring `xbridgeapp.cpp::createConf()`. |
 | `wallet/` | `Connector` contract + two implementations: `RPCConnector` (drives a wallet/node over JSON-RPC) and `LocalConnector` (signs locally). |
 | `swap/` | `Transaction` state machine (port of `xbridgetransaction.*`) + the HTLC deposit layer (`DepositSpec`, `Session`). |
-| `api/` | The `dx*` JSON-RPC surface (drop-in for dapps) + the three-party Maker ⇄ ServiceNode ⇄ Taker swap client driver. |
+| `api/` | The `dx*` JSON-RPC surface (drop-in for dapps) + the three-party Maker ⇄ ServiceNode ⇄ Taker swap client driver, on a single-owner engine (see "Engine & concurrency"). |
 | `log/` | Dependency-free logging: size-based rotating file writer + multi-handler fanout. |
 | `cmd/xbridged` | The daemon. Flags: `-conf` (default `<home>/.blocknet/xbridge.conf`, fatal if missing), `-network`, `-node`, `-addnode`, `-rpcbind`, `-datadir`, etc. |
 | `cmd/liveprobe` | Ad-hoc live node check: dials + handshakes a real service node. |
@@ -289,14 +289,54 @@ is. Contracts, response shapes and error codes are in [`api.md`](api.md).
   auth, 4 MiB request-body cap.
 - `dispatch.go` — command dispatch table.
 - `node.go` — `Node`: inbound packet handling, hub-key re-verification of
-  handshake packets, expiry/refund watchers, persistence reload.
+  handshake packets, engine-scheduled refund sweep, persistence reload.
 - `handlers.go` / `order.go` / `store.go` — per-command handlers, order model,
-  session-local fills/history store.
-- `swap.go` — the three-party swap client driver + auto-refund watcher.
+  bounded copy-on-write fills/history store.
+- `swap.go` — the three-party swap client driver, with the two-phase handshake
+  (wallet I/O on workers) and the engine-scheduled refund sweep.
+- `engine.go` — the single-owner engine goroutine + worker pool (below).
 - `persist.go` — per-trade state + keypair persistence to
-  `<datadir>/xbridged-swaps.json`.
+  `<datadir>/xbridged-swaps.json`, written on the engine goroutine.
 - `locktime.go` — `acceptableLockTimeDrift`/`computeLockTimeFor` validating the
   counterparty deposit lockTime before our deposit/redeem.
+
+### Engine & concurrency (`api/`)
+
+The engine is a **single owner**: one goroutine (`engineLoop`) owns all mutable
+state — `n.sessions`, the live book writes, refund state, and the persist path —
+so the swap handshake and the refund sweep can never race each other.
+
+- **`engineLoop`** selects over five inputs in priority order: handler commands
+  (`n.cmds`, from `submit`), decoded packets (`n.packets`, from the reader),
+  worker results (`n.results`), the 60 s refund/persist ticker, and `n.stop`.
+  Every handler runs inside `safeRun`, so a single bad packet can never kill the
+  engine.
+- **`readerLoop`** is the read half of the former `feed()`: it blocks on the
+  socket, decodes + signature-verifies bodies, and forwards raw packets to the
+  engine. A slow peer can no longer stall state processing, and malformed/forged
+  packets are dropped before they reach the engine.
+- **Worker pool** (`engineWorkers=4`): a `workTask` carries a self-contained
+  `run` closure (all wallet RPC/`SendRawTransaction` I/O, capturing values by
+  value) and an `apply` closure that runs on the engine. Results flow back over
+  a channel buffered to the worker count, so the engine can never deadlock on a
+  result send. A wallet that hangs on one coin cannot stall the engine or other
+  sessions.
+- **Two-phase handshake**: `OnCreateA/B` and `OnConfirmA/B` split into stage 1
+  (engine: validate, snapshot the session, enqueue the task, set `await`) and a
+  resume (engine: apply the outcome, clear `await`, send the hub response,
+  persist). `await` is the retransmit guard: any hub packet arriving while a
+  task is in flight is dropped, so a deposit/claim is broadcast at most once.
+- **`submit(run, await)`** queues a handler/HTTP command for the engine; when
+  the engine is not started (single-threaded tests) it runs inline. Public
+  wrappers (`dispatchSwap`, `onRemoteCancel/Reject`, `checkRefunds`) are the
+  only `submit` callers; code already on the engine calls the internal functions
+  directly.
+- **Ticker duties**: `scanRefunds` auto-broadcasts due pre-signed refunds (posting
+  worker tasks, never doing I/O on the engine), `pruneSessions` drops terminal
+  sessions so the live set stays bounded, and every 4th tick persists.
+- **`Close()`** closes `n.stop`, then waits (`wg.Wait`) for every goroutine —
+  including an in-flight wallet task — to drain *before* closing the connection,
+  so no task ever writes after teardown.
 
 ### `log/` — logging
 
@@ -324,9 +364,15 @@ the handshake: build/broadcast HTLC deposits via `swap`+`coins` and the
 `wallet.Connector` (fund/sign/broadcast) → claim/refund as the hub advances the
 state → hub-pinned inbound packets re-verified before any state mutation.
 
-**Cancellation/refund:** `dxCancelOrder` or the auto-refund watcher on expiry;
-refund spends are built locally (`coins.BuildRefundScriptSig`) and broadcast
-through the wallet connector.
+**Cancellation/refund:** `dxCancelOrder` or the engine-scheduled refund sweep on
+expiry; refund spends are built locally (`coins.BuildRefundScriptSig`) and
+broadcast through the wallet connector.
+
+**Engine channels:** the reader pushes decoded packets onto `n.packets`; HTTP
+handlers submit commands to `n.cmds`; the engine dispatches wallet I/O to
+`n.tasks`, workers post outcomes to `n.results`, and the engine applies them.
+One goroutine therefore serializes every mutation of the sessions/book/refund
+state.
 
 ## Build, test, verify
 
@@ -347,7 +393,14 @@ The suite is hermetic — no live-network dials. Notable coverage:
 - `wallet/` — `httptest` JSON-RPC mock + a real P2SH HTLC sign/verify round-trip.
 - `swap/` — state-machine transition table, drift check, session gating.
 - `api/` — `TestSwapHandshake` drives the full three-party handshake end-to-end
-  with fake connectors.
+  with fake connectors; `api/concurrency_test.go` proves the single-owner engine
+  under `-race`: refund sweep interleaving with a deposit resume, no-fork
+  concurrent takes, a parked wallet not stalling other sessions, and `Close()`
+  draining in-flight tasks.
+- `coins/` — `TestConcurrentInitFromConfGet` hot-reloads the registry against
+  concurrent readers (`-race`).
+- `log/` — write-after-close is a nil-safe no-op, also under concurrent
+  writer-vs-close (`-race`).
 
 Cross-repo parity gate: `make parity` fact-checks the port
 against the C++ `dx*` contract — run it after touching the port or C++ XBridge.

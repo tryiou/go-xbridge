@@ -41,13 +41,14 @@ Go-created order/deposit is accepted by a C++ hub.
 The `dx*` JSON-RPC surface is largely at parity (error codes, dates, amounts,
 status strings, envelope); several response/behavior divergences remain (see the
 matrix). The swap handshake inbound packets are re-verified against the trusted
-hub key pinned at session creation (S2-E fixed). Separately, production
-readiness is still blocked by two untested data races and an open divergence set.
+hub key pinned at session creation (S2-E fixed). The two untested data races
+(F3/F4) are remediated and `-race`-covered by the concurrency tests; production
+readiness is now blocked only by the remaining open divergence set.
 
 **Bottom line:** the port can **connect** to the live network (wire-faithful)
-and can **trade** with C++ peers at the wire level (S1-A…D, S2-B, S2-E fixed); it
-is not yet production-safe until the data-race + divergence items below are
-fixed.
+and can **trade** with C++ peers at the wire level (S1-A…D, S2-B, S2-E, F3/F4
+fixed); it is not yet production-safe until the remaining divergence items
+below are fixed.
 
 ## Per-area verdicts
 
@@ -61,7 +62,7 @@ fixed.
 | SA-6 Fee & dust math | MINOR DIVERGENCE (thin-client defaults) | S3 |
 | SA-7 Crypto & signatures | FAITHFUL except base58check strictness + BCH forkid | S2 |
 | SA-8 RPC/API surface | PARITY except S2 shape/behavior + S3 value-level items | S2 |
-| SA-9 Code quality & security | NOT production-ready (races, growth) | S2 |
+| SA-9 Code quality & security | IMPROVED (races + growth fixed; open S2 divergences) | S2 |
 
 ## Open divergences
 
@@ -82,18 +83,6 @@ fixed.
   unit-tested but **never invoked** by the daemon. C++ runs
   `eraseExpiredTransactions` on a timer (`xbridgeexchange.cpp:712-747`). Go only
   filters the store in `dxGetOrders` and relies on the hub to drop stale orders.
-- **S2-F. Data race on live `SwapSession` fields.** Handlers mutate `state`
-  (`api/swap.go:218,227,252,297,345,399,417`), `ourDepositTxID` (`:636`),
-  `ourLockTime` (`:637`), `refundHex` (`:649`) on the feed goroutine **without**
-  `sessMu` while the refund-watcher `checkRefunds` (`api/swap.go:487-512`) and
-  persist read under it. Untested by `-race` (watcher never runs in tests).
-  `ingestPending` (`api/node.go:641`) mutates `ex.Updated` on the same goroutine
-  via `Store.Get` — same accepted pattern.
-- **S2-G. Data race on the package-global `coins.Coins` map on hot-reload.**
-  `coins.InitFromConf` reassigns the map (`coins/coin.go:62-72`) without
-  synchronization, invoked by `dxLoadXBridgeConf → reloadConf` (`api/node.go:287`)
-  while other goroutines call `coins.Get` (`coins/coin.go:162`) — possible
-  "concurrent map read and map write" daemon crash.
 - **S2-H. base58check decode strictness.** Go hard-rejects a mismatched version
   byte (`coins/address.go:107-114`); C++ `toXAddr` strips the version byte
   blindly (`xbridgewalletconnectorbtc.cpp:1547-1555`). Valid-input payloads are
@@ -158,8 +147,6 @@ fixed.
 - Param-leniency on commands C++ rejects with error: `dxGetLocalTokens`,
   `dxGetNetworkTokens`, `dxGetTokenBalances`, `dxGetMyOrders`, `dxLoadXBridgeConf`,
   `dxGetNewTokenAddress`, extra params on `dxGetOrderFills`.
-- `dxGetMyOrders` `Mine()` omits history-only local finished/cancelled orders
-  (`api/store.go:134` vs C++ `rpcxbridge.cpp:2111-2120`).
 - `MaxPayloadSize` 64 MiB vs C++ `MAX_SIZE` 32 MiB; Go does not enforce C++'s
   per-command min-size checks on read (receive-side leniency); Go doesn't
   re-stamp the header timestamp or run `addToKnown`/hash dedup
@@ -175,7 +162,7 @@ mismatch (row note). `TIER3` = intentionally divergent thin-client limit
 |---|---|---|
 | dxGetOrders | DONE | conf/connector filter + id-sorted |
 | dxGetOrder | DONE | `NO_SESSION` gate; case-insensitive id |
-| dxGetMyOrders | PARITY-NOTE | S4: omits history-only finished/cancelled |
+| dxGetMyOrders | DONE | history-only finished/cancelled now merged (S4 resolved) |
 | dxGetOrderBook | **DIVERGENCE** | S2-A detail-4 nesting; per-side caps OK |
 | dxGetOrderFills | PARITY-NOTE | S4: param leniency (C++ rejects size∉{2,3}) |
 | dxGetMyPartialOrderChain | DONE | S2-B resolved: unknown id → `[]`; malformed id → `bad order id` |
@@ -250,6 +237,29 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
   dust/fee fidelity (`DustAmount` tier + 5460 + `MinTxFee` floor); network-token
   source via `p2p/servicenode.Registry`; empty order-book arrays as `[]`;
   panic-safe RPC envelope + rotating file logging + datadir pre-create.
+- **F3 (was S2-F).** `SwapSession` fields are single-owner: all handshake
+  mutation runs on the engine goroutine via `submit`, including the two-phase
+  task resumes; the refund sweep (`scanRefunds`), session prune
+  (`pruneSessions`), and persist run on the same engine ticker. Race-covered by
+  `TestConcurrentRefundSweepAndDepositTask` (sweep reading a session while its
+  deposit resume lands) plus the slow-wallet liveness and shutdown-drain tests in
+  `api/concurrency_test.go`.
+- **F4 (was S2-G).** The coin registry is an `atomic.Pointer[map[string]Coin]`
+  published whole by `InitFromConf` (last-good on error); `Get`/`Has`/`MustGet`
+  dereference the pointer lock-free, so a `dxLoadXBridgeConf` hot-reload can
+  never race a concurrent lookup. Race-covered by `TestConcurrentInitFromConfGet`
+  (`coins/coin_test.go`), which hot-reloads against concurrent readers.
+- **F6.** The book/session maps are never held across wallet I/O: `scanRefunds`
+  runs on the engine and posts worker refund tasks; the refund `apply` runs back
+  on the engine. The refund sweep (auto-broadcast of due pre-signed refunds)
+  therefore cannot stall packet dispatch.
+- **F5/F9.** Unbounded growth bounded: `pruneSessions` drops terminal sessions on
+  the engine ticker; `Store.fills`/`history`/`cancelled` are capped via
+  `trimOldest` (1000 each). Covered by `TestPruneSessionsRemovesTerminal`,
+  `TestPruneKeepsSessionWithInFlightDepositTask`, `TestStoreHistoryBounded`.
+- **S4 (dxGetMyOrders).** Live local orders now merge with the local
+  history (finished/cancelled) so `Mine()` matches C++
+  `rpcxbridge.cpp:2111-2120`.
 
 ## Deliberate thin-client items (explicitly NOT bugs)
 
@@ -266,10 +276,6 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
 
 | # | Finding | Severity |
 |---|---|---|
-| F3 | Data race on `SwapSession` fields (S2-F). | S2 |
-| F4 | Data race on global `coins.Coins` map on hot-reload (S2-G). | S2 |
-| F5/F9 | `sessions` / `Store.fills` / `Store.history` grow without bound (memory + persisted JSON). | S3 |
-| F6 | `sessMu` held across wallet RPC I/O in `checkRefunds` (stalls packet dispatch up to 30 s). | S3 |
 | F7 | Inbound order UTXO ownership proofs are never verified before the order is put on the book. | S3 |
 | F8 | Segwit/BIP143 signing is dead code w.r.t. the daemon; bech32 destinations re-encoded as legacy P2PKH. | S3 |
 | F11–F14 | Vestigial `Server.verify`, unused `coins.MustGet`, tested-but-unreferenced `swap` package, `LocalConnector.SignMessage`/`VerifyMessage` unsupported (test-only). | S4 |
@@ -279,8 +285,9 @@ mutation against a trusted hub key, and automatic peer discovery is rate-unbound
 An attacker can pollute the book and trigger real deposits (fund lockup,
 recoverable via refund). HTLC semantics (ELSE-branch needs the secret; refunds
 pay the depositor's own address) prevent direct **theft** — worst case is lockup +
-fee-burn + state corruption + DoS. `-race` green does **not** cover F3/F4 (the
-watcher/reload paths are untested).
+fee-burn + state corruption + DoS. `-race` green now covers F3/F4: the watcher
+path runs in `TestConcurrentRefundSweepAndDepositTask` and the hot-reload path
+in `TestConcurrentInitFromConfGet`.
 
 ## Verification gaps still open
 
@@ -303,16 +310,14 @@ watcher/reload paths are untested).
 | Swap state machine (machine/scripts) | 8 / 10 |
 | Swap deposit/execution path | 9 / 10 (S1-A…D fixed) |
 | Config / coins / crypto / wallet | 7 / 10 |
-| Code quality & security (production-readiness) | 7 / 10 (F1/F2/F10 fixed) |
+| Code quality & security (production-readiness) | 8 / 10 (F1/F2/F3/F4/F5/F6/F9/F10 fixed) |
 | Docs & prior-audit accuracy | 7 / 10 |
 | **Readiness to trade live vs C++ network** | **6 / 10** |
 
 ## Priority remediation order
 
-1. **F3/F4** session-lock scope + coin-registry `sync.RWMutex`/atomic pointer;
-   add tests that run the watcher and hot-reload paths.
-2. **S2-A/C** order-book detail-4 nesting, `dxSplitInputs` utxo schema.
-3. **S2-D** wire the expiry sweep to a timer using the correct
+1. **S2-A/C** order-book detail-4 nesting, `dxSplitInputs` utxo schema.
+2. **S2-D** wire the expiry sweep to a timer using the correct
    `IsExpiredByBlockNumber`.
-4. **S2-I/J** BCH forkid signing; DCR/PART/DEVAULT coin-family connectors.
-5. **S3-G** refund/payment payout model (`fee2` margin, `oOverpayment`).
+3. **S2-I/J** BCH forkid signing; DCR/PART/DEVAULT coin-family connectors.
+4. **S3-G** refund/payment payout model (`fee2` margin, `oOverpayment`).
