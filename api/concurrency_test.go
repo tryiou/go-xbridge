@@ -295,3 +295,180 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 		t.Fatalf("Accepting packets written = %d, want %d", got, takes)
 	}
 }
+
+// TestConcurrentCancelOrderSingleSession — the cancel counterpart of the take
+// no-fork proof. Eight HTTP-style goroutines cancel the same order with a live
+// session; the engine serializes the tails so the book ends consistent and no
+// session fork/leak occurs. NOTE: CancelOrder takes the RAW store key (the RPC
+// handler normalizes via orderIDKey before calling it), unlike TakeOrder which
+// normalizes internally.
+func TestConcurrentCancelOrderSingleSession(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConnector{ticker: "BTC", blockHeight: 1000}
+	n, cc := newStartedNode(t, map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}, map[string]wallet.Connector{"BTC": conn})
+
+	mPriv, mPub := newKey(t)
+	var oid [32]byte
+	copy(oid[:], []byte("concurrent-cancel-order-00000000"))
+	o := &Order{
+		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		Status: "open",
+	}
+	n.store.Add(o)
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: addrFor(0, "maker-c"), TakerAddress: addrFor(0, "taker-c")}, arr32(mPriv), toArr33(mPub))
+
+	const cancels = 8
+	var wg sync.WaitGroup
+	for i := 0; i < cancels; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, rerr := n.CancelOrder(CancelOrderParams{ID: hexEncode(oid[:])}); rerr != nil {
+				t.Errorf("CancelOrder: %v", rerr)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Engine-serialized tails: exactly one session survives (no fork/leak).
+	if got := readOnEngine(t, n, func() int { return len(n.sessions) }); got != 1 {
+		t.Fatalf("sessions = %d, want 1 (no fork)", got)
+	}
+	if got := n.store.Get(hexEncode(oid[:])); got == nil || got.Status != "canceled" {
+		t.Fatalf("order status = %v, want canceled", got)
+	}
+	// Each cancel tail sent its own cancel packet (signed with the session's
+	// per-trade M key) — none lost, none raced.
+	if got := len(cc.snapshot()); got != cancels {
+		t.Fatalf("cancel packets written = %d, want %d", got, cancels)
+	}
+}
+
+// TestCloseDrainsInFlightRefundTask locks in the shutdown-join order for a
+// refund sweep task parked in the wallet: Close must block (wg.Wait) until the
+// refund broadcast completes, then return cleanly. The parked task here is a
+// refund-sweep task, not a deposit task.
+func TestCloseDrainsInFlightRefundTask(t *testing.T) {
+	n, _, gated, _ := setupTwoCoinNode(t)
+	defer gated.open() // on failure, lets t.Cleanup's Close drain instead of hanging
+
+	// A session with a due pre-signed refund (lockTime 1 < height 1000) on the
+	// gated coin, so the sweep posts a refund task that parks in SendRawTransaction.
+	var rID [32]byte
+	copy(rID[:], []byte("shutdown-refund-order-0000000000"))
+	rtx := &coins.Tx{Version: 1}
+	rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("cd", 32)), Index: 0}, Sequence: 0xfffffffe}}
+	rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+	n.submit(func() {
+		n.sessions[hexEncode(rID[:])] = &SwapSession{
+			n: n, id: rID, isMaker: false, srcCur: "BTC", dstCur: "LTC",
+			refundHex: hex.EncodeToString(rtx.Serialize()), refundDone: false,
+			ourLockTime: 1, state: csCreatedA,
+		}
+	}, true)
+
+	// The sweep posts the refund task; wait until it is parked in the wallet.
+	n.checkRefunds()
+	deadline := time.Now().Add(5 * time.Second)
+	for gated.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gated.callCount() != 1 {
+		t.Fatalf("refund task never reached SendRawTransaction (calls=%d)", gated.callCount())
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- n.Close() }()
+	select {
+	case err := <-done:
+		t.Fatalf("Close returned while refund task in flight: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	gated.open()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the refund task drained")
+	}
+}
+
+// TestEngineLivenessDispatchSwapSlowWallet drives session B's CreateA through
+// the FULL dispatch path (hub-signed packet → processSwap re-verify → stage1 →
+// worker → resume → sign+send) while session A's wallet is parked, proving a
+// slow wallet cannot stall packet dispatch for unrelated sessions.
+func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
+	n, cc, gated, ltc := setupTwoCoinNode(t)
+	defer gated.open()
+
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 2
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerHub(t, n, hubPriv)
+
+	// Session A (maker, BTC): deposit parked on the gated connector.
+	mPriv, mPub := newKey(t)
+	var aID [32]byte
+	copy(aID[:], []byte("liveness-dispatch-a-order-00000"))
+	aOrder := &Order{
+		ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	}
+	n.newMakerSession(aOrder, MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
+	n.submit(func() {
+		if _, _, err := n.sessions[hexEncode(aID[:])].OnCreateA(&proto.CreateABody{ID: aID, BPubKey: to33(mPub)}); err != nil {
+			t.Errorf("A OnCreateA: %v", err)
+		}
+	}, true)
+	deadline := time.Now().Add(5 * time.Second)
+	for gated.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gated.callCount() != 1 {
+		t.Fatalf("A deposit never reached the wallet (calls=%d)", gated.callCount())
+	}
+
+	// Session B (maker, LTC): CreateA delivered as a live hub-signed packet via
+	// dispatchSwap → processSwap (hub-key re-verify + registry check).
+	_, bPub := newKey(t)
+	var bID [32]byte
+	copy(bID[:], []byte("liveness-dispatch-b-order-00000"))
+	bOrder := &Order{
+		ID: bID, FromCurrency: "LTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 1e8,
+		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	}
+	n.newMakerSession(bOrder, MakeOrderParams{MakerAddress: addrFor(48, "maker-b"), TakerAddress: addrFor(48, "taker-b")}, arr32(mPriv), toArr33(bPub))
+	createA := hubSignedPkt(t, hubPriv, proto.XbcTransactionCreateA, &proto.CreateABody{
+		HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub),
+	})
+	n.dispatchSwap(createA, bID, [20]byte{}, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		return s.OnCreateA(&proto.CreateABody{HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub)})
+	})
+
+	// B's CreatedA arrives (A's is deferred behind the parked wallet).
+	waitForPacket(t, cc, proto.XbcTransactionCreatedA, 5*time.Second)
+	if got := ltc.broadcastSnapshot(); len(got) != 1 {
+		t.Fatalf("LTC deposit broadcast %d times, want 1", len(got))
+	}
+	if got := gated.callCount(); got != 1 {
+		t.Fatalf("A wallet called %d times, want 1 (still parked)", got)
+	}
+	if got := readOnEngine(t, n, func() bool { return n.sessions[hexEncode(bID[:])].await }); got {
+		t.Error("B await still set after its CreatedA")
+	}
+	if got := readOnEngine(t, n, func() bool { return n.sessions[hexEncode(aID[:])].await }); !got {
+		t.Error("A await cleared while its deposit is still parked")
+	}
+}
