@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -95,4 +96,63 @@ func TestRotatingWriter_BackupShift(t *testing.T) {
 	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
 		t.Fatalf("backup .3 should NOT exist: %v", err)
 	}
+}
+
+// TestRotatingWriter_WriteAfterClose locks in the no-op-after-close contract: a
+// late Write (e.g. a log line racing daemon shutdown) must not panic or error,
+// and a second Close must be a no-op — the log path stays nil-safe.
+func TestRotatingWriter_WriteAfterClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xbridged.log")
+
+	rw, err := NewRotatingWriter(path, 1<<20, 2)
+	if err != nil {
+		t.Fatalf("NewRotatingWriter: %v", err)
+	}
+	if _, err := rw.Write([]byte("before\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Write after close: dropped, never an error or panic.
+	const msg = "after\n"
+	if n, err := rw.Write([]byte(msg)); err != nil || n != len(msg) {
+		t.Fatalf("Write after close = (%d, %v), want (%d, nil)", n, err, len(msg))
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "before\n" {
+		t.Fatalf("file = %q, want %q (post-close write must not land)", data, "before\n")
+	}
+}
+
+// TestRotatingWriter_ConcurrentCloseWrite races writers against Close so a
+// shutdown-path regression (nil-file deref, data race) shows up under -race.
+func TestRotatingWriter_ConcurrentCloseWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xbridged.log")
+
+	rw, err := NewRotatingWriter(path, 1<<20, 2)
+	if err != nil {
+		t.Fatalf("NewRotatingWriter: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_, _ = rw.Write([]byte("line\n"))
+			}
+		}()
+	}
+	_ = rw.Close()
+	wg.Wait()
 }

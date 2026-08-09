@@ -3,6 +3,8 @@ package coins
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"go-xbridge/config"
@@ -88,5 +90,63 @@ func TestFromConfNoHardcoding(t *testing.T) {
 	}
 	if blc.Decimals != 8 || blc.P2PKH != 26 || blc.P2SH != 28 || blc.SegWit || blc.Bech32HRP != "" {
 		t.Errorf("BLOCK coin wrong: %+v", blc)
+	}
+}
+
+// TestConcurrentInitFromConfGet proves the registry's atomic publication: a
+// hot-reload (InitFromConf) can run on one goroutine while readers call Get on
+// others, and no reader ever observes a torn or partial snapshot (the -race
+// detector would flag a plain-map implementation).
+func TestConcurrentInitFromConfGet(t *testing.T) {
+	// Restore the TestMain-seeded registry when the test finishes so sibling
+	// codec tests (which call MustGet for BLOCK/DOGE) still see their coins.
+	// Captured BEFORE the first InitFromConf below.
+	saved := registry.Load()
+	defer registry.Store(saved)
+
+	base := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC"},
+	}
+	if err := InitFromConf(base); err != nil {
+		t.Fatal(err)
+	}
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				if c, ok := Get("BTC"); !ok || c.Ticker != "BTC" || c.P2PKH != 0 {
+					t.Errorf("reader saw missing/partial BTC coin: ok=%v ticker=%q p2pkh=%d", ok, c.Ticker, c.P2PKH)
+				}
+				if c, ok := Get("LTC"); ok && (c.Ticker != "LTC" || c.P2PKH != 48) {
+					t.Error("reader saw a partial LTC coin")
+				}
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		if i%2 == 0 {
+			if err := InitFromConf(base); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		ltc := map[string]*config.CoinConf{}
+		for k, v := range base {
+			ltc[k] = v
+		}
+		ltc["LTC"] = &config.CoinConf{Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC"}
+		if err := InitFromConf(ltc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if c, ok := Get("BTC"); !ok || c.Ticker != "BTC" {
+		t.Fatalf("BTC lost from registry after reloads: ok=%v", ok)
 	}
 }
