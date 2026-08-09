@@ -139,6 +139,65 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 	}
 }
 
+// TestForceRefundTakesSweepGuard — F18 proof. A force-refund (enqueueRefund,
+// e.g. from CancelOrder/BroadcastRefund) must take the pendingRefunds guard so
+// the sweep (scanRefunds) cannot enqueue a second broadcast of the same refund
+// hex while the force-refund is in flight. With the force task parked in the
+// wallet, the sweep must skip the order; on the old code it enqueues a second
+// broadcast (SendRawTransaction called twice for one refund).
+func TestForceRefundTakesSweepGuard(t *testing.T) {
+	n, _, gated, _ := setupTwoCoinNode(t)
+	defer gated.open() // runs before t.Cleanup's Close, so shutdown can always drain
+
+	var rID [32]byte
+	copy(rID[:], []byte("force-refund-guard-order-000"))
+	rtx := &coins.Tx{Version: 1}
+	rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("ab", 32)), Index: 0}, Sequence: 0xfffffffe}}
+	rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+	n.submit(func() {
+		n.sessions[hexEncode(rID[:])] = &SwapSession{
+			n: n, id: rID, isMaker: false, srcCur: "BTC", dstCur: "LTC",
+			refundHex: hex.EncodeToString(rtx.Serialize()), refundDone: false,
+			ourLockTime: 0, state: csCreatedB,
+		}
+	}, true)
+
+	// Force-refund: the task parks in SendRawTransaction (gate held shut).
+	n.submit(func() { n.enqueueRefund(hexEncode(rID[:]), nil) }, true)
+	deadline := time.Now().Add(5 * time.Second)
+	for gated.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gated.callCount() != 1 {
+		t.Fatalf("force-refund never reached SendRawTransaction (calls=%d)", gated.callCount())
+	}
+
+	// The sweep runs while the force-refund is still in flight. With the F18
+	// guard set, it must skip this order — exactly one broadcast attempt total.
+	n.submit(func() { n.scanRefunds() }, true)
+	deadline = time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if c := gated.callCount(); c != 1 {
+			t.Fatalf("sweep double-enqueued the refund while force-refund in flight: %d SendRawTransaction calls, want 1", c)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Release the gate: the force-refund lands, marks the session refundDone,
+	// and the sweep (guard now cleared) still broadcasts nothing new.
+	gated.open()
+	deadline = time.Now().Add(5 * time.Second)
+	for !readOnEngine(t, n, func() bool { return n.sessions[hexEncode(rID[:])] == nil }) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := gated.broadcastSnapshot(); len(got) != 1 {
+		t.Fatalf("refund broadcast %d times, want 1", len(got))
+	}
+	if readOnEngine(t, n, func() bool { return n.sessions[hexEncode(rID[:])] != nil }) {
+		t.Error("session should have been pruned after its refund broadcast")
+	}
+}
+
 // TestEngineLivenessSlowWallet proves a parked wallet on one coin never stalls
 // the engine or other sessions: session B's full handshake completes while A's
 // deposit is still blocked in SendRawTransaction.

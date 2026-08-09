@@ -893,6 +893,16 @@ func (n *Node) checkRefunds() {
 // done before returning.
 func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) {
 	if s := n.sessions[orderID]; s != nil && s.refundHex != "" {
+		// F18: take the pendingRefunds guard so a concurrent sweep
+		// (scanRefunds) cannot enqueue a second broadcast of the same refund
+		// hex while this force-refund is in flight. postRefundTask's apply
+		// clears the guard on success AND error, so the sweep safety net still
+		// retries a failed force-refund once the deposit is due. Mirrors the
+		// scanRefunds guard pattern (engine-owned in started mode; redundant in
+		// inline mode, where scanRefunds skips the guard entirely).
+		if n.engineRunning.Load() {
+			n.pendingRefunds[orderID] = true
+		}
 		n.postRefundTask(orderID, s.srcCur, s.refundHex, 0, false, done)
 		return
 	}
