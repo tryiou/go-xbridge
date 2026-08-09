@@ -579,14 +579,20 @@ func (n *Node) handlePacket(in inboundPacket) {
 // order is never re-created: C++ processPendingTransaction only refreshes the
 // timestamp of a known order (xbridgesession.cpp:753-788) — store.Add would
 // REPLACE it and drop the local Role/Mine/MakerKey, so the existing record is
-// preserved and bumped. A canceled order may be re-accepted via a rebroadcast
-// (falls through to a fresh pending entry).
+// preserved and bumped. A canceled order must NOT be re-accepted via a
+// rebroadcast: C++ appendTransaction checks m_historicTransactions and returns
+// early (xbridgeapp.cpp:1358), and for active canceled orders only calls
+// updateTimestamp (never replacing state).
 func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
 	o := normalizeFromPendingBody(b, snode)
-	// A relayed copy of a known order only refreshes its timestamp (C++
-	// processPendingTransaction). Touch does the check-and-bump under the store
-	// lock, so a concurrent handler never reads a torn record.
+	// Touch handles the "known, non-canceled" case (C++ processPendingTransaction).
 	if n.store.Touch(hexEncode(o.ID[:])) {
+		return
+	}
+	// Touch returned false: the order is either unknown, canceled-while-still-
+	// live, or moved to history. Mirror appendTransaction: a known canceled/
+	// historic order must NOT be re-accepted from a network rebroadcast.
+	if n.store.HasOrder(hexEncode(o.ID[:])) {
 		return
 	}
 	n.store.Add(o)

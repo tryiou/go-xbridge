@@ -425,17 +425,18 @@ func TestIngestPending(t *testing.T) {
 		t.Fatalf("relayed copy clobbered the taken order: %+v", after)
 	}
 
-	// 3. A canceled order may be re-accepted via rebroadcast (re-created as a
-	//    fresh pending entry).
+	// 3. A canceled order must NOT be re-accepted via rebroadcast (mirrors C++
+	//    appendTransaction's history guard: known orders are never replaced). The
+	//    rebroadcast is silently dropped.
 	n2.store.Update(hexEncode(ordID[:]), func(o *Order) {
 		o.Status = "canceled"
 	})
 	n2.ingestPending(newBody(), hubPubHex)
 	after = n2.store.Get(hexEncode(ordID[:]))
 	if after == nil {
-		t.Fatal("canceled order was not re-created by the rebroadcast")
+		t.Fatal("canceled order should remain live after rejected rebroadcast")
 	}
-	if after.Status != "open" {
-		t.Fatalf("re-accepted order status = %q, want open", after.Status)
+	if after.Status != "canceled" {
+		t.Fatalf("canceled order was re-accepted as %q, want canceled", after.Status)
 	}
 }

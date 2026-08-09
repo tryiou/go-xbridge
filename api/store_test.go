@@ -207,3 +207,36 @@ func TestStoreUpdateTouchSemantics(t *testing.T) {
 		t.Fatal("Touch on a canceled order reported true; a relayed copy may not refresh it")
 	}
 }
+
+// TestStoreHasOrder verifies that HasOrder reports orders in both the live
+// orders map (including canceled-but-not-moved records) and the bounded
+// history. This backs the ingestPending history guard.
+func TestStoreHasOrder(t *testing.T) {
+	s := NewStore()
+	o := testStoreOrder(11)
+	key := hexEncode(o.ID[:])
+
+	if s.HasOrder(key) {
+		t.Fatal("HasOrder returned true for an unknown order")
+	}
+
+	s.Add(o)
+	if !s.HasOrder(key) {
+		t.Fatal("HasOrder returned false for a live order")
+	}
+
+	// Canceled-but-still-live (not moved to history): still known.
+	s.Update(key, func(o *Order) { o.Status = "canceled" })
+	if !s.HasOrder(key) {
+		t.Fatal("HasOrder returned false for a canceled live order")
+	}
+
+	// Moved to history: no longer in live map, but still known.
+	s.MoveToHistory(key, "canceled", 0, NowMicro())
+	if s.Get(key) != nil {
+		t.Fatal("order still live after MoveToHistory")
+	}
+	if !s.HasOrder(key) {
+		t.Fatal("HasOrder returned false for an order in history")
+	}
+}

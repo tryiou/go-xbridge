@@ -128,7 +128,9 @@ func (s *Store) Update(idHex string, fn func(*Order)) bool {
 // Touch refreshes the Updated timestamp of a live, non-canceled order (a
 // relayed broadcast of a known order — C++ processPendingTransaction only bumps
 // the timestamp). It reports whether a live non-canceled record was bumped;
-// callers fall through to Add when false (unknown, or canceled → re-acceptable).
+// callers fall through to Add when false (unknown order only — canceled or
+// historic orders are checked via HasOrder, mirroring C++ appendTransaction's
+// history guard).
 func (s *Store) Touch(idHex string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,6 +204,26 @@ func (s *Store) MoveToHistory(idHex, status string, reason, updated uint64) {
 // MoveToHistoryU32 is MoveToHistory with a uint32 reason (C++ TxCancelReason).
 func (s *Store) MoveToHistoryU32(idHex, status string, reason uint32, updated uint64) {
 	s.MoveToHistory(idHex, status, uint64(reason), updated)
+}
+
+// HasOrder reports whether idHex is known to the store — either live in the
+// active orders map (including canceled-but-not-yet-moved orders) or in the
+// bounded history. Mirrors C++ App::transaction(), which consults both
+// m_transactions and m_historicTransactions, and backs appendTransaction's
+// history guard that prevents a network rebroadcast from re-accepting a
+// canceled order.
+func (s *Store) HasOrder(idHex string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.orders[idHex]; ok {
+		return true
+	}
+	for _, e := range s.history {
+		if e.ID == idHex {
+			return true
+		}
+	}
+	return false
 }
 
 // AddToHistory appends a terminal history record for o without touching the
