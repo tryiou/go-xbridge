@@ -118,6 +118,66 @@ func TestMakeOrderDryRunSkipsHubGate(t *testing.T) {
 	}
 }
 
+// TestMakeOrderReturnsStoreCopy proves dxMakeOrder returns a snapshot COPY of
+// the stored order, never the store's live record (F15). On the old code the
+// returned *Order WAS the live record: the HTTP handler rendered
+// makeOrderResponse() on it while the engine could concurrently write it (a
+// relayed self-echo bumps Updated via store.Touch; a remote cancel writes
+// Status) — a real data race. Part 1 mutates the returned order and asserts the
+// book is unaffected (deterministically fails on the old aliasing code); part 2
+// runs engine-style store.Touch writes concurrently with response renders, which
+// must touch disjoint memory (green under -race only on the fixed code).
+func TestMakeOrderReturnsStoreCopy(t *testing.T) {
+	hubPriv, hubPub, _, _ := hubKey(t, 0x60)
+	reg := servicenode.NewRegistry()
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+	})
+	n, _ := newHubNode(reg)
+
+	o, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+	})
+	if rerr != nil {
+		t.Fatalf("MakeOrder: %v", rerr)
+	}
+	key := hexEncode(o.ID[:])
+	if n.store.Get(key) == nil {
+		t.Fatal("order was not added to the store")
+	}
+	liveUpdated := n.store.Get(key).Updated
+
+	// 1. Aliasing: mutating the returned order must not corrupt the book.
+	o.Updated = liveUpdated + 1
+	o.Status = "canceled"
+	got := n.store.Get(key)
+	if got.Updated != liveUpdated {
+		t.Fatalf("returned order aliases the live record: mutating it changed store Updated (%d -> %d)", liveUpdated, got.Updated)
+	}
+	if got.Status != "created" {
+		t.Fatalf("returned order aliases the live record: mutating it changed store Status to %q", got.Status)
+	}
+
+	// 2. Render-vs-engine-write race: an engine-side store.Touch writes the
+	// LIVE record's Updated while the handler renders the returned order. With
+	// the fix these touch disjoint memory (-race stays green); on the old code
+	// the returned pointer IS the live record and this is a flagged data race.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 5000; i++ {
+			n.store.Touch(key)
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		_ = o.makeOrderResponse()
+		_ = iso8601(o.Updated)
+	}
+	<-done
+	_ = hubPriv
+}
+
 // TestTakeOrderDryRunSkipsHubGate mirrors the make side: an unpinned order can
 // still be dry-run taken (preview only) — no hub required, no Accepting written.
 func TestTakeOrderDryRunSkipsHubGate(t *testing.T) {

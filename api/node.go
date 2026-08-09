@@ -1197,7 +1197,15 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		o.HubAddress = hubAddr
 		// State mutation (store.Add, session registration, SEND, persist) runs
 		// on the engine goroutine, which owns the book and session maps.
+		//
+		// F15: the response must render a store snapshot COPY, never the live
+		// record. The engine may concurrently write the live order (a relayed
+		// self-echo bumps Updated via store.Touch, or a remote cancel writes
+		// Status), so returning the live pointer to the HTTP handler would race
+		// its makeOrderResponse render. TakeOrder/CancelOrder already use this
+		// pattern (n.store.Get inside the engine closure).
 		var rerr *rpcError
+		var stored *Order
 		n.submit(func() {
 			n.store.Add(o)
 			if pending {
@@ -1205,6 +1213,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 				// confirms (C++ :2019 broadcast gate: only broadcast when
 				// !isOrderPending() || partialExactUtxoMatch). No SEND, no session.
 				n.persist()
+				stored = n.store.Get(hexEncode(o.ID[:]))
 				return
 			}
 			// SEND is addressed to the chosen hub's envelope address (C++
@@ -1218,10 +1227,12 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			n.newMakerSession(o, p, mPrivArr, mPub)
 			// Persist the new local swap (incl. its per-trade M keypair) to disk.
 			n.persist()
+			stored = n.store.Get(hexEncode(o.ID[:]))
 		}, true)
 		if rerr != nil {
 			return nil, rerr
 		}
+		return stored, nil
 	}
 	return o, nil
 }
