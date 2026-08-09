@@ -18,6 +18,9 @@ import (
 // methods (Get/List/Mine/Locked/LockedUtxoInfo) return snapshot copies, so no
 // *Order pointer ever escapes for out-of-lock mutation — a reader can never
 // observe a torn order or race the writer.
+//
+// The append-only histories (fills/history/cancelled) are bounded: each is
+// trimmed to its cap on write so the store cannot grow without bound.
 type Store struct {
 	mu        sync.RWMutex
 	orders    map[string]*Order
@@ -27,12 +30,31 @@ type Store struct {
 	history   []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
 }
 
-// historyEntry is a removed order's terminal record (C++ moveTransactionToHistory).
+const (
+	maxStoreFills   = 1000 // bound on s.fills (F9: bounded history)
+	maxStoreHistory = 1000 // bound on s.history (F9: bounded history)
+	maxCancelled    = 1000 // bound on s.cancelled (in addition to the age prune)
+)
+
+// trimOldest returns s with at most max elements, dropping the oldest entries
+// from the front.
+func trimOldest[S ~[]E, E any](s S, max int) S {
+	if len(s) > max {
+		return s[len(s)-max:]
+	}
+	return s
+}
+
+// historyEntry is a removed order's terminal record (C++ moveTransactionToHistory),
+// carrying a full snapshot of the order so finished/cancelled local orders stay
+// renderable via dxGetMyOrders / dxGetOrder (C++ m_historicTransactions holds
+// complete TransactionDescrPtrs, not thin records).
 type historyEntry struct {
 	ID      string
 	Status  string // e.g. "canceled"
 	Reason  uint32
 	Updated uint64
+	Order   *Order // snapshot of the order at removal time (nil when unavailable)
 }
 
 type fillEntry struct {
@@ -137,19 +159,44 @@ func (s *Store) Remove(idHex string) {
 	delete(s.orders, idHex)
 }
 
-// MoveToHistory deletes the live order and appends a terminal history record,
-// mirroring C++ App::moveTransactionToHistory (xbridgesession.cpp:3385). Used
-// by the remote-cancel path when an order has no deposit yet.
-func (s *Store) MoveToHistory(idHex, status string, reason, updated uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.orders, idHex)
+// historyLocked appends a terminal history entry under the held lock. It is a
+// no-op when the id is already recorded (C++ moveTransactionToHistory returns
+// early on a duplicate) and trims to the bounded cap.
+func (s *Store) historyLocked(idHex, status string, reason uint32, updated uint64, o *Order) {
+	for _, e := range s.history {
+		if e.ID == idHex {
+			return // already recorded: no duplicate entries
+		}
+	}
+	var snap *Order
+	if o != nil {
+		snap = o.Copy()
+		snap.Status = status
+		snap.Updated = updated
+	}
 	s.history = append(s.history, historyEntry{
 		ID:      idHex,
 		Status:  status,
-		Reason:  uint32(reason),
+		Reason:  reason,
 		Updated: updated,
+		Order:   snap,
 	})
+	s.history = trimOldest(s.history, maxStoreHistory)
+}
+
+// MoveToHistory deletes the live order and appends a terminal history record,
+// mirroring C++ App::moveTransactionToHistory (xbridgesession.cpp:3385). Used
+// by the remote-cancel path when an order has no deposit yet and by OnFinished.
+// Idempotent: a missing live order (already moved, or never present) is a no-op.
+func (s *Store) MoveToHistory(idHex, status string, reason, updated uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.orders[idHex]
+	if o == nil {
+		return
+	}
+	delete(s.orders, idHex)
+	s.historyLocked(idHex, status, uint32(reason), updated, o)
 }
 
 // MoveToHistoryU32 is MoveToHistory with a uint32 reason (C++ TxCancelReason).
@@ -157,12 +204,40 @@ func (s *Store) MoveToHistoryU32(idHex, status string, reason uint32, updated ui
 	s.MoveToHistory(idHex, status, uint64(reason), updated)
 }
 
+// AddToHistory appends a terminal history record for o without touching the
+// live orders map (used by restoreSwap to rebuild history from a persisted
+// terminal swap, mirroring C++ loadOrders). Idempotent on duplicate ids.
+func (s *Store) AddToHistory(o *Order, status string, reason, updated uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.historyLocked(hexEncode(o.ID[:]), status, uint32(reason), updated, o)
+}
+
+// HistoryOrder returns the snapshot copy of a removed order by id, or nil.
+// This backs the dxGetOrder history fallback (C++ App::transaction checks
+// m_historicTransactions when the live map misses).
+func (s *Store) HistoryOrder(idHex string) *Order {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.history {
+		if e.ID == idHex && e.Order != nil {
+			return e.Order.Copy()
+		}
+	}
+	return nil
+}
+
 // History returns the removed/cancelled order records.
 func (s *Store) History() []historyEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]historyEntry, len(s.history))
-	copy(out, s.history)
+	for i, e := range s.history {
+		out[i] = e
+		if e.Order != nil {
+			out[i].Order = e.Order.Copy()
+		}
+	}
 	return out
 }
 
@@ -189,6 +264,7 @@ func (s *Store) AddFill(f fillEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fills = append(s.fills, f)
+	s.fills = trimOldest(s.fills, maxStoreFills)
 }
 
 // Fills returns recorded fills, most recent first.
@@ -273,6 +349,7 @@ func (s *Store) RecordCancelled(id string, txtime uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancelled = append(s.cancelled, cancelledEntry{ID: id, Txtime: txtime, UseCount: 1})
+	s.cancelled = trimOldest(s.cancelled, maxCancelled)
 }
 
 // FlushCancelled prunes cancelled orders whose txtime is older than

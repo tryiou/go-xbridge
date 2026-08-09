@@ -674,15 +674,16 @@ func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	return body
 }
 
-// OnFinished (hub→both): the swap is complete on the hub; record the fill.
+// OnFinished (hub→both): the swap is complete on the hub; mark the order
+// terminal (C++ trFinished) and move it out of the live book into history
+// (C++ moveTransactionToHistory), which releases its reserved UTXOs and drops
+// it from dxGetOrders, then prune the session.
 func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, responseBody, error) {
-	s.n.store.Update(hexEncode(s.id[:]), func(o *Order) {
-		o.Status = "completed"
-		o.Updated = NowMicro()
-	})
+	s.n.store.MoveToHistory(hexEncode(s.id[:]), "finished", 0, NowMicro())
 	s.state = csFinished
 	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
 	s.n.persist()
+	s.n.pruneSessions()
 	return 0, nil, nil
 }
 
@@ -739,6 +740,9 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 				s.refundDone = true
 			}
 			n.persist()
+			// A refunded order is terminal: drop the session so it stops being
+			// swept and stops being re-persisted (C++ moveTransactionToHistory).
+			n.pruneSessions()
 		},
 	}
 	if !n.engineRunning.Load() {
@@ -799,6 +803,49 @@ func (n *Node) scanRefunds() {
 			n.pendingRefunds[id] = true
 		}
 		n.postRefundTask(id, s.srcCur, s.refundHex, s.ourLockTime, true, nil)
+	}
+}
+
+// sessionIsTerminal reports whether a session can be dropped from n.sessions.
+// It reached csFinished, or there is nothing left for it to do: its order left
+// the live book (moved to history), its order is terminal, or its refund was
+// already broadcast. The only reasons to keep a session are a pre-signed refund
+// that may still need broadcasting (the scanRefunds sweep — a guard that is
+// exactly the complement of the scanRefunds skip, so we never prune a session
+// that may still broadcast a refund) or an in-flight deposit/claim task whose
+// apply has not yet recorded the outcome.
+func (n *Node) sessionIsTerminal(id string, s *SwapSession) bool {
+	if s.state == csFinished {
+		return true
+	}
+	// A refund may still be owed: never prune while the sweep could broadcast.
+	if s.refundHex != "" && !s.refundDone && s.state >= csCreatedA {
+		return false
+	}
+	// A deposit/claim task is in flight (await stays set until its apply lands
+	// on the engine): pruning now would orphan the broadcast and strand a
+	// deposit whose pre-signed refund is about to be recorded.
+	if s.await {
+		return false
+	}
+	o := n.store.Get(id)
+	// Otherwise the session has no further work: the order left the live book
+	// (moved to history), the order is terminal, or the refund is already sent.
+	return o == nil || isOrderTerminal(o.Status) || s.refundDone
+}
+
+// pruneSessions removes terminal sessions from n.sessions, the lifecycle
+// counterpart to C++ App::moveTransactionToHistory (terminal transactions
+// leave the live map). Runs on the engine goroutine (ticker + resumes); inline
+// tests call it single-threaded. Deleting a session also clears its in-flight
+// refund guard so a stale sweep entry can never linger.
+func (n *Node) pruneSessions() {
+	for id, s := range n.sessions {
+		if n.sessionIsTerminal(id, s) {
+			delete(n.pendingRefunds, id)
+			delete(n.sessions, id)
+			xlog.Info("swap session pruned", "order", id, "state", s.state.String())
+		}
 	}
 }
 

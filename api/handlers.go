@@ -149,6 +149,12 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 	}
 	o := h.Store.Get(key)
 	if o == nil {
+		// C++ App::transaction falls back to m_historicTransactions when the
+		// live map misses (xbridgeapp.cpp:1273-1292): finished/cancelled local
+		// orders are still resolvable after they left the live book.
+		o = h.Store.HistoryOrder(key)
+	}
+	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetOrder", id)
 	}
 	// C++ requires a wallet session for both order currencies.
@@ -836,6 +842,19 @@ func (h *HandlerCtx) dxGetMyOrders(params []json.RawMessage) (interface{}, *rpcE
 	for _, o := range h.Store.Mine() {
 		out = append(out, o.toDetailResult())
 	}
+	// C++ dxGetMyOrders merges live local orders with historical local orders
+	// in a terminal state (rpcxbridge.cpp:2110-2121): finished/cancelled orders
+	// that left the live book stay visible.
+	for _, e := range h.Store.History() {
+		o := e.Order
+		if o == nil || !o.Mine {
+			continue
+		}
+		switch statusString(e.Status) {
+		case "finished", "canceled":
+			out = append(out, o.toDetailResult())
+		}
+	}
 	// C++ dxGetMyOrders sorts ascending by txtime (updated time).
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].UpdatedAt < out[j].UpdatedAt
@@ -876,9 +895,24 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 
 // partialOrderChain returns the full partial order chain for id — the root
 // (oldest ancestor) first, then the queried order, then all descendants,
-// matching C++ xbridge::App::getPartialOrderChain.
+// matching C++ xbridge::App::getPartialOrderChain, which walks both live
+// transactions() and history() so a finished parent stays resolvable.
 func (h *HandlerCtx) partialOrderChain(id string) []*Order {
-	cur := h.Store.Get(id)
+	idx := map[string]*Order{}
+	for _, o := range h.Store.List() {
+		idx[hexEncode(o.ID[:])] = o
+	}
+	for _, e := range h.Store.History() {
+		if e.Order == nil || !e.Order.Mine {
+			continue // C++ getPartialOrderChain walks isLocal() only
+		}
+		if _, ok := idx[e.ID]; !ok {
+			idx[e.ID] = e.Order
+		}
+	}
+	get := func(idHex string) *Order { return idx[idHex] }
+
+	cur := get(id)
 	if cur == nil {
 		return nil
 	}
@@ -887,7 +921,7 @@ func (h *HandlerCtx) partialOrderChain(id string) []*Order {
 	// Walk up to the root via ParentID.
 	for !isZeroID(cur.ParentID) {
 		pid := hexEncode(cur.ParentID[:])
-		p := h.Store.Get(pid)
+		p := get(pid)
 		if p == nil || seen[pid] {
 			break
 		}
@@ -897,8 +931,7 @@ func (h *HandlerCtx) partialOrderChain(id string) []*Order {
 	}
 	// Index parent -> children and walk down to descendants.
 	children := map[string][]string{}
-	for _, o := range h.Store.List() {
-		oid := hexEncode(o.ID[:])
+	for oid, o := range idx {
 		if isZeroID(o.ParentID) {
 			continue
 		}
@@ -910,7 +943,7 @@ func (h *HandlerCtx) partialOrderChain(id string) []*Order {
 			if seen[cid] {
 				continue
 			}
-			c := h.Store.Get(cid)
+			c := get(cid)
 			if c == nil {
 				continue
 			}

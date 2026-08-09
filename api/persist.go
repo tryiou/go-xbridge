@@ -85,6 +85,11 @@ type persistedSwap struct {
 	Hub    [20]byte    `json:"hub"`
 	HubKey [33]byte    `json:"hubKey"`
 	State  clientState `json:"state"`
+
+	// Historical marks a terminal record persisted from Store.history (C++
+	// saveOrders writes m_historicTransactions alongside the live map).
+	// restoreSwap routes these straight back into history, never the live set.
+	Historical bool `json:"historical,omitempty"`
 }
 
 // swapFile is the on-disk envelope: a sha256 checksum of the swaps blob plus
@@ -102,20 +107,37 @@ func swapStatePath(dir string) string {
 	return filepath.Join(dir, "xbridged-swaps.json")
 }
 
-// saveSwaps writes all local (Mine) swaps atomically. It snapshots the
-// engine-owned sessions, filters to those whose order is Mine (mirroring C++
-// saveOrders' isLocal() gate), then marshals + sha256s the blob and performs
-// an atomic temp-write / fsync / rename (C++ SerializeFileDB is atomic; this
-// mirrors that). The caller must be the engine goroutine (or a single-threaded
-// test): it reads n.sessions, which the engine alone owns.
+// saveSwaps writes all local (Mine) swaps atomically. It mirrors C++ saveOrders,
+// which serializes the live local transactions AND the local history: live
+// orders are persisted with their session state (so an in-flight trade can be
+// rebuilt post-restart, including its per-trade M keypair), while terminal
+// orders that moved to Store.history are persisted as historical records so
+// finished/cancelled trades remain visible after restart. It then marshals +
+// sha256s the blob and performs an atomic temp-write / fsync / rename (C++
+// SerializeFileDB is atomic; this mirrors that). The caller must be the engine
+// goroutine (or a single-threaded test): it reads n.sessions, which the engine
+// alone owns.
 func saveSwaps(path string, n *Node) error {
 	ps := make([]persistedSwap, 0, len(n.sessions))
-	for id, s := range n.sessions {
-		o := n.store.Get(id)
-		if o == nil || !o.Mine {
-			continue // only persist local swaps, like C++ saveOrders
+	for _, o := range n.store.List() {
+		if !o.Mine {
+			continue // only persist local orders, like C++ saveOrders' isLocal()
 		}
-		ps = append(ps, persistFromSession(s, o))
+		idHex := hexEncode(o.ID[:])
+		if s := n.sessions[idHex]; s != nil && !n.sessionIsTerminal(idHex, s) {
+			// Live in-flight swap: persist the session so a restart can resume.
+			ps = append(ps, persistFromSession(s, o))
+		} else {
+			// Live order with no live session (terminal session pruned, or a
+			// rolled-back order after refundDone): order-only record.
+			ps = append(ps, persistFromOrder(o))
+		}
+	}
+	for _, e := range n.store.History() {
+		if e.Order == nil || !e.Order.Mine {
+			continue // only persist local history, like C++ saveOrders
+		}
+		ps = append(ps, persistFromHistoryEntry(e))
 	}
 
 	blob, err := json.Marshal(ps)
@@ -194,11 +216,11 @@ func (n *Node) persist() {
 	}
 }
 
-// persistFromSession flattens a live session + its order into a persistedSwap.
-func persistFromSession(s *SwapSession, o *Order) persistedSwap {
+// orderFields flattens the durable Order fields shared by every persisted
+// record (live sessions, order-only records, and history entries alike).
+func orderFields(o *Order) persistedSwap {
 	return persistedSwap{
 		ID:             o.ID,
-		IsMaker:        s.isMaker,
 		Type:           o.Type,
 		From:           o.From,
 		To:             o.To,
@@ -235,37 +257,125 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 		CounterpartyRedeemed: o.CounterpartyRedeemed,
 		OrigFromCurrency:     o.OrigFromCurrency,
 		OrigToCurrency:       o.OrigToCurrency,
-		SrcCur:               s.srcCur,
-		DstCur:               s.dstCur,
-		SrcAmt:               s.srcAmt,
-		DstAmt:               s.dstAmt,
-		OurSourceAddr:        s.ourSourceAddr,
-		OurDestAddr:          s.ourDestAddr,
-		TheirPub:             s.theirPub,
-		PrivKey:              s.privKey,
-		PubKey:               s.pubKey,
-		Secret:               s.secret,
-		SecretHash:           s.secretHash,
-		OurLockTime:          s.ourLockTime,
-		OurDepositTxID:       s.ourDepositTxID,
-		RefundHex:            s.refundHex,
-		RefundDone:           s.refundDone,
-		TheirDepositTxID:     s.theirDepositTxID,
-		TheirLockTime:        s.theirLockTime,
-		TheirSecretHash:      s.theirSecretHash,
-		Hub:                  s.hub,
-		HubKey:               s.hubKey,
-		State:                s.state,
 	}
 }
 
-// restoreSwap rebuilds an Order + SwapSession from a persisted record and
-// registers them on n (mirroring C++ loadOrders). Active swaps are re-driven by
-// dispatchSwap when the hub's packets arrive post-restart; cancelled/finished
-// ones stay inert but remain restorable. The caller is the NewNode restore
-// block (single-threaded, before the engine starts).
+// persistFromOrder builds an order-only persisted record for a live order with
+// no live session (its terminal session was pruned). The session fields are
+// zeroed; restoreSwap re-adds the order without a session.
+func persistFromOrder(o *Order) persistedSwap {
+	return orderFields(o)
+}
+
+// persistFromHistoryEntry builds a historical persisted record from a
+// Store.history entry (C++ saveOrders writes local historic transactions).
+func persistFromHistoryEntry(e historyEntry) persistedSwap {
+	ps := orderFields(e.Order)
+	ps.Status = e.Status
+	ps.Reason = e.Reason
+	ps.Updated = e.Updated
+	ps.Historical = true
+	return ps
+}
+
+// persistFromSession flattens a live session + its order into a persistedSwap.
+func persistFromSession(s *SwapSession, o *Order) persistedSwap {
+	ps := orderFields(o)
+	ps.IsMaker = s.isMaker
+	ps.SrcCur = s.srcCur
+	ps.DstCur = s.dstCur
+	ps.SrcAmt = s.srcAmt
+	ps.DstAmt = s.dstAmt
+	ps.OurSourceAddr = s.ourSourceAddr
+	ps.OurDestAddr = s.ourDestAddr
+	ps.TheirPub = s.theirPub
+	ps.PrivKey = s.privKey
+	ps.PubKey = s.pubKey
+	ps.Secret = s.secret
+	ps.SecretHash = s.secretHash
+	ps.OurLockTime = s.ourLockTime
+	ps.OurDepositTxID = s.ourDepositTxID
+	ps.RefundHex = s.refundHex
+	ps.RefundDone = s.refundDone
+	ps.TheirDepositTxID = s.theirDepositTxID
+	ps.TheirLockTime = s.theirLockTime
+	ps.TheirSecretHash = s.theirSecretHash
+	ps.Hub = s.hub
+	ps.HubKey = s.hubKey
+	ps.State = s.state
+	return ps
+}
+
+// restoreSwap rebuilds an Order (and, for live records, a SwapSession) from a
+// persisted record and registers them on n (mirroring C++ loadOrders). Active
+// swaps are re-driven by dispatchSwap when the hub's packets arrive
+// post-restart; terminal records (finished, or terminal-status with no refund
+// still owed) route into Store.history like C++ routes trFinished/trCancelled
+// to m_historicTransactions. The caller is the NewNode restore block
+// (single-threaded, before the engine starts).
 func (n *Node) restoreSwap(ps persistedSwap) {
-	o := &Order{
+	o := buildOrder(ps)
+
+	// Terminal records are restored to history, never re-registered as live
+	// swaps: they would otherwise leak back into the live set on every restart.
+	// Refund-pending cancelled swaps are kept live so the sweep can still
+	// recover the deposit post-restart.
+	if ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA)) {
+		n.store.AddToHistory(o, ps.Status, uint64(ps.Reason), ps.Updated)
+		return
+	}
+	n.store.Add(o)
+
+	// Order-only records (persistFromOrder) carry no session: the terminal
+	// session was pruned, so there is nothing to resume.
+	if !hasSessionData(ps) {
+		return
+	}
+
+	s := &SwapSession{
+		n:                n,
+		isMaker:          ps.IsMaker,
+		id:               ps.ID,
+		srcCur:           ps.SrcCur,
+		dstCur:           ps.DstCur,
+		srcAmt:           ps.SrcAmt,
+		dstAmt:           ps.DstAmt,
+		ourSourceAddr:    ps.OurSourceAddr,
+		ourDestAddr:      ps.OurDestAddr,
+		theirPub:         ps.TheirPub,
+		privKey:          ps.PrivKey,
+		pubKey:           ps.PubKey,
+		secret:           ps.Secret,
+		secretHash:       ps.SecretHash,
+		ourLockTime:      ps.OurLockTime,
+		ourDepositTxID:   ps.OurDepositTxID,
+		refundHex:        ps.RefundHex,
+		refundDone:       ps.RefundDone,
+		theirDepositTxID: ps.TheirDepositTxID,
+		theirLockTime:    ps.TheirLockTime,
+		theirSecretHash:  ps.TheirSecretHash,
+		hub:              ps.Hub,
+		hubKey:           ps.HubKey,
+		state:            ps.State,
+	}
+	n.sessions[hexEncode(ps.ID[:])] = s
+}
+
+// hasSessionData reports whether a persisted record carries a live session
+// (persisted via persistFromSession) as opposed to an order-only record
+// (persistFromOrder, whose session fields are all zero).
+func hasSessionData(ps persistedSwap) bool {
+	return ps.State > csIdle ||
+		ps.PrivKey != ([32]byte{}) ||
+		ps.PubKey != ([33]byte{}) ||
+		ps.RefundHex != "" ||
+		ps.OurDepositTxID != "" ||
+		ps.SecretHash != ([20]byte{})
+}
+
+// buildOrder reconstructs the durable Order from a persisted record.
+func buildOrder(ps persistedSwap) *Order {
+	return &Order{
 		ID:             ps.ID,
 		Type:           ps.Type,
 		From:           ps.From,
@@ -305,33 +415,4 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		OrigFromCurrency:     ps.OrigFromCurrency,
 		OrigToCurrency:       ps.OrigToCurrency,
 	}
-	n.store.Add(o)
-
-	s := &SwapSession{
-		n:                n,
-		isMaker:          ps.IsMaker,
-		id:               ps.ID,
-		srcCur:           ps.SrcCur,
-		dstCur:           ps.DstCur,
-		srcAmt:           ps.SrcAmt,
-		dstAmt:           ps.DstAmt,
-		ourSourceAddr:    ps.OurSourceAddr,
-		ourDestAddr:      ps.OurDestAddr,
-		theirPub:         ps.TheirPub,
-		privKey:          ps.PrivKey,
-		pubKey:           ps.PubKey,
-		secret:           ps.Secret,
-		secretHash:       ps.SecretHash,
-		ourLockTime:      ps.OurLockTime,
-		ourDepositTxID:   ps.OurDepositTxID,
-		refundHex:        ps.RefundHex,
-		refundDone:       ps.RefundDone,
-		theirDepositTxID: ps.TheirDepositTxID,
-		theirLockTime:    ps.TheirLockTime,
-		theirSecretHash:  ps.TheirSecretHash,
-		hub:              ps.Hub,
-		hubKey:           ps.HubKey,
-		state:            ps.State,
-	}
-	n.sessions[hexEncode(ps.ID[:])] = s
 }

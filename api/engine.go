@@ -177,6 +177,9 @@ func (n *Node) engineLoop() {
 			// deposit lockTime has passed. Engine-owned: workers do the wallet
 			// I/O; the engine applies the results.
 			n.safeRun(func() { n.scanRefunds() })
+			// Lifecycle sweep: drop terminal sessions (finished swaps, orders
+			// whose refund has been broadcast) so the live set stays bounded.
+			n.safeRun(func() { n.pruneSessions() })
 			// Mirror C++ saveOrders cadence: flush local swap state to disk
 			// periodically so a crash loses at most a few minutes of progress.
 			if n.tickCount%4 == 0 {
