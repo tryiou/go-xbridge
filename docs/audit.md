@@ -42,8 +42,12 @@ The `dx*` JSON-RPC surface is largely at parity (error codes, dates, amounts,
 status strings, envelope); several response/behavior divergences remain (see the
 matrix). The swap handshake inbound packets are re-verified against the trusted
 hub key pinned at session creation (S2-E fixed). The two untested data races
-(F3/F4) are remediated and `-race`-covered by the concurrency tests; production
-readiness is now blocked only by the remaining open divergence set.
+(F3/F4) are remediated and `-race`-covered by the concurrency tests; on the
+`concurrency/engine` branch the make-order live-pointer escape (F15), the
+post-completion handshake retransmit gap (F16), and the force-refund
+double-broadcast window (F18) are additionally fixed, leaving one documented
+engine-I/O limitation (F17). Production readiness is now blocked only by the
+remaining open divergence set.
 
 **Bottom line:** the port can **connect** to the live network (wire-faithful)
 and can **trade** with C++ peers at the wire level (S1-A…D, S2-B, S2-E, F3/F4
@@ -243,7 +247,9 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
   (`pruneSessions`), and persist run on the same engine ticker. Race-covered by
   `TestConcurrentRefundSweepAndDepositTask` (sweep reading a session while its
   deposit resume lands) plus the slow-wallet liveness and shutdown-drain tests in
-  `api/concurrency_test.go`.
+  `api/concurrency_test.go`. The `swap/` package documents its pure/ownership
+  contract (`swap/state.go`): `Session`/`Transaction` values are never shared
+  across goroutines; workers receive immutable `swapCtx` snapshots.
 - **F4 (was S2-G).** The coin registry is an `atomic.Pointer[map[string]Coin]`
   published whole by `InitFromConf` (last-good on error); `Get`/`Has`/`MustGet`
   dereference the pointer lock-free, so a `dxLoadXBridgeConf` hot-reload can
@@ -260,6 +266,31 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
 - **S4 (dxGetMyOrders).** Live local orders now merge with the local
   history (finished/cancelled) so `Mine()` matches C++
   `rpcxbridge.cpp:2111-2120`.
+- **F15.** `dxMakeOrder`/`dxMakePartialOrder` returned the STORE'S LIVE
+  `*Order` (`api/node.go` MakeOrder): the HTTP handler rendered
+  `makeOrderResponse()` on it while the engine could concurrently write the
+  same record (a relayed self-echo bumps `Updated` via `Store.Touch`; a remote
+  cancel writes `Status`) — a real data race that escaped the store's own "no
+  live pointer escapes" contract (`api/store.go:17-20`). Fixed: MakeOrder
+  returns `n.store.Get(key)` (a snapshot copy) from inside the engine closure,
+  mirroring TakeOrder/CancelOrder. Covered by `TestMakeOrderReturnsStoreCopy`
+  (aliasing check + render-vs-`store.Touch` under `-race`).
+- **F16.** The handshake handlers had no C++-style post-completion state guard:
+  a retransmit arriving after the deposit/claim completed (`await` already
+  cleared) re-ran stage 1 and re-broadcast the deposit/claim — a second on-chain
+  broadcast attempt. Fixed with C++-faithful guards: `OnCreateA/B` drop once
+  `state >= csCreatedA/B` (C++ `state >= trCreated`, `xbridgesession.cpp:1947,
+  2424`); `OnConfirmA/B` drop once `state >= csConfirmedA/B` (C++ `state >=
+  trCommited`, `:2897,3152`). The `await` guard covers the in-flight window;
+  these cover post-completion. Covered by the `*StateGuard*` unit tests and
+  `TestCreateAStateGuardDropsPostCompletionRetransmitE2E`.
+- **F18.** A force-refund (`enqueueRefund`, from CancelOrder/BroadcastRefund)
+  did not take the `pendingRefunds` guard, so it could overlap the sweep's
+  auto-refund for the same order (two `SendRawTransaction` of the same hex;
+  on-chain idempotent but noisy). Fixed: `enqueueRefund` sets the guard before
+  posting, so `scanRefunds` skips while it is in flight; the apply still clears
+  the guard on success AND error, preserving the sweep safety net. Covered by
+  `TestForceRefundTakesSweepGuard`.
 
 ## Deliberate thin-client items (explicitly NOT bugs)
 
@@ -279,6 +310,7 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
 | F7 | Inbound order UTXO ownership proofs are never verified before the order is put on the book. | S3 |
 | F8 | Segwit/BIP143 signing is dead code w.r.t. the daemon; bech32 destinations re-encoded as legacy P2PKH. | S3 |
 | F11–F14 | Vestigial `Server.verify`, unused `coins.MustGet`, tested-but-unreferenced `swap` package, `LocalConnector.SignMessage`/`VerifyMessage` unsupported (test-only). | S4 |
+| F17 | Blocking I/O on the engine goroutine: `MakeOrder`/`CancelOrder` closures and the two-phase resumes run `conn.WritePacket` (blocking TCP write) and `persist()` (fsync) inline; a stalled peer or slow disk stalls all state processing. | S3 |
 
 **Attacker model:** inbound signature verification *is* enforced before state
 mutation against a trusted hub key, and automatic peer discovery is rate-unbounded.
@@ -287,7 +319,11 @@ recoverable via refund). HTLC semantics (ELSE-branch needs the secret; refunds
 pay the depositor's own address) prevent direct **theft** — worst case is lockup +
 fee-burn + state corruption + DoS. `-race` green now covers F3/F4: the watcher
 path runs in `TestConcurrentRefundSweepAndDepositTask` and the hot-reload path
-in `TestConcurrentInitFromConfGet`.
+in `TestConcurrentInitFromConfGet`. F15 (make-response vs engine `store.Touch`),
+F16 (post-completion retransmit), and F18 (force-refund vs sweep) are covered by
+`TestMakeOrderReturnsStoreCopy`, the `*StateGuard*` tests, and
+`TestForceRefundTakesSweepGuard`. F17 (blocking engine I/O) is a documented
+liveness hazard, not a memory-safety one.
 
 ## Verification gaps still open
 
@@ -310,7 +346,7 @@ in `TestConcurrentInitFromConfGet`.
 | Swap state machine (machine/scripts) | 8 / 10 |
 | Swap deposit/execution path | 9 / 10 (S1-A…D fixed) |
 | Config / coins / crypto / wallet | 7 / 10 |
-| Code quality & security (production-readiness) | 8 / 10 (F1/F2/F3/F4/F5/F6/F9/F10 fixed) |
+| Code quality & security (production-readiness) | 8 / 10 (F1/F2/F3/F4/F5/F6/F9/F10/F15/F16/F18 fixed; F17 documented) |
 | Docs & prior-audit accuracy | 7 / 10 |
 | **Readiness to trade live vs C++ network** | **6 / 10** |
 
