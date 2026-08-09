@@ -3,6 +3,12 @@
 // Transaction lifecycle: order join, the two-confirmation state progression,
 // and terminal/cancellation paths. See docs/architecture.md for the canonical
 // spec.
+//
+// Ownership contract: this package is PURE — it holds no mutexes and no shared
+// mutable state. Session/Transaction values must never be shared across
+// goroutines; the api package owns them exclusively on its engine goroutine and
+// passes immutable snapshots (swapCtx) to worker goroutines, which never touch a
+// live Session/Transaction.
 package swap
 
 import "fmt"
