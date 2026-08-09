@@ -317,6 +317,14 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateA received by taker session %s", orderID)
 	}
+	// F16: C++ processTransactionCreateA drops a CreateA once the transaction
+	// already reached trCreated (xbridgesession.cpp:1947). A retransmit arriving
+	// AFTER our deposit completed (await is cleared) must not re-broadcast a
+	// second deposit.
+	if s.state >= csCreatedA {
+		xlog.Info("CreateA ignored: swap already past deposit", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
 	if b.BPubKey == [33]byte{} {
 		return 0, nil, fmt.Errorf("api: CreateA missing B pubkey")
 	}
@@ -397,6 +405,13 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	orderID := hexEncode(s.id[:])
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateB received by maker session %s", orderID)
+	}
+	// F16: C++ processTransactionCreateB drops a CreateB once the transaction
+	// already reached trCreated (xbridgesession.cpp:2424). A post-completion
+	// retransmit must not re-broadcast a second deposit.
+	if s.state >= csCreatedB {
+		xlog.Info("CreateB ignored: swap already past deposit", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
 	}
 	if b.APubKey == [33]byte{} {
 		return 0, nil, fmt.Errorf("api: CreateB missing A pubkey")
@@ -494,6 +509,13 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", orderID)
 	}
+	// F16: C++ processTransactionConfirmA drops a ConfirmA once the transaction
+	// already reached trCommited (xbridgesession.cpp:2897). A retransmit AFTER
+	// we redeemed must not re-broadcast a second claim payTx.
+	if s.state >= csConfirmedA {
+		xlog.Info("ConfirmA ignored: swap already past claim", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
 	s.theirDepositTxID = b.BDepositTxID
 	s.theirLockTime = b.BLockTime
 	// Record the counterparty (taker) deposit txid on the order so
@@ -585,6 +607,13 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	orderID := hexEncode(s.id[:])
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", orderID)
+	}
+	// F16: C++ processTransactionConfirmB drops a ConfirmB once the transaction
+	// already reached trCommited (xbridgesession.cpp:3152). A retransmit AFTER
+	// we redeemed must not re-broadcast a second claim payTx.
+	if s.state >= csConfirmedB {
+		xlog.Info("ConfirmB ignored: swap already past claim", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
 	}
 	c := s.snapshot()
 	task := workTask{

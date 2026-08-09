@@ -282,6 +282,110 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	}
 }
 
+// TestCreateAStateGuardDropsPostCompletionRetransmitE2E proves the F16 state
+// guard end-to-end: after the deposit task COMPLETES (await cleared, state ==
+// csCreatedA), a duplicate CreateA from the hub must be dropped by the handler
+// — not processSwap's in-flight guard — so exactly one deposit is ever
+// broadcast and exactly one CreatedA response is sent. Mirrors C++
+// processTransactionCreateA's `state >= trCreated` guard (xbridgesession.cpp:1947).
+func TestCreateAStateGuardDropsPostCompletionRetransmitE2E(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Title: "Bitcoin", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mPriv, mPub := newKey(t)
+	_, tkPub := newKey(t)
+	btcFundingPriv, btcFundingPub := newKey(t)
+	btcFunding := wallet.Utxo{
+		TxID:         strings.Repeat("aa", 32),
+		Vout:         0,
+		Amount:       5e8,
+		ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(btcFundingPub))),
+	}
+	btcConn := &fakeConnector{
+		ticker: "BTC", funding: btcFunding, fundingPriv: btcFundingPriv, fundingPub: btcFundingPub,
+		changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	conns := map[string]wallet.Connector{"BTC": btcConn}
+
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 2
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, cc := newStartedNode(t, confs, conns)
+	registerHub(t, n, hubPriv)
+
+	var orderID [32]byte
+	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
+	mkAddr := addrFor(0, "maker-btc-dest")
+	o := &Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	}
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	s := n.sessions[hexEncode(orderID[:])]
+
+	dispatch := func() {
+		n.submit(func() {
+			n.processSwap(createAPkt(t, hubPriv, orderID, tkPub), orderID, [20]byte{}, "CreateA", func(sess *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+				return sess.OnCreateA(&proto.CreateABody{HubAddress: coins.KeyID(hubPub[:]), ID: orderID, BPubKey: to33(tkPub)})
+			})
+		}, true)
+	}
+
+	// First delivery completes: deposit broadcast by the worker, CreatedA sent.
+	dispatch()
+	pkt := waitForPacket(t, cc, proto.XbcTransactionCreatedA, 5*time.Second)
+	if _, err := proto.DecodeBody(pkt.Command, pkt.Body); err != nil {
+		t.Fatalf("decode CreatedA response: %v", err)
+	}
+	if got := readOnEngine(t, n, func() clientState { return s.state }); got != csCreatedA {
+		t.Fatalf("session state = %v after first CreateA, want csCreatedA", got)
+	}
+	if got := btcConn.broadcastSnapshot(); len(got) != 1 {
+		t.Fatalf("deposit broadcast %d times after first CreateA, want 1", len(got))
+	}
+
+	// Post-completion retransmit: await is cleared, so only the handler's state
+	// guard can drop it. No second deposit, no second CreatedA.
+	dispatch()
+	if got := btcConn.broadcastSnapshot(); len(got) != 1 {
+		t.Fatalf("retransmit re-broadcast the deposit: %d broadcasts, want 1", len(got))
+	}
+	var createdA int
+	for _, p := range cc.snapshot() {
+		if p.Command == proto.XbcTransactionCreatedA {
+			createdA++
+		}
+	}
+	if createdA != 1 {
+		t.Fatalf("%d CreatedA responses sent, want 1", createdA)
+	}
+	if got := readOnEngine(t, n, func() clientState { return s.state }); got != csCreatedA {
+		t.Fatalf("session state = %v after retransmit, want csCreatedA", got)
+	}
+	if got := readOnEngine(t, n, func() bool { return s.await }); got {
+		t.Error("session await set after retransmit (should stay clear)")
+	}
+}
+
+// createAPkt returns a hub-signed CreateA packet for the given order, the wire
+// shape a retransmit takes.
+func createAPkt(t *testing.T, hubPriv []byte, orderID [32]byte, tkPub []byte) *proto.Packet {
+	t.Helper()
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hubSignedPkt(t, hubPriv, proto.XbcTransactionCreateA, &proto.CreateABody{HubAddress: coins.KeyID(hubPub[:]), ID: orderID, BPubKey: to33(tkPub)})
+}
+
 // mustHash decodes a 32-byte hex string into a [32]byte, panicking on bad hex.
 func mustHash(s string) [32]byte {
 	b, err := hex.DecodeString(s)
