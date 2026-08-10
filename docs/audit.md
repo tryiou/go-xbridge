@@ -291,6 +291,26 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
   posting, so `scanRefunds` skips while it is in flight; the apply still clears
   the guard on success AND error, preserving the sweep safety net. Covered by
   `TestForceRefundTakesSweepGuard`.
+- **F20.** `p2p/servicenode` registration integrity. `ParseServiceNode` and
+  `ParseServiceNodePing` retain paymentAddress, collateral, bestBlock,
+  bestBlockHash, and the registration signature (servicenode.h:354-384) instead
+  of discarding them. A ping whose embedded registration fails the
+  thin-client-enforceable subset of `ServiceNode::isValid` — SPV tier, fully-valid
+  curve pubkey (C++ `IsFullyValid`), non-null payment address, collateral 1..10
+  with no duplicates, recoverable signature over `CreateSigHash`
+  (servicenode.h:104-111, 398-484) — is rejected at parse, mirroring
+  `ServiceNodePing::isValid` running `snode.isValid` (servicenode.h:817-818) and
+  `processPing` dropping the ping (servicenodemgr.h:186-187). `AddRegistration`
+  applies the same gate (C++ `addSn`, servicenodemgr.h:862). `Registry.
+  PaymentAddress()` resolves the hub's fee destination for B2. Coverage:
+  `TestParseServiceNodeRetainsRegistration`,
+  `TestParseServiceNodePingRetainsEmbeddedRegistration`, `TestCreateSigHashGolden`
+  (pins the `CreateSigHash` byte serialization), `TestAddRegistrationRejectMatrix`,
+  `TestAddPingRejectsInvalidEmbeddedRegistration`, `TestPaymentAddress*`.
+  **Residual (thin client, documented):** on-chain collateral ancestry/ownership/
+  total (`>= COLLATERAL_SPV`) and block ancestry (servicenode.h:401,447-478) still
+  require a full chain index, so a well-formed signature over different data is
+  only rejected on-chain.
 
 ## Deliberate thin-client items (explicitly NOT bugs)
 
@@ -311,6 +331,25 @@ Documented once, not silently divergent — see [`api.md`](api.md) "Tier 3":
 | F8 | Segwit/BIP143 signing is dead code w.r.t. the daemon; bech32 destinations re-encoded as legacy P2PKH. | S3 |
 | F11–F14 | Vestigial `Server.verify`, unused `coins.MustGet`, tested-but-unreferenced `swap` package, `LocalConnector.SignMessage`/`VerifyMessage` unsupported (test-only). | S4 |
 | F17 | Blocking I/O on the engine goroutine: `MakeOrder`/`CancelOrder` closures and the two-phase resumes run `conn.WritePacket` (blocking TCP write) and `persist()` (fsync) inline; a stalled peer or slow disk stalls all state processing. | S3 |
+
+## 2026 audit findings — F19–F27 register
+
+The 2026 re-audit reported findings F1–F9 that collide with the prior F-numbering
+above, so they are registered as **F19–F27**. Fixes land branch-by-branch
+(execution order in the remediation plan); each branch moves its IDs to
+"Fixed / verified" and marks them here.
+
+| # | Severity | Verdict | Status |
+|---|---|---|---|
+| F19 | Blocker | CONFIRMED — `TakeOrder` emits an `AcceptingBody` with empty `ServiceNodeFeeTx`/`Utxos` (156 bytes < C++ 188 minimum) | OPEN — B2 `fix/wire-acceptingbody` |
+| F20 | Critical | CONFIRMED — registration fields read-then-discarded; gates miss the `isValid` subset | **FIXED — B1 `fix/servicenode-registry` (at HEAD)** |
+| F21 | Critical | CONFIRMED — no `checkDepositTransaction` in the Connector contract | OPEN — B3 `fix/deposit-path` |
+| F22 | Critical | CONFIRMED — HTLC ELSE branch + CreateB-derived taker deposit; composition is SOUND | OPEN — closed by B3 (composite acceptance; no standalone code) |
+| F23 | High | CONFIRMED — `buildDeposit` broadcasts before building the refund | OPEN — B3 |
+| F24 | High | CONFIRMED — HTTP auth/timeout hardening missing | OPEN — B4 `fix/http-hardening` |
+| F25 | High | CONFIRMED — P2P addr/varint allocation DoS | OPEN — B5 `fix/p2p-dos` |
+| F26 | High | CONFIRMED — plaintext secrets + debug-log leakage | OPEN — B6 `fix/secrets-hygiene` |
+| F27 | High | CONFIRMED — deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | OPEN — B3 |
 
 **Attacker model:** inbound signature verification *is* enforced before state
 mutation against a trusted hub key, and automatic peer discovery is rate-unbounded.
@@ -346,7 +385,7 @@ liveness hazard, not a memory-safety one.
 | Swap state machine (machine/scripts) | 8 / 10 |
 | Swap deposit/execution path | 9 / 10 (S1-A…D fixed) |
 | Config / coins / crypto / wallet | 7 / 10 |
-| Code quality & security (production-readiness) | 8 / 10 (F1/F2/F3/F4/F5/F6/F9/F10/F15/F16/F18 fixed; F17 documented) |
+| Code quality & security (production-readiness) | 8 / 10 (F1/F2/F3/F4/F5/F6/F9/F10/F15/F16/F18/F20 fixed; F17 documented) |
 | Docs & prior-audit accuracy | 7 / 10 |
 | **Readiness to trade live vs C++ network** | **6 / 10** |
 
