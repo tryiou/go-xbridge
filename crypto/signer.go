@@ -146,6 +146,16 @@ func NewPrivateKey() ([]byte, error) {
 	return b[:], nil
 }
 
+// FullyValidPubKey reports whether pk is a 33-byte compressed secp256k1
+// public key with a valid curve point, mirroring CPubKey::IsFullyValid
+// (pubkey.cpp:157-196): length check plus point-on-curve. The trivial
+// 02/03-prefix check is not enough — an invalid point must be rejected like
+// C++ (servicenode.h:405,791).
+func FullyValidPubKey(pk [33]byte) bool {
+	_, err := secp256k1.ParsePubKey(pk[:])
+	return err == nil
+}
+
 // CompressedPubKey derives the 33-byte compressed secp256k1 public key for a
 // 32-byte private scalar, without signing anything.
 func CompressedPubKey(priv []byte) ([33]byte, error) {

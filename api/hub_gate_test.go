@@ -325,11 +325,19 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 // keeps the running() filter (findNodeWithService, xbridgeapp.cpp:2910), so
 // the same stale-but-known node is never selected for a new make.
 func TestStaleHubKnownTakenNotPicked(t *testing.T) {
-	_, hubPub, hubPubHex, hubAddr := hubKey(t, 0x55)
+	priv, hubPub, hubPubHex, hubAddr := hubKey(t, 0x55)
 	reg := servicenode.NewRegistry()
-	reg.AddRegistration(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
-	})
+	hubReg, err := servicenode.SignRegistration(servicenode.ServiceNode{
+		PubKey:         hubPub,
+		Tier:           servicenode.TierSPV,
+		PaymentAddress: hubAddr,
+		Collateral:     []servicenode.CollateralUTXO{{TxID: [32]byte{0x01}, Vout: 0}},
+		BestBlock:      1000,
+	}, priv[:])
+	if err != nil {
+		t.Fatalf("SignRegistration: %v", err)
+	}
+	reg.AddRegistration(hubReg)
 	n, cc := newHubNode(reg)
 
 	// Make still requires a RUNNING hub: a registered-but-never-pinged node is

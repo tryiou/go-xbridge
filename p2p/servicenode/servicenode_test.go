@@ -1,6 +1,7 @@
 package servicenode
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 	"time"
@@ -26,14 +27,83 @@ func mustKeypair(t *testing.T) ([33]byte, [32]byte) {
 	return pub, privArr
 }
 
+// validReg builds a ServiceNode whose registration passes the
+// thin-client-enforceable subset of ServiceNode::isValid (servicenode.h:398-484):
+// SPV tier, fully-valid pubkey, non-null payment address, one collateral
+// outpoint, and a signature over CreateSigHash signed with priv
+// (servicenode.h:104-111, sign :376-380). Any valid key may sign the
+// registration in this test — identity to the on-chain collateral is the
+// documented thin-client residual.
+func validReg(t *testing.T, pub [33]byte, priv [32]byte) ServiceNode {
+	t.Helper()
+	sn := ServiceNode{
+		PubKey:         pub,
+		Tier:           TierSPV,
+		PaymentAddress: [20]byte{0xaa},
+		Collateral:     []CollateralUTXO{{TxID: [32]byte{0x11}, Vout: 0}},
+		BestBlock:      1000,
+		BestBlockHash:  [32]byte{0x22},
+	}
+	sn.Signature = signRegistration(t, sn, priv)
+	return sn
+}
+
+// signRegistration signs sn's CreateSigHash with priv, mirroring
+// ServiceNode::sign (servicenode.h:376-380).
+func signRegistration(t *testing.T, sn ServiceNode, priv [32]byte) []byte {
+	t.Helper()
+	hash := crypto.DoubleSHA256(serializeSigHashFields(sn))
+	sig, err := crypto.SignCompact(priv[:], hash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sig
+}
+
+// embeddedRegistrationBytes serializes the embedded ServiceNode of a ping
+// (snodePubKey, tier, paymentAddress, collateral, bestBlock, bestBlockHash,
+// signature) exactly as ServiceNode::SerializationOp (servicenode.h:354-384) —
+// the ping carries the config at the outer level, not here.
+func embeddedRegistrationBytes(sn ServiceNode) []byte {
+	var b []byte
+	b = append(b, p2p.MarshalVarStr(string(sn.PubKey[:]))...)
+	b = append(b, sn.Tier)
+	b = append(b, sn.PaymentAddress[:]...)
+	b = append(b, compactSize(len(sn.Collateral))...)
+	for _, op := range sn.Collateral {
+		b = append(b, op.TxID[:]...)
+		b = append(b, byte(op.Vout), byte(op.Vout>>8), byte(op.Vout>>16), byte(op.Vout>>24))
+	}
+	b = append(b, byte(sn.BestBlock), byte(sn.BestBlock>>8), byte(sn.BestBlock>>16), byte(sn.BestBlock>>24))
+	b = append(b, sn.BestBlockHash[:]...)
+	b = append(b, p2p.MarshalVarStr(string(sn.Signature))...)
+	return b
+}
+
 // buildPingParts marshals a ServiceNodePing payload following the EXACT C++
 // ServiceNodePing::SerializationOp order (servicenode.h:683-694): snodePubKey,
-// bestBlock, bestBlockHash, pingTime, config, embedded ServiceNode (pubkey,
-// tier, paymentAddress, collateral vec(0), bestBlock, bestBlockHash, signature
-// vec(0)), ping signature. The ping is signed with priv over its sigHash
-// (servicenode.h:748-752, sign :769-771) like a real SNPING. Outer and inner
-// pubkeys may differ to exercise the isValid pubkey check (servicenode.h:791).
+// bestBlock, bestBlockHash, pingTime, config, embedded ServiceNode, ping
+// signature. The embedded registration is auto-built VALID at the given tier
+// (validReg) so the ping passes the thin-client isValid subset for SPV; the
+// ping is signed with priv over its sigHash (servicenode.h:748-752, sign
+// :769-771) like a real SNPING. Outer and inner pubkeys may differ to exercise
+// the isValid pubkey check (servicenode.h:791).
 func buildPingParts(t *testing.T, outer, inner [33]byte, priv [32]byte, tier uint8, config string) []byte {
+	t.Helper()
+	reg := validReg(t, inner, priv)
+	reg.Tier = tier
+	if tier != TierSPV {
+		// A non-SPV registration fails registrationValid at the tier check
+		// (servicenode.h:409), but give it a structurally valid sig anyway so
+		// the tier is the (only) reason it is rejected.
+		reg.Signature = signRegistration(t, reg, priv)
+	}
+	return buildPingPartsReg(t, outer, priv, config, reg)
+}
+
+// buildPingPartsReg is buildPingParts with an explicit embedded registration,
+// for exercising the embedded-registration isValid checks.
+func buildPingPartsReg(t *testing.T, outer [33]byte, priv [32]byte, config string, reg ServiceNode) []byte {
 	t.Helper()
 	var b []byte
 	b = append(b, p2p.MarshalVarStr(string(outer[:]))...) // ping snodePubKey
@@ -41,14 +111,7 @@ func buildPingParts(t *testing.T, outer, inner [33]byte, priv [32]byte, tier uin
 	b = append(b, make([]byte, 32)...)                    // bestBlockHash
 	b = appendLE32(b, uint32(time.Now().Unix()))          // pingTime (uint32)
 	b = append(b, p2p.MarshalVarStr(config)...)           // config (varstr)
-	// embedded ServiceNode
-	b = append(b, p2p.MarshalVarStr(string(inner[:]))...) // snodePubKey
-	b = append(b, tier)                                   // tier uint8
-	b = append(b, make([]byte, 20)...)                    // paymentAddress (CKeyID, 20 raw)
-	b = appendVarInt0(b)                                  // collateral vec count = 0
-	b = appendLE32(b, 1000)                               // bestBlock (int32)
-	b = append(b, make([]byte, 32)...)                    // bestBlockHash
-	b = appendVarInt0(b)                                  // signature vec len = 0
+	b = append(b, embeddedRegistrationBytes(reg)...)      // embedded ServiceNode
 	// ping signature = SignCompact over double-SHA256(b) (sigHash)
 	hash := crypto.DoubleSHA256(b)
 	sig, err := crypto.SignCompact(priv[:], hash[:])
@@ -116,24 +179,19 @@ func TestWalletServicesParity(t *testing.T) {
 		t.Fatalf("ParseServiceNodePing #2: %v", err)
 	}
 
-	// A non-SPV (OPEN) node must contribute NO wallet services.
+	// A non-SPV (OPEN) node must be rejected outright: C++ ping.isValid fails on
+	// the SPV-tier requirement (servicenode.h:787) and processPing drops the
+	// whole ping (servicenodemgr.h:186-187) — it never reaches AddPing. The
+	// embedded registration of an OPEN ping also fails the registration subset.
 	pk3, priv3 := mustKeypair(t)
 	cfg3 := `{"xbridgeversion":4140100,"xrouterversion":4140100,"xbridge":["EVIL"]}`
-	ping3 := buildPing(t, pk3, priv3, TierOpen, cfg3)
-	sn3, err := ParseServiceNodePing(ping3)
-	if err != nil {
-		t.Fatalf("ParseServiceNodePing #3: %v", err)
-	}
-	if len(sn3.Services) != 0 {
-		t.Fatalf("non-SPV services = %v, want empty", sn3.Services)
+	if _, err := ParseServiceNodePing(buildPing(t, pk3, priv3, TierOpen, cfg3)); err == nil {
+		t.Fatal("OPEN-tier ping must be rejected at parse (C++ isValid:787)")
 	}
 
 	reg := NewRegistry()
 	reg.AddPing(sn1)
 	reg.AddPing(sn2)
-	reg.AddPing(sn3)
-	// The OPEN-tier ping fails isValid (servicenode.h:787) and creates no node,
-	// mirroring C++ processPing (servicenodemgr.h:186-187).
 	if reg.Count() != 2 {
 		t.Fatalf("registry count = %d, want 2 (non-SPV ping creates no node)", reg.Count())
 	}
@@ -173,13 +231,20 @@ func TestRunningGate(t *testing.T) {
 	}
 }
 
-// pickPubkey builds a distinct compressed pubkey per seed so Pick tests can
-// distinguish candidates.
+// pickPubkey builds a deterministic, CURVE-VALID compressed pubkey per seed so
+// Pick tests can distinguish candidates. (An x=0 pubkey like "02"+"00"*32 is
+// not on the secp256k1 curve and now fails fullyValidCPubKey — the point is
+// rejected exactly as C++ IsFullyValid would.)
 func pickPubkey(t *testing.T, seed byte) [33]byte {
 	t.Helper()
 	raw := make([]byte, 32)
 	raw[31] = seed
-	return mustPubkey(t, "02"+hex.EncodeToString(raw))
+	raw[0] &= 0x7f // clear high bits so the scalar is a valid secp256k1 key
+	pub, err := crypto.CompressedPubKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub
 }
 
 // TestPickEmpty verifies Pick on an empty registry returns false (no eligible
@@ -453,7 +518,8 @@ func TestAddRegistrationClearsNode(t *testing.T) {
 		t.Fatal("pinged node should be eligible before registration")
 	}
 
-	reg.AddRegistration(ServiceNode{PubKey: key, Tier: TierSPV}) // no wire config -> version 0, no services
+	_, signPriv := mustKeypair(t)
+	reg.AddRegistration(validReg(t, key, signPriv)) // valid registration, no wire config -> version 0, no services
 	if _, ok := reg.Pick([]string{"BTC"}); ok {
 		t.Fatal("registration-after-ping must reset the node (C++ addSn replace)")
 	}
@@ -492,5 +558,243 @@ func TestParseServiceNode(t *testing.T) {
 	}
 	if sn.Tier != TierSPV {
 		t.Fatalf("tier = %d, want SPV", sn.Tier)
+	}
+}
+
+// TestParseServiceNodeRetainsRegistration verifies SNREGISTER parsing retains
+// every registration field (F20): paymentAddress, collateral, bestBlock,
+// bestBlockHash, signature. These were read-then-discarded before the fix.
+func TestParseServiceNodeRetainsRegistration(t *testing.T) {
+	pub, priv := mustKeypair(t)
+	sn := validReg(t, pub, priv)
+	got, err := ParseServiceNode(embeddedRegistrationBytes(sn))
+	if err != nil {
+		t.Fatalf("ParseServiceNode: %v", err)
+	}
+	if got.PaymentAddress != sn.PaymentAddress {
+		t.Fatalf("paymentAddress = %x, want %x", got.PaymentAddress, sn.PaymentAddress)
+	}
+	if got.BestBlock != sn.BestBlock {
+		t.Fatalf("bestBlock = %d, want %d", got.BestBlock, sn.BestBlock)
+	}
+	if got.BestBlockHash != sn.BestBlockHash {
+		t.Fatalf("bestBlockHash = %x, want %x", got.BestBlockHash, sn.BestBlockHash)
+	}
+	if len(got.Collateral) != 1 || got.Collateral[0] != sn.Collateral[0] {
+		t.Fatalf("collateral = %+v, want %+v", got.Collateral, sn.Collateral)
+	}
+	if !bytes.Equal(got.Signature, sn.Signature) {
+		t.Fatalf("signature = %x, want %x", got.Signature, sn.Signature)
+	}
+}
+
+// TestParseServiceNodePingRetainsEmbeddedRegistration verifies a ping's
+// embedded registration fields survive parsing into the returned ServiceNode
+// (F20) — B2 reads PaymentAddress from the hub's ping-learned record.
+func TestParseServiceNodePingRetainsEmbeddedRegistration(t *testing.T) {
+	pub, priv := mustKeypair(t)
+	cfg := `{"xbridgeversion":55,"xrouterversion":55,"xbridge":["BTC"]}`
+	sn, err := ParseServiceNodePing(buildPing(t, pub, priv, TierSPV, cfg))
+	if err != nil {
+		t.Fatalf("ParseServiceNodePing: %v", err)
+	}
+	if sn.PaymentAddress != ([20]byte{0xaa}) {
+		t.Fatalf("paymentAddress = %x, want aa0000..", sn.PaymentAddress)
+	}
+	if len(sn.Collateral) != 1 {
+		t.Fatalf("collateral = %+v, want 1 outpoint", sn.Collateral)
+	}
+	if sn.BestBlock != 1000 {
+		t.Fatalf("bestBlock = %d, want 1000", sn.BestBlock)
+	}
+	if len(sn.Signature) == 0 {
+		t.Fatal("embedded registration signature must be retained")
+	}
+}
+
+// TestCreateSigHashGolden pins the CreateSigHash serialization
+// (servicenode.h:104-111) to an independently hand-assembled byte string. Any
+// drift in the operand order, CompactSize encoding, or endianness changes the
+// digest and breaks the wire signature check.
+func TestCreateSigHashGolden(t *testing.T) {
+	golden := "e0825066ed73a0c236104aabcedc5a00204d9ef0eb8e553c2e7a32aecf9267ad"
+
+	// Hand-assembled operands (NOT via serializeSigHashFields):
+	// varstr(G), tier=50, paymentAddress=20x0xaa, collateral=[txid 0x11.., vout
+	// 0], bestBlock=1000 LE, bestBlockHash=32x0x22.
+	var b []byte
+	b = append(b, 0x21) // CompactSize 33
+	g, _ := hex.DecodeString("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+	b = append(b, g...)
+	b = append(b, TierSPV)
+	for i := 0; i < 20; i++ {
+		b = append(b, 0xaa)
+	}
+	b = append(b, 0x01) // CompactSize 1 collateral
+	txid := make([]byte, 32)
+	txid[0] = 0x11
+	b = append(b, txid...)
+	b = append(b, 0, 0, 0, 0)             // vout 0 LE
+	b = append(b, 0xe8, 0x03, 0x00, 0x00) // bestBlock 1000 LE
+	for i := 0; i < 32; i++ {
+		b = append(b, 0x22)
+	}
+	want := [32]byte{}
+	raw, _ := hex.DecodeString(golden)
+	copy(want[:], raw)
+
+	// The package helper must serialize the same registration to the same
+	// bytes and hash to the same digest.
+	sn := ServiceNode{
+		PubKey:         [33]byte{},
+		Tier:           TierSPV,
+		PaymentAddress: [20]byte{},
+		Collateral:     []CollateralUTXO{{TxID: [32]byte{}, Vout: 0}},
+		BestBlock:      1000,
+		BestBlockHash:  [32]byte{},
+	}
+	copy(sn.PubKey[:], g)
+	for i := 0; i < 20; i++ {
+		sn.PaymentAddress[i] = 0xaa
+	}
+	sn.Collateral[0].TxID[0] = 0x11
+	for i := 0; i < 32; i++ {
+		sn.BestBlockHash[i] = 0x22
+	}
+
+	if got := crypto.DoubleSHA256(serializeSigHashFields(sn)); got != want {
+		t.Fatalf("CreateSigHash = %x, want %x", got, want)
+	}
+}
+
+// TestAddRegistrationRejectMatrix verifies AddRegistration drops any
+// registration failing the thin-client subset of ServiceNode::isValid
+// (servicenode.h:398-484), exactly like C++ addSn returning nullptr
+// (servicenodemgr.h:862).
+func TestAddRegistrationRejectMatrix(t *testing.T) {
+	pub, priv := mustKeypair(t)
+
+	offCurve := [33]byte{0x02} // x=0: not on the secp256k1 curve
+	dupCollateral := []CollateralUTXO{{TxID: [32]byte{0x01}, Vout: 0}, {TxID: [32]byte{0x01}, Vout: 0}}
+	eleven := make([]CollateralUTXO, 11)
+
+	cases := map[string]ServiceNode{
+		"non-SPV tier": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.Tier = TierOpen
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"off-curve pubkey": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.PubKey = offCurve
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"null payment address": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.PaymentAddress = [20]byte{}
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"empty collateral": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.Collateral = nil
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"duplicate collateral": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.Collateral = dupCollateral
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"oversized collateral": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.Collateral = eleven
+			sn.Signature = signRegistration(t, sn, priv)
+			return sn
+		}(),
+		"malformed signature": func() ServiceNode {
+			// A structurally-broken compact sig fails RecoverCompact. NOTE: a
+			// WELL-FORMED sig over different data recovers a *different valid
+			// key* and cannot be rejected without the on-chain collateral
+			// ownership check (servicenode.h:447-476) — that is the documented
+			// thin-client residual.
+			sn := validReg(t, pub, priv)
+			sn.Signature = bytes.Repeat([]byte{0xff}, 65)
+			return sn
+		}(),
+		"nil signature": func() ServiceNode {
+			sn := validReg(t, pub, priv)
+			sn.Signature = nil
+			return sn
+		}(),
+	}
+
+	for name, sn := range cases {
+		reg := NewRegistry()
+		reg.AddRegistration(sn)
+		if reg.Count() != 0 {
+			t.Fatalf("%s: registration must be rejected (count=%d)", name, reg.Count())
+		}
+	}
+}
+
+// TestAddRegistrationAcceptsValid verifies a registration passing the
+// thin-client subset is stored and its payment address is resolvable — B2's
+// hub fee destination.
+func TestAddRegistrationAcceptsValid(t *testing.T) {
+	pub, priv := mustKeypair(t)
+	reg := NewRegistry()
+	reg.AddRegistration(validReg(t, pub, priv))
+	if reg.Count() != 1 {
+		t.Fatalf("count = %d, want 1", reg.Count())
+	}
+	addr, ok := reg.PaymentAddress(pub)
+	if !ok || addr != ([20]byte{0xaa}) {
+		t.Fatalf("PaymentAddress = (%x, %v), want (aa0000.., true)", addr, ok)
+	}
+}
+
+// TestAddPingRejectsInvalidEmbeddedRegistration verifies a ping whose embedded
+// registration fails the thin-client subset is rejected at parse — C++
+// ping.isValid runs snode.isValid (servicenode.h:817-818) and processPing drops
+// the whole ping (servicenodemgr.h:186-187).
+func TestAddPingRejectsInvalidEmbeddedRegistration(t *testing.T) {
+	pub, priv := mustKeypair(t)
+	cfg := `{"xbridgeversion":55,"xrouterversion":55,"xbridge":["BTC"]}`
+
+	// Null payment address in the embedded registration.
+	reg := validReg(t, pub, priv)
+	reg.PaymentAddress = [20]byte{}
+	reg.Signature = signRegistration(t, reg, priv)
+	if _, err := ParseServiceNodePing(buildPingPartsReg(t, pub, priv, cfg, reg)); err != errInvalidRegistration {
+		t.Fatalf("ParseServiceNodePing = %v, want errInvalidRegistration (null payment address)", err)
+	}
+
+	// Structurally-broken embedded-registration signature (fails
+	// RecoverCompact). A well-formed sig over different data recovers a
+	// different key and is only rejected on-chain — documented residual.
+	reg2 := validReg(t, pub, priv)
+	reg2.Signature = bytes.Repeat([]byte{0xff}, 65)
+	if _, err := ParseServiceNodePing(buildPingPartsReg(t, pub, priv, cfg, reg2)); err != errInvalidRegistration {
+		t.Fatalf("ParseServiceNodePing = %v, want errInvalidRegistration (bad registration sig)", err)
+	}
+
+	// A ping signed by a DIFFERENT key must still be reported as a bad PING
+	// signature (checked before the embedded registration, servicenode.h:810-815).
+	_, otherPriv := mustKeypair(t)
+	if _, err := ParseServiceNodePing(buildPing(t, pub, otherPriv, TierSPV, cfg)); err != errBadSignature {
+		t.Fatalf("ParseServiceNodePing = %v, want errBadSignature", err)
+	}
+}
+
+// TestPaymentAddressUnknown verifies PaymentAddress returns false for a pubkey
+// the registry has never seen.
+func TestPaymentAddressUnknown(t *testing.T) {
+	reg := NewRegistry()
+	if _, ok := reg.PaymentAddress(pickPubkey(t, 0x99)); ok {
+		t.Fatal("PaymentAddress for an unknown pubkey must return false")
 	}
 }

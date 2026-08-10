@@ -258,14 +258,25 @@ func TestDxTokenListsFromConf(t *testing.T) {
 func TestDxGetNetworkTokensLive(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// Simulate two SPV servicenodes advertising their supported tokens via
-	// the registry (as if parsed from SNREGISTER / SNPING payloads).
+	// the registry (as if parsed from SNREGISTER / SNPING payloads). Pubkeys
+	// must be valid secp256k1 curve points — AddPing rejects off-curve keys
+	// like C++ IsFullyValid (servicenode.h:405,791).
+	validKey := func(seed byte) [33]byte {
+		scalar := make([]byte, 32)
+		scalar[31] = seed
+		pub, err := crypto.CompressedPubKey(scalar)
+		if err != nil {
+			t.Fatalf("CompressedPubKey: %v", err)
+		}
+		return pub
+	}
 	ctx.Node.snReg.AddPing(servicenode.ServiceNode{
-		PubKey:   [33]byte{0x02},
+		PubKey:   validKey(0x01),
 		Tier:     servicenode.TierSPV,
 		Services: []string{"BTC", "LTC", "SYS"},
 	})
 	ctx.Node.snReg.AddPing(servicenode.ServiceNode{
-		PubKey:   [33]byte{0x03},
+		PubKey:   validKey(0x02),
 		Tier:     servicenode.TierSPV,
 		Services: []string{"LTC", "DOGE"},
 	})
