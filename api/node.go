@@ -1508,11 +1508,15 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", cerr.Error())
 	}
 
-	// Atomic input reservation (C++ lockFeeUtxos + lockCoins under
-	// m_utxosOrderLock, xbridgeapp.cpp:2236-2267). The fee inputs and the
-	// taker's funding set are claimed in one step under the store lock, BEFORE
-	// any Accepting packet leaves, so a concurrent take of a different order
-	// can never double-select the same BLOCK fee utxo or funding utxo. A
+	// Atomic input reservation (C++ state gate + lockFeeUtxos + lockCoins
+	// under m_utxosOrderLock, xbridgeapp.cpp:2122-2267). An order with an
+	// in-flight take is refused FIRST with BAD_REQUEST ("not accepting, order
+	// already accepted", C++ :2122-2125) — mirroring C++'s state-gate check
+	// order, so a concurrent take of the same order can never overwrite the
+	// first take's reserved keys. The fee inputs and the taker's funding set
+	// are otherwise claimed in one step under the store lock, BEFORE any
+	// Accepting packet leaves, so a concurrent take of a different order can
+	// never double-select the same BLOCK fee utxo or funding utxo. A key
 	// collision fails the take like C++'s "cannot reuse utxo inputs".
 	reserveKeys := make([]string, 0, len(feeKey)+len(usedCoins))
 	for k := range feeKey {
@@ -1521,7 +1525,10 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	for _, u := range usedCoins {
 		reserveKeys = append(reserveKeys, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10))
 	}
-	if !n.store.ReserveForTake(key, reserveKeys) {
+	switch n.store.ReserveForTake(key, reserveKeys) {
+	case reserveOrderBusy:
+		return orderListResult{}, makeError(errBadRequest, "dxTakeOrder", "not accepting, order already accepted")
+	case reserveKeyCollision, reserveOrderGone:
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "cannot reuse utxo inputs")
 	}
 

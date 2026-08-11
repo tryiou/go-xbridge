@@ -10,24 +10,28 @@ import (
 // TestStoreReserveForTake verifies the atomic take-input reservation (B2
 // Finding 1): only one order can claim a "txid:vout" key, the reservation is
 // immediately visible through LockedUtxoInfo alongside committed order inputs,
-// terminal orders release their locks, and ReleaseReserve clears an in-flight
-// reservation. Mirrors C++ lockFeeUtxos + lockCoins ("cannot reuse utxo
-// inputs", xbridgeapp.cpp:2267).
+// a second in-flight take of the SAME order is refused (C++ state gate
+// xbridgeapp.cpp:2122), terminal orders release their locks, and ReleaseReserve
+// clears an in-flight reservation. Mirrors C++ lockFeeUtxos + lockCoins
+// ("cannot reuse utxo inputs", xbridgeapp.cpp:2267).
 func TestStoreReserveForTake(t *testing.T) {
 	s := NewStore()
 	a := testStoreOrder(1)
 	b := testStoreOrder(2)
+	c := testStoreOrder(3)
 	keyA := hexEncode(a.ID[:])
 	keyB := hexEncode(b.ID[:])
+	keyC := hexEncode(c.ID[:])
 	s.Add(a)
 	s.Add(b)
+	s.Add(c)
 
 	// A first reservation succeeds and is immediately visible to other takers.
-	if !s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}) {
-		t.Fatal("first reservation should succeed")
+	if got := s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}); got != reserveOK {
+		t.Fatalf("first reservation = %v, want reserveOK", got)
 	}
-	if !s.ReserveForTake(keyB, []string{"cc:2"}) {
-		t.Fatal("disjoint reservation should succeed")
+	if got := s.ReserveForTake(keyB, []string{"cc:2"}); got != reserveOK {
+		t.Fatalf("disjoint reservation = %v, want reserveOK", got)
 	}
 	keys, byOrder := s.LockedUtxoInfo()
 	for _, k := range []string{"aa:0", "bb:1", "cc:2"} {
@@ -39,17 +43,29 @@ func TestStoreReserveForTake(t *testing.T) {
 		t.Errorf("byOrder[aa:0] = %q, want %q", byOrder["aa:0"], orderIDString(a.ID))
 	}
 
-	// A collision with an active reservation must fail the second taker.
-	if s.ReserveForTake(keyB, []string{"aa:0"}) {
-		t.Fatal("reuse of an actively reserved key must fail")
+	// A second in-flight take of the SAME order is refused even on disjoint
+	// keys (C++ state gate BAD_REQUEST, xbridgeapp.cpp:2122-2125): the
+	// reservation is one-per-order, never overwritten by a concurrent take.
+	// The gate fires even when the proposed keys would ALSO collide with the
+	// order's own claimed keys, proving the state gate precedes the lock scan.
+	if got := s.ReserveForTake(keyA, []string{"zz:9"}); got != reserveOrderBusy {
+		t.Fatalf("same-order re-reservation (disjoint) = %v, want reserveOrderBusy", got)
+	}
+	if got := s.ReserveForTake(keyA, []string{"aa:0"}); got != reserveOrderBusy {
+		t.Fatalf("same-order re-reservation (own key) = %v, want reserveOrderBusy", got)
+	}
+
+	// A collision with an active reservation must fail an unrelated taker.
+	if got := s.ReserveForTake(keyC, []string{"aa:0"}); got != reserveKeyCollision {
+		t.Fatalf("reuse of an actively reserved key = %v, want reserveKeyCollision", got)
 	}
 
 	// A committed order input (FeeUtxos) also blocks a reservation.
 	s.Update(keyA, func(o *Order) {
 		o.FeeUtxos = []wallet.Utxo{{TxID: "dd", Vout: 2}}
 	})
-	if s.ReserveForTake(keyB, []string{"dd:2"}) {
-		t.Fatal("reuse of a committed order fee utxo must fail")
+	if got := s.ReserveForTake(keyC, []string{"dd:2"}); got != reserveKeyCollision {
+		t.Fatalf("reuse of a committed order fee utxo = %v, want reserveKeyCollision", got)
 	}
 	lkeys, lowner := s.LockedUtxoInfo()
 	if !lkeys["dd:2"] {
@@ -60,8 +76,8 @@ func TestStoreReserveForTake(t *testing.T) {
 	}
 
 	// An unknown order cannot reserve (the take re-checks the live order).
-	if s.ReserveForTake("no-such-order", []string{"zz:0"}) {
-		t.Fatal("reservation for an absent order must fail")
+	if got := s.ReserveForTake("no-such-order", []string{"zz:0"}); got != reserveOrderGone {
+		t.Fatalf("reservation for an absent order = %v, want reserveOrderGone", got)
 	}
 
 	// Release clears the reservation so the keys can be claimed again.
@@ -70,8 +86,8 @@ func TestStoreReserveForTake(t *testing.T) {
 	if keys["aa:0"] || keys["bb:1"] {
 		t.Error("released reservation keys still reported locked")
 	}
-	if !s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}) {
-		t.Fatal("re-reservation after release should succeed")
+	if got := s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}); got != reserveOK {
+		t.Fatalf("re-reservation after release = %v, want reserveOK", got)
 	}
 
 	// A terminal (canceled) order releases all of its locks — committed inputs

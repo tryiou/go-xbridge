@@ -405,30 +405,65 @@ func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]strin
 	return s.lockedInfoLocked()
 }
 
+// takeReserve is the outcome of ReserveForTake. It distinguishes C++'s two
+// distinct take-refusal paths: the order state gate (xbridgeapp.cpp:2122-2125,
+// "not accepting, order already accepted", BAD_REQUEST) and the utxo lock
+// collision (lockFeeUtxos + lockCoins, "cannot reuse utxo inputs",
+// INSUFFICIENT_FUNDS).
+type takeReserve int
+
+const (
+	// reserveOrderBusy reports a second in-flight take of the same order. C++
+	// refuses any accept while the order's state is already >= trAccepting
+	// (xbridgeapp.cpp:2122); Go's analog is the single in-flight reservation,
+	// so a concurrent take can never overwrite the first take's claimed keys.
+	// Unlike C++'s persistent trAccepting state, the gate only spans the
+	// reservation window: ReleaseReserve clears it on submit, so sequential
+	// re-takes of a settled order are still allowed (Go divergence, kept for
+	// TestDxTakeOrderFullTake).
+	reserveOrderBusy takeReserve = iota
+	// reserveKeyCollision reports that a claimed "txid:vout" key is already
+	// locked by another non-terminal order's committed Utxos/FeeUtxos or by an
+	// active reservation ("cannot reuse utxo inputs").
+	reserveKeyCollision
+	// reserveOrderGone reports the order is absent or terminal (the take's
+	// authoritative re-check under the store lock).
+	reserveOrderGone
+	// reserveOK reports the keys were claimed for this take.
+	reserveOK
+)
+
 // ReserveForTake atomically reserves the "txid:vout" (display order) keys for
 // the order identified by key, mirroring C++ lockFeeUtxos + lockCoins
-// (xbridgeapp.cpp:2267): any overlap with an already-reserved key — another
-// non-terminal order's committed Utxos/FeeUtxos or an active reservation —
-// fails the take ("cannot reuse utxo inputs"). On success the reservation is
-// immediately visible through LockedUtxoInfo, so a concurrent take can never
-// select the same inputs. The reservation is folded into the owner order on
-// submit (Update) and must be released (ReleaseReserve) on any take error path.
-func (s *Store) ReserveForTake(key string, keys []string) bool {
+// (xbridgeapp.cpp:2267) behind the state gate (xbridgeapp.cpp:2122). The
+// same-order gate fires FIRST: an order with an in-flight reservation is
+// refused with reserveOrderBusy (BAD_REQUEST) before any utxo work, matching
+// C++'s check order. Otherwise any overlap with an already-reserved key —
+// another non-terminal order's committed Utxos/FeeUtxos or an active
+// reservation — fails the take with reserveKeyCollision ("cannot reuse utxo
+// inputs"). On success the reservation is immediately visible through
+// LockedUtxoInfo, so a concurrent take can never select the same inputs. The
+// reservation is folded into the owner order on submit (Update) and must be
+// released (ReleaseReserve) on any take error path.
+func (s *Store) ReserveForTake(key string, keys []string) takeReserve {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if o := s.orders[key]; o == nil || isOrderTerminal(o.Status) {
-		return false
+		return reserveOrderGone
+	}
+	if _, ok := s.reserved[key]; ok {
+		return reserveOrderBusy
 	}
 	locked, _ := s.lockedInfoLocked()
 	for _, k := range keys {
 		if locked[k] {
-			return false
+			return reserveKeyCollision
 		}
 	}
 	if len(keys) > 0 {
 		s.reserved[key] = keys
 	}
-	return true
+	return reserveOK
 }
 
 // ReleaseReserve drops a take's in-flight reservation (error paths where the

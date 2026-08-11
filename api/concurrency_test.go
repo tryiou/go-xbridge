@@ -375,11 +375,16 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 				wins++
 				return
 			}
-			// A losing raft always fails on the atomic input reservation (C++
-			// "cannot reuse utxo inputs"), never on a partial-wallet error: the
-			// selection windows are over the full pool and the reservation is
-			// the one exclusion point that serializes concurrent takes.
-			if rerr.Code != errInsufficientFunds {
+			// A losing raft always fails on the atomic reservation, never on a
+			// partial-wallet error: the selection windows are over the full pool
+			// and the reservation is the one exclusion point that serializes
+			// concurrent takes. A same-order loser is refused by the in-flight
+			// gate with BAD_REQUEST ("not accepting, order already accepted", C++
+			// xbridgeapp.cpp:2122-2125); a distinct-order loser still collides on
+			// a shared key with INSUFFICIENT_FUNDS ("cannot reuse utxo inputs").
+			// A stale locked-set snapshot (node.go:1428) can also route a
+			// same-order loser to the collision path, so accept either code.
+			if rerr.Code != errBadRequest && rerr.Code != errInsufficientFunds {
 				t.Errorf("TakeOrder %d: unexpected error %v", i, rerr)
 			} else {
 				loses++
