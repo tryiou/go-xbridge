@@ -341,7 +341,7 @@ above, so they are registered as **F19–F27**. Fixes land branch-by-branch
 
 | # | Severity | Verdict | Status |
 |---|---|---|---|
-| F19 | Blocker | CONFIRMED — `TakeOrder` emits an `AcceptingBody` with empty `ServiceNodeFeeTx`/`Utxos` (156 bytes < C++ 188 minimum) | OPEN — B2 `fix/wire-acceptingbody` |
+| F19 | Blocker | CONFIRMED — `TakeOrder` emits an `AcceptingBody` with empty `ServiceNodeFeeTx`/`Utxos` (156 bytes < C++ 188 minimum) | **FIXED — B2 `fix/wire-acceptingbody` (at HEAD)** |
 | F20 | Critical | CONFIRMED — registration fields read-then-discarded; gates miss the `isValid` subset | **FIXED — B1 `fix/servicenode-registry` (at HEAD)** |
 | F21 | Critical | CONFIRMED — no `checkDepositTransaction` in the Connector contract | OPEN — B3 `fix/deposit-path` |
 | F22 | Critical | CONFIRMED — HTLC ELSE branch + CreateB-derived taker deposit; composition is SOUND | OPEN — closed by B3 (composite acceptance; no standalone code) |
