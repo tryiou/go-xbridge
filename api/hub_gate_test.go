@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"testing"
 
 	"go-xbridge/coins"
@@ -12,10 +13,12 @@ import (
 )
 
 // newHubNode builds a Node wired for hub-gate tests: two wallet connectors,
-// a captureXConn (so requireWrite passes and outbound packets are recorded),
-// an empty store + session map, and the given service-node registry. The BTC
-// connector is funded with a single 3.0 BTC utxo so selection passes for the
-// standard 1.5 BTC exact make (C++ selectUtxos gt-single path).
+// a BLOCK connector (fee cs are paid on the Blocknet chain), a captureXConn
+// (so requireWrite passes and outbound packets are recorded), an empty store +
+// session map, and the given service-node registry. The BTC connector is funded
+// with a single 3.0 BTC utxo so selection passes for the standard 1.5 BTC exact
+// make (C++ selectUtxos gt-single path) and the BLOCK connector holds a 1.0
+// BLOCK p2pkh utxo for the take's service-node fee tx.
 func newHubNode(reg *servicenode.Registry) (*Node, *captureXConn) {
 	return newHubNodeUtxos(reg, []wallet.Utxo{
 		{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
@@ -23,13 +26,58 @@ func newHubNode(reg *servicenode.Registry) (*Node, *captureXConn) {
 	})
 }
 
+// blkUtxo returns the default funding BLOCK p2pkh utxo used by the take fee
+// path: a 1.0 BLOCK output (native 1e8) spending to btcAddr (BLOCK conf uses
+// the same base58 prefix so the legacy change script decodes).
+func blkUtxo() wallet.Utxo {
+	return wallet.Utxo{
+		TxID:         "0000000000000000000000000000000000000000000000000000000000000002",
+		Vout:         0,
+		Amount:       100000000,
+		Value:        1.0,
+		ScriptPubKey: "76a914000000000000000000000000000000000000000088ac",
+		Address:      btcAddr,
+	}
+}
+
 // newHubNodeUtxos is newHubNode with an explicit BTC utxo set (used by the
 // Stage 3c make-order KATs: custom partial-exact wallets, unfunded wallets).
 func newHubNodeUtxos(reg *servicenode.Registry, btc []wallet.Utxo) (*Node, *captureXConn) {
-	coins.InitFromConf(map[string]*config.CoinConf{
+	return buildHubNode(reg, btc, []wallet.Utxo{blkUtxo()})
+}
+
+// newHubNodeWithoutBlock is newHubNode minus any BLOCK connector, used to prove
+// the take's fee prep refuses INSUFFICIENT_FUNDS when no Blocknet wallet is
+// configured (C++ acceptXBridgeTransaction :2236). buildHubNode only installs a
+// BLOCK entry when a utxo set is provided, so nil here means the connector does
+// not exist at all.
+func newHubNodeWithoutBlock(reg *servicenode.Registry) (*Node, *captureXConn) {
+	return buildHubNode(reg, []wallet.Utxo{
+		{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
+			Amount: 300000000, Value: 3.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+	}, nil)
+}
+
+// newHubNodeUnfundedBlock wires a BLOCK connector that reports no spendable
+// utxos, proving the take's fee prep refuses INSUFFICIENT_FUNDS (C++ :2240).
+func newHubNodeUnfundedBlock(reg *servicenode.Registry) (*Node, *captureXConn) {
+	return buildHubNode(reg, []wallet.Utxo{
+		{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
+			Amount: 300000000, Value: 3.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+	}, []wallet.Utxo{})
+}
+
+func buildHubNode(reg *servicenode.Registry, btc []wallet.Utxo, block []wallet.Utxo) (*Node, *captureXConn) {
+	coinConfs := map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 		"SYS": {Ticker: "SYS", CreateTxMethod: "SYS", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
-	})
+	}
+	if block != nil {
+		coinConfs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+	}
+	if err := coins.InitFromConf(coinConfs); err != nil {
+		panic(err)
+	}
 	cc := &captureXConn{}
 	cfg := &Config{
 		Confs: map[string]*config.CoinConf{
@@ -40,6 +88,10 @@ func newHubNodeUtxos(reg *servicenode.Registry, btc []wallet.Utxo) (*Node, *capt
 			"BTC": &stubConn{ticker: "BTC", addr: btcAddr, utxos: btc},
 			"SYS": &stubConn{ticker: "SYS", addr: btcAddr},
 		},
+	}
+	if block != nil {
+		cfg.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+		cfg.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: block}
 	}
 	n := &Node{
 		config:   cfg,
@@ -271,6 +323,7 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
 		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PaymentAddress: hubAddr,
 	})
 	n, cc := newHubNode(reg)
 	id := [32]byte{0x22}
@@ -309,11 +362,52 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 	if ab.HubAddress != hubAddr {
 		t.Fatalf("Accepting body hubAddress = %x, want %x", ab.HubAddress, hubAddr)
 	}
+	// F19: the Accepting must carry a real service-node fee tx AND the taker's
+	// signed funding utxo entries — an empty pair is dropped by the hub
+	// (xbridgesession.cpp:848-916, crBadFeeTx). The body must be >= 188 bytes.
+	if len(ab.ServiceNodeFeeTx) == 0 {
+		t.Fatal("Accepting body has an empty ServiceNodeFeeTx")
+	}
+	if len(ab.Utxos) == 0 {
+		t.Fatal("Accepting body has no funding utxo entries")
+	}
+	if len(pkts[0].Body) < 188 {
+		t.Fatalf("Accepting packet body = %d bytes, want >= 188 (hub drop gate)", len(pkts[0].Body))
+	}
+	// The fee tx's 0.015 BLOCK output must pay the hub's registry payment
+	// address (snode.getPaymentAddress(), xbridgeapp.cpp:2196), not the body's
+	// hubAddress alias or a zero address.
+	if got := hasFeeOutput(ab.ServiceNodeFeeTx, hubAddr); !got {
+		t.Fatalf("Accepting fee tx does not pay the registry payment address %x", hubAddr)
+	}
 	// The taker session must be pinned to the order's hub.
 	s := n.sessions[hexEncode(id[:])]
 	if s == nil || s.hubKey != hubPub || s.hub != hubAddr {
 		t.Fatalf("taker session not pinned to order hub: %+v", s)
 	}
+}
+
+// hasFeeOutput decodes the fee tx bytes and reports whether some output is a
+// 25-byte P2PKH paying at least serviceNodeFee*COIN to the given 20-byte key
+// (mirrors the hub receiver's check, xbridgesession.cpp:895-911).
+func hasFeeOutput(feeTx []byte, dest [20]byte) bool {
+	tx, err := coins.Deserialize(feeTx)
+	if err != nil {
+		return false
+	}
+	want := uint64(serviceNodeFeeReal * 100000000)
+	for _, out := range tx.Outputs {
+		if out.Value < want {
+			continue
+		}
+		if len(out.ScriptPubKey) != 25 || out.ScriptPubKey[0] != 0x76 || out.ScriptPubKey[1] != 0xa9 || out.ScriptPubKey[2] != 0x14 {
+			continue
+		}
+		if bytes.Equal(out.ScriptPubKey[3:23], dest[:]) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestStaleHubKnownTakenNotPicked locks the C++ split between the take and
@@ -446,5 +540,101 @@ func TestIngestPending(t *testing.T) {
 	}
 	if after.Status != "canceled" {
 		t.Fatalf("canceled order was re-accepted as %q, want canceled", after.Status)
+	}
+}
+
+// pinnedHub registers a running SPV servicenode (with a payment address) for
+// the take-path tests and returns its pubkey hex and address.
+func pinnedHub(t *testing.T, seed byte) (_ *servicenode.Registry, pubHex string, hubAddr [20]byte) {
+	t.Helper()
+	_, hubPub, hubPubHex, hubAddr := hubKey(t, seed)
+	reg := servicenode.NewRegistry()
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PaymentAddress: hubAddr,
+	})
+	return reg, hubPubHex, hubAddr
+}
+
+// TestTakeOrderNoBlockConnector makes the fee-prep step fail INSUFFICIENT_FUNDS
+// when no BLOCK connector is configured (C++ acceptXBridgeTransaction :2236-2240:
+// connBLOCK->getUnspent fails the take) and asserts nothing is broadcast.
+func TestTakeOrderNoBlockConnector(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x61)
+	n, cc := newHubNodeWithoutBlock(reg)
+	id := [32]byte{0x71}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "open", Mine: false,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errInsufficientFunds {
+		t.Fatalf("TakeOrder(no BLOCK connector) = %v, want errInsufficientFunds", rerr)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatalf("no Accepting should be written when the fee cannot be prepared")
+	}
+}
+
+// TestTakeOrderUnfundedBLOCKFee makes the fee-prep step fail INSUFFICIENT_FUNDS
+// when the BLOCK wallet holds no spendable p2pkh funder (selectFeeUtxos finds
+// nothing, C++ :2240).
+func TestTakeOrderUnfundedBLOCKFee(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x62)
+	n, cc := newHubNodeUnfundedBlock(reg)
+	id := [32]byte{0x72}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "open", Mine: false,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errInsufficientFunds {
+		t.Fatalf("TakeOrder(unfunded BLOCK) = %v, want errInsufficientFunds", rerr)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatalf("no Accepting should be written for an unfunded fee")
+	}
+}
+
+// TestTakeOrderUnfundedFromCurrency makes the taker-funding step fail
+// INSUFFICIENT_FUNDS when the to-currency wallet cannot cover the take amount
+// (selectUtxos :2269-2302). The fee prep succeeds; no Accepting is broadcast.
+func TestTakeOrderUnfundedFromCurrency(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x63)
+	n, cc := newHubNodeUtxos(reg, nil) // BTC wallet has no utxos
+	id := [32]byte{0x73}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "open", Mine: false,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errInsufficientFunds {
+		t.Fatalf("TakeOrder(unfunded from-currency) = %v, want errInsufficientFunds", rerr)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatalf("no Accepting should be written for unfunded takers")
+	}
+}
+
+// TestTakeOrderDust refuses a take whose taker amount falls below the dust
+// threshold with DUST (C++ acceptXBridgeTransaction :2147-2157).
+func TestTakeOrderDust(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x64)
+	n, cc := newHubNode(reg)
+	id := [32]byte{0x74}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 10, Status: "open", Mine: false,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errDust {
+		t.Fatalf("TakeOrder(dust) = %v, want errDust", rerr)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatalf("no Accepting should be written for a dust take")
 	}
 }

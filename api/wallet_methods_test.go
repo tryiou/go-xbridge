@@ -29,6 +29,9 @@ type stubConn struct {
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
+func (s *stubConn) GetBalance() (uint64, error) {
+	return 100000000, nil
+}
 func (s *stubConn) GetNewAddress() (string, error) {
 	return s.addr, nil
 }

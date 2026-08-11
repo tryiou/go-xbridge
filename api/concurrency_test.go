@@ -301,15 +301,44 @@ func TestCloseDrainsInFlightTask(t *testing.T) {
 // taker-session registration so exactly one session survives, the book stays
 // consistent, and no Accepting packet is lost.
 func TestConcurrentTakeOrderSingleSession(t *testing.T) {
+	const takes = 8
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
-		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	conn := &fakeConnector{ticker: "BTC", blockHeight: 1000}
+	// The taker's funding wallet must clear the B2 pre-checks: eight 300 BTC
+	// utxos cover the 100-BTC order (selectUtxos gt path) one per concurrent
+	// take, and the BLOCK connector holds eight distinct 1.0 BLOCK p2pkh utxos
+	// so each take can reserve its own service-node fee funder (take #1 locks
+	// its selections; a shared set starves takes 2..8).
+	var funders []wallet.Utxo
+	for i := 0; i < takes; i++ {
+		funders = append(funders, wallet.Utxo{
+			TxID: fmt.Sprintf("%064d", i+1), Vout: 0,
+			Amount: 30000000000, Value: 300.0,
+			ScriptPubKey: "76a914000000000000000000000000000000000000000088ac",
+			Address:      addrFor(0, fmt.Sprintf("take-funding-%d", i)),
+		})
+	}
+	conn := &fakeConnector{
+		ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{},
+		funders: funders,
+	}
+	blkUtxos := make([]wallet.Utxo, 0, takes)
+	for i := 0; i < takes; i++ {
+		u := blkUtxo()
+		u.TxID = fmt.Sprintf("%064d", 0x100+i)
+		blkUtxos = append(blkUtxos, u)
+	}
 	n, cc := newStartedNode(t, map[string]*config.CoinConf{
-		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
-	}, map[string]wallet.Connector{"BTC": conn})
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}, map[string]wallet.Connector{
+		"BTC":   conn,
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: blkUtxos},
+	})
 
 	hubPriv := make([]byte, 32)
 	hubPriv[31] = 2
@@ -327,7 +356,6 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 	}
 	n.store.Add(o)
 
-	const takes = 8
 	var wg sync.WaitGroup
 	for i := 0; i < takes; i++ {
 		wg.Add(1)

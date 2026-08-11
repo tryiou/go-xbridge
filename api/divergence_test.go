@@ -7,8 +7,10 @@ import (
 	"testing"
 
 	"go-xbridge/coins"
+	"go-xbridge/config"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // fakeXConn is a no-op XConn so dxTakeOrder can pass requireWrite and "broadcast"
@@ -106,6 +108,24 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	ctx := newWalletTestCtx()
 	ctx.Node.conn = fakeXConn{}
 	ctx.Node.sessions = make(map[string]*SwapSession)
+	// Take #1 consumes the shared ctx's single 1.0 BTC funding utxo (the order's
+	// Utxos are reserved via LockedUtxoInfo), so a second full take needs a
+	// second funder. Same for the BLOCK fee utxos below.
+	ctx.Node.config.Connectors["BTC"] = &stubConn{ticker: "BTC", addr: btcAddr, utxos: append(
+		ctx.Node.config.Connectors["BTC"].(*stubConn).utxos,
+		wallet.Utxo{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0, Amount: 100000000, Value: 1.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+	)}
+	// The take's service-node fee prep requires a funded BLOCK connector
+	// (F19, C++ acceptXBridgeTransaction :2236). Reward the shared ctx with the
+	// default BLOCK conf + a 1.0 BLOCK p2pkh funder, matching newHubNode.
+	ctx.Node.config.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+	// Two BLOCK funders: take #1 locks its fee utxo (LockedUtxoInfo reserves a
+	// live order's FeeUtxos, C++ lockFeeUtxos :2267), so take #2 needs a second.
+	u1 := blkUtxo()
+	u2 := blkUtxo()
+	u2.TxID = "0000000000000000000000000000000000000000000000000000000000000003"
+	u2.Vout = 1
+	ctx.Node.config.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{u1, u2}}
 	// A takeable order must have a hub that is a known servicenode;
 	// dxTakeOrder refuses unregistered hubs with NO_SERVICE_NODE (C++
 	// acceptXBridgeTransaction, getSn). Seed the registry with the hub.
@@ -115,6 +135,7 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
 		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion,
+		PaymentAddress: coins.KeyID(hubPub[:]),
 	})
 	ctx.Node.snReg = reg
 	o := &Order{

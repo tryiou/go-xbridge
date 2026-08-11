@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -368,28 +369,59 @@ func (n *Node) relayFeeFor(ticker string) (float64, error) {
 	return conn.GetRelayFee()
 }
 
-// blockContext returns the best block height and the first 8 bytes of the block
-// hash for ticker, mirroring C++ xbridgeapp.cpp:2420 (the chain tip stamped on
-// AcceptingBody). A missing/unreachable connector yields zeros — the order is
-// still accepted; only the anti-replay context is absent.
-func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte) {
-	conn, err := n.connector(ticker)
-	if err != nil {
-		return 0, [8]byte{}
+// blockContext returns the best block height and the first 8 ASCII characters
+// of the display-hex block hash for ticker, mirroring C++
+// xbridgeapp.cpp:2361-2374 and :2420-2424 (C++ memcpy's the first 8 chars of
+// the getblockhash string onto the wire). GetBlockHash returns the internal
+// little-endian hash, so the bytes are reversed to display order (uint256::GetHex)
+// before the prefix is taken. Any failure is an error — the accept path reverts
+// with NO_SESSION (xbridgeapp.cpp:2373); the anti-replay context is mandatory.
+func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte, err error) {
+	conn, cerr := n.connector(ticker)
+	if cerr != nil {
+		return 0, [8]byte{}, cerr
 	}
-	h, err := conn.GetBlockCount()
-	if err != nil || h < 1 {
-		return 0, [8]byte{}
+	h, herr := conn.GetBlockCount()
+	if herr != nil {
+		return 0, [8]byte{}, herr
+	}
+	if h < 1 {
+		return 0, [8]byte{}, errors.New("api: block height below 1 for " + ticker)
 	}
 	if h <= int64(^uint32(0)) {
 		height = uint32(h)
 	}
-	bh, err := conn.GetBlockHash(h)
-	if err != nil {
-		return height, [8]byte{}
+	bh, berr := conn.GetBlockHash(h)
+	if berr != nil {
+		return height, [8]byte{}, berr
 	}
-	copy(hash[:], bh[:8])
-	return height, hash
+	var rev [32]byte
+	for i := 0; i < 32; i++ {
+		rev[i] = bh[31-i]
+	}
+	hx := hexEncode(rev[:])
+	copy(hash[:], hx[:8])
+	return height, hash, nil
+}
+
+// availableBalance returns the sum of every configured connector's wallet-wide
+// confirmed balance in native base units, mirroring C++ App::availableBalance
+// (xbridgeapp.h:798-806). acceptXBridgeTransaction sums all wallets for the
+// INSUFFICIENT_FUNDS_DX pre-check (xbridgeapp.cpp:2159-2163); a wallet that
+// cannot report a balance fails the take as a session error.
+func (n *Node) availableBalance() (uint64, error) {
+	if n.cfg() == nil || n.cfg().Connectors == nil {
+		return 0, errors.New("dx: no wallet configured")
+	}
+	var total uint64
+	for _, conn := range n.cfg().Connectors {
+		b, err := conn.GetBalance()
+		if err != nil {
+			return 0, err
+		}
+		total += b
+	}
+	return total, nil
 }
 
 // wholeCoinOstream renders a whole-coin amount the way C++ does when streaming
@@ -1319,38 +1351,171 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "Unable to accept your own order.")
 	}
 
-	// C++ acceptXBridgeTransaction (xbridgeapp.cpp:2168-2197): the order is
+	// C++ acceptXBridgeTransaction pre-checks (xbridgeapp.cpp:2133-2163): both
+	// legs must have live connectors (NO_SESSION), neither amount may be dust
+	// (DUST), and the wallet-wide available balance must cover the to-currency
+	// connector's serviceNodeFee (INSUFFICIENT_FUNDS_DX). The dryrun preview is
+	// rendered BEFORE any of the accept work (rpcxbridge.cpp:1236-1252): no hub,
+	// no fee, no funding, nothing signed or broadcast.
+	if _, e := n.connector(o.ToCurrency); e != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", "Unable to connect to wallet: "+o.ToCurrency)
+	}
+	if _, e := n.connector(o.FromCurrency); e != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", "Unable to connect to wallet: "+o.FromCurrency)
+	}
+
+	ccTo := n.cfg().Confs[o.ToCurrency]
+	ccFrom := n.cfg().Confs[o.FromCurrency]
+	nativeTo := uint64(coinScale)
+	if ccTo != nil {
+		nativeTo = ccTo.Coin
+	}
+	nativeFrom := uint64(coinScale)
+	if ccFrom != nil {
+		nativeFrom = ccFrom.Coin
+	}
+	relayTo, _ := n.relayFeeFor(o.ToCurrency)
+	relayFrom, _ := n.relayFeeFor(o.FromCurrency)
+	if isDustNative(xBridgeValueFromAmount(fromSize), ccTo, relayTo, nativeTo) {
+		return orderListResult{}, makeError(errDust, "dxTakeOrder", "taker amount is dust")
+	}
+	if isDustNative(xBridgeValueFromAmount(toSize), ccFrom, relayFrom, nativeFrom) {
+		return orderListResult{}, makeError(errDust, "dxTakeOrder", "maker amount is dust")
+	}
+
+	if p.DryRun {
+		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
+		return o.toTakeDryrunResult(fromSize, toSize), nil
+	}
+
+	if funds, ferr := n.availableBalance(); ferr != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", ferr.Error())
+	} else if funds < xBridgeIntFromReal(serviceNodeFeeReal) {
+		return orderListResult{}, makeError(errInsufficientFundsDX, "dxTakeOrder", "not accepting order, insufficient funds")
+	}
+
+	// C++ acceptXBridgeTransaction (xbridgeapp.cpp:2165-2204): the order is
 	// refused with NO_SERVICE_NODE when its sPubKey is not a valid 33-byte
 	// servicenode key (:2168, decodePub33 yields a zero key) or when the key is
 	// not a known servicenode in the local registry (:2179, getSn null —
 	// membership only, no running filter). The session is pinned to that key
 	// for the whole swap, so a forged order cannot steer the taker's funds to
-	// a key we do not trust.
-	//
-	// Skipped in dry-run: the take is a Go-only validation/preview extension
-	// (nothing is broadcast and no session is created), so no hub is required.
-	if !p.DryRun {
-		hubKey := decodePub33(o.SNodePubkey)
-		if !n.hubRegistered(hubKey[:]) {
-			return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
-		}
+	// a key we do not trust. The service-node fee DESTINATION is the registry
+	// payment address (snode.getPaymentAddress(), :2196) — never the body's
+	// hubAddress.
+	hubKey := decodePub33(o.SNodePubkey)
+	if !n.hubRegistered(hubKey[:]) {
+		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
+	}
+	feeDest, ok := n.snReg.PaymentAddress(hubKey)
+	if !ok {
+		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
 	}
 
-	fromH, fromHash := n.blockContext(o.ToCurrency)
-	toH, toHash := n.blockContext(o.FromCurrency)
+	// BLOCK service-node fee prep (C++ :2236-2267). Only 25-byte p2pkh UTXOs at
+	// minconf 1 fund the fee; locked UTXOs are excluded. Every fee-prep failure
+	// maps to INSUFFICIENT_FUNDS (C++ :2240-2264).
+	blk := n.blockConnector()
+	if blk == nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "not accepting order, no BLOCK connector for service node fee payment")
+	}
+	blkCoin, _ := coins.Get("BLOCK")
+	blkConf := n.cfg().Confs["BLOCK"]
+	feeUtxoAvail, err := blk.ListUnspent(1)
+	if err != nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
+	}
+	lockedKeys, _ := n.store.LockedUtxoInfo()
+	feeUtxos := make([]wallet.Utxo, 0, len(feeUtxoAvail))
+	for _, u := range feeUtxoAvail {
+		if !isP2PKH25(u.ScriptPubKey) {
+			continue
+		}
+		if lockedKeys[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] {
+			continue
+		}
+		feeUtxos = append(feeUtxos, u)
+	}
+	info, ierr := feeOrderInfo(o.ID, o.ToCurrency, fromSize, o.FromCurrency, toSize)
+	if ierr != nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", ierr.Error())
+	}
+	rawFeeHex, feeInputs, rerr := buildServiceNodeFeeTx(blk, blkCoin, blkConf, feeDest, info, feeUtxos)
+	if rerr != nil {
+		return orderListResult{}, rerr
+	}
+	feeBytes, ferr := hex.DecodeString(rawFeeHex)
+	if ferr != nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", ferr.Error())
+	}
+
+	// Taker funding (C++ :2269-2358): selectUtxos from the to-currency wallet,
+	// excluding both the store-wide locked set and the just-selected fee inputs
+	// (C++ excludes them via lockFeeUtxos, :2267). Every failure maps to
+	// INSUFFICIENT_FUNDS; the proof-signing failures map per C++ :2306-2316.
+	conn, _ := n.connector(o.ToCurrency)
+	minConf := 0
+	if ccTo != nil {
+		minConf = ccTo.Confirmations
+	}
+	outputs, err := conn.ListUnspent(minConf)
+	if err != nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
+	}
+	feeKey := make(map[string]bool, len(feeInputs))
+	for _, u := range feeInputs {
+		feeKey[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] = true
+	}
+	filtered := make([]wallet.Utxo, 0, len(outputs))
+	for _, u := range outputs {
+		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+		if lockedKeys[k] || feeKey[k] {
+			continue
+		}
+		filtered = append(filtered, u)
+	}
+	usedCoins, _, _, ok := selectUtxos(p.FromAddress, filtered, ccTo, fromSize)
+	if !ok {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "insufficient funds")
+	}
+	coin, _ := coins.Get(o.ToCurrency)
+	proofs, err := buildUtxoProofs(conn, usedCoins, coin)
+	if err != nil {
+		if errors.Is(err, errBadSigLen) {
+			return orderListResult{}, makeError(errInvalidSignature, "dxTakeOrder", "incorrect signature length, need 65 bytes")
+		}
+		if errors.Is(err, errBadAddr) {
+			return orderListResult{}, makeError(errInvalidAddress, "dxTakeOrder", err.Error())
+		}
+		return orderListResult{}, makeError(errFundsNotSigned, "dxTakeOrder", err.Error())
+	}
+
+	// Block context from both connectors (C++ :2361-2374); any failure reverts
+	// with NO_SESSION.
+	fromH, fromHash, cerr := n.blockContext(o.ToCurrency)
+	if cerr != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", cerr.Error())
+	}
+	toH, toHash, cerr := n.blockContext(o.FromCurrency)
+	if cerr != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", cerr.Error())
+	}
+
 	acc := &proto.AcceptingBody{
-		ID:              o.ID,
-		HubAddress:      o.HubAddress,
-		From:            fromID,
-		FromCurrency:    o.ToCurrency,
-		FromAmount:      fromSize,
-		FromBlockHeight: fromH,
-		FromBlockHash:   fromHash,
-		To:              toID,
-		ToCurrency:      o.FromCurrency,
-		ToAmount:        toSize,
-		ToBlockHeight:   toH,
-		ToBlockHash:     toHash,
+		ID:               o.ID,
+		HubAddress:       o.HubAddress,
+		ServiceNodeFeeTx: feeBytes,
+		From:             fromID,
+		FromCurrency:     o.ToCurrency,
+		FromAmount:       fromSize,
+		FromBlockHeight:  fromH,
+		FromBlockHash:    fromHash,
+		To:               toID,
+		ToCurrency:       o.FromCurrency,
+		ToAmount:         toSize,
+		ToBlockHeight:    toH,
+		ToBlockHash:      toHash,
+		Utxos:            proofs,
 	}
 	// Generate the per-trade M keypair (C++ xtx->mPubKey/mPrivKey), generated
 	// at accept time so the wire signing pubkey == the HTLC pubkey by construction.
@@ -1367,11 +1532,6 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	pkt := proto.NewPacket(proto.XbcTransactionAccepting, acc.Marshal())
 	if err := n.signer.Sign(pkt, tPriv); err != nil {
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
-	}
-	if p.DryRun {
-		// C++ renders the dryrun result BEFORE the swap and does not broadcast.
-		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
-		return o.toTakeDryrunResult(fromSize, toSize), nil
 	}
 	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
@@ -1399,6 +1559,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		o.MakerKey = makerKey
 		o.OrigFromCurrency = o.FromCurrency
 		o.OrigToCurrency = o.ToCurrency
+		o.Utxos = proofs
+		o.UsedCoins = usedCoins
+		o.FeeUtxos = feeInputs
 		// Publish the take's mutations to the book under the store lock.
 		n.store.Update(key, func(stored *Order) {
 			stored.Updated = now
@@ -1407,6 +1570,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 			stored.MakerKey = makerKey
 			stored.OrigFromCurrency = o.FromCurrency
 			stored.OrigToCurrency = o.ToCurrency
+			stored.Utxos = proofs
+			stored.UsedCoins = usedCoins
+			stored.FeeUtxos = feeInputs
 		})
 		// Begin driving the client-side deposit handshake for this taken order.
 		n.newTakerSession(o, p, tPrivArr, tPub)

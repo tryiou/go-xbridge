@@ -149,6 +149,77 @@ func TestAcceptingBodyRoundTrip(t *testing.T) {
 	)
 }
 
+// TestAcceptingBodyGolden is a byte-exact C++-writer KAT for the
+// xbcTransactionAccepting layout (sendAcceptingTransaction,
+// xbridgeapp.cpp:2406-2469): hub(20) ‖ id(32) ‖ u32(feeLen) ‖ feeBytes ‖
+// from(20) ‖ fc(varstr) ‖ fromAmount(u64LE) ‖ fromHeight(u32LE) ‖ fromHash(8) ‖
+// to(20) ‖ tc(varstr) ‖ toAmount(u64LE) ‖ toHeight(u32LE) ‖ toHash(8) ‖
+// varint(utxoCount) ‖ entries. The body uses no funding entries and a 3-byte
+// fee to keep the golden readable; every fixed field is seeded with the same
+// distinct bytes as TestAcceptingBodyRoundTrip.
+func TestAcceptingBodyGolden(t *testing.T) {
+	b := &AcceptingBody{
+		HubAddress:       [20]byte{1},
+		ID:               [32]byte{2},
+		ServiceNodeFeeTx: []byte{0xaa, 0xbb, 0xcc},
+		From:             [20]byte{3},
+		FromCurrency:     "LTC",
+		FromAmount:       111,
+		FromBlockHeight:  700000,
+		FromBlockHash:    [8]byte{4, 5, 6, 7, 8, 9, 10, 11},
+		To:               [20]byte{12},
+		ToCurrency:       "DOGE",
+		ToAmount:         222,
+		ToBlockHeight:    700001,
+		ToBlockHash:      [8]byte{13, 14, 15, 16, 17, 18, 19, 20},
+	}
+	want := "0100000000000000000000000000000000000000" + // hub
+		"0200000000000000000000000000000000000000000000000000000000000000" + // id
+		"03000000" + // feeLen
+		"aabbcc" + // fee bytes
+		"0300000000000000000000000000000000000000" + // from
+		"4c54430000000000" + // Currency("LTC"): 8-byte ASCII, null-padded
+		"6f00000000000000" + // 111
+		"60ae0a00" + // 700000 = 0x000AAE60
+		"0405060708090a0b" + // fromHash
+		"0c00000000000000000000000000000000000000" + // to (20 bytes)
+		"444f474500000000" + // Currency("DOGE"): 8-byte ASCII, null-padded
+		"de00000000000000" + // 222
+		"61ae0a00" + // 700001
+		"0d0e0f1011121314" + // toHash
+		"00000000" // utxoCount (uint32) = 0
+	got := b.Marshal()
+	if hex.EncodeToString(got) != want {
+		t.Fatalf("AcceptingBody.Marshal:\n got  %x\n want %s", got, want)
+	}
+}
+
+// TestAcceptingBodySizeFloor locks the hub's drop gate: an Accepting packet is
+// only accepted when the body is >= 188 bytes (xbridgesession.cpp:855). A real
+// take — non-trivial fee tx plus at least one utxo entry (121 bytes each) — must
+// clear it; the F19 bug's empty-fee/empty-utxos body did not.
+func TestAcceptingBodySizeFloor(t *testing.T) {
+	b := &AcceptingBody{
+		HubAddress:       [20]byte{1},
+		ID:               [32]byte{2},
+		ServiceNodeFeeTx: bytes.Repeat([]byte{0xab}, 200), // ~real fee tx length
+		From:             [20]byte{3},
+		FromCurrency:     "BTC",
+		FromAmount:       300000,
+		FromBlockHeight:  700000,
+		FromBlockHash:    [8]byte{4, 5, 6, 7, 8, 9, 10, 11},
+		To:               [20]byte{12},
+		ToCurrency:       "LTC",
+		ToAmount:         1500000,
+		ToBlockHeight:    700001,
+		ToBlockHash:      [8]byte{13, 14, 15, 16, 17, 18, 19, 20},
+		Utxos:            []UtxoEntry{sampleUtxo()},
+	}
+	if n := len(b.Marshal()); n < 188 {
+		t.Fatalf("realistic Accepting body = %d bytes, want >= 188 (hub drop gate)", n)
+	}
+}
+
 func TestSwapBodiesRoundTrip(t *testing.T) {
 	roundTrip(t, "HoldBody",
 		func() []byte {

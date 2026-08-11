@@ -172,6 +172,21 @@ func (c *RPCConnector) Ticker() string { return c.chain.Ticker }
 // Endpoint returns the configured wallet RPC endpoint (e.g. http://host:port).
 func (c *RPCConnector) Endpoint() string { return c.chain.Endpoint }
 
+// GetBalance returns the wallet-wide available balance in native base units via
+// the getbalance RPC (C++ CWallet::GetBalance()). The wallet returns a
+// whole-coin float; it is converted to base units through the coin's decimals.
+func (c *RPCConnector) GetBalance() (uint64, error) {
+	var v float64
+	if err := c.cli.Call("getbalance", nil, &v); err != nil {
+		return 0, c.wrapErr("getbalance", err)
+	}
+	bal, err := amountFloatToBase(c.chain.Decimals, v)
+	if err != nil {
+		return 0, c.wrapErr("getbalance", err)
+	}
+	return bal, nil
+}
+
 // GetNewAddress returns a fresh receive address. Mirrors C++
 // xbridgewalletconnectorbtc.cpp rpc::getNewAddress, which calls "getnewaddress"
 // with an EMPTY params array (no label, no address-type argument) so the wallet

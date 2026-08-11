@@ -45,6 +45,11 @@ func NewLocalConnector(ticker string, signer LocalSigner, broadcast Broadcaster)
 
 func (l *LocalConnector) Ticker() string { return l.ticker }
 
+// GetBalance has no local balance source (see ListUnspent).
+func (l *LocalConnector) GetBalance() (uint64, error) {
+	return 0, errors.New("wallet: LocalConnector has no balance source")
+}
+
 func (l *LocalConnector) GetNewAddress() (string, error) {
 	return "", errors.New("wallet: LocalConnector has no address pool")
 }

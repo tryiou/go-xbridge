@@ -362,6 +362,15 @@ func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]strin
 			keys[k] = true
 			byOrder[k] = oid
 		}
+		// C++ reservers the fee utxos of an accepting order via lockFeeUtxos
+		// (xbridgeapp.cpp:2267) before selecting the taker's funding set, so a
+		// concurrent take cannot double-spend them. wallet.Utxo.TxID is display
+		// order, so the key is the plain "txid:vout" (no reversal).
+		for _, u := range o.FeeUtxos {
+			k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+			keys[k] = true
+			byOrder[k] = oid
+		}
 	}
 	return keys, byOrder
 }

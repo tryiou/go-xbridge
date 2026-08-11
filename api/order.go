@@ -12,6 +12,7 @@ package api
 
 import (
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // Order is the internal normalized model of a live XBridge order. It carries
@@ -55,6 +56,17 @@ type Order struct {
 	PrepTx string
 	Utxos  []proto.UtxoEntry
 	Mine   bool // true if created locally by this node
+
+	// UsedCoins is the caller's selected funding utxo set (C++ xtx->usedCoins):
+	// for a take it is the taker's funding selection attached to the Accepting
+	// body; for a make it is the maker's selection. B3 consumes it when building
+	// deposits instead of re-running ListUnspent.
+	UsedCoins []wallet.Utxo
+	// FeeUtxos is the BLOCK utxo set that funded the service-node fee tx of a
+	// take. LockedUtxoInfo reserves them for the order's lifetime so a second
+	// take cannot double-spend them (C++ lockFeeUtxos, xbridgeapp.cpp:2267).
+	// Runtime-only: the reserved set derives from live (non-terminal) orders.
+	FeeUtxos []wallet.Utxo
 
 	// --- cancel/reject + fidelity fields (mirror xbridge::TransactionDescr) ---
 	// SNodePubkey is C++ sPubKey: the servicenode pubkey carried in the
@@ -157,6 +169,10 @@ func (o *Order) Copy() *Order {
 	c := *o
 	c.Utxos = make([]proto.UtxoEntry, len(o.Utxos))
 	copy(c.Utxos, o.Utxos)
+	c.UsedCoins = make([]wallet.Utxo, len(o.UsedCoins))
+	copy(c.UsedCoins, o.UsedCoins)
+	c.FeeUtxos = make([]wallet.Utxo, len(o.FeeUtxos))
+	copy(c.FeeUtxos, o.FeeUtxos)
 	return &c
 }
 
@@ -285,4 +301,6 @@ func (o *Order) clearUsedCoins() {
 	o.ToCurrency = o.OrigToCurrency
 	o.FromAmount = o.OrigFromAmount
 	o.ToAmount = o.OrigToAmount
+	o.UsedCoins = nil
+	o.FeeUtxos = nil
 }

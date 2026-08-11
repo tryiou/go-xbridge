@@ -27,20 +27,25 @@ func TestEstimateFeeMatchesCppVsize(t *testing.T) {
 }
 
 // TestNodeBlockContext confirms TakeOrder's anti-replay block context is read
-// from each coin's connector (height + first 8 bytes of the tip hash), and that
-// a missing connector yields zeros rather than an error.
+// from each coin's connector (height + first 8 ASCII chars of the display-hex
+// tip hash, C++ xbridgeapp.cpp:2420-2424), and that a missing connector is an
+// error (a mandatory context, unlike the old zeros-and-continue).
 func TestNodeBlockContext(t *testing.T) {
 	node := newWalletTestCtx().Node
-	h, hash := node.blockContext("BTC")
+	h, hash, err := node.blockContext("BTC")
+	if err != nil {
+		t.Fatalf("blockContext(BTC): %v", err)
+	}
 	if h != 100 {
 		t.Errorf("blockContext(BTC) height = %d, want 100", h)
 	}
-	if hash[0] != 0xab {
-		t.Errorf("blockContext(BTC) hash[0] = 0x%x, want 0xab", hash[0])
+	// stubConn's GetBlockHash is [32]byte{0xab}; display order reverses it so
+	// the hex string ends in "ab" and the first 8 chars are 8x '0' (0x30).
+	if got, want := hash, [8]byte{0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30}; got != want {
+		t.Errorf("blockContext(BTC) hash = %q (%x), want %q", hash, hash[:], want)
 	}
-	// Missing connector yields zeros (order still accepted).
-	zh, zhash := node.blockContext("DOGE")
-	if zh != 0 || zhash != ([8]byte{}) {
-		t.Errorf("blockContext(DOGE) = (%d, %v), want (0, zero)", zh, zhash)
+	// A missing connector is an error, not a silent zero context.
+	if _, _, err := node.blockContext("DOGE"); err == nil {
+		t.Errorf("blockContext(DOGE) = nil error, want error")
 	}
 }
