@@ -341,7 +341,7 @@ above, so they are registered as **F19–F27**. Fixes land branch-by-branch
 
 | # | Severity | Verdict | Status |
 |---|---|---|---|
-| F19 | Blocker | CONFIRMED — `TakeOrder` emits an `AcceptingBody` with empty `ServiceNodeFeeTx`/`Utxos` (156 bytes < C++ 188 minimum) | **FIXED — B2 `fix/wire-acceptingbody` (at HEAD)** |
+| F19 | Blocker | CONFIRMED — `TakeOrder` emits an `AcceptingBody` with empty `ServiceNodeFeeTx`/`Utxos` (156 bytes < C++ 188 minimum) | **FIXED — B2 `fix/wire-acceptingbody` (at HEAD)**: take inputs reserved atomically per order (`Store.ReserveForTake`, C++ lockCoins/lockFeeUtxos under m_utxosOrderLock) so no two concurrent takes can double-select a BLOCK fee utxo or taker funding utxo; funding inputs are p2pkh-25 filtered (C++ unspentP2PKH). Both verified by `TestStoreReserveForTake`, `TestConcurrentTakeOrderDistinctOrdersExclusiveReservation`, `TestTakeOrderFundingRejectsNonP2PKH` + `make parity`. |
 | F20 | Critical | CONFIRMED — registration fields read-then-discarded; gates miss the `isValid` subset | **FIXED — B1 `fix/servicenode-registry` (at HEAD)** |
 | F21 | Critical | CONFIRMED — no `checkDepositTransaction` in the Connector contract | OPEN — B3 `fix/deposit-path` |
 | F22 | Critical | CONFIRMED — HTLC ELSE branch + CreateB-derived taker deposit; composition is SOUND | OPEN — closed by B3 (composite acceptance; no standalone code) |
