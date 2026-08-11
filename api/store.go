@@ -28,6 +28,12 @@ type Store struct {
 	locked    map[string]*Order
 	cancelled []cancelledEntry
 	history   []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
+	// reserved holds the "txid:vout" keys (display order) committed atomically
+	// by a take before its Accepting packet leaves (C++ lockCoins/lockFeeUtxos
+	// under m_utxosOrderLock, xbridgeapp.cpp:2236-2267). The reservation is
+	// exposed through LockedUtxoInfo immediately, folded into the owner order's
+	// Utxos/FeeUtxos on submit, and released on any take error path.
+	reserved map[string][]string
 }
 
 const (
@@ -84,8 +90,9 @@ type cancelledEntry struct {
 // NewStore returns an empty order store.
 func NewStore() *Store {
 	return &Store{
-		orders: make(map[string]*Order),
-		locked: make(map[string]*Order),
+		orders:   make(map[string]*Order),
+		locked:   make(map[string]*Order),
+		reserved: make(map[string][]string),
 	}
 }
 
@@ -343,13 +350,15 @@ func utxoEntryKey(e proto.UtxoEntry) string {
 	return hexEncode(rev[:]) + ":" + strconv.FormatUint(uint64(e.Vout), 10)
 }
 
-// LockedUtxoInfo returns the set of "txid:vout" (display order) reserved by
-// active orders, plus a map from each key to the hex id of the order locking it.
-// dxGetLockedUtxos / dxGetUtxos / dxGetTokenBalances consume this so locked
-// coins are reported and excluded from available balances, matching C++.
-func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]string) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// lockedInfoLocked returns the "txid:vout" (display order) reservation set plus
+// the order id owning each key, under a held lock. Non-terminal orders
+// contribute their committed Utxos (via utxoEntryKey) and FeeUtxos (plain
+// "txid:vout"), and active take reservations (s.reserved) count too — C++
+// reserves the fee utxos of an accepting order via lockFeeUtxos
+// (xbridgeapp.cpp:2267) before selecting the taker's funding set, so a
+// concurrent take cannot double-spend them. wallet.Utxo.TxID is display order,
+// so the key is the plain "txid:vout" (no reversal).
+func (s *Store) lockedInfoLocked() (keys map[string]bool, byOrder map[string]string) {
 	keys = map[string]bool{}
 	byOrder = map[string]string{}
 	for _, o := range s.orders {
@@ -362,17 +371,73 @@ func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]strin
 			keys[k] = true
 			byOrder[k] = oid
 		}
-		// C++ reservers the fee utxos of an accepting order via lockFeeUtxos
-		// (xbridgeapp.cpp:2267) before selecting the taker's funding set, so a
-		// concurrent take cannot double-spend them. wallet.Utxo.TxID is display
-		// order, so the key is the plain "txid:vout" (no reversal).
 		for _, u := range o.FeeUtxos {
 			k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
 			keys[k] = true
 			byOrder[k] = oid
 		}
 	}
+	for oid, list := range s.reserved {
+		// A reservation only holds while its owner order is live and
+		// non-terminal; once the order ends the take cannot proceed, so the
+		// in-flight inputs are released like committed ones (isOrderTerminal).
+		// The reported owner is the display id (orderIDString), matching the
+		// committed-input loop above.
+		if o := s.orders[oid]; o == nil || isOrderTerminal(o.Status) {
+			continue
+		}
+		disp := orderIDString(s.orders[oid].ID)
+		for _, k := range list {
+			keys[k] = true
+			byOrder[k] = disp
+		}
+	}
 	return keys, byOrder
+}
+
+// LockedUtxoInfo returns the set of "txid:vout" (display order) reserved by
+// active orders, plus a map from each key to the hex id of the order locking it.
+// dxGetLockedUtxos / dxGetUtxos / dxGetTokenBalances consume this so locked
+// coins are reported and excluded from available balances, matching C++.
+func (s *Store) LockedUtxoInfo() (keys map[string]bool, byOrder map[string]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lockedInfoLocked()
+}
+
+// ReserveForTake atomically reserves the "txid:vout" (display order) keys for
+// the order identified by key, mirroring C++ lockFeeUtxos + lockCoins
+// (xbridgeapp.cpp:2267): any overlap with an already-reserved key — another
+// non-terminal order's committed Utxos/FeeUtxos or an active reservation —
+// fails the take ("cannot reuse utxo inputs"). On success the reservation is
+// immediately visible through LockedUtxoInfo, so a concurrent take can never
+// select the same inputs. The reservation is folded into the owner order on
+// submit (Update) and must be released (ReleaseReserve) on any take error path.
+func (s *Store) ReserveForTake(key string, keys []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.orders[key]; o == nil || isOrderTerminal(o.Status) {
+		return false
+	}
+	locked, _ := s.lockedInfoLocked()
+	for _, k := range keys {
+		if locked[k] {
+			return false
+		}
+	}
+	if len(keys) > 0 {
+		s.reserved[key] = keys
+	}
+	return true
+}
+
+// ReleaseReserve drops a take's in-flight reservation (error paths where the
+// order never submits). Success releases it implicitly: the take's Update
+// commits the same keys into the order's Utxos/FeeUtxos.
+func (s *Store) ReleaseReserve(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.reserved, key)
 }
 
 // RecordCancelled records a flushed cancelled order (dxFlushCancelledOrders).

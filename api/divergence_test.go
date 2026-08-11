@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"strings"
@@ -8,10 +9,21 @@ import (
 
 	"go-xbridge/coins"
 	"go-xbridge/config"
+	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
 	"go-xbridge/wallet"
 )
+
+// reverseTxID renders a little-endian proto.UtxoEntry.TxID in display order
+// (the inverse of the entry's storage), for matching wallet-reported txids.
+func reverseTxID(id [32]byte) string {
+	var rev [32]byte
+	for i := 0; i < 32; i++ {
+		rev[i] = id[31-i]
+	}
+	return hex.EncodeToString(rev[:])
+}
 
 // fakeXConn is a no-op XConn so dxTakeOrder can pass requireWrite and "broadcast"
 // without a live service node.
@@ -173,6 +185,107 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 		t.Errorf("full take (amount 0) = %s/%s, want %s/%s",
 			r.MakerSize, r.TakerSize, formatXAmount(o.ToAmount), formatXAmount(o.FromAmount))
 	}
+}
+
+// TestTakeOrderFundingRejectsNonP2PKH — B2 Finding 2. C++ getUnspent only funds
+// a taker with 25-byte P2PKH outputs (unspentP2PKH,
+// xbridgewalletconnectorbtc.cpp:1605-1638); a P2SH/multisig/OP_RETURN output is
+// never spendable by the deposit path and must never enter the
+// AcceptingBody's Utxos. Given a P2SH and a P2PKH funder of equal size, the
+// take must select only the P2PKH; with only non-P2PKH funders it must fail
+// INSUFFICIENT_FUNDS.
+func TestTakeOrderFundingRejectsNonP2PKH(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A 23-byte P2SH output (OP_HASH160 <20> OP_EQUAL, "a914..87") — NOT the
+	// 25-byte P2PKH template the taker is allowed to fund with.
+	p2sh := wallet.Utxo{
+		TxID: strings.Repeat("ab", 32), Vout: 1,
+		Amount: 30000000000, Value: 300.0,
+		ScriptPubKey: "a914" + strings.Repeat("11", 20) + "87",
+		Address:      addrFor(5, "p2sh-out"),
+	}
+	p2pkh := wallet.Utxo{
+		TxID: strings.Repeat("cd", 32), Vout: 0,
+		Amount: 30000000000, Value: 300.0,
+		ScriptPubKey: "76a914000000000000000000000000000000000000000088ac",
+		Address:      addrFor(0, "p2pkh-out"),
+	}
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 0x42
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conf := func() map[string]*config.CoinConf {
+		return map[string]*config.CoinConf{
+			"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+			"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+		}
+	}
+
+	t.Run("p2sh plus p2pkh selects only p2pkh", func(t *testing.T) {
+		btc := &fakeConnector{ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{},
+			funders: []wallet.Utxo{p2sh, p2pkh}}
+		n, cc := newStartedNode(t, conf(), map[string]wallet.Connector{
+			"BTC":   btc,
+			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{blkUtxo()}},
+		})
+		registerHub(t, n, hubPriv)
+		var oid [32]byte
+		copy(oid[:], []byte("funding-p2pkh-only-order-0000000000"))
+		n.store.Add(&Order{
+			ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+			Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+		})
+		if _, rerr := n.TakeOrder(TakeOrderParams{
+			ID: orderIDString(oid), FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to"),
+		}); rerr != nil {
+			t.Fatalf("take with a P2PKH alternative should succeed: %v", rerr)
+		}
+		o := n.store.Get(hexEncode(oid[:]))
+		if o == nil || len(o.Utxos) != 1 {
+			t.Fatalf("accepted order utxos = %+v, want exactly 1", o)
+		}
+		// The single selected entry must be the P2PKH output (cd.. txid), never
+		// the P2SH one (ab..). proto.UtxoEntry.TxID is little-endian, so the
+		// wall-reported display txid is the reversed form.
+		if got := reverseTxID(o.Utxos[0].TxID); got != p2pkh.TxID {
+			t.Errorf("selected funding txid = %s, want %s (P2PKH only)", got, p2pkh.TxID)
+		}
+		if len(cc.snapshot()) != 1 {
+			t.Fatalf("accepting packets = %d, want 1", len(cc.snapshot()))
+		}
+	})
+
+	t.Run("only non-p2pkh funders fail", func(t *testing.T) {
+		btc := &fakeConnector{ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{},
+			funders: []wallet.Utxo{p2sh}}
+		n, cc := newStartedNode(t, conf(), map[string]wallet.Connector{
+			"BTC":   btc,
+			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{blkUtxo()}},
+		})
+		registerHub(t, n, hubPriv)
+		var oid [32]byte
+		copy(oid[:], []byte("funding-non-p2pkh-order-00000000000"))
+		n.store.Add(&Order{
+			ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+			Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+		})
+		if _, rerr := n.TakeOrder(TakeOrderParams{
+			ID: orderIDString(oid), FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to"),
+		}); rerr == nil || rerr.Code != errInsufficientFunds {
+			t.Fatalf("take with only non-P2PKH funders = %v, want INSUFFICIENT_FUNDS", rerr)
+		}
+		if len(cc.snapshot()) != 0 {
+			t.Fatalf("accepting packets = %d, want 0 (no non-P2PKH funding)", len(cc.snapshot()))
+		}
+	})
 }
 
 // TestDxLockedUtxoExclusion verifies that UTXOs reserved by an active order are

@@ -1468,6 +1468,13 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	filtered := make([]wallet.Utxo, 0, len(outputs))
 	for _, u := range outputs {
+		// Funding inputs must be 25-byte P2PKH outputs (C++ getUnspent's
+		// unspentP2PKH filter, xbridgewalletconnectorbtc.cpp:1605-1638). A
+		// P2SH/multisig/OP_RETURN output is not spendable by the deposit path
+		// and must never fund a taker entry.
+		if !isP2PKH25(u.ScriptPubKey) {
+			continue
+		}
 		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
 		if lockedKeys[k] || feeKey[k] {
 			continue
@@ -1501,6 +1508,23 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", cerr.Error())
 	}
 
+	// Atomic input reservation (C++ lockFeeUtxos + lockCoins under
+	// m_utxosOrderLock, xbridgeapp.cpp:2236-2267). The fee inputs and the
+	// taker's funding set are claimed in one step under the store lock, BEFORE
+	// any Accepting packet leaves, so a concurrent take of a different order
+	// can never double-select the same BLOCK fee utxo or funding utxo. A
+	// collision fails the take like C++'s "cannot reuse utxo inputs".
+	reserveKeys := make([]string, 0, len(feeKey)+len(usedCoins))
+	for k := range feeKey {
+		reserveKeys = append(reserveKeys, k)
+	}
+	for _, u := range usedCoins {
+		reserveKeys = append(reserveKeys, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10))
+	}
+	if !n.store.ReserveForTake(key, reserveKeys) {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "cannot reuse utxo inputs")
+	}
+
 	acc := &proto.AcceptingBody{
 		ID:               o.ID,
 		HubAddress:       o.HubAddress,
@@ -1521,19 +1545,23 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// at accept time so the wire signing pubkey == the HTLC pubkey by construction.
 	tPriv, err := crypto.NewPrivateKey()
 	if err != nil {
+		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	var tPrivArr [32]byte
 	copy(tPrivArr[:], tPriv)
 	tPub, err := crypto.CompressedPubKey(tPriv)
 	if err != nil {
+		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	pkt := proto.NewPacket(proto.XbcTransactionAccepting, acc.Marshal())
 	if err := n.signer.Sign(pkt, tPriv); err != nil {
+		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
+		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	// State mutation (store update, session registration, persist) runs on the
@@ -1545,6 +1573,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		// Authoritative re-check on the engine: the order may have been
 		// cancelled/removed since the HTTP snapshot.
 		if n.store.Get(key) == nil {
+			n.store.ReleaseReserve(key)
 			return
 		}
 		now := NowMicro()
@@ -1574,6 +1603,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 			stored.UsedCoins = usedCoins
 			stored.FeeUtxos = feeInputs
 		})
+		// The committed Utxos/FeeUtxos now carry the reserved keys (LockedUtxoInfo
+		// reads them off the order), so the in-flight reservation is exhausted.
+		n.store.ReleaseReserve(key)
 		// Begin driving the client-side deposit handshake for this taken order.
 		n.newTakerSession(o, p, tPrivArr, tPub)
 		// Persist the new local swap (incl. its per-trade M keypair) to disk.

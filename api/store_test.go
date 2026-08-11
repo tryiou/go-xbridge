@@ -4,7 +4,89 @@ import (
 	"testing"
 
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
+
+// TestStoreReserveForTake verifies the atomic take-input reservation (B2
+// Finding 1): only one order can claim a "txid:vout" key, the reservation is
+// immediately visible through LockedUtxoInfo alongside committed order inputs,
+// terminal orders release their locks, and ReleaseReserve clears an in-flight
+// reservation. Mirrors C++ lockFeeUtxos + lockCoins ("cannot reuse utxo
+// inputs", xbridgeapp.cpp:2267).
+func TestStoreReserveForTake(t *testing.T) {
+	s := NewStore()
+	a := testStoreOrder(1)
+	b := testStoreOrder(2)
+	keyA := hexEncode(a.ID[:])
+	keyB := hexEncode(b.ID[:])
+	s.Add(a)
+	s.Add(b)
+
+	// A first reservation succeeds and is immediately visible to other takers.
+	if !s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}) {
+		t.Fatal("first reservation should succeed")
+	}
+	if !s.ReserveForTake(keyB, []string{"cc:2"}) {
+		t.Fatal("disjoint reservation should succeed")
+	}
+	keys, byOrder := s.LockedUtxoInfo()
+	for _, k := range []string{"aa:0", "bb:1", "cc:2"} {
+		if !keys[k] {
+			t.Fatalf("reserved key %s not reported by LockedUtxoInfo", k)
+		}
+	}
+	if byOrder["aa:0"] != orderIDString(a.ID) {
+		t.Errorf("byOrder[aa:0] = %q, want %q", byOrder["aa:0"], orderIDString(a.ID))
+	}
+
+	// A collision with an active reservation must fail the second taker.
+	if s.ReserveForTake(keyB, []string{"aa:0"}) {
+		t.Fatal("reuse of an actively reserved key must fail")
+	}
+
+	// A committed order input (FeeUtxos) also blocks a reservation.
+	s.Update(keyA, func(o *Order) {
+		o.FeeUtxos = []wallet.Utxo{{TxID: "dd", Vout: 2}}
+	})
+	if s.ReserveForTake(keyB, []string{"dd:2"}) {
+		t.Fatal("reuse of a committed order fee utxo must fail")
+	}
+	lkeys, lowner := s.LockedUtxoInfo()
+	if !lkeys["dd:2"] {
+		t.Errorf("committed fee utxo dd:2 not reported locked")
+	}
+	if lowner["dd:2"] != orderIDString(a.ID) {
+		t.Errorf("byOrder[dd:2] = %q, want %q (committed fee utxo owner)", lowner["dd:2"], orderIDString(a.ID))
+	}
+
+	// An unknown order cannot reserve (the take re-checks the live order).
+	if s.ReserveForTake("no-such-order", []string{"zz:0"}) {
+		t.Fatal("reservation for an absent order must fail")
+	}
+
+	// Release clears the reservation so the keys can be claimed again.
+	s.ReleaseReserve(keyA)
+	keys, _ = s.LockedUtxoInfo()
+	if keys["aa:0"] || keys["bb:1"] {
+		t.Error("released reservation keys still reported locked")
+	}
+	if !s.ReserveForTake(keyA, []string{"aa:0", "bb:1"}) {
+		t.Fatal("re-reservation after release should succeed")
+	}
+
+	// A terminal (canceled) order releases all of its locks — committed inputs
+	// and in-flight reservations alike.
+	s.Update(keyA, func(o *Order) {
+		o.Status = "canceled"
+	})
+	keys, _ = s.LockedUtxoInfo()
+	if keys["dd:2"] {
+		t.Error("terminal order's committed fee utxo still reported locked")
+	}
+	if keys["aa:0"] || keys["bb:1"] {
+		t.Error("terminal order's in-flight reservation still reported locked")
+	}
+}
 
 // testStoreOrder builds an order with a deterministic id and a couple of UTXOs
 // so the deep-copy behavior of Order.Copy is exercised.

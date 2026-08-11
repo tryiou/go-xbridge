@@ -357,29 +357,192 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 	n.store.Add(o)
 
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wins := 0
+	loses := 0
 	for i := 0; i < takes; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if _, rerr := n.TakeOrder(TakeOrderParams{
+			_, rerr := n.TakeOrder(TakeOrderParams{
 				ID:          orderIDString(oid),
 				FromAddress: addrFor(0, fmt.Sprintf("take-from-%d", i)),
 				ToAddress:   addrFor(0, fmt.Sprintf("take-to-%d", i)),
-			}); rerr != nil {
-				t.Errorf("TakeOrder %d: %v", i, rerr)
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if rerr == nil {
+				wins++
+				return
+			}
+			// A losing raft always fails on the atomic input reservation (C++
+			// "cannot reuse utxo inputs"), never on a partial-wallet error: the
+			// selection windows are over the full pool and the reservation is
+			// the one exclusion point that serializes concurrent takes.
+			if rerr.Code != errInsufficientFunds {
+				t.Errorf("TakeOrder %d: unexpected error %v", i, rerr)
+			} else {
+				loses++
 			}
 		}(i)
 	}
 	wg.Wait()
 
+	if wins < 1 {
+		t.Fatalf("no take succeeded (wins=%d)", wins)
+	}
+	if wins+loses != takes {
+		t.Fatalf("outcomes = %d, want %d takes accounted for", wins+loses, takes)
+	}
+	// The engine serializes the tails, so exactly one taker session survives
+	// regardless of how many acceptings raced to the wire (no fork).
 	if got := readOnEngine(t, n, func() int { return len(n.sessions) }); got != 1 {
 		t.Fatalf("sessions = %d, want 1 (no fork)", got)
 	}
 	if got := n.store.Get(hexEncode(oid[:])); got == nil || got.Status != "accepting" {
 		t.Fatalf("order status = %v, want accepting", got)
 	}
-	if got := len(cc.snapshot()); got != takes {
-		t.Fatalf("Accepting packets written = %d, want %d", got, takes)
+	// Every take that won broadcasts exactly one Accepting packet; a loser
+	// fails at the reservation BEFORE any packet leaves.
+	if got := len(cc.snapshot()); got != wins {
+		t.Fatalf("Accepting packets written = %d, want %d (one per winning take)", got, wins)
+	}
+}
+
+// TestConcurrentTakeOrderDistinctOrdersExclusiveReservation — B2 Finding 1.
+// Eight concurrent takes of eight DISTINCT orders draw from one SHARED scarce
+// pool (3 funding utxos + 3 BLOCK fee utxos). The atomic reservation
+// (ReserveForTake) must guarantee no two orders ever claim the same key, so
+// the surviving acceptings' inputs are pairwise disjoint, at most 3 takes can
+// win, and every loser fails with INSUFFICIENT_FUNDS before broadcasting.
+func TestConcurrentTakeOrderDistinctOrdersExclusiveReservation(t *testing.T) {
+	const (
+		takes = 8 // concurrent takes
+		pool  = 3 // shared scarce utxos per currency
+	)
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var funders []wallet.Utxo
+	for i := 0; i < pool; i++ {
+		funders = append(funders, wallet.Utxo{
+			TxID: fmt.Sprintf("%064d", i+1), Vout: 0,
+			Amount: 30000000000, Value: 300.0,
+			ScriptPubKey: "76a914000000000000000000000000000000000000000088ac",
+			Address:      addrFor(0, fmt.Sprintf("shared-funding-%d", i)),
+		})
+	}
+	conn := &fakeConnector{
+		ticker: "BTC", blockHeight: 1000, rawTx: map[string]string{},
+		funders: funders,
+	}
+	blkUtxos := make([]wallet.Utxo, 0, pool)
+	for i := 0; i < pool; i++ {
+		u := blkUtxo()
+		u.TxID = fmt.Sprintf("%064d", 0x100+i)
+		blkUtxos = append(blkUtxos, u)
+	}
+	n, cc := newStartedNode(t, map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}, map[string]wallet.Connector{
+		"BTC":   conn,
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: blkUtxos},
+	})
+
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 2
+	registerHub(t, n, hubPriv)
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var oids [takes][32]byte
+	for i := 0; i < takes; i++ {
+		var oid [32]byte
+		copy(oid[:], []byte(fmt.Sprintf("exclusive-order-%02d-0000000000", i)))
+		oids[i] = oid
+		o := &Order{
+			ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+			Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+		}
+		n.store.Add(o)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wins := map[int]bool{}
+	loses := map[int]bool{}
+	for i := 0; i < takes; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, rerr := n.TakeOrder(TakeOrderParams{
+				ID:          orderIDString(oids[i]),
+				FromAddress: addrFor(0, fmt.Sprintf("take-from-%d", i)),
+				ToAddress:   addrFor(0, fmt.Sprintf("take-to-%d", i)),
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if rerr == nil {
+				wins[i] = true
+			} else if rerr.Code == errInsufficientFunds {
+				loses[i] = true
+			} else {
+				t.Errorf("TakeOrder %d: unexpected error %v", i, rerr)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if len(wins) < 1 {
+		t.Fatal("no take succeeded")
+	}
+	if len(wins) > pool {
+		t.Fatalf("wins = %d, want at most %d with a shared pool of %d", len(wins), pool, pool)
+	}
+	if len(loses) != takes-len(wins) {
+		t.Fatalf("losers = %d, want %d", len(loses), takes-len(wins))
+	}
+	if len(cc.snapshot()) != len(wins) {
+		t.Fatalf("Accepting packets = %d, want %d (losers must not broadcast)", len(cc.snapshot()), len(wins))
+	}
+
+	// The core guarantee: across ALL surviving acceptings, no "txid:vout" key
+	// is shared by two different orders. Winners carry exactly one funding and
+	// one fee utxo, so a collision-free union of size 2*|wins| proves the
+	// exclusion worked (Fixing the TOCTOU, each survivor claimed unique inputs).
+	seen := map[string]string{}
+	for _, o := range n.store.List() {
+		if o.Status != "accepting" {
+			continue
+		}
+		if len(o.Utxos) != 1 || len(o.FeeUtxos) != 1 {
+			t.Fatalf("accepted order %s has %d utxos / %d fee utxos, want 1/1",
+				orderIDString(o.ID), len(o.Utxos), len(o.FeeUtxos))
+		}
+		owner := orderIDString(o.ID)
+		for _, u := range o.Utxos {
+			k := utxoEntryKey(u)
+			if prev, ok := seen[k]; ok && prev != owner {
+				t.Fatalf("funding key %s claimed by both %s and %s (double-reserve)", k, prev, owner)
+			}
+			seen[k] = owner
+		}
+		for _, u := range o.FeeUtxos {
+			k := u.TxID + ":" + fmt.Sprint(u.Vout)
+			if prev, ok := seen[k]; ok && prev != owner {
+				t.Fatalf("fee key %s claimed by both %s and %s (double-reserve)", k, prev, owner)
+			}
+			seen[k] = owner
+		}
+	}
+	if got := len(seen); got != 2*len(wins) {
+		t.Fatalf("reserved key count = %d, want %d (each winner 1 funding + 1 fee)", got, 2*len(wins))
 	}
 }
 
