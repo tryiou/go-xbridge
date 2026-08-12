@@ -288,7 +288,7 @@ func TestPaymentScriptSig(t *testing.T) {
 	}
 }
 
-// TestDepositLocksAmountPlusFee2 verifies S1-C: the HTLC deposit output locks
+// TestDepositLocksAmountPlusFee2 verifies CRYPTO-F95: the HTLC deposit output locks
 // Amount + fee2 (the p2sh redeem margin), matching C++ outAmount+fee2
 // (xbridgesession.cpp:2094 maker, :2615 taker). checkDepositTransaction
 // requires depositP2SHAmount >= amount + 0.95*fee2

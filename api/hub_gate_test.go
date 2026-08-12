@@ -171,7 +171,7 @@ func TestMakeOrderDryRunSkipsHubGate(t *testing.T) {
 }
 
 // TestMakeOrderReturnsStoreCopy proves dxMakeOrder returns a snapshot COPY of
-// the stored order, never the store's live record (F15). On the old code the
+// the stored order, never the store's live record (CONC-F101). On the old code the
 // returned *Order WAS the live record: the HTTP handler rendered
 // makeOrderResponse() on it while the engine could concurrently write it (a
 // relayed self-echo bumps Updated via store.Touch; a remote cancel writes
@@ -362,7 +362,7 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 	if ab.HubAddress != hubAddr {
 		t.Fatalf("Accepting body hubAddress = %x, want %x", ab.HubAddress, hubAddr)
 	}
-	// F19: the Accepting must carry a real service-node fee tx AND the taker's
+	// CRYPTO-F84: the Accepting must carry a real service-node fee tx AND the taker's
 	// signed funding utxo entries — an empty pair is dropped by the hub
 	// (xbridgesession.cpp:848-916, crBadFeeTx). The body must be >= 188 bytes.
 	if len(ab.ServiceNodeFeeTx) == 0 {

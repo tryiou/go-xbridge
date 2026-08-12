@@ -282,7 +282,7 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	}
 }
 
-// TestCreateAStateGuardDropsPostCompletionRetransmitE2E proves the F16 state
+// TestCreateAStateGuardDropsPostCompletionRetransmitE2E proves the STATE-F77 state
 // guard end-to-end: after the deposit task COMPLETES (await cleared, state ==
 // csCreatedA), a duplicate CreateA from the hub must be dropped by the handler
 // — not processSwap's in-flight guard — so exactly one deposit is ever

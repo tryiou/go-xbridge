@@ -114,7 +114,7 @@ type SwapSession struct {
 	theirSecretHash  [20]byte
 
 	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
-	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (F2/S2-E)
+	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (STATE-F78)
 	state  clientState
 
 	// await is true while a two-phase handshake task (deposit/claim) for this
@@ -228,7 +228,7 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [
 		secretHash:    coins.KeyID(xpk[:]),
 		state:         csMaker,
 	}
-	// F2/S2-E: the maker's trusted hub key is the servicenode chosen at make
+	// STATE-F78: the maker's trusted hub key is the servicenode chosen at make
 	// time (C++ xtx->sPubKey = findNodeWithService result). It is pinned HERE,
 	// at session creation — never learned from network packets — so every hub
 	// handshake packet (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified
@@ -258,7 +258,7 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 		pubKey:        pub,
 		state:         csTaker,
 	}
-	// F2/S2-E: the taker's trusted hub key is the servicenode that broadcast
+	// STATE-F78: the taker's trusted hub key is the servicenode that broadcast
 	// the order (C++ xtx->sPubKey = the SN whose header signed the order). It is
 	// pinned HERE, at session creation, so every hub handshake packet
 	// (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified against it — a
@@ -317,7 +317,7 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateA received by taker session %s", orderID)
 	}
-	// F16: C++ processTransactionCreateA drops a CreateA once the transaction
+	// STATE-F77: C++ processTransactionCreateA drops a CreateA once the transaction
 	// already reached trCreated (xbridgesession.cpp:1947). A retransmit arriving
 	// AFTER our deposit completed (await is cleared) must not re-broadcast a
 	// second deposit.
@@ -406,7 +406,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateB received by maker session %s", orderID)
 	}
-	// F16: C++ processTransactionCreateB drops a CreateB once the transaction
+	// STATE-F77: C++ processTransactionCreateB drops a CreateB once the transaction
 	// already reached trCreated (xbridgesession.cpp:2424). A post-completion
 	// retransmit must not re-broadcast a second deposit.
 	if s.state >= csCreatedB {
@@ -509,7 +509,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", orderID)
 	}
-	// F16: C++ processTransactionConfirmA drops a ConfirmA once the transaction
+	// STATE-F77: C++ processTransactionConfirmA drops a ConfirmA once the transaction
 	// already reached trCommited (xbridgesession.cpp:2897). A retransmit AFTER
 	// we redeemed must not re-broadcast a second claim payTx.
 	if s.state >= csConfirmedA {
@@ -608,7 +608,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", orderID)
 	}
-	// F16: C++ processTransactionConfirmB drops a ConfirmB once the transaction
+	// STATE-F77: C++ processTransactionConfirmB drops a ConfirmB once the transaction
 	// already reached trCommited (xbridgesession.cpp:3152). A retransmit AFTER
 	// we redeemed must not re-broadcast a second claim payTx.
 	if s.state >= csConfirmedB {
@@ -893,7 +893,7 @@ func (n *Node) checkRefunds() {
 // done before returning.
 func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) {
 	if s := n.sessions[orderID]; s != nil && s.refundHex != "" {
-		// F18: take the pendingRefunds guard so a concurrent sweep
+		// CONC-F102: take the pendingRefunds guard so a concurrent sweep
 		// (scanRefunds) cannot enqueue a second broadcast of the same refund
 		// hex while this force-refund is in flight. postRefundTask's apply
 		// clears the guard on success AND error, so the sweep safety net still
@@ -1326,7 +1326,7 @@ func secretFromScriptSig(script []byte, hx [20]byte) ([33]byte, bool) {
 
 // decodePub33 decodes a 33-byte compressed pubkey hex into a fixed array,
 // returning the zero value when the string is empty, malformed, or the wrong
-// length. It is used to materialize a session's trusted hub key (F2/S2-E).
+// length. It is used to materialize a session's trusted hub key (STATE-F78).
 func decodePub33(s string) [33]byte {
 	var out [33]byte
 	if s == "" {

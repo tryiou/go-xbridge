@@ -444,7 +444,7 @@ func hasDupCollateral(collateral []CollateralUTXO) bool {
 // ServiceNode::isValid (servicenode.h:398-484). The on-chain checks it cannot
 // make — block ancestry (:401) and collateral utxo existence/amount/ownership
 // (:447-478, total >= COLLATERAL_SPV) — need a full chain index and are
-// documented as a thin-client limitation in docs/audit.md.
+// documented as a thin-client limitation in docs/audit/register.md (WIRE-F71).
 func registrationValid(sn ServiceNode) bool {
 	if sn.Tier != TierSPV {
 		return false // servicenode.h:409

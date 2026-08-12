@@ -197,7 +197,7 @@ func TestAcceptingBodyGolden(t *testing.T) {
 // TestAcceptingBodySizeFloor locks the hub's drop gate: an Accepting packet is
 // only accepted when the body is >= 188 bytes (xbridgesession.cpp:855). A real
 // take — non-trivial fee tx plus at least one utxo entry (121 bytes each) — must
-// clear it; the F19 bug's empty-fee/empty-utxos body did not.
+// clear it; the CRYPTO-F84 bug's empty-fee/empty-utxos body did not.
 func TestAcceptingBodySizeFloor(t *testing.T) {
 	b := &AcceptingBody{
 		HubAddress:       [20]byte{1},

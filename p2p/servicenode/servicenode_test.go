@@ -562,7 +562,7 @@ func TestParseServiceNode(t *testing.T) {
 }
 
 // TestParseServiceNodeRetainsRegistration verifies SNREGISTER parsing retains
-// every registration field (F20): paymentAddress, collateral, bestBlock,
+// every registration field (WIRE-F71): paymentAddress, collateral, bestBlock,
 // bestBlockHash, signature. These were read-then-discarded before the fix.
 func TestParseServiceNodeRetainsRegistration(t *testing.T) {
 	pub, priv := mustKeypair(t)
@@ -590,7 +590,7 @@ func TestParseServiceNodeRetainsRegistration(t *testing.T) {
 
 // TestParseServiceNodePingRetainsEmbeddedRegistration verifies a ping's
 // embedded registration fields survive parsing into the returned ServiceNode
-// (F20) — B2 reads PaymentAddress from the hub's ping-learned record.
+// (WIRE-F71) — B2 reads PaymentAddress from the hub's ping-learned record.
 func TestParseServiceNodePingRetainsEmbeddedRegistration(t *testing.T) {
 	pub, priv := mustKeypair(t)
 	cfg := `{"xbridgeversion":55,"xrouterversion":55,"xbridge":["BTC"]}`

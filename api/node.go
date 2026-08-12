@@ -705,7 +705,7 @@ func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdNam
 // sends it addressed to the session's pinned hub. Runs on the engine goroutine
 // (or inline when the engine is not started).
 //
-// F2/S2-E (hub-key auth): every handshake packet is re-verified against the
+// STATE-F78 (hub-key auth): every handshake packet is re-verified against the
 // session's TRUSTED hub key before dispatch — mirroring C++
 // xbridgesession.cpp:1364 packet->verify(xtx->sPubKey). The trusted key is
 // pinned at session creation for BOTH roles (maker: the hub chosen at make
@@ -761,7 +761,7 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 }
 
 // verifyHubPacket authenticates a hub-originated handshake packet against the
-// session's trusted hub key (F2/S2-E, C++ packet->verify(xtx->sPubKey)). The
+// session's trusted hub key (STATE-F78, C++ packet->verify(xtx->sPubKey)). The
 // trusted key is pinned at session creation for BOTH roles — the maker's chosen
 // servicenode, the taker's order SNodePubkey — never learned from network
 // packets. A packet signed by any other key is dropped before it reaches the
@@ -1237,7 +1237,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		// State mutation (store.Add, session registration, SEND, persist) runs
 		// on the engine goroutine, which owns the book and session maps.
 		//
-		// F15: the response must render a store snapshot COPY, never the live
+		// CONC-F101: the response must render a store snapshot COPY, never the live
 		// record. The engine may concurrently write the live order (a relayed
 		// self-echo bumps Updated via store.Touch, or a remote cancel writes
 		// Status), so returning the live pointer to the HTTP handler would race

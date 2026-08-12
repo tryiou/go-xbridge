@@ -45,7 +45,7 @@ type Server struct {
 
 	// user/pass are the HTTP Basic credentials RPC callers must present. When
 	// both are empty (the daemon's default) no authentication is enforced —
-	// F1 (RPC auth) binds to loopback by default and defers to the operator to
+	// SEC-F01 (RPC auth) binds to loopback by default and defers to the operator to
 	// enable auth explicitly via -rpcuser/-rpcpassword.
 	user, pass string
 }
@@ -105,14 +105,14 @@ func parseBasicAuth(h string) (user, pass string, ok bool) {
 	return string(b[:i]), string(b[i+1:]), true
 }
 
-// rpcMaxBodyBytes caps the JSON-RPC request body (F10/S3): a body larger than
+// rpcMaxBodyBytes caps the JSON-RPC request body (RPC-F49): a body larger than
 // this is rejected instead of being buffered in whole, closing the
 // unbounded-decode surface in ServeHTTP.
 const rpcMaxBodyBytes = 4 << 20
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	// RPC auth gate (F1): reject without a 401 + challenge when credentials
+	// RPC auth gate (SEC-F01): reject without a 401 + challenge when credentials
 	// are configured, before any handler runs.
 	if !s.authorized(r) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+basicRealm+`"`)
@@ -124,7 +124,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Bound the request body (F10/S3): read it fully through MaxBytesReader so
+	// Bound the request body (RPC-F49): read it fully through MaxBytesReader so
 	// an oversized body is rejected instead of buffered unbounded.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rpcMaxBodyBytes))
 	if err != nil {

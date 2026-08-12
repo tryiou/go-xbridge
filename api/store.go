@@ -50,8 +50,8 @@ type reservedKeys struct {
 }
 
 const (
-	maxStoreFills   = 1000 // bound on s.fills (F9: bounded history)
-	maxStoreHistory = 1000 // bound on s.history (F9: bounded history)
+	maxStoreFills   = 1000 // bound on s.fills (CONC-F99: bounded history)
+	maxStoreHistory = 1000 // bound on s.history (CONC-F99: bounded history)
 	maxCancelled    = 1000 // bound on s.cancelled (in addition to the age prune)
 )
 

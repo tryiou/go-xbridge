@@ -85,11 +85,11 @@ func isLoopbackAddr(addr string) bool {
 }
 
 func main() {
-	// RPC bind defaults to loopback only (F1), mirroring blocknetd's
+	// RPC bind defaults to loopback only (SEC-F01), mirroring blocknetd's
 	// httpserver.cpp:308 loopback default. An explicit -rpcbind (host:port) is
 	// required to expose the JSON-RPC surface beyond localhost.
 	rpcBind := flag.String("rpcbind", "127.0.0.1:41414", "JSON-RPC listen address (host:port); defaults to loopback, set explicitly to bind elsewhere")
-	// RPC auth (F1): enforced only when BOTH -rpcuser and -rpcpassword are set
+	// RPC auth (SEC-F01): enforced only when BOTH -rpcuser and -rpcpassword are set
 	// (no cookie fallback). Unauthenticated RPC is safe only because the
 	// default bind is loopback; a non-loopback bind with no auth logs a warning.
 	rpcUser := flag.String("rpcuser", "", "RPC Basic auth username (requires -rpcpassword)")
@@ -213,7 +213,7 @@ func main() {
 
 	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
-	// F1: RPC auth is enforced only when both -rpcuser and -rpcpassword are
+	// SEC-F01: RPC auth is enforced only when both -rpcuser and -rpcpassword are
 	// provided (no cookie fallback). Either alone is ignored.
 	if *rpcUser != "" && *rpcPass != "" {
 		srv.SetAuth(*rpcUser, *rpcPass)

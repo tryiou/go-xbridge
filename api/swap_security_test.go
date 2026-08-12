@@ -125,7 +125,7 @@ func seedHub(node *Node, pub [33]byte) {
 	node.snReg = reg
 }
 
-// TestDispatchSwapDropsForgedFinished is the S2-E regression test: a Finished
+// TestDispatchSwapDropsForgedFinished is the STATE-F78 regression test: a Finished
 // packet NOT signed by the session's trusted hub key must be dropped before it
 // reaches OnFinished, so it can never set csFinished and disable the refund
 // watcher (swap.go:473). A Finished signed by the real hub still processes.

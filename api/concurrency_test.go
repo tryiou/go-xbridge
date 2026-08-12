@@ -45,7 +45,7 @@ func setupTwoCoinNode(t *testing.T) (*Node, *captureXConn, *gatedConnector, *fak
 	return n, cc, gated, ltc
 }
 
-// TestConcurrentRefundSweepAndDepositTask — F3 proof. The refund sweep
+// TestConcurrentRefundSweepAndDepositTask — CONC-F97 proof. The refund sweep
 // (scanRefunds, engine-owned) reads session A's await/refundHex/state while A's
 // deposit resume writes them, and posts session B's due pre-signed refund to a
 // worker. -race is the pass criteria; the broadcast-count invariants prove
@@ -139,7 +139,7 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 	}
 }
 
-// TestForceRefundTakesSweepGuard — F18 proof. A force-refund (enqueueRefund,
+// TestForceRefundTakesSweepGuard — CONC-F102 proof. A force-refund (enqueueRefund,
 // e.g. from CancelOrder/BroadcastRefund) must take the pendingRefunds guard so
 // the sweep (scanRefunds) cannot enqueue a second broadcast of the same refund
 // hex while the force-refund is in flight. With the force task parked in the
@@ -172,7 +172,7 @@ func TestForceRefundTakesSweepGuard(t *testing.T) {
 		t.Fatalf("force-refund never reached SendRawTransaction (calls=%d)", gated.callCount())
 	}
 
-	// The sweep runs while the force-refund is still in flight. With the F18
+	// The sweep runs while the force-refund is still in flight. With the CONC-F102
 	// guard set, it must skip this order — exactly one broadcast attempt total.
 	n.submit(func() { n.scanRefunds() }, true)
 	deadline = time.Now().Add(300 * time.Millisecond)

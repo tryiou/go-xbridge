@@ -8,7 +8,7 @@ import (
 
 // guardSession returns a session pre-positioned at the given client state so a
 // guard test can drive a POST-COMPLETION retransmit through a handler without
-// any coin/node setup: the F16 state guards fire before any wallet or store
+// any coin/node setup: the STATE-F77 state guards fire before any wallet or store
 // work, so no connector, registry, or store is needed.
 func guardSession(isMaker bool, state clientState) *SwapSession {
 	var id [32]byte

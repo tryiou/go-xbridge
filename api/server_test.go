@@ -132,7 +132,7 @@ func callRPC(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder 
 	return rec
 }
 
-// TestServerRPCAuth verifies F1: with -rpcuser/-rpcpassword configured, the
+// TestServerRPCAuth verifies SEC-F01: with -rpcuser/-rpcpassword configured, the
 // JSON-RPC server requires valid HTTP Basic credentials (401 + challenge
 // otherwise) and rejects with constant-time semantics; without credentials
 // configured, requests pass through unchanged (the loopback-default contract).
@@ -182,7 +182,7 @@ func TestServerRPCAuth(t *testing.T) {
 	}
 }
 
-// TestServerMaxBodyBytes verifies F10/S3: an oversized JSON-RPC body is rejected
+// TestServerMaxBodyBytes verifies RPC-F49: an oversized JSON-RPC body is rejected
 // by the http.MaxBytesReader gate rather than buffered/decoded unbounded.
 func TestServerMaxBodyBytes(t *testing.T) {
 	ctx := newTestCtx()

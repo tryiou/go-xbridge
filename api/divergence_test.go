@@ -128,7 +128,7 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 		wallet.Utxo{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0, Amount: 100000000, Value: 1.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 	)}
 	// The take's service-node fee prep requires a funded BLOCK connector
-	// (F19, C++ acceptXBridgeTransaction :2236). Reward the shared ctx with the
+	// (CRYPTO-F84, C++ acceptXBridgeTransaction :2236). Reward the shared ctx with the
 	// default BLOCK conf + a 1.0 BLOCK p2pkh funder, matching newHubNode.
 	ctx.Node.config.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
 	// Two BLOCK funders: take #1 locks its fee utxo (LockedUtxoInfo reserves a

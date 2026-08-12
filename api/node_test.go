@@ -179,7 +179,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	n.conn = cc
 
 	// The inbound Hold must be signed by the session's pinned hub key (pinned at
-	// newMakerSession from the order's SNodePubkey, F2/S2-E).
+	// newMakerSession from the order's SNodePubkey, STATE-F78).
 	hubPkt := proto.NewPacket(proto.XbcTransactionHold, (&proto.HoldBody{}).Marshal())
 	if err := crypto.NewBtcSigner().Sign(hubPkt, hubPriv); err != nil {
 		t.Fatal(err)
