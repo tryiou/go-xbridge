@@ -218,7 +218,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 	// node is unreachable (read-only mode) — matching C++'s restart behaviour.
 	if cfg.DataDir != "" {
 		if ps, err := loadSwaps(swapStatePath(cfg.DataDir)); err != nil {
-			xlog.Warn("could not load persisted swaps; starting fresh", "dir", cfg.DataDir, "err", err)
+			xlog.Error("could not load persisted swaps; starting fresh", "dir", cfg.DataDir, "err", err)
 		} else if len(ps) > 0 {
 			for _, p := range ps {
 				n.restoreSwap(p)
