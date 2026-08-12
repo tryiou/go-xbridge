@@ -1,10 +1,16 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"strings"
 	"testing"
 
 	"go-xbridge/coins"
 	"go-xbridge/crypto"
+	xlog "go-xbridge/log"
 )
 
 // newPersistNode builds a minimal Node wired for persistence tests: a temp
@@ -13,7 +19,7 @@ import (
 func newPersistNode(t *testing.T, dir string) *Node {
 	t.Helper()
 	return &Node{
-		config:   &Config{DataDir: dir},
+		config:   &Config{DataDir: dir, PersistSecrets: true},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),
@@ -202,5 +208,146 @@ func TestPersistOnlyLocal(t *testing.T) {
 	}
 	if ps[0].ID != localID {
 		t.Errorf("persisted id = %x, want local id %x", ps[0].ID, localID)
+	}
+}
+
+// TestPersistSecretsOptOut proves the -persistsecrets=false gate (SEC-F04): the
+// per-trade M keypair, HTLC secret, and pre-signed refund are zeroed at write
+// time, while the non-secret derived fields (pubkey, secretHash, deposit
+// identity) survive. restoreSwap still re-adds the order and restores the live
+// session via its existing signals (State > csIdle / OurDepositTxID), with the
+// signing material left zero so no refund/cancel re-sign is possible.
+func TestPersistSecretsOptOut(t *testing.T) {
+	dir := t.TempDir()
+	n := &Node{
+		config:   &Config{DataDir: dir, PersistSecrets: false},
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		store:    NewStore(),
+		sessions: map[string]*SwapSession{},
+	}
+
+	mPriv := make([]byte, 32)
+	mPriv[31] = 0x41
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id [32]byte
+	copy(id[:], []byte("optout-secrets-order-id00000"))
+	o := &Order{
+		ID:           id,
+		FromCurrency: "BTC",
+		ToCurrency:   "LTC",
+		FromAmount:   1e8,
+		ToAmount:     2e8,
+		Mine:         true,
+	}
+	n.store.Add(o)
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
+
+	// Drive the session past the deposit so every secret-bearing field is set.
+	s := n.sessions[hexEncode(id[:])]
+	s.state = csCreatedA
+	s.ourDepositTxID = "aabbccdd"
+	s.ourLockTime = 1234
+	var sec [33]byte
+	sec[0], sec[32] = 0x02, 0x77
+	s.secret = sec
+	s.secretHash = coins.KeyID(sec[:])
+	s.refundHex = "01000000deadbeef"
+
+	n.persist()
+
+	ps, err := loadSwaps(swapStatePath(dir))
+	if err != nil {
+		t.Fatalf("loadSwaps: %v", err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("persisted %d swaps, want 1", len(ps))
+	}
+	got := ps[0]
+	if got.PrivKey != ([32]byte{}) {
+		t.Errorf("PrivKey leaked to disk: %x", got.PrivKey)
+	}
+	if got.Secret != ([33]byte{}) {
+		t.Errorf("Secret leaked to disk: %x", got.Secret)
+	}
+	if got.RefundHex != "" {
+		t.Errorf("RefundHex leaked to disk: %q", got.RefundHex)
+	}
+	if got.PubKey != mPub {
+		t.Errorf("PubKey = %x, want %x (must survive opt-out)", got.PubKey, mPub)
+	}
+	if got.OurDepositTxID != "aabbccdd" || got.OurLockTime != 1234 {
+		t.Errorf("deposit identity lost: txid %q lockTime %d", got.OurDepositTxID, got.OurLockTime)
+	}
+	if got.State != csCreatedA {
+		t.Errorf("State = %v, want csCreatedA", got.State)
+	}
+
+	// restoreSwap must re-add the order and restore the live session with the
+	// signing material zeroed.
+	n2 := &Node{
+		config:   &Config{DataDir: dir, PersistSecrets: false},
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		store:    NewStore(),
+		sessions: map[string]*SwapSession{},
+	}
+	n2.restoreSwap(got)
+	if n2.store.Get(hexEncode(id[:])) == nil {
+		t.Fatal("order must be re-added on restore")
+	}
+	rs := n2.sessions[hexEncode(id[:])]
+	if rs == nil {
+		t.Fatal("live session must be restored")
+	}
+	if rs.privKey != ([32]byte{}) {
+		t.Errorf("restored session privKey = %x, want zero (opt-out)", rs.privKey)
+	}
+	if rs.refundHex != "" {
+		t.Errorf("restored session refundHex = %q, want empty (opt-out)", rs.refundHex)
+	}
+	if rs.state != csCreatedA {
+		t.Errorf("restored state = %v, want csCreatedA", rs.state)
+	}
+}
+
+// TestCorruptSwapFileContinuesLikeCpp proves a corrupt swap-state file surfaces
+// as an Error and restores nothing, mirroring C++ App::loadOrders: a failed
+// orders.dat read logs "Failed to load existing orders database" at erro level
+// and continues with an empty set — the node never refuses to start.
+func TestCorruptSwapFileContinuesLikeCpp(t *testing.T) {
+	dir := t.TempDir()
+
+	// A valid envelope whose checksum does not match the payload.
+	env := swapFile{Sum: strings.Repeat("0", 64), Swaps: nil}
+	data, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(swapStatePath(dir), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadSwaps(swapStatePath(dir)); err == nil {
+		t.Fatal("corrupt swap file: loadSwaps must return an error")
+	}
+
+	old := xlog.L()
+	defer xlog.SetLogger(old)
+	var buf bytes.Buffer
+	xlog.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	n := newPersistNode(t, dir)
+	n.restoreLocalSwaps(dir)
+
+	if got := buf.String(); !strings.Contains(got, "level=ERROR") ||
+		!strings.Contains(got, "could not load persisted swaps") {
+		t.Errorf("corrupt file must log at Error severity, got:\n%s", got)
+	}
+	if len(n.store.List()) != 0 || len(n.store.History()) != 0 {
+		t.Fatalf("corrupt file must restore nothing; live=%d history=%d", len(n.store.List()), len(n.store.History()))
 	}
 }
