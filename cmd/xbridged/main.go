@@ -104,6 +104,7 @@ func main() {
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
+	persistSecrets := flag.Bool("persistsecrets", true, "persist per-trade M keypair/secret/pre-signed refund in the swap-state file (default true; C++ orders.dat parity); false keeps the file secret-free, but a restarted mid-flight swap cannot auto-refund or re-sign cancels")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -204,6 +205,7 @@ func main() {
 		WalletVersionStr: *walletVersionStr,
 		DataDir:          dataDir,
 		ConfPath:         *confPath,
+		PersistSecrets:   *persistSecrets,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {

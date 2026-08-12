@@ -126,8 +126,8 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 	}
 	var r rpcResponse
 	if err := json.Unmarshal(data, &r); err != nil {
-		xlog.Error("rpc decode failed", "coin", c.ticker, "method", method, "err", err, "body", string(data))
-		return fmt.Errorf("wallet: rpc decode: %w (body %q)", err, string(data))
+		xlog.Error("rpc decode failed", "coin", c.ticker, "method", method, "err", err)
+		return fmt.Errorf("wallet: rpc decode: %w", err)
 	}
 	if r.Error != nil {
 		xlog.Error("rpc error", "coin", c.ticker, "method", method, "code", r.Error.Code, "msg", r.Error.Message)
@@ -135,8 +135,8 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 	}
 	if out != nil && len(r.Result) > 0 && string(r.Result) != "null" {
 		if err := json.Unmarshal(r.Result, out); err != nil {
-			xlog.Error("rpc result decode failed", "coin", c.ticker, "method", method, "err", err, "body", string(r.Result))
-			return fmt.Errorf("wallet: rpc result decode: %w (body %q)", err, string(r.Result))
+			xlog.Error("rpc result decode failed", "coin", c.ticker, "method", method, "err", err)
+			return fmt.Errorf("wallet: rpc result decode: %w", err)
 		}
 	}
 	return nil

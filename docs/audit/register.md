@@ -201,7 +201,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | SEC-F01 | S2 | RPC binds to loopback by default (auth only when both creds set) | FIXED | loopback bind |
 | SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B7 |
 | SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | OPEN | closed by B3 (composite) |
-| SEC-F04 | S2 | Plaintext secrets + debug-log leakage | OPEN | B6 |
+| SEC-F04 | S2 | Plaintext secrets + debug-log leakage | FIXED | B6 `fix/secrets-hygiene`: `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`. |
 
 ---
 
@@ -233,7 +233,7 @@ namespace is the Current register above.
 | F23 | CRYPTO-F86 | `buildDeposit` broadcast order — OPEN (B3) |
 | F24 | RPC-F58 | HTTP auth/timeout hardening — OPEN (B4) |
 | F25 | WIRE-F57/F63 | P2P addr/varint DoS — OPEN (B5) |
-| F26 | SEC-F04 | plaintext secrets — OPEN (B6) |
+| F26 | SEC-F04 | plaintext secrets — FIXED (B6 `fix/secrets-hygiene`) |
 | F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — OPEN (B3) |
 | S1-A | CRYPTO-F93 | ownership-proof challenge stream — FIXED |
 | S1-B | CRYPTO-F94 | deposit `SEQUENCE_FINAL` — FIXED |

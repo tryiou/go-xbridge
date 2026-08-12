@@ -69,7 +69,8 @@ SEC-F01, RPC-F59, CRYPTO-F84/F93–F96 (fixed; regression-covered). Each is
 marked `FIXED`/`DOCUMENTED` in `register.md`.
 
 **Status (2026-08-12):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
-A1–A7 + per-token D4). B3–B11 pending.
+A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
+log-site removals, corrupt-file severity parity). B3–B5, B7–B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -161,14 +162,17 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   (WIRE-F67/F68); getaddr policy + addr cap (WIRE-F69); handshake
   deadline/negotiation (WIRE-F70); WIRE-F71 already fixed on B1.
 
-### B6 — `fix/secrets-hygiene` — SEC-F04 (high)
+### B6 — `fix/secrets-hygiene` — SEC-F04 (high) — MERGED
 
-- Remove `PrivKey`/`Secret`/`RefundHex` from plaintext persistence
-  (`api/persist.go:71-79`) or gate behind explicit opt-in; fail loud on persist
-  errors instead of log-and-continue (`:214-216`); treat a corrupt file as an
-  error, not a silent fresh start (`api/node.go:212-213`); drop refund/claim
-  hex and full RPC bodies from debug logs (`api/swap.go:383,485,545,650`,
-  `wallet/rpc.go:129,138`). **Merge before B3** (swap.go log lines).
+Gate `PrivKey`/`Secret`/`RefundHex` behind `-persistsecrets` (default ON = C++
+`orders.dat` parity; OFF zeroes them at write — the sole deliberate
+divergence). Corrupt swap file logs at **Error** like C++ `loadOrders`'s `erro`
+(continue-empty, never refuse to start) — this also satisfies "treat a corrupt
+file as an error". Persist failures already log at Error + continue, matching
+`saveOrders`'s ignored `xdb.Write` return. Dropped refund/claim hex and full
+RPC bodies from debug logs (`api/swap.go:383,485,545,650`,
+`wallet/rpc.go:129,138`). See `remediation/B6-secrets.md`. Tests:
+`TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`.
 
 ### B7 — `fix/rpc-surface` — RPC-F03–F59 (RPC S2/S3 set)
 
