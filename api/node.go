@@ -217,14 +217,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 	// runs BEFORE the dial so a swap-loaded node survives even when the service
 	// node is unreachable (read-only mode) — matching C++'s restart behaviour.
 	if cfg.DataDir != "" {
-		if ps, err := loadSwaps(swapStatePath(cfg.DataDir)); err != nil {
-			xlog.Error("could not load persisted swaps; starting fresh", "dir", cfg.DataDir, "err", err)
-		} else if len(ps) > 0 {
-			for _, p := range ps {
-				n.restoreSwap(p)
-			}
-			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", cfg.DataDir)
-		}
+		n.restoreLocalSwaps(cfg.DataDir)
 	}
 
 	if cfg.NodeAddr != "" {
@@ -273,6 +266,25 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 	}
 	n.start()
 	return n, nil
+}
+
+// restoreLocalSwaps loads and re-registers swap state persisted in dataDir,
+// mirroring C++ App::loadOrders (xbridgeapp.cpp:3828). A missing file is a
+// no-op; a corrupt file logs at Error and is skipped — C++ logs "Failed to
+// load existing orders database" at erro level and continues with an empty
+// set, it never refuses to start.
+func (n *Node) restoreLocalSwaps(dataDir string) {
+	ps, err := loadSwaps(swapStatePath(dataDir))
+	if err != nil {
+		xlog.Error("could not load persisted swaps; starting fresh", "dir", dataDir, "err", err)
+		return
+	}
+	for _, p := range ps {
+		n.restoreSwap(p)
+	}
+	if len(ps) > 0 {
+		xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
+	}
 }
 
 // cfg returns the live configuration under a read lock. All config reads must
