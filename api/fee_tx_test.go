@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"testing"
 
 	"go-xbridge/coins"
@@ -37,6 +38,18 @@ func TestFeeOrderInfo(t *testing.T) {
 	_, err = feeOrderInfo(id, long, 1, long, 1)
 	if err != nil {
 		t.Errorf("feeOrderInfo(oversize) = %v, want no error (truncated to fit)", err)
+	}
+	// A base that already exceeds the datacarrier cap cannot be rescued: the id
+	// stays full (C++ size_t underflow in orderId.erase) and the payload is
+	// reported as an overflow sentinel — the C++ path reverts the order with
+	// INVALID_ONCHAIN_HISTORY (xbridgeapp.cpp:2226-2228), which the caller maps
+	// separately from the generic fee-prep errors. This must not panic.
+	huge := ""
+	for i := 0; i < 100; i++ {
+		huge += "X"
+	}
+	if _, err := feeOrderInfo(id, huge, 1, huge, 1); !errors.Is(err, errOrderInfoOverflow) {
+		t.Errorf("feeOrderInfo(overflow) = %v, want errOrderInfoOverflow", err)
 	}
 }
 

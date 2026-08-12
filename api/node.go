@@ -404,24 +404,23 @@ func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte, err err
 	return height, hash, nil
 }
 
-// availableBalance returns the sum of every configured connector's wallet-wide
-// confirmed balance in native base units, mirroring C++ App::availableBalance
-// (xbridgeapp.h:798-806). acceptXBridgeTransaction sums all wallets for the
-// INSUFFICIENT_FUNDS_DX pre-check (xbridgeapp.cpp:2159-2163); a wallet that
-// cannot report a balance fails the take as a session error.
+// availableBalance returns the Blocknet wallet's confirmed balance in native
+// base units, mirroring C++ App::availableBalance (xbridgeapp.h:798-806).
+// C++ sums CWallet::GetBalance() over GetWallets() — the wallets loaded in the
+// running daemon, which for blocknetd is the BLOCK wallet only (wallet/wallet.h
+// GetWallets = vpwallets registry). It is NOT the sum over every XBridge coin
+// connector: the port must use the BLOCK connector alone. acceptXBridgeTransaction
+// uses it for the INSUFFICIENT_FUNDS_DX pre-check (xbridgeapp.cpp:2159-2163);
+// with no BLOCK wallet the balance is 0, which fails the take.
 func (n *Node) availableBalance() (uint64, error) {
 	if n.cfg() == nil || n.cfg().Connectors == nil {
 		return 0, errors.New("dx: no wallet configured")
 	}
-	var total uint64
-	for _, conn := range n.cfg().Connectors {
-		b, err := conn.GetBalance()
-		if err != nil {
-			return 0, err
-		}
-		total += b
+	blk := n.blockConnector()
+	if blk == nil {
+		return 0, nil
 	}
-	return total, nil
+	return blk.GetBalance()
 }
 
 // wholeCoinOstream renders a whole-coin amount the way C++ does when streaming
@@ -1284,6 +1283,43 @@ type TakeOrderParams struct {
 	DryRun      bool
 }
 
+// checkAcceptParams mirrors C++ App::checkAcceptParams (xbridgeapp.cpp:
+// 2539-2541) forwarded to checkAmount (:2561-2580): the given currency must
+// have a live connector (else NO_SESSION) and its wallet must hold at least
+// fromSize in spendable whole-coin utxos (else INSUFFICIENT_FUNDS). The balance
+// is WalletConnector::getWalletBalance (xbridgewalletconnector.cpp:52-73): the
+// sum of getUnspent whole-coin values at minconf 1, p2pkh only, excluding the
+// locked utxo set; a wallet that fails to enumerate unspent reports -1 and so
+// fails the check. dxTakeOrder calls it with the taker's sending currency
+// (toCurrency) and fromSize (rpcxbridge.cpp:1204). The error message args
+// mirror rpcxbridge.cpp:1262-1263 exactly: NO_SESSION carries the bare
+// toCurrency ticker, INSUFFICIENT_FUNDS carries fromAddress.
+func (n *Node) checkAcceptParams(currency string, fromSize uint64, fromAddress string) *rpcError {
+	conn, e := n.connector(currency)
+	if e != nil {
+		return makeError(errNoSession, "dxTakeOrder", currency)
+	}
+	outputs, err := conn.ListUnspent(1)
+	if err != nil {
+		return makeError(errInsufficientFunds, "dxTakeOrder", fromAddress)
+	}
+	lockedKeys, _ := n.store.LockedUtxoInfo()
+	var balance float64
+	for _, u := range outputs {
+		if !isP2PKH25(u.ScriptPubKey) {
+			continue
+		}
+		if lockedKeys[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] {
+			continue
+		}
+		balance += u.Value
+	}
+	if balance < float64(fromSize)/float64(coinScale) {
+		return makeError(errInsufficientFunds, "dxTakeOrder", fromAddress)
+	}
+	return nil
+}
+
 // TakeOrder broadcasts an xbcTransactionAccepting packet for the given order and
 // returns the dxTakeOrder response shape. C++ swaps maker/taker before rendering
 // the real take (so maker = order's toCurrency), keeps the PRE-swap frame for
@@ -1306,14 +1342,6 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	o := n.store.Get(key)
 	if o == nil {
 		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
-	}
-	fromID, e := decodeAddr(o.ToCurrency, p.FromAddress)
-	if e != nil {
-		return orderListResult{}, e
-	}
-	toID, e := decodeAddr(o.FromCurrency, p.ToAddress)
-	if e != nil {
-		return orderListResult{}, e
 	}
 
 	// C++ pre-swap orientation: fromSize = toAmount (taker sends), toSize =
@@ -1346,17 +1374,26 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		}
 	}
 
+	// C++ dxTakeOrder checkAcceptParams (rpcxbridge.cpp:1204): the taker's
+	// sending currency (toCurrency, the swap frame has not swapped yet) must be
+	// connected and must hold at least fromSize in spendable whole-coin utxos.
+	// It forwards to checkAmount (xbridgeapp.cpp:2561-2580): NO_SESSION for a
+	// missing connector, INSUFFICIENT_FUNDS when the balance is below
+	// fromSize/COIN. The message args carry toCurrency/fromAddress
+	// (rpcxbridge.cpp:1262-1263). This gate runs BEFORE the self-trade,
+	// connector and address checks (matching C++ error precedence).
+	if e := n.checkAcceptParams(o.ToCurrency, fromSize, p.FromAddress); e != nil {
+		return orderListResult{}, e
+	}
+
 	// No self-trades.
 	if o.Mine {
 		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "Unable to accept your own order.")
 	}
 
-	// C++ acceptXBridgeTransaction pre-checks (xbridgeapp.cpp:2133-2163): both
-	// legs must have live connectors (NO_SESSION), neither amount may be dust
-	// (DUST), and the wallet-wide available balance must cover the to-currency
-	// connector's serviceNodeFee (INSUFFICIENT_FUNDS_DX). The dryrun preview is
-	// rendered BEFORE any of the accept work (rpcxbridge.cpp:1236-1252): no hub,
-	// no fee, no funding, nothing signed or broadcast.
+	// C++ dxTakeOrder:1216-1217 requires both legs to have live connectors
+	// before proceeding (the same NO_SESSION check repeats inside
+	// acceptXBridgeTransaction at xbridgeapp.cpp:2137-2140).
 	if _, e := n.connector(o.ToCurrency); e != nil {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", "Unable to connect to wallet: "+o.ToCurrency)
 	}
@@ -1364,6 +1401,30 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", "Unable to connect to wallet: "+o.FromCurrency)
 	}
 
+	// C++ validates the taker/maker addresses only AFTER the amount,
+	// checkAcceptParams, self-trade and connector gates (rpcxbridge.cpp:
+	// 1219-1225 isValidAddress). An invalid address is INVALID_ADDRESS, but a
+	// prior gate failure wins.
+	fromID, e := decodeAddr(o.ToCurrency, p.FromAddress)
+	if e != nil {
+		return orderListResult{}, e
+	}
+	toID, e := decodeAddr(o.FromCurrency, p.ToAddress)
+	if e != nil {
+		return orderListResult{}, e
+	}
+
+	if p.DryRun {
+		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
+		return o.toTakeDryrunResult(fromSize, toSize), nil
+	}
+
+	// C++ acceptXBridgeTransaction pre-checks (xbridgeapp.cpp:2133-2163): both
+	// legs must have live connectors (NO_SESSION), neither amount may be dust
+	// (DUST), and the Blocknet wallet balance must cover the service-node fee
+	// (INSUFFICIENT_FUNDS_DX). The dust checks live in the ACCEPT path only —
+	// the dryrun preview above returns before they ever run (rpcxbridge.cpp:
+	// 1227 vs xbridgeapp.cpp:2147-2157).
 	ccTo := n.cfg().Confs[o.ToCurrency]
 	ccFrom := n.cfg().Confs[o.FromCurrency]
 	nativeTo := uint64(coinScale)
@@ -1381,11 +1442,6 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	if isDustNative(xBridgeValueFromAmount(toSize), ccFrom, relayFrom, nativeFrom) {
 		return orderListResult{}, makeError(errDust, "dxTakeOrder", "maker amount is dust")
-	}
-
-	if p.DryRun {
-		xlog.Warn("TakeOrder dry run — take not broadcast", "order", p.ID, "fromCur", o.ToCurrency, "toCur", o.FromCurrency)
-		return o.toTakeDryrunResult(fromSize, toSize), nil
 	}
 
 	if funds, ferr := n.availableBalance(); ferr != nil {
@@ -1438,6 +1494,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	info, ierr := feeOrderInfo(o.ID, o.ToCurrency, fromSize, o.FromCurrency, toSize)
 	if ierr != nil {
+		if errors.Is(ierr, errOrderInfoOverflow) {
+			return orderListResult{}, makeError(errInvalidOnchainHist, "dxTakeOrder", ierr.Error())
+		}
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", ierr.Error())
 	}
 	rawFeeHex, feeInputs, rerr := buildServiceNodeFeeTx(blk, blkCoin, blkConf, feeDest, info, feeUtxos)
@@ -1453,12 +1512,12 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// excluding both the store-wide locked set and the just-selected fee inputs
 	// (C++ excludes them via lockFeeUtxos, :2267). Every failure maps to
 	// INSUFFICIENT_FUNDS; the proof-signing failures map per C++ :2306-2316.
+	// Unspent is enumerated at minconf 1, mirroring C++ getUnspent's rpc::
+	// listUnspent with an EMPTY params array (xbridgewalletconnectorbtc.cpp:
+	// 1604-1612), i.e. the wallet's default minconf of 1 — NOT the conf
+	// Confirmations value.
 	conn, _ := n.connector(o.ToCurrency)
-	minConf := 0
-	if ccTo != nil {
-		minConf = ccTo.Confirmations
-	}
-	outputs, err := conn.ListUnspent(minConf)
+	outputs, err := conn.ListUnspent(1)
 	if err != nil {
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
 	}

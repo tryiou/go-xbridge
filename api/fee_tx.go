@@ -3,7 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"sort"
 
 	"go-xbridge/coins"
@@ -30,6 +30,12 @@ const minFeeChangeDust = 5460
 // (xbridgeapp.cpp:2207; MAX_OP_RETURN_RELAY = 160, script/standard.h:34).
 const maxOrderInfoBytes = 160 - 3
 
+// errOrderInfoOverflow is returned by feeOrderInfo when the assembled order-info
+// payload exceeds maxOrderInfoBytes. C++ reverts the take and reports
+// INVALID_ONCHAIN_HISTORY on this overflow (xbridgeapp.cpp:2226-2228), so the
+// caller must not fold it into the generic INSUFFICIENT_FUNDS fee-prep errors.
+var errOrderInfoOverflow = errors.New("fee order info exceeds max bytes")
+
 // feeOrderInfo builds the OP_RETURN order-info JSON carried by the service-node
 // fee tx, mirroring C++ xbridgeapp.cpp:2209-2229: the base list
 // ["", fromCur, fromAmt, toCur, toAmt] is sized, the 64-hex order id truncated
@@ -37,7 +43,13 @@ const maxOrderInfoBytes = 160 - 3
 // write_string is byte-identical to encoding/json for these scalar types, so
 // the result is the exact wire payload. For valid input the id never truncates
 // (max base size is 68 < 93 = 157-64); the truncation path is implemented for
-// fidelity.
+// fidelity. When the base already exceeds maxBytes the leftover underflows: Go
+// keeps the full id and lets the final size check report errOrderInfoOverflow
+// (C++ INVALID_ONCHAIN_HISTORY, :2226-2228). This is a deliberate safe
+// deviation — C++ computes leftOver as a size_t and passes it to
+// std::string::erase(pos > size), which throws std::out_of_range (libstdc++
+// basic_string::_M_check) and terminates the daemon. Unreachable for valid
+// input (max base size is 68 < 93 = 157-64).
 func feeOrderInfo(id [32]byte, fromCur string, fromAmt uint64, toCur string, toAmt uint64) ([]byte, error) {
 	base := []any{"", fromCur, fromAmt, toCur, toAmt}
 	strInfo, err := json.Marshal(base)
@@ -46,7 +58,20 @@ func feeOrderInfo(id [32]byte, fromCur string, fromAmt uint64, toCur string, toA
 	}
 	orderID := orderIDString(id)
 	if len(strInfo)+len(orderID) > maxOrderInfoBytes {
-		orderID = orderID[:maxOrderInfoBytes-len(strInfo)]
+		switch leftOver := maxOrderInfoBytes - len(strInfo); {
+		case leftOver > 0:
+			// leftOver < len(orderID) is guaranteed: the enclosing guard
+			// len(strInfo)+len(orderID) > maxOrderInfoBytes means
+			// len(orderID) > maxOrderInfoBytes-len(strInfo) = leftOver.
+			orderID = orderID[:leftOver]
+		case leftOver == 0:
+			orderID = ""
+		case leftOver < 0:
+			// Base already over maxBytes: C++'s size_t leftover underflows and
+			// std::string::erase(pos > size) throws out_of_range, killing the
+			// daemon. Go deliberately keeps the full id so the size check below
+			// reports errOrderInfoOverflow instead.
+		}
 	}
 	full := []any{orderID, fromCur, fromAmt, toCur, toAmt}
 	out, err := json.Marshal(full)
@@ -54,7 +79,7 @@ func feeOrderInfo(id [32]byte, fromCur string, fromAmt uint64, toCur string, toA
 		return nil, err
 	}
 	if len(out) > maxOrderInfoBytes {
-		return nil, fmt.Errorf("fee order info exceeds %d bytes", maxOrderInfoBytes)
+		return nil, errOrderInfoOverflow
 	}
 	return out, nil
 }
