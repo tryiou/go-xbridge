@@ -1006,14 +1006,15 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	}
 
 	// Fetch the maker's spendable utxos, excluding those locked by other orders
-	// (C++ getAllLockedUtxos :1614) and, when use_all_funds is false, those not
-	// owned by the maker address (:1621-1627). getUnspent failure fails the order.
+	// (C++ getAllLockedUtxos :1614 — per-token) and, when use_all_funds is
+	// false, those not owned by the maker address (:1621-1627). getUnspent
+	// failure fails the order.
 	conn, _ := n.connector(p.Maker)
 	minConf := 0
 	if cc != nil {
 		minConf = cc.Confirmations
 	}
-	locked, _ := n.store.LockedUtxoInfo()
+	locked := n.store.LockedUtxoInfoFor(p.Maker)
 	outputs, err := conn.ListUnspent(minConf)
 	if err != nil {
 		return nil, makeError(errInsufficientFunds, "dxMakeOrder", err.Error())
@@ -1205,6 +1206,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.BlockID = orderIDString(body.BlockHash)
 	o.PartialRepost = p.Repost
 	o.Mine = true
+	o.UtxoCurrency = p.Maker
 	// Local maker: set our per-trade M key and original currencies (C++
 	// xbridgeapp.cpp:1751,2380). MakerKey is OUR mPubKey (not the snode
 	// header); Orig* currencies are the maker-facing pair, restored on reject.
@@ -1303,7 +1305,9 @@ func (n *Node) checkAcceptParams(currency string, fromSize uint64, fromAddress s
 	if err != nil {
 		return makeError(errInsufficientFunds, "dxTakeOrder", fromAddress)
 	}
-	lockedKeys, _ := n.store.LockedUtxoInfo()
+	// Balance excludes only the coins locked on this currency (C++ checkAmount
+	// getAllLockedUtxos(currency), xbridgeapp.cpp:2574) plus the global fee set.
+	lockedKeys := n.store.LockedUtxoInfoFor(currency)
 	var balance float64
 	for _, u := range outputs {
 		if !isP2PKH25(u.ScriptPubKey) {
@@ -1470,18 +1474,23 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 
 	// BLOCK service-node fee prep (C++ :2236-2267). Only 25-byte p2pkh UTXOs at
 	// minconf 1 fund the fee; locked UTXOs are excluded. Every fee-prep failure
-	// maps to INSUFFICIENT_FUNDS (C++ :2240-2264).
+	// maps to INSUFFICIENT_FUNDS (C++ :2240-2264). blk is guaranteed non-nil
+	// here: a missing BLOCK connector was already rejected by the
+	// availableBalance pre-check above (INSUFFICIENT_FUNDS_DX, balance 0 < fee),
+	// and a connector whose GetBalance errors returns NO_SESSION — so the fee
+	// prep can only run with a live BLOCK wallet.
 	blk := n.blockConnector()
-	if blk == nil {
-		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "not accepting order, no BLOCK connector for service node fee payment")
-	}
 	blkCoin, _ := coins.Get("BLOCK")
 	blkConf := n.cfg().Confs["BLOCK"]
 	feeUtxoAvail, err := blk.ListUnspent(1)
 	if err != nil {
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
 	}
-	lockedKeys, _ := n.store.LockedUtxoInfo()
+	// C++ fee-prep excludes getAllLockedUtxos(connFrom->currency) (toCurrency)
+	// from the BLOCK fee outputs (:2247); in practice only the global fee set
+	// collides, but stay faithful per-token. The same snapshot feeds the
+	// funding exclusion below (:2270, same ticker).
+	lockedKeys := n.store.LockedUtxoInfoFor(o.ToCurrency)
 	feeUtxos := make([]wallet.Utxo, 0, len(feeUtxoAvail))
 	for _, u := range feeUtxoAvail {
 		if !isP2PKH25(u.ScriptPubKey) {
@@ -1509,13 +1518,18 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 
 	// Taker funding (C++ :2269-2358): selectUtxos from the to-currency wallet,
-	// excluding both the store-wide locked set and the just-selected fee inputs
-	// (C++ excludes them via lockFeeUtxos, :2267). Every failure maps to
-	// INSUFFICIENT_FUNDS; the proof-signing failures map per C++ :2306-2316.
+	// excluding both the per-token locked set (getAllLockedUtxos(o.ToCurrency),
+	// re-fetched after lockFeeUtxos at :2270 — the lockedKeys snapshot above is
+	// taken at the same point since nothing locks in between) and the
+	// just-selected fee inputs (C++ excludes them via lockFeeUtxos, :2267).
+	// Every failure maps to INSUFFICIENT_FUNDS; the proof-signing failures map
+	// per C++ :2306-2316.
 	// Unspent is enumerated at minconf 1, mirroring C++ getUnspent's rpc::
 	// listUnspent with an EMPTY params array (xbridgewalletconnectorbtc.cpp:
 	// 1604-1612), i.e. the wallet's default minconf of 1 — NOT the conf
-	// Confirmations value.
+	// Confirmations value. This is the SECOND enumeration of the taker wallet:
+	// checkAcceptParams above already ran one via getWalletBalance→getUnspent
+	// (xbridgeapp.cpp:2279 -> xbridgewalletconnector.cpp:55), exactly as C++.
 	conn, _ := n.connector(o.ToCurrency)
 	outputs, err := conn.ListUnspent(1)
 	if err != nil {
@@ -1577,14 +1591,18 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// Accepting packet leaves, so a concurrent take of a different order can
 	// never double-select the same BLOCK fee utxo or funding utxo. A key
 	// collision fails the take like C++'s "cannot reuse utxo inputs".
-	reserveKeys := make([]string, 0, len(feeKey)+len(usedCoins))
+	// Claim the take's inputs atomically: the BLOCK fee keys as the global fee
+	// set and the taker's funding keys (usedCoins) on o.ToCurrency — the same
+	// split C++ lockFeeUtxos/lockCoins keep in m_feeUtxos vs m_utxosDict.
+	feeList := make([]string, 0, len(feeKey))
 	for k := range feeKey {
-		reserveKeys = append(reserveKeys, k)
+		feeList = append(feeList, k)
 	}
+	fundList := make([]string, 0, len(usedCoins))
 	for _, u := range usedCoins {
-		reserveKeys = append(reserveKeys, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10))
+		fundList = append(fundList, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10))
 	}
-	switch n.store.ReserveForTake(key, reserveKeys) {
+	switch n.store.ReserveForTake(key, feeList, fundList, o.ToCurrency) {
 	case reserveOrderBusy:
 		return orderListResult{}, makeError(errBadRequest, "dxTakeOrder", "not accepting, order already accepted")
 	case reserveKeyCollision, reserveOrderGone:
@@ -1657,6 +1675,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		o.Utxos = proofs
 		o.UsedCoins = usedCoins
 		o.FeeUtxos = feeInputs
+		o.UtxoCurrency = o.ToCurrency // taker funding coins live on the take's from-currency
 		// Publish the take's mutations to the book under the store lock.
 		n.store.Update(key, func(stored *Order) {
 			stored.Updated = now
@@ -1668,6 +1687,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 			stored.Utxos = proofs
 			stored.UsedCoins = usedCoins
 			stored.FeeUtxos = feeInputs
+			stored.UtxoCurrency = o.ToCurrency
 		})
 		// The committed Utxos/FeeUtxos now carry the reserved keys (LockedUtxoInfo
 		// reads them off the order), so the in-flight reservation is exhausted.

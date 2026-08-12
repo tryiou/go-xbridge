@@ -48,6 +48,7 @@ type persistedSwap struct {
 	OBinTxId       string            `json:"oBinTxId"`
 	Status         string            `json:"status"`
 	Utxos          []proto.UtxoEntry `json:"utxos"`
+	UtxoCurrency   string            `json:"utxoCurrency"`
 
 	SNodePubkey          string   `json:"sNodePubkey"`
 	HubAddress           [20]byte `json:"hubAddress"`
@@ -246,6 +247,7 @@ func orderFields(o *Order) persistedSwap {
 		OBinTxId:       o.OBinTxId,
 		Status:         o.Status,
 		Utxos:          o.Utxos,
+		UtxoCurrency:   o.UtxoCurrency,
 
 		SNodePubkey:          o.SNodePubkey,
 		HubAddress:           o.HubAddress,
@@ -402,6 +404,7 @@ func buildOrder(ps persistedSwap) *Order {
 		OBinTxId:       ps.OBinTxId,
 		Status:         ps.Status,
 		Utxos:          ps.Utxos,
+		UtxoCurrency:   ps.UtxoCurrency,
 		Mine:           true,
 
 		SNodePubkey:          ps.SNodePubkey,

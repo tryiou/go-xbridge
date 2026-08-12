@@ -68,6 +68,16 @@ type Order struct {
 	// Runtime-only: the reserved set derives from live (non-terminal) orders.
 	FeeUtxos []wallet.Utxo
 
+	// UtxoCurrency is the chain the order's locked Utxos live on: the maker's
+	// FromCurrency (dxMakeOrder / a remote maker body) or the taker's funding
+	// ToCurrency (TakeOrder). It mirrors C++ m_utxosDict[token] so the lock
+	// exclusion is per-token (App::getAllLockedUtxos, xbridgeapp.cpp:2827),
+	// not store-wide. Unset (legacy persisted records that predate the tag)
+	// falls back to the Role-derived rule in Store.utxoCurrency. The tag is not
+	// cleared by clearUsedCoins: a rejected take's Utxos remain claimed on the
+	// same chain, so the tag stays correct.
+	UtxoCurrency string
+
 	// --- cancel/reject + fidelity fields (mirror xbridge::TransactionDescr) ---
 	// SNodePubkey is C++ sPubKey: the servicenode pubkey carried in the
 	// packet header (pkt.Pubkey) of the SN that originated/broadcast the order
@@ -134,6 +144,7 @@ func normalizeFromOrderBody(b *proto.OrderBody, maker string) *Order {
 		MakerPubkey:    maker, // display key = snode header for observed orders
 		SNodePubkey:    maker, // C++ sPubKey = pkt.Pubkey
 		Utxos:          b.Utxos,
+		UtxoCurrency:   b.FromCurrency,
 	}
 }
 
