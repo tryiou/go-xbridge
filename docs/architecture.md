@@ -4,8 +4,7 @@ This is the developer-facing reference for the `go-xbridge` codebase: how the
 packages are organized, what each one does, how the pieces connect, and how to
 build/test the port. End users should read [`../README.md`](../README.md); the
 wire contract is in [`protocol.md`](protocol.md); the `dx*` JSON-RPC surface is
-in [`api.md`](api.md); C++↔Go fidelity and open divergences are in
-[`audit.md`](audit.md).
+in [`api.md`](api.md).
 
 > Status here can lag the code; the code is authoritative.
 
@@ -419,11 +418,11 @@ against the C++ `dx*` contract — run it after touching the port or C++ XBridge
 
 ## Status & open items
 
-See [`audit.md`](audit.md) for the live C++↔Go divergence register, security
-findings, and verification gaps. Long-standing open work:
+Long-standing open work:
 
 - Non-UTXO coin adapters: Decred (`DCR`), Particl (`PART`); DEVAULT is
-  misclassified as the BTC family (audit S2-J).
+  misclassified as the BTC family (its `CreateTxMethod` should be set to its
+  own family, not BTC).
 - Live-service-node verification of the swap-handshake claim/refund spends
   (in-memory connectors only today; `cmd/liveprobe` dials + handshakes but does
   not drive a swap).

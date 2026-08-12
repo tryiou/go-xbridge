@@ -274,5 +274,6 @@ fills only) are documented under "Tier 3" there.
 | [`docs/protocol.md`](docs/protocol.md) | The XBridge wire contract: transport, packet layout, commands, swap handshake, signing. |
 | [`docs/api.md`](docs/api.md) | The `dx*` JSON-RPC surface (params, response shapes, error codes). |
 | [`docs/architecture.md`](docs/architecture.md) | Contributor guide: package-by-package code architecture, build/test/verify, conventions. |
-| [`docs/audit.md`](docs/audit.md) | C++↔Go fidelity audit register: open divergences, equivalence matrix, security findings. |
+| [`docs/audit/`](docs/audit/README.md) | C++↔Go audit home: canonical register (`audit/register.md`), per-finding detail, axis evidence, verify reports. |
+| [`conformance/`](conformance/) | Behavioral/wire conformance suite (external Go module, build-tag `conformance`; runs via `make parity` stage F). |
 | [`CLAUDE.md`](CLAUDE.md) | Repo conventions and hard rules for coding agents/contributors. |

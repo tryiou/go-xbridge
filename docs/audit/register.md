@@ -1,0 +1,323 @@
+# Audit register — canonical finding list
+
+Single source of truth for every known C++↔Go divergence and its status. The
+detail behind each row lives in `findings.md` (per-finding cards) and
+`evidence/` (per-axis deep dives); the remediation todo list lives in
+[`remediation-plan.md`](remediation-plan.md). This file only tracks
+**what is wrong and where it stands** — nothing else.
+
+## Numbering & status legend
+
+- **Canonical IDs** — every finding has exactly one axis-prefixed ID:
+  `RPC-F01..F59`, `WIRE-F57..F71`, `STATE-F71..F79`, `CRYPTO-F77..F96`,
+  `CFG-F84..F91`, `CONC-F92..F102`, `INV-F97..F100`, `SEC-F01..F04`. The 2026
+  full audit (`F01–F99`) supplied the core; prior audits' `F1–F27`, `S2/S3/S4`
+  and `S1-A…D` findings were folded in — duplicates mapped onto the surviving
+  row, orphans promoted to new IDs. The one-to-one mapping lives in the
+  [ID-history appendix](#id-history-appendix) at the bottom.
+
+Status values:
+
+| Status | Meaning |
+|---|---|
+| `OPEN` | Divergence present; assigned to a remediation branch |
+| `FIXED` | Remediated at HEAD; branch or test that closed it is named |
+| `DOCUMENTED` | Deliberate divergence, decided (not a bug); reference where decided |
+| `RE-DECIDE` | Prior register documented it deliberate; the new audit disagrees — re-open the decision |
+
+Detail for every Current finding lives in [`findings.md`](findings.md)
+(per-finding REF/CAND/IMPACT/FIX cards) and the per-axis deep dives in
+[`evidence/`](evidence/); the register tables below carry only the status.
+
+---
+
+## Current register
+
+### RPC axis (`RPC-F01`–`RPC-F59`) — evidence: `evidence/rpc.md`, `evidence/rpc-groups/`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| RPC-F01 | S2 | Error-channel policy: C++ *throws* envelope errors for param/type errors; Go returns business results | OPEN | B4 |
+| RPC-F02 | S2 | `NO_SESSION` error `name` hardcoded `"dx"` instead of the method name | OPEN | B4 |
+| RPC-F03 | S2 | `dxGetOrders` array order random (Go map) vs id-ascending (C++ std::map) | OPEN | B7 |
+| RPC-F04 | S3 | `dxGetOrders` 60 s filter boundary (µs-exact vs second-truncated) | OPEN | B7 |
+| RPC-F05 | S2 | Exactly-64-hex id gate vs C++ `uint256S` left-pad/truncate tolerance | OPEN | B7 |
+| RPC-F06 | S3 | `dxGetOrder` not-found message renders id raw vs zero-padded | OPEN | B7 |
+| RPC-F07 | S3 | `dxCancelOrder` cancels *before* validating connectors (side-effect order) | OPEN | B7 |
+| RPC-F08 | S3 | `dxCancelOrder` cancel-failure error codes/text set differs (incl. isLocal→1021) | OPEN | B7 |
+| RPC-F09 | S2 | `dxMakeOrder` response field ORDER differs (updated/created swapped; addresses/block_id last) | OPEN | B7 |
+| RPC-F10 | S2 | `dxMakeOrder`/`dxMakePartialOrder` dryrun returns real id + extra fields vs C++ zero id | OPEN | B7 |
+| RPC-F11 | S2 | `dxMakeOrder` non-partial `partial_*` values: literal `"0"` vs `"0.000000"` | OPEN | B7 |
+| RPC-F12 | S3 | `dxMakeOrder` `NO_SERVICE_NODE` message includes the pair; C++ bare | OPEN | B7 |
+| RPC-F13 | S2 | `dxMakePartialOrder` dust gate: 1e6-scale minFrom vs native 1e8-scale dust | OPEN | B7 |
+| RPC-F14 | S2 | `dxTakeOrder` explicit amount `"0"` is a full take in Go, error 1025 in C++ | OPEN | B7 |
+| RPC-F15 | S3 | `dxTakeOrder` error texts/names leak (`INVALID_ADDRESS` text, `name` "dxMakeOrder") | OPEN | B7 |
+| RPC-F16 | S2 | `dxGetOrderHistory` sums the WRONG asset volume (taker vs from/maker) | OPEN | B7 |
+| RPC-F17 | S2 | `dxGetOrderHistory` encoding: shortest-roundtrip floats vs C++ fixed-8; raw ratio vs 1e-6-quantized price | OPEN | B7 |
+| RPC-F18 | S2 | `dxGetOrderHistory` validation missing (granularity whitelist, end≤start, limit) | OPEN | B7 |
+| RPC-F19 | S2 | `dxGetOrderHistory` data source: fills store never written → always empty | DOCUMENTED | Tier-3 (session-local fills, `api.md`) |
+| RPC-F20 | S3 | `dxGetOrderBook` price formula omits C++ +1/COIN bump | OPEN | B7 |
+| RPC-F21 | S3 | `dxGetOrderBook` equal-best-price tie-break nondeterministic | OPEN | B7 |
+| RPC-F22 | S3 | `dxGetOrderBook` int-width (Go `int` vs C++ int64_t) | OPEN | B7 |
+| RPC-F23 | S2 | `dxGetTokenBalances` `"Wallet"` key derivation/presence differ | OPEN | B7 |
+| RPC-F24 | S3 | `dxGetTokenBalances` key order (Go map-sorted, Wallet last) | OPEN | B7 |
+| RPC-F25 | S3 | `dxGetTokenBalances` precision (C++ per-UTXO double sum vs Go exact integer) | OPEN | B7 |
+| RPC-F26 | S3 | `dxGetMyOrders` field order, param rejection, dedup, sort | OPEN | B7 |
+| RPC-F27 | S2 | `dxGetMyPartialOrderChain` chain membership differs (filters/sort) | OPEN | B7 |
+| RPC-F28 | S2 | `dxPartialOrderChainDetails` `p2sh_deposits` array length ≠ chain length | OPEN | B7 |
+| RPC-F29 | S3 | `dxPartialOrderChainDetails` bad-id error text differs | OPEN | B7 |
+| RPC-F30 | S3 | `dxPartialOrderChainDetails` key order alphabetized (Go map) | OPEN | B7 |
+| RPC-F31 | S3 | `dxGetLockedUtxos` amount encoding (default-float vs fixed-6/native) | OPEN | B7 |
+| RPC-F32 | S2 | `dxGetLockedUtxos` 1021 trigger too narrow in Go | OPEN | B7 |
+| RPC-F33 | S3 | `dxGetLockedUtxos` per-order key selection (status ordinal vs map membership) | OPEN | B7 |
+| RPC-F34 | S3 | `dxGetLockedUtxos` id echo un-normalized | OPEN | B7 |
+| RPC-F35 | S2 | `dxFlushCancelledOrders` flushes only the cancelled ledger, not book/history | OPEN | B7 |
+| RPC-F36 | S3 | `dxFlushCancelledOrders` use_count/ordering/key order | OPEN | B7 |
+| RPC-F37 | S2 | `gettradingdata` (lowercase) missing from Go dispatch | RE-DECIDE | B7 (prior: deliberate removal) |
+| RPC-F38 | S2 | `dxGetTradingData` `fee_txid`/`nodepubkey` always `""` | OPEN | B7 |
+| RPC-F39 | S2 | `dxGetTradingData` data source: local fills vs on-chain scan | DOCUMENTED | Tier-3 (`api.md`) |
+| RPC-F40 | S2 | `dxSplitInputs` requires amount/scriptPubKey; C++ needs only txid/vout | OPEN | B7 |
+| RPC-F41 | S2 | `dxSplit` fee formula differs (520·fpb per output + claw-back) | OPEN | B7 |
+| RPC-F42 | S2 | `dxSplit` change destination differs (requested address vs fresh address) | OPEN | B7 |
+| RPC-F43 | S3 | `dxSplit` submit-failure code and error names | OPEN | B7 |
+| RPC-F44 | S2 | `dxGetUtxos` amounts trimmed vs C++ fixed-8 | OPEN | B7 |
+| RPC-F45 | S3 | `dxGetUtxos` listunspent failure code/text (1004 vs 1002) | OPEN | B7 |
+| RPC-F46 | S2 | `getnetworkinfo` shim diverges from real blocknetd (protocolversion, fees, subversion, fields) | RE-DECIDE | B7 (prior: Go-only extension) |
+| RPC-F47 | S2 | JSON-RPC HTTP status for parse/method-not-found (C++ 500/404 vs Go 200) | OPEN | B4 |
+| RPC-F48 | S3 | method-not-found message appends the method name | OPEN | B4 |
+| RPC-F49 | S3 | request body limit 4 MiB vs C++ 32 MiB | OPEN | B4 |
+| RPC-F50 | S2 | auth model: Go open-by-default vs C++ always-auth | OPEN | B4 |
+| RPC-F51 | S3 | batch / named params / -32600 unsupported | OPEN | B4 |
+| RPC-F52 | S3 | extra positional params accepted where C++ errors (business 1025) | OPEN | B4 |
+| RPC-F53 | S3 | `dxGetLocalTokens` returns unconnected/duplicate tickers | OPEN | B7 |
+| RPC-F54 | S3 | `dxGetNetworkTokens` membership: Go unions config; C++ pure SN service union | OPEN | B7 |
+| RPC-F55 | S3 | `dxGetNewTokenAddress` error path returns `[]` in C++, business 1002 in Go | OPEN | B7 |
+| RPC-F56 | S3 | `dxLoadXBridgeConf` reload failure shape and side effects differ | OPEN | B7 |
+| RPC-F57 | S2 | `dxGetOrderBook` detail-4 nesting `[[…]]` vs flat | OPEN | B7 |
+| RPC-F58 | S2 | HTTP auth/timeout hardening missing | OPEN | B4 |
+| RPC-F59 | S3 | `dxGetMyPartialOrderChain` unknown/malformed id handling | FIXED | B7 (bad-order-id) |
+
+### WIRE axis (`WIRE-F57`–`WIRE-F71`) — evidence: `evidence/wire.md`, `evidence/wire_p1.md`, `evidence/wire_p2.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| WIRE-F57 | S2 | P2P max payload 67 MiB vs C++ 4,000,000 | OPEN | B5 |
+| WIRE-F58 | S2 | Received magic never validated | OPEN | B5 |
+| WIRE-F59 | S2 | No `MIN_PEER_PROTO_VERSION` gate | OPEN | B5 |
+| WIRE-F60 | S2 | `"staging"` network magic is actually C++ REGTEST | OPEN | B5 |
+| WIRE-F61 | S2 | `snl` (SNLIST) responses ignored | OPEN | B5 |
+| WIRE-F62 | S3 | `proto.Unmarshal` silently ignores trailing body bytes | OPEN | B5 |
+| WIRE-F63 | S3 | Non-canonical CompactSize varint accepted | OPEN | B5 |
+| WIRE-F64 | S3 | Bad checksum disconnects instead of log-and-drop | OPEN | B5 |
+| WIRE-F65 | S3 | Go-only 1 MiB XBridge body cap (C++ has none) | DOCUMENTED | hardening limit (`protocol.md`) |
+| WIRE-F66 | S3 | Command 4 has two C++ writers differing by trailing minFromAmount | DOCUMENTED | Go is correct; doc'd in `findings.md` |
+| WIRE-F67 | S2 | Command 2 (xbcXChatMessage) body is speculative (no C++ writer) | OPEN | B5 (implement writer or delete type) |
+| WIRE-F68 | S2 | Command 50 (xbcServicesPing) body claim is unbacked | OPEN | B5 (parser or remove type) |
+| WIRE-F69 | S3 | getaddr policy and addr cap differ | OPEN | B5 |
+| WIRE-F70 | S3 | Version handshake differences (deadline, SENDHEADERS/SENDCMPCT, pings) | OPEN | B5 |
+| WIRE-F71 | S2 | Servicenode registration integrity: fields read-then-discarded; gates miss `isValid` subset | FIXED | B1 `fix/servicenode-registry` |
+
+### STATE axis (`STATE-F71`–`STATE-F79`) — evidence: `evidence/state.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| STATE-F71 | S2 | OnHold/OnInit skip the C++ amount/identity/price verification | OPEN | B3 |
+| STATE-F72 | S2 | Expiry pruning never wired in Go (IsExpired has no production caller) | OPEN | B8 |
+| STATE-F73 | S3 | TxCancelReason enum + text table not ported (incl. C++ bugs) | OPEN | B8 |
+| STATE-F74 | S3 | `trRollbackFailed` never set (refund broadcast failure) | OPEN | B8 |
+| STATE-F75 | S3 | No peer penalty/Misbehaving analogue | OPEN | B8 |
+| STATE-F76 | S4 | Live handshake uses separate `clientState`, not ported `swap.State` | DOCUMENTED | internal choice (`findings.md`) |
+| STATE-F77 | S2 | Post-completion handshake retransmit re-broadcasts deposit/claim | FIXED | state guards (`swap_guard_test.go`) |
+| STATE-F78 | S2 | Handshake inbound packets re-verified against pinned hub key, no TOFU | FIXED | hub-key pinning (`swap.go`) |
+| STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | OPEN | B7 |
+
+### CRYPTO axis (`CRYPTO-F77`–`CRYPTO-F96`) — evidence: `evidence/crypto.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| CRYPTO-F77 | S1 | BCH forkid `0x41` sighash missing in Go local signing | OPEN | B9 |
+| CRYPTO-F78 | S2 | Deposit tx fee formula `minTxFee1(nIn,3)` vs Go `estimateFee(nIn,2)` | OPEN | B3 |
+| CRYPTO-F79 | S3 | Fee fallback: C++ 0 vs Go 2 sat/vB when FeePerByte unset | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
+| CRYPTO-F80 | S3 | Go honors `DustAmount` conf key C++ never reads | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
+| CRYPTO-F81 | S3 | Address decoding strictness differs (base58check version byte, cashaddr) | DOCUMENTED | deliberate hardening (`api.md` Tier-3) |
+| CRYPTO-F82 | S4 | RNG top-bit bias in Go private-key generation | OPEN | B9 |
+| CRYPTO-F83 | S3 | Block-hash byte order assumption unverified end-to-end | OPEN | B9 |
+| CRYPTO-F84 | S2 | `TakeOrder` emits `AcceptingBody` with empty fee/utxos (156 B < 188 B) | FIXED | B2 `fix/wire-acceptingbody` |
+| CRYPTO-F85 | S2 | No `checkDepositTransaction` in the Connector contract | OPEN | B3 |
+| CRYPTO-F86 | S2 | `buildDeposit` broadcasts before building the refund | OPEN | B3 |
+| CRYPTO-F87 | S2 | Deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | OPEN | B3 |
+| CRYPTO-F88 | S3 | Segwit/BIP143 signing dead code; bech32 re-encoded legacy | OPEN | B9 |
+| CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | OPEN | B7 |
+| CRYPTO-F90 | S3 | Refund/payment payout model (fee2 margin, oOverpayment) | OPEN | B3 |
+| CRYPTO-F91 | S3 | `signrawtransaction` param payload ("ALL" in privkeys slot) | OPEN | B9 |
+| CRYPTO-F92 | S3 | `secretFromScriptSig` requires 33-byte push | OPEN | B9 |
+| CRYPTO-F93 | S3 | UTXO ownership-proof challenge stream format | FIXED | `TestWholeCoinOstreamMatchesCppStream` |
+| CRYPTO-F94 | S3 | Deposit inputs `SEQUENCE_FINAL`; refund spend `SEQUENCE_FINAL-1` | FIXED | `checkDepositTransaction` parity |
+| CRYPTO-F95 | S3 | Deposit locks `Amount + fee2` (`minTxFee2(1,1)`); change after fee+fee2 | FIXED | `TestDepositLocksAmountPlusFee2` |
+| CRYPTO-F96 | S3 | `nTime` committed in sighash on `TxWithTimeField` coins | FIXED | `TestHashForSigningWithTimeField` |
+
+### CONFIG axis (`CFG-F84`–`CFG-F91`) — evidence: `evidence/config.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| CFG-F84 | S2 | `[Rpc]` section in xbridge.conf aborts xbridged at startup | OPEN | B10 |
+| CFG-F85 | S2 | Wallet admission validation gates absent (locktime/confirmation drift) | OPEN | B10 |
+| CFG-F86 | S2 | Missing conf: C++ creates template and runs; Go exits(1) | OPEN | B10 |
+| CFG-F87 | S2 | Hot-reload semantics differ (ExchangeWallets keying, gates, order clearing) | OPEN | B10 |
+| CFG-F88 | S3 | ExchangeWallets parsing differs (`,` `;` `:` + validation) | OPEN | B10 |
+| CFG-F89 | S3 | Case-insensitive keys in Go vs case-sensitive C++ | OPEN | B10 |
+| CFG-F90 | S3 | Missing CLI flags / flag differences (-enableexchange, -dxnowallets, version case) | OPEN | B10 |
+| CFG-F91 | S3 | Go-only conf keys and ignored C++ keys (MinimumAmount, CashAddrPrefix, CreateTxMethod) | OPEN | B10 |
+
+### CONCURRENCY axis (`CONC-F92`–`CONC-F102`) — evidence: `evidence/concurrency.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| CONC-F92 | S2 | Engine goroutine can block on socket write / fsync, stalling packet processing + RPC | OPEN | B11 |
+| CONC-F93 | S3 | Discovery peer goroutines never joined; Dedupe sweeper leaks without Flush | OPEN | B11 |
+| CONC-F94 | S3 | Conf reload mid-swap-task hazard (untested) | OPEN | B11 |
+| CONC-F95 | S3 | Go hides C++'s transient "accepting" window | DOCUMENTED | Go-stricter; `findings.md` |
+| CONC-F96 | S4 | Go runs swap wallet I/O + RPC concurrently where C++ serializes | DOCUMENTED | model note; `findings.md` |
+| CONC-F97 | S2 | `SwapSession` fields single-owner, engine-only | FIXED | race tests |
+| CONC-F98 | S2 | Coin registry `atomic.Pointer` hot-reload safe | FIXED | race tests |
+| CONC-F99 | S2 | Unbounded growth bounded (pruneSessions, trimOldest, fills/history caps) | FIXED | `TestPruneSessions*` |
+| CONC-F100 | S2 | Book/session maps never held across wallet I/O | FIXED | lock discipline |
+| CONC-F101 | S2 | `dxMakeOrder` returned the store's LIVE `*Order` (data race) | FIXED | `TestMakeOrderReturnsStoreCopy` |
+| CONC-F102 | S2 | Force-refund double-broadcast window | FIXED | `TestForceRefundTakesSweepGuard` |
+
+### INVENTORY / DOC axis (`INV-F97`–`INV-F100`) — evidence: `evidence/inventory.md`
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| INV-F97 | S4 | Unported C++ internal helpers (not dApp-facing) | DOCUMENTED | gap list in `evidence/inventory.md` |
+| INV-F98 | S4 | `docs/protocol.md` says order `Created` is unix seconds; wire carries µs | OPEN | doc fix |
+| INV-F99 | S4 | Stale C++ header-comment enums (commands 11/12/13/18/20/24) | DOCUMENTED | C++ side; writers authoritative |
+| INV-F100 | S4 | Vestigial `Server.verify`, `coins.MustGet`, unreferenced `swap`, LocalConnector sign/verify | FIXED | documented |
+
+### SECURITY axis (`SEC-F01`–`SEC-F04`) — security/robustness findings outside the RPC/wire/config axes
+
+| ID | Sev | Finding (one line) | Status | Owner |
+|---|---|---|---|---|
+| SEC-F01 | S2 | RPC binds to loopback by default (auth only when both creds set) | FIXED | loopback bind |
+| SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B7 |
+| SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | OPEN | closed by B3 (composite) |
+| SEC-F04 | S2 | Plaintext secrets + debug-log leakage | OPEN | B6 |
+
+---
+
+## ID-history appendix
+
+Every prior-audit ID (`F1–F27`, `S2/S3/S4` series, `S1-A…D`) resolves to
+exactly one canonical ID. This appendix exists for archaeology; the live
+namespace is the Current register above.
+
+| Legacy | Canonical | Notes |
+|---|---|---|
+| F1 | SEC-F01 | RPC loopback bind — FIXED |
+| F3 | CONC-F97 | `SwapSession` single-owner — FIXED |
+| F4 | CONC-F98 | coin registry atomic reload — FIXED |
+| F5/F9 | CONC-F99 | bounded growth — FIXED |
+| F6 | CONC-F100 | no wallet I/O under lock — FIXED |
+| F7 | SEC-F02 | inbound UTXO proofs unverified — OPEN |
+| F8 | CRYPTO-F88 | segwit dead code — OPEN |
+| F10 | RPC-F49 | 4 MiB body cap — RE-DECIDE |
+| F11–F14 | INV-F100 | vestigial helpers — FIXED |
+| F15 | CONC-F101 | live `*Order` race — FIXED |
+| F16 | STATE-F77 | post-completion retransmit — FIXED |
+| F17 | CONC-F92 | blocking I/O on engine goroutine — OPEN |
+| F18 | CONC-F102 | force-refund double-broadcast — FIXED |
+| F19 | CRYPTO-F84 | AcceptingBody empty fee/utxos — FIXED (B2) |
+| F20 | WIRE-F71 | registration integrity — FIXED (B1) |
+| F21 | CRYPTO-F85 | `checkDepositTransaction` absent — OPEN (B3) |
+| F22 | SEC-F03 | taker-trust composite — OPEN (closed by B3) |
+| F23 | CRYPTO-F86 | `buildDeposit` broadcast order — OPEN (B3) |
+| F24 | RPC-F58 | HTTP auth/timeout hardening — OPEN (B4) |
+| F25 | WIRE-F57/F63 | P2P addr/varint DoS — OPEN (B5) |
+| F26 | SEC-F04 | plaintext secrets — OPEN (B6) |
+| F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — OPEN (B3) |
+| S1-A | CRYPTO-F93 | ownership-proof challenge stream — FIXED |
+| S1-B | CRYPTO-F94 | deposit `SEQUENCE_FINAL` — FIXED |
+| S1-C | CRYPTO-F95 | deposit locks `Amount + fee2` — FIXED |
+| S1-D | CRYPTO-F96 | `nTime` sighash on time-field coins — FIXED |
+| S2-A | RPC-F57 | order-book detail-4 nesting — OPEN (B7) |
+| S2-B | RPC-F59 | partial-chain unknown/malformed id — FIXED |
+| S2-C | RPC-F40 | `dxSplitInputs` utxo schema — OPEN (B7) |
+| S2-D | STATE-F72 | expiry sweep unwired — OPEN (B8) |
+| S2-E | STATE-F78 | hub-key pinning, no TOFU — FIXED |
+| S2-H | CRYPTO-F81 | base58check strictness — DOCUMENTED |
+| S2-I | CRYPTO-F77 | BCH forkid sighash — OPEN (B9) |
+| S2-J | CRYPTO-F89 | coin-family misclassification — OPEN |
+| S3-A | RPC-F11 | partial fields `"0"` literal — OPEN (B7) |
+| S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — OPEN (B7) |
+| S3-C | RPC-F31 | locked-utxos amount format — OPEN (B7) |
+| S3-D | RPC-F28 | `p2sh_deposits` alignment — OPEN (B7) |
+| S3-E | RPC-F55 | new-token-address `[]` vs error — OPEN (B7) |
+| S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
+| S3-G | CRYPTO-F90 | payout model (fee2 margin) — OPEN (B3) |
+| S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |
+| S3-I | CRYPTO-F92 | `secretFromScriptSig` 33-byte push — OPEN (B9) |
+| S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B7) |
+| S4 | RPC-F24/F30/F36, RPC-F52, WIRE-F57 | key order, +1/COIN, help text, leniency, 64 MiB cap — DOCUMENTED |
+
+---
+
+## How to maintain
+
+- **Open a new divergence?** Add a Current-register row with the next free
+  axis-prefixed ID; add its card to `findings.md` and its axis deep dive to
+  `evidence/`.
+- **Fix one?** Move the row's status to `FIXED` and name the branch/test that
+  closed it, in the same branch that fixes the code (remediation-plan §done
+  criteria step 5).
+- **Decide it's deliberate?** Set `DOCUMENTED` and name where the decision lives
+  (`api.md` Tier-3 / deliberate list).
+- Never duplicate a finding's *status* in `findings.md` or `evidence/` — those
+  files describe the divergence, this file tracks its disposition.
+
+## Remediated at HEAD (detail)
+
+The following prior findings are fixed and `-race`/golden-vector covered. Their
+row status above is `FIXED`; this section records the closure detail so the
+regression tests are locatable:
+
+- **CRYPTO-F93.** UTXO ownership-proof challenge = C++ `UtxoEntry::toString()`:
+  whole-coin `listunspent` `"value"` double streamed with
+  `strconv.FormatFloat(v, 'g', 6, 64)`; golden vectors from real g++ output in
+  `TestWholeCoinOstreamMatchesCppStream`.
+- **CRYPTO-F94.** Deposit inputs `SEQUENCE_FINAL` (0xffffffff); refund spend keeps
+  `SEQUENCE_FINAL-1` (C++ `checkDepositTransaction` hard-rejects non-final).
+- **CRYPTO-F95.** Deposit locks `Amount + fee2` (`fee2 = minTxFee2(1,1)`), satisfying
+  C++ `depositP2SHAmount >= amount + 0.95*fee2`; change = total − Amount − fee − fee2.
+- **CRYPTO-F96.** `nTime` committed in the sighash on `TxWithTimeField` coins (4-byte
+  LE `TxTime` after `nVersion` in `HashForSigning`); golden digests from a C++
+  oracle in `TestHashForSigningWithTimeField`.
+- **RPC-F59.** `dxGetMyPartialOrderChain` unknown id → `[]`, malformed id →
+  `bad order id` (`api/handlers.go:863-865,858-861`).
+- **STATE-F78.** Handshake inbound packets (Hold/Init/CreateA/B/ConfirmA/B/Finished)
+  re-verified against the pinned hub key + registry membership — no TOFU; a
+  forged `Finished` is dropped before `OnFinished`; non-registered hub →
+  `NO_SERVICE_NODE`.
+- **SEC-F01.** RPC binds loopback by default; Basic auth when both `-rpcuser` +
+  `-rpcpassword` set (constant-time compare); non-loopback bind without auth
+  warns.
+- **CONC-F97/F98.** `SwapSession` single-owner (engine-only) +
+  `atomic.Pointer[map]` coin registry; race-covered by
+  `TestConcurrentRefundSweepAndDepositTask`, `TestConcurrentInitFromConfGet`.
+- **CONC-F99.** Unbounded growth bounded: `pruneSessions` + `trimOldest` (1000
+  each); `TestPruneSessionsRemovesTerminal`, `TestStoreHistoryBounded`.
+- **CONC-F101.** MakeOrder returns a store snapshot copy, not the live pointer;
+  `TestMakeOrderReturnsStoreCopy`.
+- **STATE-F77.** Post-completion retransmit guards (`state >= csCreatedA/B`,
+  `>= csConfirmedA/B`); `*StateGuard*` tests + `TestCreateAStateGuard*`.
+- **CONC-F102.** Force-refund takes the `pendingRefunds` sweep guard;
+  `TestForceRefundTakesSweepGuard`.
+- **CRYPTO-F84.** AcceptingBody funded — B2 `fix/wire-acceptingbody`
+  (atomic per-order reservation `Store.ReserveForTake`, p2pkh-25 funding filter,
+  same-order `BAD_REQUEST` gate, A1–A7 gate closeout, per-token lock exclusion
+  D4). Tests: `TestStoreReserveForTake`, `TestConcurrentTakeOrder*`,
+  `TestTakeOrderFundingRejectsNonP2PKH`, `TestTakeOrderEmptyBlockWallet`,
+  `TestLockedUtxoInfoFor` + `make parity`.
+- **WIRE-F71.** Servicenode registration integrity — B1
+  `fix/servicenode-registry` (retain + gate registration fields, `CreateSigHash`
+  golden, `PaymentAddress()`); `TestParseServiceNode*`, `TestCreateSigHashGolden`,
+  `TestAddRegistrationRejectMatrix`, `TestPaymentAddress*`.

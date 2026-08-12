@@ -30,7 +30,7 @@ curl -s http://127.0.0.1:41414 \
 - **Amounts** are fixed **6-decimal strings** (base units of `COIN = 1_000_000`),
   truncating: `"1.500000"`. (Exceptions: `dxGetUtxos`/`dxGetLockedUtxos` amounts
   are native-decimal with trailing zeros trimmed, and `dxGetTokenBalances`
-  rounds — see [audit.md](audit.md) S3-B/S4.)
+  rounds — see [audit/register.md](audit/register.md) RPC-F44/RPC-F31.)
 - **Timestamps** are ISO-8601 strings with millisecond precision:
   `"2026-08-07T12:00:00.000Z"`.
 - **Order ids** are 64-hex strings in display order.
@@ -331,5 +331,5 @@ view, so three families of commands are bounded by what this node has observed:
 The full C++↔Go fidelity register — including the known response-shape
 differences (order-book detail-4 nesting, `dxGetMyPartialOrderChain` unknown-id
 behavior, `dxSplitInputs` utxo schema, per-command amount formats) — is tracked
-in [`audit.md`](audit.md). This document is the stable contract for the port as
-built.
+in [`audit/register.md`](audit/register.md). This document is the stable
+contract for the port as built.
