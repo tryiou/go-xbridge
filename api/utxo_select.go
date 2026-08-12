@@ -15,9 +15,11 @@ import (
 const maxPartialOrderUtxos = 10
 
 // xBridgeValueFromAmount converts XBridge base units (COIN=1e6) into a whole
-// coin, mirroring C++ xBridgeValueFromAmount (xutil.cpp:303-312): a/COIN.
+// coin, mirroring C++ xBridgeValueFromAmount (xutil.cpp:223-227):
+// a/COIN + 1.0/::COIN. The trailing 1e-8 term matches C++ exactly and is what
+// makes amounts at the coin-scale boundary round up instead of truncating down.
 func xBridgeValueFromAmount(a uint64) float64 {
-	return float64(a) / float64(coinScale)
+	return float64(a)/float64(coinScale) + 1.0/1e8
 }
 
 // xBridgeIntFromReal converts a whole-coin double into XBridge base units the

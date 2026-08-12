@@ -4,7 +4,105 @@ import (
 	"testing"
 
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
+
+// TestStoreReserveForTake verifies the atomic take-input reservation (B2
+// Finding 1): only one order can claim a "txid:vout" key, the reservation is
+// immediately visible through LockedUtxoInfo alongside committed order inputs,
+// a second in-flight take of the SAME order is refused (C++ state gate
+// xbridgeapp.cpp:2122), terminal orders release their locks, and ReleaseReserve
+// clears an in-flight reservation. Mirrors C++ lockFeeUtxos + lockCoins
+// ("cannot reuse utxo inputs", xbridgeapp.cpp:2267).
+func TestStoreReserveForTake(t *testing.T) {
+	s := NewStore()
+	a := testStoreOrder(1)
+	b := testStoreOrder(2)
+	c := testStoreOrder(3)
+	keyA := hexEncode(a.ID[:])
+	keyB := hexEncode(b.ID[:])
+	keyC := hexEncode(c.ID[:])
+	s.Add(a)
+	s.Add(b)
+	s.Add(c)
+
+	// A first reservation succeeds and is immediately visible to other takers.
+	if got := s.ReserveForTake(keyA, nil, []string{"aa:0", "bb:1"}, "BTC"); got != reserveOK {
+		t.Fatalf("first reservation = %v, want reserveOK", got)
+	}
+	if got := s.ReserveForTake(keyB, nil, []string{"cc:2"}, "BTC"); got != reserveOK {
+		t.Fatalf("disjoint reservation = %v, want reserveOK", got)
+	}
+	keys, byOrder := s.LockedUtxoInfo()
+	for _, k := range []string{"aa:0", "bb:1", "cc:2"} {
+		if !keys[k] {
+			t.Fatalf("reserved key %s not reported by LockedUtxoInfo", k)
+		}
+	}
+	if byOrder["aa:0"] != orderIDString(a.ID) {
+		t.Errorf("byOrder[aa:0] = %q, want %q", byOrder["aa:0"], orderIDString(a.ID))
+	}
+
+	// A second in-flight take of the SAME order is refused even on disjoint
+	// keys (C++ state gate BAD_REQUEST, xbridgeapp.cpp:2122-2125): the
+	// reservation is one-per-order, never overwritten by a concurrent take.
+	// The gate fires even when the proposed keys would ALSO collide with the
+	// order's own claimed keys, proving the state gate precedes the lock scan.
+	if got := s.ReserveForTake(keyA, nil, []string{"zz:9"}, "BTC"); got != reserveOrderBusy {
+		t.Fatalf("same-order re-reservation (disjoint) = %v, want reserveOrderBusy", got)
+	}
+	if got := s.ReserveForTake(keyA, nil, []string{"aa:0"}, "BTC"); got != reserveOrderBusy {
+		t.Fatalf("same-order re-reservation (own key) = %v, want reserveOrderBusy", got)
+	}
+
+	// A collision with an active reservation must fail an unrelated taker.
+	if got := s.ReserveForTake(keyC, nil, []string{"aa:0"}, "BTC"); got != reserveKeyCollision {
+		t.Fatalf("reuse of an actively reserved key = %v, want reserveKeyCollision", got)
+	}
+
+	// A committed order input (FeeUtxos) also blocks a reservation.
+	s.Update(keyA, func(o *Order) {
+		o.FeeUtxos = []wallet.Utxo{{TxID: "dd", Vout: 2}}
+	})
+	if got := s.ReserveForTake(keyC, nil, []string{"dd:2"}, "BTC"); got != reserveKeyCollision {
+		t.Fatalf("reuse of a committed order fee utxo = %v, want reserveKeyCollision", got)
+	}
+	lkeys, lowner := s.LockedUtxoInfo()
+	if !lkeys["dd:2"] {
+		t.Errorf("committed fee utxo dd:2 not reported locked")
+	}
+	if lowner["dd:2"] != orderIDString(a.ID) {
+		t.Errorf("byOrder[dd:2] = %q, want %q (committed fee utxo owner)", lowner["dd:2"], orderIDString(a.ID))
+	}
+
+	// An unknown order cannot reserve (the take re-checks the live order).
+	if got := s.ReserveForTake("no-such-order", nil, []string{"zz:0"}, "BTC"); got != reserveOrderGone {
+		t.Fatalf("reservation for an absent order = %v, want reserveOrderGone", got)
+	}
+
+	// Release clears the reservation so the keys can be claimed again.
+	s.ReleaseReserve(keyA)
+	keys, _ = s.LockedUtxoInfo()
+	if keys["aa:0"] || keys["bb:1"] {
+		t.Error("released reservation keys still reported locked")
+	}
+	if got := s.ReserveForTake(keyA, nil, []string{"aa:0", "bb:1"}, "BTC"); got != reserveOK {
+		t.Fatalf("re-reservation after release = %v, want reserveOK", got)
+	}
+
+	// A terminal (canceled) order releases all of its locks — committed inputs
+	// and in-flight reservations alike.
+	s.Update(keyA, func(o *Order) {
+		o.Status = "canceled"
+	})
+	keys, _ = s.LockedUtxoInfo()
+	if keys["dd:2"] {
+		t.Error("terminal order's committed fee utxo still reported locked")
+	}
+	if keys["aa:0"] || keys["bb:1"] {
+		t.Error("terminal order's in-flight reservation still reported locked")
+	}
+}
 
 // testStoreOrder builds an order with a deterministic id and a couple of UTXOs
 // so the deep-copy behavior of Order.Copy is exercised.
@@ -238,5 +336,100 @@ func TestStoreHasOrder(t *testing.T) {
 	}
 	if !s.HasOrder(key) {
 		t.Fatal("HasOrder returned false for an order in history")
+	}
+}
+
+// TestLockedUtxoInfoFor verifies the per-token exclusion set C++
+// getAllLockedUtxos(token) (xbridgeapp.cpp:2827-2834): the global fee set
+// applies to every ticker, but an order's Utxos are excluded only on the chain
+// they were locked on (UtxoCurrency, else the Role-derived fallback), and a
+// reservation's funding keys apply only to fundCurrency while its fee keys are
+// global.
+func TestLockedUtxoInfoFor(t *testing.T) {
+	s := NewStore()
+	btcOrder := &Order{
+		ID: [32]byte{0x01}, FromCurrency: "BTC", ToCurrency: "LTC", Status: "open", Mine: true,
+		UtxoCurrency: "BTC",
+		Utxos:        []proto.UtxoEntry{{TxID: [32]byte{0xaa}, Vout: 0}},
+		FeeUtxos:     []wallet.Utxo{{TxID: "ff", Vout: 0}},
+	}
+	ltcTaker := &Order{
+		ID: [32]byte{0x02}, FromCurrency: "BTC", ToCurrency: "LTC", Status: "open", Mine: false, Role: 'B',
+		UtxoCurrency: "LTC",
+		Utxos:        []proto.UtxoEntry{{TxID: [32]byte{0xbb}, Vout: 0}},
+	}
+	legacyTaker := &Order{
+		// No tag: the Role 'B' fallback resolves funds to ToCurrency.
+		ID: [32]byte{0x03}, FromCurrency: "BTC", ToCurrency: "LTC", Status: "open", Mine: false, Role: 'B',
+		Utxos: []proto.UtxoEntry{{TxID: [32]byte{0xcc}, Vout: 0}},
+	}
+	legacyMaker := &Order{
+		// No tag, not a taker: funds resolve to FromCurrency.
+		ID: [32]byte{0x04}, FromCurrency: "LTC", ToCurrency: "BTC", Status: "open", Mine: false,
+		Utxos: []proto.UtxoEntry{{TxID: [32]byte{0xdd}, Vout: 0}},
+	}
+	for _, o := range []*Order{btcOrder, ltcTaker, legacyTaker, legacyMaker} {
+		s.Add(o)
+	}
+
+	aa := utxoEntryKey(proto.UtxoEntry{TxID: [32]byte{0xaa}, Vout: 0})
+	bb := utxoEntryKey(proto.UtxoEntry{TxID: [32]byte{0xbb}, Vout: 0})
+	cc := utxoEntryKey(proto.UtxoEntry{TxID: [32]byte{0xcc}, Vout: 0})
+	dd := utxoEntryKey(proto.UtxoEntry{TxID: [32]byte{0xdd}, Vout: 0})
+
+	btc := s.LockedUtxoInfoFor("BTC")
+	ltc := s.LockedUtxoInfoFor("LTC")
+
+	// Global fee set: the BLOCK fee utxo is excluded for every ticker.
+	if !btc["ff:0"] || !ltc["ff:0"] {
+		t.Error("fee utxo must be excluded for every currency")
+	}
+	// BTC-tagged utxo: excluded for BTC, absent for LTC.
+	if !btc[aa] {
+		t.Error("BTC-tagged utxo not excluded for BTC")
+	}
+	if ltc[aa] {
+		t.Error("BTC-tagged utxo must not be excluded for LTC")
+	}
+	// LTC-tagged taker utxo: excluded for LTC, absent for BTC.
+	if !ltc[bb] {
+		t.Error("LTC-tagged taker utxo not excluded for LTC")
+	}
+	if btc[bb] {
+		t.Error("LTC-tagged taker utxo must not be excluded for BTC")
+	}
+	// Legacy Role-'B' record resolves to ToCurrency (LTC).
+	if !ltc[cc] {
+		t.Error("legacy Role-'B' taker utxo must resolve to ToCurrency (LTC)")
+	}
+	if btc[cc] {
+		t.Error("legacy Role-'B' taker utxo must not be excluded for BTC")
+	}
+	// Legacy non-taker record resolves to FromCurrency (LTC here).
+	if !ltc[dd] {
+		t.Error("legacy non-taker utxo must resolve to FromCurrency (LTC)")
+	}
+	if btc[dd] {
+		t.Error("legacy LTC utxo must not be excluded for BTC")
+	}
+
+	// Reservation: fee keys global, funding keys only on fundCurrency.
+	takerKey := hexEncode((ltcTaker.ID)[:])
+	if got := s.ReserveForTake(takerKey, nil, []string{aa}, "BTC"); got != reserveKeyCollision {
+		t.Fatalf("reservation against the order's own committed utxo = %v, want reserveKeyCollision", got)
+	}
+	if got := s.ReserveForTake(takerKey, []string{"10"}, []string{"00"}, "BTC"); got != reserveOK {
+		t.Fatalf("disjoint reservation = %v, want reserveOK", got)
+	}
+	btc2 := s.LockedUtxoInfoFor("BTC")
+	ltc2 := s.LockedUtxoInfoFor("LTC")
+	if !btc2["10"] || !ltc2["10"] {
+		t.Error("reserved fee key must be excluded for every currency")
+	}
+	if !btc2["00"] {
+		t.Error("reserved funding key not excluded for its fundCurrency (BTC)")
+	}
+	if ltc2["00"] {
+		t.Error("reserved funding key must not be excluded for another currency (LTC)")
 	}
 }

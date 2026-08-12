@@ -77,6 +77,12 @@ type fakeConnector struct {
 	changeAddr  string
 	blockHeight int64
 
+	// funders, when non-nil, is the UTXO set reported by ListUnspent, used by
+	// tests where multiple concurrent takes must each reserve a distinct
+	// funding utxo (the B2 funding path locks take #1's selection, so a
+	// single-utxo fixture starves later takes).
+	funders []wallet.Utxo
+
 	mu         sync.Mutex
 	broadcasts []string
 	rawTx      map[string]string // display txid -> hex
@@ -84,9 +90,23 @@ type fakeConnector struct {
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
 
+func (f *fakeConnector) GetBalance() (uint64, error) {
+	if len(f.funders) > 0 {
+		var total uint64
+		for _, u := range f.funders {
+			total += u.Amount
+		}
+		return total, nil
+	}
+	return f.funding.Amount, nil
+}
+
 func (f *fakeConnector) GetNewAddress() (string, error) { return f.changeAddr, nil }
 
 func (f *fakeConnector) ListUnspent(minConf int) ([]wallet.Utxo, error) {
+	if len(f.funders) > 0 {
+		return append([]wallet.Utxo(nil), f.funders...), nil
+	}
 	return []wallet.Utxo{f.funding}, nil
 }
 

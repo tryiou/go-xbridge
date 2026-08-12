@@ -19,6 +19,7 @@ const (
 	OpCheckSig            = 0xac
 	OpCheckSigVerify      = 0xad
 	OpCheckLockTimeVerify = 0xb1
+	OpReturn              = 0x6a
 	OpPushData1           = 0x4c
 	OpPushData2           = 0x4d
 	OpPushData4           = 0x4e
@@ -100,4 +101,13 @@ func BuildP2SHScript(scriptHash [20]byte) []byte {
 	s = append(s, pushData(scriptHash[:])...)
 	s = append(s, OpEqual)
 	return s
+}
+
+// BuildOpReturnScript returns OP_RETURN <push(data)>, mirroring C++'s
+// CScript() << OP_RETURN << ToByteVector(data) (bitcoinrpcconnector.cpp:202):
+// the data is pushed with the minimal push opcode for its length. Used for the
+// service-node fee tx's order-info data carrier.
+func BuildOpReturnScript(data []byte) []byte {
+	s := []byte{OpReturn}
+	return append(s, pushData(data)...)
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"errors"
+	"math"
 	"testing"
 
 	"go-xbridge/coins"
@@ -198,5 +199,27 @@ func TestBuildUtxoProofsRejectsShortSig(t *testing.T) {
 	}}
 	if _, err := buildUtxoProofs(conn, utxos, c); !errors.Is(err, errBadSigLen) {
 		t.Fatalf("buildUtxoProofs = %v, want errBadSigLen", err)
+	}
+}
+
+// TestXBridgeValueFromAmountRoundUp locks C++ xBridgeValueFromAmount
+// (xutil.cpp:223-227): a/COIN + 1.0/::COIN. The +1e-8 term rounds amounts at
+// the coin-scale boundary UP — without it, 999999/1e6 would truncate to exactly
+// 0.999999 and camount() would lose a satoshi on round-trips.
+func TestXBridgeValueFromAmountRoundUp(t *testing.T) {
+	trunc := float64(coinScale-1) / float64(coinScale)
+	v := xBridgeValueFromAmount(coinScale - 1)
+	if v <= trunc {
+		t.Fatalf("xBridgeValueFromAmount(%d) = %.17g, want > %.17g (round-up term missing)", coinScale-1, v, trunc)
+	}
+	if math.Abs(v-trunc-1e-8) > 1e-15 {
+		t.Fatalf("xBridgeValueFromAmount(%d) - truncated = %.17g, want ~1e-8", coinScale-1, v-trunc)
+	}
+	// A full coin maps to 1.00000001, and camount() round-trips losslessly.
+	if got := xBridgeValueFromAmount(coinScale); got != 1.00000001 {
+		t.Fatalf("xBridgeValueFromAmount(%d) = %.17g, want 1.00000001", coinScale, got)
+	}
+	if camount(wallet.Utxo{Value: 1.0}) != coinScale {
+		t.Fatalf("camount(1.0) = %d, want %d", camount(wallet.Utxo{Value: 1.0}), coinScale)
 	}
 }

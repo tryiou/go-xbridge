@@ -73,6 +73,11 @@ type PrevTx struct {
 type Connector interface {
 	// Ticker returns the coin this connector drives.
 	Ticker() string
+	// GetBalance returns the wallet-wide confirmed available balance in native
+	// base units (getbalance). Mirrors C++ CWallet::GetBalance(), which C++
+	// acceptXBridgeTransaction sums over all wallets for the
+	// INSUFFICIENT_FUNDS_DX pre-check (xbridgeapp.h:798-806, xbridgeapp.cpp:2159).
+	GetBalance() (uint64, error)
 	// GetNewAddress returns a fresh receive address.
 	GetNewAddress() (string, error)
 	// ListUnspent returns spendable UTXOs with at least minConf confirmations.
