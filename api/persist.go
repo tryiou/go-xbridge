@@ -305,6 +305,11 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.Hub = s.hub
 	ps.HubKey = s.hubKey
 	ps.State = s.state
+	if !s.n.cfg().PersistSecrets {
+		ps.PrivKey = [32]byte{}
+		ps.Secret = [33]byte{}
+		ps.RefundHex = ""
+	}
 	return ps
 }
 
