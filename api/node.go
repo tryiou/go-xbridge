@@ -102,6 +102,13 @@ type Config struct {
 	// hot-reloads from this path, mirroring C++'s reload-from-the-same-conf
 	// behaviour. Empty disables hot-reload (the call returns an error).
 	ConfPath string
+	// PersistSecrets controls whether each trade's per-trade M keypair, HTLC
+	// secret, and pre-signed refund are written to the swap-state file. On by
+	// default, mirroring C++ saveOrders()/orders.dat (an in-flight swap can be
+	// rebuilt and auto-refunded post-restart). Set -persistsecrets=false to
+	// keep the swap-state file free of signing material (SEC-F04); a restarted
+	// mid-flight swap then cannot auto-refund or re-sign a cancel.
+	PersistSecrets bool
 }
 
 // XConn is the connection surface the Node needs. Both *p2p.Conn (a single
