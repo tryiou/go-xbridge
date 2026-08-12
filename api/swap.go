@@ -380,7 +380,7 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	s.state = csCreatedA
 	xlog.Info("deposit A broadcast", "order", orderID, "txid", out.txid,
 		"lockTime", out.lockTime, "secretHash", hexEncode(s.secretHash[:]))
-	xlog.Debug("deposit A refund pre-signed", "order", orderID, "refundHex", out.refundHex)
+	xlog.Debug("deposit A refund pre-signed", "order", orderID)
 	body := responseBody(&proto.CreatedABody{
 		HubAddress: s.hub, ID: s.id,
 		ADepositTxID: out.txid, HashedSecret: s.secretHash, ALockTime: out.lockTime,
@@ -482,7 +482,7 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	s.state = csCreatedB
 	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.txid,
 		"lockTime", out.lockTime, "makerDeposit", s.theirDepositTxID)
-	xlog.Debug("deposit B refund pre-signed", "order", orderID, "refundHex", out.refundHex)
+	xlog.Debug("deposit B refund pre-signed", "order", orderID)
 	body := responseBody(&proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
 		BDepositTxID: out.txid, BLockTime: out.lockTime,
@@ -542,7 +542,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, err
 			}
-			xlog.Debug("ConfirmA: claim tx built", "order", orderID, "cur", cur, "payHex", payHex)
+			xlog.Debug("ConfirmA: claim tx built", "order", orderID, "cur", cur)
 			conn, e := s.n.connector(cur)
 			if e != nil {
 				return nil, e
@@ -647,7 +647,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, err
 			}
-			xlog.Debug("ConfirmB: claim tx built", "order", orderID, "cur", cur, "payHex", payHex2)
+			xlog.Debug("ConfirmB: claim tx built", "order", orderID, "cur", cur)
 			conn2, e := s.n.connector(cur)
 			if e != nil {
 				return nil, e
