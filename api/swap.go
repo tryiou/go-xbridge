@@ -286,6 +286,11 @@ type swapCtx struct {
 	ourDepositTxID   string
 	ourLockTime      uint32
 	refundHex        string
+
+	// funding is the deposit's exact funding set — the make/take-time selection
+	// recorded as Order.UsedCoins (CRYPTO-F87, C++ xtx->usedCoins). buildDeposit
+	// spends exactly this, never a fresh ListUnspent.
+	funding []wallet.Utxo
 }
 
 // snapshot copies the session's fields a worker task needs. It runs on the
@@ -316,7 +321,20 @@ func (s *SwapSession) snapshot() swapCtx {
 		ourDepositTxID:   s.ourDepositTxID,
 		ourLockTime:      s.ourLockTime,
 		refundHex:        s.refundHex,
+		funding:          s.n.orderFunding(s.id),
 	}
+}
+
+// orderFunding returns the order's recorded funding set (Order.UsedCoins) for
+// the deposit to spend — C++ xtx->usedCoins, populated at make/take time
+// (CRYPTO-F87). store.Get returns a deep copy, so the worker can hold this
+// without racing the engine.
+func (n *Node) orderFunding(id [32]byte) []wallet.Utxo {
+	o := n.store.Get(hexEncode(id[:]))
+	if o == nil {
+		return nil
+	}
+	return o.UsedCoins
 }
 
 // newMakerSession registers the client-side maker for a freshly created order and
@@ -1214,12 +1232,11 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !ok {
 		return depositOutcome{}, fmt.Errorf("api: unknown coin %s", cur)
 	}
-	funding, err := conn.ListUnspent(c.minConf(cc))
-	if err != nil {
-		return depositOutcome{}, err
-	}
+	// CRYPTO-F87: spend the recorded make/take-time selection (Order.UsedCoins,
+	// C++ xtx->usedCoins), never a fresh ListUnspent.
+	funding := c.funding
 	if len(funding) == 0 {
-		return depositOutcome{}, fmt.Errorf("api: no funding UTXOs for %s", cur)
+		return depositOutcome{}, fmt.Errorf("api: no funding UTXOs for %s (order has no used coins)", cur)
 	}
 	changeStr, err := conn.GetNewAddress()
 	if err != nil {

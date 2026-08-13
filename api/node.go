@@ -1064,6 +1064,10 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if !ok {
 		return nil, makeError(errInsufficientFunds, "dxMakeOrder", "insufficient funds")
 	}
+	// CRYPTO-F87: the exact funding set the maker's deposit must spend (C++
+	// xtx->usedCoins). autoSplit rebuilds it from the prep-tx outputs below;
+	// otherwise the plain selection stands.
+	funding := outputsForUse
 
 	// Sign the selected utxos; an un-signable wallet, a wrong-length signature,
 	// or an undecodable address fails the order (C++ :1689-1715).
@@ -1189,6 +1193,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			}
 			id = sha256dOrderID(fromID, p.Maker, fromAmt, toID, p.Taker, toAmt, ts, bh, finalProofs[0].Signature[:])
 			proofs = finalProofs
+			funding = used
 			pending = true
 		}
 		// else: !autoSplit && !exactMatch — list immediately with the first id
@@ -1233,6 +1238,10 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.MakerKey = hexEncode(mPub[:])
 	o.OrigFromCurrency = p.Maker
 	o.OrigToCurrency = p.Taker
+	// CRYPTO-F87: record the make-time selection as the deposit's funding set
+	// (C++ xtx->usedCoins, set at take-order time xbridgeapp.cpp:2350); the
+	// deposit path consumes o.UsedCoins instead of re-running ListUnspent.
+	o.UsedCoins = funding
 	if partial {
 		if pending {
 			// C++ setOrderPending(true): held until the prep tx confirms (:1949).

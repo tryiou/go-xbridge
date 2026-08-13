@@ -397,6 +397,17 @@ func toArr33(b []byte) [33]byte {
 	return a
 }
 
+// withUsedCoins stores o in n.store with its funding set recorded, mirroring
+// production MakeOrder/TakeOrder which populate Order.UsedCoins (CRYPTO-F87):
+// the deposit path consumes o.UsedCoins, never a fresh ListUnspent. Tests create
+// sessions directly, so they must seed the record.
+func withUsedCoins(t *testing.T, n *Node, o *Order, funding []wallet.Utxo) *Order {
+	t.Helper()
+	o.UsedCoins = funding
+	n.store.Add(o)
+	return o
+}
+
 // arr32 converts a 32-byte privkey slice to a fixed array.
 func arr32(b []byte) [32]byte {
 	var a [32]byte
@@ -470,8 +481,8 @@ func TestSwapHandshake(t *testing.T) {
 	makerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
 	takerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
 
-	makerNode.newMakerSession(makerOrder, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
-	takerNode.newTakerSession(takerOrder, TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), toArr33(tkMPub))
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, makerOrder, []wallet.Utxo{btcFunding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, takerOrder, []wallet.Utxo{ltcFunding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), toArr33(tkMPub))
 
 	var hub [20]byte
 	hb := hash20("hub")
@@ -636,8 +647,8 @@ func TestDepositNativeScale(t *testing.T) {
 	mkMPriv, mkMPub := newKey(t)
 	tkMPriv := tkPriv
 	tkMPub := tkPub
-	makerNode.newMakerSession(mkOrder, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
-	takerNode.newTakerSession(tkOrder, TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), to33(tkMPub))
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), to33(tkMPub))
 	var hub [20]byte
 	hubHash := hash20("hub")
 	copy(hub[:], hubHash[:])
@@ -731,6 +742,50 @@ func deserializeHex(t *testing.T, hexStr string) *coins.Tx {
 	return tx
 }
 
+// TestDepositSpendsUsedCoins (CRYPTO-F87) proves buildDeposit consumes the
+// recorded Order.UsedCoins (C++ xtx->usedCoins), never a fresh ListUnspent: the
+// connector reports TWO funders but the order records only one, so the deposit
+// must spend exactly the recorded one.
+func TestDepositSpendsUsedCoins(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mPriv, mPub := newKey(t)
+	_, tkPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	u1 := wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 3e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))}
+	u2 := wallet.Utxo{TxID: strings.Repeat("cc", 32), Vout: 0, Amount: 3e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))}
+	btc := &fakeConnector{
+		ticker: "BTC", funders: []wallet.Utxo{u1, u2}, fundingPriv: fundingPriv, fundingPub: fundingPub,
+		changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+
+	var orderID [32]byte
+	oscHash := hash20("used-coins-order")
+	copy(orderID[:], oscHash[:])
+	// Record ONLY u1 as the funding set, even though the wallet reports both.
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{u1}),
+		MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, body, err := s.OnCreateA(&proto.CreateABody{ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("OnCreateA: %v", err)
+	}
+	createdA := body.(*proto.CreatedABody)
+	dep := deserializeBroadcast(t, btc, createdA.ADepositTxID)
+	if len(dep.Inputs) != 1 {
+		t.Fatalf("deposit inputs = %d, want exactly 1 (the recorded UsedCoins, not the wallet's 2 funders)", len(dep.Inputs))
+	}
+	if got := hashToDisplayHex(dep.Inputs[0].PrevOut.Hash[:]); got != u1.TxID {
+		t.Fatalf("deposit input spends %s, want the recorded %s", got, u1.TxID)
+	}
+}
+
 // TestDepositNotBroadcastWhenRefundFails (CRYPTO-F86) proves the build order:
 // the deposit must be signed and the CLTV refund pre-built BEFORE the broadcast,
 // so a refund-build failure never strands a broadcast deposit without an escape
@@ -756,7 +811,7 @@ func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
 	var orderID [32]byte
 	rfoHash := hash20("refund-fails-order")
 	copy(orderID[:], rfoHash[:])
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{btc.funding}),
 		MakeOrderParams{MakerAddress: "not-a-valid-address", TakerAddress: addrFor(0, "taker-dest")}, arr32(priv), toArr33(pub))
 	s := n.sessions[hexEncode(orderID[:])]
 
@@ -1176,7 +1231,7 @@ func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 	oid := hash20("order-id")
 	copy(orderID[:], oid[:])
 	mkAddr := addrFor(0, "maker-btc-dest")
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{btcFunding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	hub := hash20("hub")
 	s.hub = hub
