@@ -82,7 +82,7 @@ type Config struct {
 	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
 	// Network is the Blocknet network to discover on: "mainnet" (default),
-	// "testnet", or "staging". Used only when NodeAddr is empty (discovery).
+	// "testnet", or "regtest". Used only when NodeAddr is empty (discovery).
 	Network string
 	// AddNodes are explicit peer addresses (host:port) to connect to in addition
 	// to discovered peers (the -addnode flag). Used only when NodeAddr is empty.

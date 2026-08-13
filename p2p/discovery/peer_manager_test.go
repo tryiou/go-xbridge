@@ -155,10 +155,10 @@ func writeVarIntLocal(n int) []byte {
 // advertised address lands in the address manager. No real network is used.
 func TestPeerManagerFakePeer(t *testing.T) {
 	magic := p2p.MainnetMagic
-	// Use "staging" so BootstrapAddrs performs no real DNS lookups (staging has
+	// Use "regtest" so BootstrapAddrs performs no real DNS lookups (regtest has
 	// no configured seeds) — the only candidate is our injected explicit peer,
 	// keeping the test hermetic. The magic still drives the handshake.
-	pm := New(magic, "staging", Options{
+	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
 		Dialer: func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
@@ -216,7 +216,7 @@ func TestPeerManagerExplicitCooldown(t *testing.T) {
 	fake := time.Unix(1000, 0)
 	now = func() time.Time { return fake }
 
-	pm := New(p2p.MainnetMagic, "staging", Options{
+	pm := New(p2p.MainnetMagic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"hostname.example:41412"},
 		DialCooldown:  2 * time.Minute,
@@ -300,7 +300,7 @@ func TestPeerManagerSeedSurvivesPrune(t *testing.T) {
 func TestPeerManagerIgnoresGetaddr(t *testing.T) {
 	magic := p2p.MainnetMagic
 	done := make(chan struct{})
-	pm := New(magic, "staging", Options{
+	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
 		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
@@ -341,7 +341,7 @@ func TestPeerManagerSNListEcho(t *testing.T) {
 	key[0], key[1] = 0x02, 0xaa
 	payload := []byte{0x21, 0x02, 0xaa, 0xff} // arbitrary accepted ping bytes
 	done := make(chan struct{})
-	pm := New(magic, "staging", Options{
+	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
 		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
@@ -390,7 +390,7 @@ func TestPeerManagerSNListEcho(t *testing.T) {
 // the oversized one is rejected (C++ Misbehaving, net_processing.cpp:1825-1830).
 func TestPeerManagerAddrCapDropped(t *testing.T) {
 	magic := p2p.MainnetMagic
-	pm := New(magic, "staging", Options{
+	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
 		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
