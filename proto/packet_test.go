@@ -46,3 +46,26 @@ func TestUnmarshalBodyExceedsData(t *testing.T) {
 		t.Fatal("expected error when declared body exceeds data")
 	}
 }
+
+// TestUnmarshalTrailingBytes rejects bytes beyond the declared body, matching
+// C++ XBridgePacket::copyFrom's exact-length check (xbridgepacket.h:489-493).
+func TestUnmarshalTrailingBytes(t *testing.T) {
+	body := []byte{0x01, 0x02, 0x03}
+	buf := make([]byte, HeaderSize+len(body)+4) // 4 stray trailing bytes
+	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
+	binary.LittleEndian.PutUint32(buf[offSize:], uint32(len(body)))
+	copy(buf[BodyOffset:], body)
+	if _, err := Unmarshal(buf); err == nil {
+		t.Fatal("expected error for trailing bytes after the declared body")
+	}
+
+	// Exact-length packets still parse.
+	p, err := Unmarshal(buf[:HeaderSize+len(body)])
+	if err != nil {
+		t.Fatalf("exact-length packet: %v", err)
+	}
+	if string(p.Body) != string(body) {
+		t.Fatalf("body = %x, want %x", p.Body, body)
+	}
+}

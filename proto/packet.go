@@ -120,5 +120,12 @@ func Unmarshal(data []byte) (*Packet, error) {
 	}
 	p.Body = make([]byte, p.Size)
 	copy(p.Body, data[BodyOffset:BodyOffset+p.Size])
+	if uint64(len(data)) != uint64(HeaderSize)+uint64(p.Size) {
+		// C++ XBridgePacket::copyFrom rejects a size mismatch
+		// (xbridgepacket.h:489-493): the declared body must consume the whole
+		// buffer, so trailing bytes are an error, not silently ignored.
+		xlog.Debug("proto: packet unmarshal failed", "err", "trailing bytes after body", "size", p.Size, "len", len(data))
+		return nil, errors.New("xbridge: trailing bytes after packet body")
+	}
 	return p, nil
 }

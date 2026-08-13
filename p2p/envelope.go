@@ -96,34 +96,54 @@ func writeVarInt(n int) []byte {
 // parse raw P2P payloads sharing Bitcoin's varint encoding.
 func ReadVarInt(b []byte, pos int) (int, int, error) { return readVarInt(b, pos) }
 
+// maxCompactSize mirrors C++ MAX_SIZE (src/serialize.h:27): ReadCompactSize
+// throws on any decoded value above it (0x02000000 = 32 MiB).
+const maxCompactSize = 0x02000000
+
 // readVarInt reads a Bitcoin CompactSize (varint) at *pos, advancing pos past
-// it and returning the decoded value.
+// it and returning the decoded value. It rejects non-canonical encodings
+// (an extended form used where the single-byte/16-bit form would do) and
+// values above MAX_SIZE, matching C++ ReadCompactSize (serialize.h:289-305).
 func readVarInt(b []byte, pos int) (int, int, error) {
 	if pos >= len(b) {
 		return 0, pos, errors.New("p2p: varint truncated")
 	}
 	first := b[pos]
 	pos++
+	var v uint64
 	switch {
 	case first < 0xfd:
-		return int(first), pos, nil
+		v = uint64(first)
 	case first == 0xfd:
 		if pos+2 > len(b) {
 			return 0, pos, errors.New("p2p: varint truncated")
 		}
-		v := int(binary.LittleEndian.Uint16(b[pos:]))
-		return v, pos + 2, nil
+		v = uint64(binary.LittleEndian.Uint16(b[pos:]))
+		pos += 2
+		if v < 0xfd {
+			return 0, pos, errors.New("p2p: non-canonical varint")
+		}
 	case first == 0xfe:
 		if pos+4 > len(b) {
 			return 0, pos, errors.New("p2p: varint truncated")
 		}
-		v := int(binary.LittleEndian.Uint32(b[pos:]))
-		return v, pos + 4, nil
+		v = uint64(binary.LittleEndian.Uint32(b[pos:]))
+		pos += 4
+		if v < 0x10000 {
+			return 0, pos, errors.New("p2p: non-canonical varint")
+		}
 	default:
 		if pos+8 > len(b) {
 			return 0, pos, errors.New("p2p: varint truncated")
 		}
-		v := int(binary.LittleEndian.Uint64(b[pos:]))
-		return v, pos + 8, nil
+		v = binary.LittleEndian.Uint64(b[pos:])
+		pos += 8
+		if v < 0x100000000 {
+			return 0, pos, errors.New("p2p: non-canonical varint")
+		}
 	}
+	if v > maxCompactSize {
+		return 0, pos, errors.New("p2p: varint too large")
+	}
+	return int(v), pos, nil
 }
