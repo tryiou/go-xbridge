@@ -495,20 +495,31 @@ func TestSwapHandshake(t *testing.T) {
 	takerSession.hub = hub
 	makerSecret := makerSession.secret
 
-	// 1) Hold (hub→both) → HoldApply.
-	if _, _, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2.5e6, ToAmount: 2e6}); err != nil {
+	// 1) Hold (hub→both) → HoldApply. The body carries the TAKER's give
+	// (FromAmount=order.to=2e6) and take (ToAmount=order.from=2.5e6); both
+	// parties' verifyHold accepts it (STATE-F71).
+	if _, _, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
 		t.Fatalf("maker OnHold: %v", err)
 	}
-	if _, _, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2.5e6, ToAmount: 2e6}); err != nil {
+	if _, _, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
 		t.Fatalf("taker OnHold: %v", err)
 	}
 
-	// 2) Init (hub→each) → Initialized. ClientAddress is the destination address.
-	mkInit := &proto.InitBody{ClientAddress: ltcHash, HubAddress: hub, ID: orderID}
+	// 2) Init (hub→each) → Initialized. ClientAddress is the destination address;
+	// the full order details must match the session (STATE-F71 intended-OR).
+	mkInit := &proto.InitBody{
+		ClientAddress: ltcHash, HubAddress: hub, ID: orderID,
+		FromAddress: hash20("maker-btc-dest"), FromCurrency: "BTC", FromAmount: 2.5e6,
+		ToAddress: hash20("taker-ltc-source"), ToCurrency: "LTC", ToAmount: 2e6,
+	}
 	if _, _, err := makerSession.OnInit(mkInit); err != nil {
 		t.Fatalf("maker OnInit: %v", err)
 	}
-	tkInit := &proto.InitBody{ClientAddress: btcHash, HubAddress: hub, ID: orderID}
+	tkInit := &proto.InitBody{
+		ClientAddress: btcHash, HubAddress: hub, ID: orderID,
+		FromAddress: hash20("taker-ltc-source"), FromCurrency: "LTC", FromAmount: 2e6,
+		ToAddress: hash20("maker-btc-dest"), ToCurrency: "BTC", ToAmount: 2.5e6,
+	}
 	if _, _, err := takerSession.OnInit(tkInit); err != nil {
 		t.Fatalf("taker OnInit: %v", err)
 	}
@@ -868,6 +879,94 @@ func TestRedeemCounterpartyPayout(t *testing.T) {
 	o := makerNode.store.Get(hexEncode(orderID[:]))
 	if o == nil || o.OBinTxVout != 0 || o.OBinTxP2SHAmount != toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess) {
 		t.Fatalf("order OBinTxVout/P2SHAmount = %d/%d, want 0/%d", o.OBinTxVout, o.OBinTxP2SHAmount, toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess))
+	}
+}
+
+// TestHoldInitVerification (STATE-F71) proves the hub-driven Hold/Init packets
+// are re-verified against the order: a mismatched amount (Hold) or ANY
+// single-field mismatch (Init, intended-OR) is dropped with NO response and no
+// state advance; matching packets pass and advance the state.
+func TestHoldInitVerification(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkMPriv, mkMPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}, "LTC": mkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}, "LTC": mkLtc})
+	var orderID [32]byte
+	hvHash := hash20("hold-init-order")
+	copy(orderID[:], hvHash[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkLtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{mkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	// --- Hold ---
+	// Maker: taker take (3e6) exceeds the maker's give (2.5e6) → dropped.
+	if cmd, body, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 3e6}); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("maker oversized-take Hold not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csMaker {
+		t.Fatalf("maker state advanced despite rejected Hold: %v", makerSession.state)
+	}
+	// Taker: take (3e6) mismatches its expected dstAmt (2.5e6) → dropped.
+	if cmd, body, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 3e6}); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("taker mismatched Hold not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	// Correct Hold (taker give/take = 2e6/2.5e6) → both apply.
+	if cmd, body, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil || cmd != proto.XbcTransactionHoldApply || body == nil {
+		t.Fatalf("maker good Hold failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csHoldApplied {
+		t.Fatalf("maker state = %v, want csHoldApplied", makerSession.state)
+	}
+	if cmd, body, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil || cmd != proto.XbcTransactionHoldApply || body == nil {
+		t.Fatalf("taker good Hold failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if takerSession.state != csHoldApplied {
+		t.Fatalf("taker state = %v, want csHoldApplied", takerSession.state)
+	}
+
+	// --- Init (intended OR: any single mismatch drops) ---
+	goodMk := &proto.InitBody{ClientAddress: hash20("taker-ltc-source"), HubAddress: hub, ID: orderID,
+		FromAddress: hash20("maker-btc-dest"), FromCurrency: "BTC", FromAmount: 2.5e6,
+		ToAddress: hash20("taker-ltc-source"), ToCurrency: "LTC", ToAmount: 2e6}
+	bad := *goodMk
+	bad.ToAmount = 1 // a SINGLE field mismatch must drop (the C++ && bug would accept it)
+	if cmd, body, err := makerSession.OnInit(&bad); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("Init with one mismatched field not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csHoldApplied {
+		t.Fatalf("maker state advanced despite rejected Init: %v", makerSession.state)
+	}
+	// Correct Init → Initialized.
+	if cmd, body, err := makerSession.OnInit(goodMk); err != nil || cmd != proto.XbcTransactionInitialized || body == nil {
+		t.Fatalf("maker good Init failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csInitialized {
+		t.Fatalf("maker state = %v, want csInitialized", makerSession.state)
+	}
+	// Duplicate Init → dropped by the state gate (C++ :1725-1732).
+	if cmd, body, err := makerSession.OnInit(goodMk); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("duplicate Init not dropped: cmd=%v body=%v err=%v", cmd, body, err)
 	}
 }
 

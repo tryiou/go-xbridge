@@ -432,9 +432,17 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 
 // OnHold (hub→both) → HoldApply (7): echo our source address as the client's own.
 func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseBody, error) {
+	orderID := hexEncode(s.id[:])
 	c, ok := coins.Get(s.srcCur)
 	if !ok {
 		return 0, nil, fmt.Errorf("api: unknown coin %s", s.srcCur)
+	}
+	// STATE-F71: re-verify the hub-relayed give/take amounts against the order
+	// (C++ processTransactionHold, xbridgesession.cpp:1404-1471). Any mismatch
+	// is dropped with NO reply (C++ return true) — the hub retransmits.
+	if err := s.verifyHold(b); err != nil {
+		xlog.Warn("hold rejected", "order", orderID, "err", err)
+		return 0, nil, nil
 	}
 	a, err := c.DecodeAddress(s.ourSourceAddr)
 	if err != nil {
@@ -443,19 +451,129 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 	src := [20]byte{}
 	copy(src[:], a.Hash)
 	s.state = csHoldApplied
-	xlog.Info("hold applied", "order", hexEncode(s.id[:]), "state", s.state.String())
+	xlog.Info("hold applied", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionHoldApply, &proto.HoldApplyBody{
 		HubAddress: s.hub, ClientAddress: src, ID: s.id,
 	}, nil
 }
 
+// verifyHold ports the C++ processTransactionHold amount/price re-verification
+// (xbridgesession.cpp:1404-1471). The Hold body carries the TAKER's give
+// (FromAmount) and take (ToAmount) — for the maker that is (dstAmt, srcAmt),
+// for the taker (srcAmt, dstAmt). Returns nil on success; the caller drops the
+// packet without a reply on failure.
+func (s *SwapSession) verifyHold(b *proto.HoldBody) error {
+	if s.isMaker {
+		// role 'A' (C++ :1425-1461): the taker cannot take more than the maker
+		// holds, cannot offer more than the maker wants, and cannot take below a
+		// partial order's minimum.
+		if b.ToAmount > s.srcAmt {
+			return fmt.Errorf("taker requesting an amount that is too large")
+		}
+		if b.FromAmount > s.dstAmt {
+			return fmt.Errorf("taker sending an amount that is too large")
+		}
+		if o := s.order(); o != nil && o.PartialAllowed && b.ToAmount < o.MinFromAmount {
+			return fmt.Errorf("taker requesting an amount that is too small")
+		}
+		if !swap.PartialOrderDriftCheck(s.srcAmt, s.dstAmt, b.FromAmount, b.ToAmount) {
+			return fmt.Errorf("taker price doesn't match maker expected price")
+		}
+		return nil
+	}
+	// role 'B' (C++ :1404-1424): the taker's give/take must match exactly.
+	if b.FromAmount != s.srcAmt {
+		return fmt.Errorf("taker from amount from snode should match expected amount")
+	}
+	if b.ToAmount != s.dstAmt {
+		return fmt.Errorf("taker to amount from snode should match expected amount")
+	}
+	// Drift against the order's original (maker-facing) pair; for a taker the
+	// orig pair is (dstAmt, srcAmt) when no store order is present.
+	origFrom, origTo := s.dstAmt, s.srcAmt
+	if o := s.order(); o != nil && o.OrigFromAmount > 0 {
+		origFrom, origTo = o.OrigFromAmount, o.OrigToAmount
+	}
+	if !swap.PartialOrderDriftCheck(origFrom, origTo, s.srcAmt, s.dstAmt) {
+		return fmt.Errorf("taker price doesn't match maker expected price")
+	}
+	return nil
+}
+
 // OnInit (hub→each) → Initialized (9): echo back our destination address.
 func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseBody, error) {
+	orderID := hexEncode(s.id[:])
+	// STATE-F71: C++ processTransactionInit drops once already initialized
+	// (xbridgesession.cpp:1725-1732).
+	if s.state >= csInitialized {
+		xlog.Info("Init ignored: swap already initialized", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	// STATE-F71: full order-detail re-verification with the INTENDED OR
+	// semantics (reject on ANY single-field mismatch). C++ :1750-1756 uses a
+	// buggy && (only rejects when EVERY field differs); the intended — and
+	// secure — behavior is to reject on any mismatch. Documented divergence.
+	if err := s.verifyInit(b); err != nil {
+		xlog.Warn("init rejected", "order", orderID, "err", err)
+		return 0, nil, nil
+	}
 	s.state = csInitialized
-	xlog.Info("initialized", "order", hexEncode(s.id[:]), "state", s.state.String())
+	xlog.Info("initialized", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionInitialized, &proto.InitializedBody{
 		HubAddress: s.hub, ClientAddress: b.ClientAddress, ID: s.id,
 	}, nil
+}
+
+// verifyInit re-verifies the Init packet's order details against the session
+// (intended OR semantics — see OnInit).
+func (s *SwapSession) verifyInit(b *proto.InitBody) error {
+	if b.ID != s.id {
+		return fmt.Errorf("order id mismatch")
+	}
+	if b.FromAddress != decodeAddrHash(s.srcCur, s.ourSourceAddr) {
+		return fmt.Errorf("from address mismatch")
+	}
+	if b.FromCurrency != s.srcCur {
+		return fmt.Errorf("from currency mismatch")
+	}
+	if b.FromAmount != s.srcAmt {
+		return fmt.Errorf("from amount mismatch")
+	}
+	if b.ToAddress != decodeAddrHash(s.dstCur, s.ourDestAddr) {
+		return fmt.Errorf("to address mismatch")
+	}
+	if b.ToCurrency != s.dstCur {
+		return fmt.Errorf("to currency mismatch")
+	}
+	if b.ToAmount != s.dstAmt {
+		return fmt.Errorf("to amount mismatch")
+	}
+	return nil
+}
+
+// order returns the session's store order, or nil when the node has no store
+// (raw test nodes) or the order is absent.
+func (s *SwapSession) order() *Order {
+	if s.n == nil || s.n.store == nil {
+		return nil
+	}
+	return s.n.store.Get(hexEncode(s.id[:]))
+}
+
+// decodeAddrHash decodes addrStr on cur into its 20-byte HASH160 (zero on an
+// unknown coin / undecodable address).
+func decodeAddrHash(cur, addrStr string) [20]byte {
+	c, ok := coins.Get(cur)
+	if !ok {
+		return [20]byte{}
+	}
+	a, err := c.DecodeAddress(addrStr)
+	if err != nil {
+		return [20]byte{}
+	}
+	var h [20]byte
+	copy(h[:], a.Hash)
+	return h
 }
 
 // OnCreateA (hub→maker) → CreatedA (11): build + broadcast our deposit A.
