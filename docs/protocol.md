@@ -32,7 +32,11 @@ validate blocks and does NOT run a service node.
 |----------|--------------------|--------------|
 | mainnet  | `a1 a0 a2 a3`      | 41412        |
 | testnet  | `45 76 65 bb`      | 41474        |
-| staging  | `a1 cf 7e ac`      | 41489        |
+| regtest  | `a1 cf 7e ac`      | 41489        |
+
+The third network is C++ **REGTEST** (`chainparams.cpp:373-421`); go-xbridge
+exposes it as `-network regtest` (`RegtestMagic`). There is no Blocknet staging
+network.
 
 ### 1.2 Bitcoin P2P message framing
 
@@ -71,8 +75,25 @@ own 4-byte `timestamp`, §2.1, is **seconds**.)
 envelope via `encodeXBridgePayload`; on receive, `DecodeXBridgePayload` strips
 the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
 
+**Transport hardening (B5):**
+- **Frame cap 4,000,000 bytes** — the declared `length` is rejected above
+  `MaxPayloadSize` (C++ `MAX_PROTOCOL_MESSAGE_LENGTH`, `net.h:55`), disconnecting
+  the peer like C++ (`net.cpp:583-585`).
+- **Magic validated on receive** — a frame whose magic differs from the
+  configured network disconnects the peer (C++ `net_processing.cpp:3117-3121`).
+- **Checksum mismatch is log-and-drop** — a bad-checksum frame is dropped and
+  the connection kept, matching C++ (`net_processing.cpp:3138-3145`); the
+  `ErrChecksum` sentinel distinguishes it from fatal decode errors.
+- **Canonical CompactSize** — `readVarInt` rejects non-canonical extended
+  encodings and values above `MAX_SIZE` (32 MiB), like C++ `ReadCompactSize`
+  (`serialize.h:289-305`). This governs the envelope varint, `addr` counts, and
+  servicenode varints uniformly.
+- **`proto.Unmarshal` requires an exact-length body** — trailing bytes after the
+  declared body are an error, matching `XBridgePacket::copyFrom`
+  (`xbridgepacket.h:489-493`).
+
 Implemented in `p2p/message.go` (`Message`, `Checksum`, `Marshal`,
-`UnmarshalMessage`) and `p2p/envelope.go`.
+`UnmarshalMessage`), `p2p/envelope.go` (`readVarInt`), and `proto/packet.go`.
 
 ### 1.3 Handshake
 
@@ -105,9 +126,15 @@ Field values (`p2p/version.go`):
 - `fxrouter` = `false` (thin client is not an XRouter hub). Sent explicitly so
   address gossip/discovery works against stock service nodes.
 
+**Version gate (B5):** the peer's advertised `version` must be at least
+`MinPeerProtoVersion` (70712, `src/version.h:27`); a lower version or a
+duplicate `version` message disconnects the peer (C++
+`net_processing.cpp:1617-1626,1574-1582`).
+
 The handshake sends `version`, then reads until it has seen both the peer's
 `version` (to which it replies `verack`) and the peer's `verack`; unrelated
-messages are ignored. A 30 s deadline bounds the exchange.
+messages are ignored. A 60 s deadline bounds the exchange (C++
+`DEFAULT_PEER_CONNECT_TIMEOUT`, `net.h:83`).
 
 #### 1.3.1 `net_addr` / CAddress layout
 
@@ -186,7 +213,7 @@ intentional — historical.)
 | Value | Name | Direction / purpose |
 |-------|------|---------------------|
 | 0  | `xbcInvalid`            | — |
-| 2  | `xbcXChatMessage`       | relay envelope (carries a serialized Bitcoin p2p msg) |
+| 2  | `xbcXChatMessage`       | relay envelope (no C++ writer; body type removed on B5) |
 | 3  | `xbcTransaction`        | make / broadcast an order |
 | 4  | `xbcPendingTransaction` | list of open orders broadcast |
 | 5  | `xbcTransactionAccepting` | accept an open order |
@@ -205,9 +232,11 @@ intentional — historical.)
 | 22 | `xbcTransactionCancel`  | cancel (uint256 id, uint32 reason) |
 | 24 | `xbcTransactionFinished`| finished |
 | 26 | `xbcTransactionReject`  | reject (uint256 id, uint32 reason) |
-| 50 | `xbcServicesPing`       | supported-services ping |
+| 50 | `xbcServicesPing`       | supported-services ping (no C++ writer; body type removed on B5 — `DecodeBody` rejects) |
 
-Implemented in `proto/command.go`.
+Implemented in `proto/command.go`. Commands 2 (`xbcXChatMessage`) and 50 have
+no C++ writer on either side; their speculative body types were removed on B5
+(WIRE-F67/F68) and `DecodeBody` returns an unsupported-command error for them.
 
 ---
 

@@ -48,7 +48,7 @@ here can lag the code.
 | B2 | `fix/wire-acceptingbody` | **CRYPTO-F84** (+ A1–A7 closeout, per-token D4) | `api/fee_tx.go` (new), `api/node.go`, `api/order.go`, `proto/body_test.go`, `api/hub_gate_test.go`, `api/store.go`, `api/persist.go` | B1 |
 | B3 | `fix/deposit-path` | **CRYPTO-F85, CRYPTO-F86, CRYPTO-F87, SEC-F03**, **STATE-F71**, **CRYPTO-F78** (+ folded **CRYPTO-F90**, promoted **CRYPTO-F97** unit-scale) | `wallet/connector.go`, `wallet/rpc.go`, `wallet/local.go`, `api/swap.go`, `api/node.go`, `api/order.go`, `api/persist.go` | B2, B6 |
 | B4 | `fix/http-hardening` | **RPC-F58**, **RPC-F01, F02, F47–F52** | `api/server.go`, `api/dispatch.go`, `cmd/main.go` | — |
-| B5 | `fix/wire-hardening` | **WIRE-F57–F71** | `p2p/addr.go`, `p2p/envelope.go`, `p2p/conn.go`, `p2p/message.go`, `p2p/params.go`, `p2p/version.go`, `p2p/discovery/peer_manager.go`, `proto/packet.go`, `proto/body_types.go`, `p2p/servicenode/servicenode.go` | — |
+| B5 | `fix/wire-hardening` | **WIRE-F57–F64, F67–F70** (F65/F66 DOCUMENTED; F71 on B1) | `p2p/addr.go`, `p2p/envelope.go`, `p2p/conn.go`, `p2p/message.go`, `p2p/params.go`, `p2p/version.go`, `p2p/seeds.go`, `p2p/discovery/peer_manager.go`, `proto/packet.go`, `proto/body_types.go`, `p2p/servicenode/servicenode.go`, `cmd/xbridged/main.go` | — |
 | B6 | `fix/secrets-hygiene` | **SEC-F04** | `api/persist.go`, `wallet/rpc.go`, `api/swap.go` (log lines only) | — |
 | B7 | `fix/rpc-surface` | **RPC-F03–F59** (+ re-decide F37) | `api/handlers.go`, `api/response.go`, `api/order.go`, `api/utxo_select.go`, `api/store.go`, `coins/amount.go`, `api/node.go` | B3, B4 |
 | B8 | `fix/state-machinery` | **STATE-F72–F75** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `swap/transaction.go` | B3 |
@@ -72,7 +72,9 @@ marked `FIXED`/`DOCUMENTED` in `register.md`.
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
 log-site removals, corrupt-file severity parity). **B3 merged** (deposit path:
 CRYPTO-F85/F86/F87/F78/F90/F97, STATE-F71, SEC-F03 — validated-deposit gate,
-native-unit scale, wire-Cancel). B4/B5, B7–B11 pending.
+native-unit scale, wire-Cancel). **B5 merged** (wire hardening: WIRE-F57–F64,
+F67–F70 — caps, magic/version/checksum gates, canonical varint, snl echo,
+regtest rename, cmd2/50 removal). B4, B7–B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -163,7 +165,7 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
 - **RPC-F47–F52:** HTTP status 500/404 vs 200; method-not-found text; 32 MiB
   body; always-auth model; batch/named params + `-32600`; arity gates → 1025.
 
-### B5 — `fix/wire-hardening` — WIRE-F57–F71
+### B5 — `fix/wire-hardening` — WIRE-F57–F64, WIRE-F67–F70 — MERGED
 
 - `ParseAddr` pre-bounds `make(…, n)` (`p2p/addr.go:33-43`); `readVarInt`
   uint64→int cast (`p2p/envelope.go:126`); no `recover` in discovery read loop
@@ -174,6 +176,18 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   (WIRE-F63); checksum log-and-drop (WIRE-F64); cmd2/cmd50 disposition
   (WIRE-F67/F68); getaddr policy + addr cap (WIRE-F69); handshake
   deadline/negotiation (WIRE-F70); WIRE-F71 already fixed on B1.
+- **Delivered (B5):** `MaxPayloadSize` 4,000,000 + conn cap; `conn.readMessage`
+  magic validation (disconnect) and bad-checksum log-and-drop (`ErrChecksum` sentinel);
+  handshake gates on `MinPeerProtoVersion` (70712) + duplicate `version`; 60 s
+  handshake deadline; `staging`→`regtest` network rename (`RegtestMagic`,
+  `-network regtest`); `snl` answered with a raw accepted-ping echo;
+  `proto.Unmarshal` exact-length body; `readVarInt` rejects non-canonical
+  CompactSize + `> MAX_SIZE` (32 MiB); cmd-2/cmd-50 speculative body types
+  deleted (`DecodeBody` rejects); `getaddr` never answered (outbound-only) +
+  1000-record `addr` cap. F65 (1 MiB body cap) and F66 (cmd-4 dual writer) stay
+  DOCUMENTED; SENDHEADERS/SENDCMPCT + periodic pings remain DOCUMENTED under
+  F70. See `remediation/B5-wire.md`.
+- **Verify:** as B1; `make parity` + `make canary`.
 
 ### B6 — `fix/secrets-hygiene` — SEC-F04 (high) — MERGED
 

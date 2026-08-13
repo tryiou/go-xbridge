@@ -56,9 +56,9 @@ status strings, envelope); the 2026 full audit (`findings.md`, `register.md`)
 found **130 divergences** (1×S1, 61×S2, 61×S3, 7×S4) across the RPC, wire,
 state, crypto, config, and concurrency axes, including prior-audit findings
 folded into the same namespace. The B1 (servicenode-registry), B2
-(wire-acceptingbody), B3 (deposit-path), and B6 (secrets-hygiene) branches are
-merged to `main`; B4/B5, B7–B11 execute the remaining open rows per
-[`remediation-plan.md`](remediation-plan.md).
+(wire-acceptingbody), B3 (deposit-path), B6 (secrets-hygiene), and B5
+(wire-hardening) branches are merged to `main`; B4, B7–B11 execute the
+remaining open rows per [`remediation-plan.md`](remediation-plan.md).
 
 ## Attacker model
 
@@ -104,6 +104,7 @@ audit's hostile outcome is **theft**, not recoverable lockup — see
 2. **STATE-F72** wire the expiry sweep to a timer (`IsExpiredByBlockNumber`).
 3. **RPC S2 set** error channel (RPC-F01), names, ordering, `uint256S` parser,
    split fee formula, order-history encoding/data sources.
-4. **WIRE hardening (B5)** caps, magic/version gates, checksum handling.
+4. ~~WIRE hardening (B5)~~ **done** — caps, magic/version gates, checksum handling
+   merged on B5.
 5. **CFG startup hazards (B10)** `[Rpc]` section, missing-conf, admission gates.
 6. Per-branch detail: see [`remediation-plan.md`](remediation-plan.md).

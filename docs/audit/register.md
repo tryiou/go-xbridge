@@ -101,20 +101,20 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| WIRE-F57 | S2 | P2P max payload 67 MiB vs C++ 4,000,000 | OPEN | B5 |
-| WIRE-F58 | S2 | Received magic never validated | OPEN | B5 |
-| WIRE-F59 | S2 | No `MIN_PEER_PROTO_VERSION` gate | OPEN | B5 |
-| WIRE-F60 | S2 | `"staging"` network magic is actually C++ REGTEST | OPEN | B5 |
-| WIRE-F61 | S2 | `snl` (SNLIST) responses ignored | OPEN | B5 |
-| WIRE-F62 | S3 | `proto.Unmarshal` silently ignores trailing body bytes | OPEN | B5 |
-| WIRE-F63 | S3 | Non-canonical CompactSize varint accepted | OPEN | B5 |
-| WIRE-F64 | S3 | Bad checksum disconnects instead of log-and-drop | OPEN | B5 |
+| WIRE-F57 | S2 | P2P max payload 67 MiB vs C++ 4,000,000 | FIXED | B5 `fix/wire-hardening` (`MaxPayloadSize`, conn cap test) |
+| WIRE-F58 | S2 | Received magic never validated | FIXED | B5 `fix/wire-hardening` (`conn.readMessage`, `TestConnWrongMagicRejected`) |
+| WIRE-F59 | S2 | No `MIN_PEER_PROTO_VERSION` gate | FIXED | B5 `fix/wire-hardening` (`MinPeerProtoVersion`, `TestConnVersionBelowMinimum`) |
+| WIRE-F60 | S2 | `"staging"` network magic is actually C++ REGTEST | FIXED | B5 `fix/wire-hardening` (`RegtestMagic`, `-network regtest`) |
+| WIRE-F61 | S2 | `snl` (SNLIST) responses ignored | FIXED | B5 `fix/wire-hardening` (raw accepted-ping echo, `TestPeerManagerSNListEcho`) |
+| WIRE-F62 | S3 | `proto.Unmarshal` silently ignores trailing body bytes | FIXED | B5 `fix/wire-hardening` (`TestUnmarshalTrailingBytes`) |
+| WIRE-F63 | S3 | Non-canonical CompactSize varint accepted | FIXED | B5 `fix/wire-hardening` (`readVarInt` canonicality, `TestReadVarIntCanonical`) |
+| WIRE-F64 | S3 | Bad checksum disconnects instead of log-and-drop | FIXED | B5 `fix/wire-hardening` (`ErrChecksum` sentinel, `TestConnChecksumFrameDropped`) |
 | WIRE-F65 | S3 | Go-only 1 MiB XBridge body cap (C++ has none) | DOCUMENTED | hardening limit (`protocol.md`) |
 | WIRE-F66 | S3 | Command 4 has two C++ writers differing by trailing minFromAmount | DOCUMENTED | Go is correct; doc'd in `findings.md` |
-| WIRE-F67 | S2 | Command 2 (xbcXChatMessage) body is speculative (no C++ writer) | OPEN | B5 (implement writer or delete type) |
-| WIRE-F68 | S2 | Command 50 (xbcServicesPing) body claim is unbacked | OPEN | B5 (parser or remove type) |
-| WIRE-F69 | S3 | getaddr policy and addr cap differ | OPEN | B5 |
-| WIRE-F70 | S3 | Version handshake differences (deadline, SENDHEADERS/SENDCMPCT, pings) | OPEN | B5 |
+| WIRE-F67 | S2 | Command 2 (xbcXChatMessage) body is speculative (no C++ writer) | FIXED | B5 `fix/wire-hardening` (type deleted; `DecodeBody` rejects) |
+| WIRE-F68 | S2 | Command 50 (xbcServicesPing) body claim is unbacked | FIXED | B5 `fix/wire-hardening` (type deleted; `DecodeBody` rejects) |
+| WIRE-F69 | S3 | getaddr policy and addr cap differ | FIXED | B5 `fix/wire-hardening` (outbound-ignore; 1000-cap, `TestPeerManagerAddrCapDropped`) |
+| WIRE-F70 | S3 | Version handshake differences (deadline, SENDHEADERS/SENDCMPCT, pings) | FIXED | B5 `fix/wire-hardening` (60 s deadline; SENDHEADERS/SENDCMPCT + pings remain DOCUMENTED) |
 | WIRE-F71 | S2 | Servicenode registration integrity: fields read-then-discarded; gates miss `isValid` subset | FIXED | B1 `fix/servicenode-registry` |
 
 ### STATE axis (`STATE-F71`–`STATE-F79`) — evidence: `evidence/state.md`
@@ -233,7 +233,7 @@ namespace is the Current register above.
 | F22 | SEC-F03 | taker-trust composite — FIXED (B3 `fix/deposit-path`) |
 | F23 | CRYPTO-F86 | `buildDeposit` broadcast order — FIXED (B3 `fix/deposit-path`) |
 | F24 | RPC-F58 | HTTP auth/timeout hardening — OPEN (B4) |
-| F25 | WIRE-F57/F63 | P2P addr/varint DoS — OPEN (B5) |
+| F25 | WIRE-F57/F63 | P2P addr/varint DoS — FIXED (B5 `fix/wire-hardening`) |
 | F26 | SEC-F04 | plaintext secrets — FIXED (B6 `fix/secrets-hygiene`) |
 | F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — FIXED (B3 `fix/deposit-path`) |
 | S1-A | CRYPTO-F93 | ownership-proof challenge stream — FIXED |
