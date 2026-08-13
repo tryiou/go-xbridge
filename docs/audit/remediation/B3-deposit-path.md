@@ -1,4 +1,4 @@
-# Diff brief — deposit path (B3, CRYPTO-F85/F86/F87/F78/F90 + STATE-F71 + SEC-F03)
+# Diff brief — deposit path (B3, CRYPTO-F85/F86/F87/F78/F90/F97 + STATE-F71 + SEC-F03)
 
 Session-scratch notes for branch `fix/deposit-path`. Source of truth is the
 C++ writers; the register rows (`CRYPTO-F85/F86/F87/F78/F90`, `STATE-F71`,
@@ -152,14 +152,18 @@ C++ writers; the register rows (`CRYPTO-F85/F86/F87/F78/F90`, `STATE-F71`,
      `store.Get(orderID).UsedCoins`) instead of `conn.ListUnspent`
      (`:1047`). Maker `MakeOrder` records `o.UsedCoins` before `store.Add`
      (`api/node.go`), in both the autoSplit-rebuild and direct branches.
-   - **F78**: `estimateFee(cc, len(funding), 3)` at `:1064`.
-   - **F90**: `redeemCounterparty` (`:1166-1218`) spends
-     `theirDepositVout` (was `Index:0`), pays `dstAmt + theirOverpayment`
-     (was `dstAmt − fee`), input amount `theirP2SHAmount`; excess retained.
-   - **W0 unit-scale**: convert `c.srcAmt`, `fee`, `fee2` (deposit), `fee`,
-     `spec.Amount` (refund `:1127-1148`), and claim output (F90) to **native**
-     via `fromXBridgeAmt` before `BuildDepositTx`/builders; `swap` package stays
-     on-chain-native. Registers the promoted finding (W0) in `register.md`.
+   - **F78**: `estimateFee(cc, len(funding), 3)` at `:1064` (C++
+     `minTxFee1(nIn,3)`, `xbridgesession.cpp:1994/:2526`).
+   - **F90**: `redeemCounterparty` (`:1166-1218`) spends the VALIDATED deposit —
+     exact native `P2SHNative` at `DepositVout` — paying `p2sh − fee2` (the
+     redeemer keeps any excess; C++ output = outAmount + oOverpayment =
+     depositP2SH − fee2, `xbridgesession.cpp:3971`); `buildRefundTx` pays the
+     full nominal (fee2 is the implicit miner fee, C++ `:2134/2149`); order
+     fields `OBinTxVout/OBinTxP2SHAmount/OOverpayment` persisted.
+   - **W0 → CRYPTO-F97 (promoted)**: convert `c.srcAmt`, `fee`, `fee2`
+     (deposit), `fee`, `spec.Amount` (refund `:1127-1148`), and claim output
+     (F90) to **native** via `fromXBridgeAmt` before `BuildDepositTx`/builders;
+     `swap` package stays on-chain-native. Register promotion: CRYPTO-F97.
    - **STATE-F71**: `OnHold` (`:283-299`) + `OnInit` (`:302-308`) re-verify
      amounts/currency/price/identity per C++ (intended OR for Init; state gate
      `csInitialized`).

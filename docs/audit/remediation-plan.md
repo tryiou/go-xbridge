@@ -46,7 +46,7 @@ here can lag the code.
 |---|---|---|---|---|
 | B1 | `fix/servicenode-registry` | **WIRE-F71** | `p2p/servicenode/*` | — |
 | B2 | `fix/wire-acceptingbody` | **CRYPTO-F84** (+ A1–A7 closeout, per-token D4) | `api/fee_tx.go` (new), `api/node.go`, `api/order.go`, `proto/body_test.go`, `api/hub_gate_test.go`, `api/store.go`, `api/persist.go` | B1 |
-| B3 | `fix/deposit-path` | **CRYPTO-F85, CRYPTO-F86, CRYPTO-F87, SEC-F03***, **STATE-F71**, **CRYPTO-F78** | `wallet/connector.go`, `wallet/rpc.go`, `wallet/local.go`, `api/swap.go`, `api/node.go`, `api/order.go` | B2, B6 |
+| B3 | `fix/deposit-path` | **CRYPTO-F85, CRYPTO-F86, CRYPTO-F87, SEC-F03**, **STATE-F71**, **CRYPTO-F78** (+ folded **CRYPTO-F90**, promoted **CRYPTO-F97** unit-scale) | `wallet/connector.go`, `wallet/rpc.go`, `wallet/local.go`, `api/swap.go`, `api/node.go`, `api/order.go`, `api/persist.go` | B2, B6 |
 | B4 | `fix/http-hardening` | **RPC-F58**, **RPC-F01, F02, F47–F52** | `api/server.go`, `api/dispatch.go`, `cmd/main.go` | — |
 | B5 | `fix/wire-hardening` | **WIRE-F57–F71** | `p2p/addr.go`, `p2p/envelope.go`, `p2p/conn.go`, `p2p/message.go`, `p2p/params.go`, `p2p/version.go`, `p2p/discovery/peer_manager.go`, `proto/packet.go`, `proto/body_types.go`, `p2p/servicenode/servicenode.go` | — |
 | B6 | `fix/secrets-hygiene` | **SEC-F04** | `api/persist.go`, `wallet/rpc.go`, `api/swap.go` (log lines only) | — |
@@ -68,9 +68,11 @@ WIRE-F65/F66 (hardening/doc), STATE-F76, CONC-F95/F96, CRYPTO-F79/F80/F81
 SEC-F01, RPC-F59, CRYPTO-F84/F93–F96 (fixed; regression-covered). Each is
 marked `FIXED`/`DOCUMENTED` in `register.md`.
 
-**Status (2026-08-12):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
+**Status (2026-08-13):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
-log-site removals, corrupt-file severity parity). B3–B5, B7–B11 pending.
+log-site removals, corrupt-file severity parity). **B3 merged** (deposit path:
+CRYPTO-F85/F86/F87/F78/F90/F97, STATE-F71, SEC-F03 — validated-deposit gate,
+native-unit scale, wire-Cancel). B4/B5, B7–B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -110,29 +112,40 @@ Funded `AcceptingBody`: atomic per-order reservation, p2pkh-25 funding filter,
 same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
 `remediation/B2-acceptingbody.md`.
 
-### B3 — `fix/deposit-path` — CRYPTO-F85 + CRYPTO-F86 + CRYPTO-F87 (+ closes SEC-F03), STATE-F71, CRYPTO-F78
+### B3 — `fix/deposit-path` — CRYPTO-F85 + CRYPTO-F86 + CRYPTO-F87 + STATE-F71 + CRYPTO-F78 (+ CRYPTO-F90, CRYPTO-F97) — MERGED
 
 - **C++ source:** `xbridgesession.cpp:2490-2515` (deposit validation),
   `:2077-2194` (maker), `:2625/2669/2711` (taker), `:1975, 2515-2530`
   (`xtx->usedCoins`), `:1993` (`minTxFee1(nIn,3)`), `:1401-1471,1750-1760`
-  (Hold/Init re-verify).
-- **CRYPTO-F85:** add `CheckDepositTransaction` to `wallet.Connector` + both
-  implementations; call in maker + taker deposit paths with C++ semantics
-  (confirmations, `SEQUENCE_FINAL`, prevouts, script, amount).
-- **CRYPTO-F86:** reorder `buildDeposit` to deposit → refund → broadcast
-  (`api/swap.go:1104/1111`).
-- **CRYPTO-F87:** store the maker's make-time selection as `UsedCoins`
-  (`api/node.go`); `buildDeposit` consumes `UsedCoins` (maker + taker) instead
-  of re-running `ListUnspent` and passing **all** results (`api/swap.go:1047,
-  1087`).
-- **CRYPTO-F78:** deposit network fee `minTxFee1(nIn,3)` =
-  `(192·nIn+102)·feePerByte` vs Go `estimateFee(nIn,2)` (`api/swap.go:1064`).
-- **STATE-F71:** `OnHold`/`OnInit` re-verify the hub's amounts/currency/price/
-  identity against the order, matching `processTransactionHold`/`Init`
-  (`api/swap.go:283-308`).
-- **SEC-F03 closure:** composite acceptance test — the taker refuses an
-  unverified hub / unvalidated deposit end-to-end; correct the attacker model
-  in the register (theft, not lockup).
+  (Hold/Init re-verify), `:3920-4016` (redeem payout), `:2134/2149` (refund
+  payout), `:3525-3576` (sendCancelTransaction).
+- **CRYPTO-F85:** `CheckDepositTransaction` on `wallet.Connector` (interface +
+  RPCConnector 1:1 port of `xbridgewalletconnectorbtc.cpp:1981-2194` +
+  LocalConnector `ErrNoChainSource`); wired into `OnCreateB` (taker checks the
+  maker's A deposit) and `OnConfirmA` (maker checks the taker's B deposit) with
+  the C++ tri-state — wait → no reply (hub retransmits), bad → wire-Cancel
+  (`crBadADepositTx`/`crBadBDepositTx`) + local rollback, good → record the
+  validated out-params. MockRPC goldens + `TestCreateBBadDepositCancels` /
+  `TestCreateBWaitsOnNotReadyDeposit`.
+- **CRYPTO-F86:** `buildDeposit` signs → derives the local txid → pre-builds the
+  CLTV refund → only then broadcasts (`TestDepositNotBroadcastWhenRefundFails`).
+- **CRYPTO-F87:** maker `MakeOrder` records `Order.UsedCoins` (incl. autoSplit);
+  `buildDeposit` consumes the `swapCtx.funding` snapshot, never `ListUnspent`
+  (`TestDepositSpendsUsedCoins`).
+- **CRYPTO-F78:** deposit fee `estimateFee(nIn, 3)`.
+- **CRYPTO-F90:** the claim spends the VALIDATED deposit (exact `P2SHNative`
+  value at `DepositVout`), paying `p2sh − fee2` so the redeemer keeps any excess;
+  the refund pays the full nominal (fee2 implicit); `OBinTxVout/OBinTxP2SHAmount/
+  OOverpayment` persisted (`TestRedeemCounterpartyPayout`, round-trip).
+- **CRYPTO-F97 (promoted from planning):** deposit path now operates in native
+  base units via `fromXBridgeAmt` at the boundary — for COIN≠1e6 (BTC) the
+  on-chain deposit previously locked 100× too little (`TestDepositNativeScale`).
+- **STATE-F71:** `OnHold`/`OnInit` re-verify amounts/price/identity against the
+  order (intended-OR for Init — documented divergence from the C++ `&&` bug);
+  state gate on duplicate Init (`TestHoldInitVerification`).
+- **SEC-F03 closure:** composite acceptance — taker and maker refuse an
+  unvalidated counterparty deposit end-to-end (`TestSecF03CompositeRefusal`);
+  attacker model corrected in the register (theft, not lockup).
 - **Verify:** as B1; `make parity` + `make canary`. Commits: one per ID + docs.
 
 ### B4 — `fix/http-hardening` — RPC-F58, RPC-F01/F02/F47–F52

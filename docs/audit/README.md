@@ -55,19 +55,22 @@ The `dx*` JSON-RPC surface is largely at parity (error codes, dates, amounts,
 status strings, envelope); the 2026 full audit (`findings.md`, `register.md`)
 found **130 divergences** (1×S1, 61×S2, 61×S3, 7×S4) across the RPC, wire,
 state, crypto, config, and concurrency axes, including prior-audit findings
-folded into the same namespace. The B1 (servicenode-registry) and B2
-(wire-acceptingbody) branches are merged to `main`; B3–B11 execute the remaining
-open rows per [`remediation-plan.md`](remediation-plan.md).
+folded into the same namespace. The B1 (servicenode-registry), B2
+(wire-acceptingbody), B3 (deposit-path), and B6 (secrets-hygiene) branches are
+merged to `main`; B4/B5, B7–B11 execute the remaining open rows per
+[`remediation-plan.md`](remediation-plan.md).
 
 ## Attacker model
 
 Inbound signature verification *is* enforced before state mutation against a
 trusted hub key, and automatic peer discovery is rate-unbounded. An attacker
-can pollute the book and trigger real deposits (fund lockup, recoverable via
-refund). HTLC semantics (ELSE-branch needs the secret; refunds pay the
-depositor's own address) prevent direct **theft** — worst case is lockup +
-fee-burn + state corruption + DoS. (Corrected from the prior lockup-only model;
-the 2026 audit's hostile outcome is **theft**, not recoverable lockup — see
+can pollute the book and trigger real deposits. B3's validated-deposit gate
+(`wallet.CheckDepositTransaction` on the counterparty's HTLC before committing
+or redeeming our own) plus pre-signed CLTV refunds that pay the depositor's own
+address make the hostile outcome **recoverable lockup + fee-burn + state
+corruption + DoS**, never direct **theft** — neither party can claim a deposit
+they did not validate. (Corrected from the prior lockup-only model; the 2026
+audit's hostile outcome is **theft**, not recoverable lockup — see
 `register.md` SEC-F03 and `remediation-plan.md`.)
 
 ## Verification gaps still open
