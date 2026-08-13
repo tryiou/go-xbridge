@@ -1,10 +1,12 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -64,6 +66,12 @@ type PeerManager struct {
 	// network token set). Exposed via ServiceNodes() for dxGetNetworkTokens.
 	snReg *servicenode.Registry
 
+	// rawPings holds the last ACCEPTED ping payload per servicenode pubkey,
+	// so an inbound SNLIST can be answered with SNLISTPING messages that are
+	// byte-identical to the pings the peer relayed (C++ re-serializes its
+	// stored ServiceNodePing, which round-trips byte-for-byte).
+	rawPings map[[33]byte][]byte
+
 	// dialCooldown is how long a failed/used address is skipped before being
 	// re-candidated, so unreachable peers are not dialed every maintain tick.
 	dialCooldown time.Duration
@@ -113,6 +121,7 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		done:          make(chan struct{}),
 		peers:         make(map[string]*p2p.Conn),
 		snReg:         servicenode.NewRegistry(),
+		rawPings:      make(map[[33]byte][]byte),
 		dialCooldown:  dialCooldown,
 	}
 }
@@ -316,12 +325,19 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 				return
 			}
 		case p2p.CmdAddr:
-			if entries, aerr := p2p.ParseAddr(msg.Payload); aerr == nil {
-				m.addrMan.AddSlice(entries)
+			entries, aerr := p2p.ParseAddr(msg.Payload)
+			if aerr != nil {
+				// Includes the >1000-record cap, which C++ answers with
+				// Misbehaving (net_processing.cpp:1825-1830).
+				xlog.Warn("p2p: addr payload rejected", "peer", addr, "err", aerr)
+				break
 			}
+			m.addrMan.AddSlice(entries)
 		case p2p.CmdGetAddr:
-			sample := m.addrMan.Random(64)
-			_ = conn.SendCommand(p2p.CmdAddr, p2p.MarshalAddr(sample))
+			// C++ ignores "getaddr" from outbound connections
+			// (net_processing.cpp:2665-2668), and go-xbridge only makes
+			// outbound connections, so the request is never answered.
+			xlog.Debug("p2p: ignoring getaddr (outbound-only client)", "peer", addr)
 		case p2p.CmdPing:
 			_ = conn.SendCommand(p2p.CmdPong, msg.Payload)
 		case servicenode.CmdSNRegister:
@@ -337,11 +353,35 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 				xlog.Warn("servicenode: SNPING/SNLISTPING parse failed", "peer", addr, "cmd", msg.Command, "err", derr)
 				break
 			}
-			m.snReg.AddPing(sn)
+			// Mirror the strict-newer accept gate so SNLIST is answered with
+			// exactly the pings the registry keeps (servicenodemgr.h:843-852).
+			if m.snReg.AddPing(sn) {
+				m.mu.Lock()
+				m.rawPings[sn.PubKey] = msg.Payload
+				m.mu.Unlock()
+			}
 		case servicenode.CmdSNList:
-			xlog.Debug("servicenode: ignoring SNLIST (stock client does not answer)", "peer", addr)
-			// A stock XBridge client does not answer SNLIST (only XRouter
-			// does); ignore it. We learn the SN set from relayed pings.
+			// C++ answers SNLIST with one SNLISTPING per known ping
+			// (net_processing.cpp:2992-3001); we echo the stored raw accepted
+			// pings (byte-identical to C++'s re-serialization). Sorted by
+			// pubkey for deterministic ordering across relays.
+			m.mu.Lock()
+			keys := make([][33]byte, 0, len(m.rawPings))
+			for k := range m.rawPings {
+				keys = append(keys, k)
+			}
+			pings := make([][]byte, 0, len(keys))
+			for _, k := range keys {
+				pings = append(pings, m.rawPings[k])
+			}
+			m.mu.Unlock()
+			sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+			for _, raw := range pings {
+				if err := conn.SendCommand(servicenode.CmdSNListPing, raw); err != nil {
+					xlog.Debug("servicenode: SNLISTPING send failed", "peer", addr, "err", err)
+					break
+				}
+			}
 		default:
 			// version/verack (handshake) and addrv2 are intentionally ignored.
 		}

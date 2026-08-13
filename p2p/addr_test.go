@@ -57,3 +57,18 @@ func TestAddrEmptyPayload(t *testing.T) {
 		t.Fatalf("empty addr len = %d, want 0", len(got))
 	}
 }
+
+// TestAddrRecordCap asserts a declared count above MaxAddrRecords is rejected,
+// matching C++ Misbehaving on an oversized addr message
+// (net_processing.cpp:1825-1830, MAX_ADDR_TO_SEND net.h:53).
+func TestAddrRecordCap(t *testing.T) {
+	// Declared 1001 records (0xfd 0xe9 0x03); rejected before any record decode.
+	oversized := []byte{0xfd, 0xe9, 0x03}
+	if _, err := ParseAddr(oversized); err == nil {
+		t.Fatal("expected error for addr payload declaring >1000 records")
+	}
+	// Exactly the cap is still accepted (zero records follow the count).
+	if _, err := ParseAddr(writeVarInt(MaxAddrRecords)); err != nil {
+		t.Fatalf("cap payload: %v", err)
+	}
+}

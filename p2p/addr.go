@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 )
 
@@ -25,14 +26,23 @@ type AddrEntry struct {
 	Port     uint16
 }
 
+// MaxAddrRecords mirrors C++ MAX_ADDR_TO_SEND (net.h:53): the cap on how many
+// addresses a single `addr` message may carry. C++ Misbehaves and drops a
+// message with more (net_processing.cpp:1825-1830).
+const MaxAddrRecords = 1000
+
 // ParseAddr decodes a legacy `addr` message payload: a CompactSize count
 // followed by that many (time, services, net_addr) tuples. It is tolerant of a
 // payload that carries fewer than the declared count (it returns what it can
-// decode), matching Bitcoin's own lenient parsing.
+// decode), matching Bitcoin's own lenient parsing, but rejects a declared count
+// above MaxAddrRecords like C++.
 func ParseAddr(payload []byte) ([]AddrEntry, error) {
 	n, off, err := readVarInt(payload, 0)
 	if err != nil {
 		return nil, err
+	}
+	if n > MaxAddrRecords {
+		return nil, errors.New("p2p: addr payload exceeds 1000 records")
 	}
 	out := make([]AddrEntry, 0, n)
 	for i := 0; i < n; i++ {

@@ -592,7 +592,9 @@ func (r *Registry) AddRegistration(sn ServiceNode) {
 // setConfig (servicenode.h:277-281). A ping failing isValid never creates a
 // node — C++ never knows it (:186-187). The stored pingtime is clamped like
 // updatePing (servicenode.h:254-260) and drives running() (:244-247).
-func (r *Registry) AddPing(sn ServiceNode) {
+// It returns whether the ping was actually stored (the strict-newer gate
+// passed), which lets callers mirror the wire response set for SNLIST.
+func (r *Registry) AddPing(sn ServiceNode) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := sn.PubKey
@@ -612,8 +614,10 @@ func (r *Registry) AddPing(sn ServiceNode) {
 			e.paymentAddress = sn.PaymentAddress
 			e.pingTime = clampPingTime(sn.PingTime, r.now().Unix())
 			xlog.Debug("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
+			return true
 		}
 	}
+	return false
 }
 
 // clampPingTime mirrors ServiceNode::updatePing (servicenode.h:254-260): a 0 or

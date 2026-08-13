@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go-xbridge/p2p"
+	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
 )
 
@@ -289,5 +290,141 @@ func TestPeerManagerSeedSurvivesPrune(t *testing.T) {
 	pm.addrMan.MarkTried(seed)
 	if pm.addrMan.NeedsTry(seed, pm.dialCooldown) {
 		t.Fatal("just-tried seed must be cooled down even after 30+ min of ticks")
+	}
+}
+
+// TestPeerManagerIgnoresGetaddr asserts an inbound getaddr is never answered:
+// C++ ignores getaddr from outbound connections (net_processing.cpp:2665-2668)
+// and go-xbridge only makes outbound connections, so the request must draw no
+// response (the peer times out rather than reading an addr message).
+func TestPeerManagerIgnoresGetaddr(t *testing.T) {
+	magic := p2p.MainnetMagic
+	done := make(chan struct{})
+	pm := New(magic, "staging", Options{
+		TargetPeers:   1,
+		ExplicitAddrs: []string{"fake:1"},
+		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer close(done)
+				readMsg(tDummy{}, server) // our version
+				writeMsg(server, p2p.Message{Magic: m, Command: "version", Payload: peerVersionPayload(), Checksum: p2p.Checksum(peerVersionPayload())})
+				readMsg(tDummy{}, server) // our verack
+				writeMsg(server, p2p.Message{Magic: m, Command: "verack", Checksum: p2p.Checksum(nil)})
+				readMsg(tDummy{}, server) // manager's getaddr
+				writeMsg(server, p2p.Message{Magic: m, Command: p2p.CmdGetAddr, Checksum: p2p.Checksum(nil)})
+				_ = server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				if msg := readMsg(tDummy{}, server); msg != nil {
+					t.Errorf("getaddr was answered with %q, want no response", msg.Command)
+				}
+			}()
+			return p2p.NewConn(client, m)
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pm.Start(ctx)
+	defer pm.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for getaddr-ignore assertion")
+	}
+}
+
+// TestPeerManagerSNListEcho asserts an inbound SNLIST is answered with an
+// SNLISTPING per stored accepted ping, echoing the raw accepted payloads
+// (C++ net_processing.cpp:2992-3001).
+func TestPeerManagerSNListEcho(t *testing.T) {
+	magic := p2p.MainnetMagic
+	var key [33]byte
+	key[0], key[1] = 0x02, 0xaa
+	payload := []byte{0x21, 0x02, 0xaa, 0xff} // arbitrary accepted ping bytes
+	done := make(chan struct{})
+	pm := New(magic, "staging", Options{
+		TargetPeers:   1,
+		ExplicitAddrs: []string{"fake:1"},
+		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer close(done)
+				readMsg(tDummy{}, server)
+				writeMsg(server, p2p.Message{Magic: m, Command: "version", Payload: peerVersionPayload(), Checksum: p2p.Checksum(peerVersionPayload())})
+				readMsg(tDummy{}, server)
+				writeMsg(server, p2p.Message{Magic: m, Command: "verack", Checksum: p2p.Checksum(nil)})
+				readMsg(tDummy{}, server) // manager's getaddr
+				writeMsg(server, p2p.Message{Magic: m, Command: servicenode.CmdSNList, Checksum: p2p.Checksum(nil)})
+				msg := readMsg(tDummy{}, server)
+				if msg == nil || msg.Command != servicenode.CmdSNListPing {
+					t.Errorf("expected SNLISTPING response, got %+v", msg)
+					return
+				}
+				if !bytes.Equal(msg.Payload, payload) {
+					t.Errorf("SNLISTPING payload = %x, want %x", msg.Payload, payload)
+				}
+				_ = server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				if extra := readMsg(tDummy{}, server); extra != nil {
+					t.Errorf("unexpected extra response %q", extra.Command)
+				}
+			}()
+			return p2p.NewConn(client, m)
+		},
+	})
+	// Seed a stored accepted ping so the manager has something to echo.
+	pm.mu.Lock()
+	pm.rawPings[key] = payload
+	pm.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pm.Start(ctx)
+	defer pm.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for SNLIST echo assertion")
+	}
+}
+
+// TestPeerManagerAddrCapDropped asserts an addr payload declaring more than
+// 1000 records is dropped (not stored): a valid single-record addr is kept,
+// the oversized one is rejected (C++ Misbehaving, net_processing.cpp:1825-1830).
+func TestPeerManagerAddrCapDropped(t *testing.T) {
+	magic := p2p.MainnetMagic
+	pm := New(magic, "staging", Options{
+		TargetPeers:   1,
+		ExplicitAddrs: []string{"fake:1"},
+		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				readMsg(tDummy{}, server)
+				writeMsg(server, p2p.Message{Magic: m, Command: "version", Payload: peerVersionPayload(), Checksum: p2p.Checksum(peerVersionPayload())})
+				readMsg(tDummy{}, server)
+				writeMsg(server, p2p.Message{Magic: m, Command: "verack", Checksum: p2p.Checksum(nil)})
+				readMsg(tDummy{}, server) // manager's getaddr
+				entries := []p2p.AddrEntry{{Time: 1, Services: 1, IP: net.ParseIP("8.8.8.8"), Port: 41412}}
+				addrPayload := p2p.MarshalAddr(entries)
+				writeMsg(server, p2p.Message{Magic: m, Command: p2p.CmdAddr, Payload: addrPayload, Checksum: p2p.Checksum(addrPayload)})
+				// Declared 1001 records, no bytes follow; rejected by the cap.
+				oversized := writeVarIntLocal(1001)
+				writeMsg(server, p2p.Message{Magic: m, Command: p2p.CmdAddr, Payload: oversized, Checksum: p2p.Checksum(oversized)})
+			}()
+			return p2p.NewConn(client, m)
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pm.Start(ctx)
+	defer pm.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for pm.AddrCount() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pm.AddrCount() != 1 {
+		t.Fatalf("AddrCount = %d, want 1 (valid addr stored, oversized dropped)", pm.AddrCount())
+	}
+	time.Sleep(200 * time.Millisecond)
+	if pm.AddrCount() != 1 {
+		t.Fatalf("AddrCount grew to %d; oversized addr was not dropped", pm.AddrCount())
 	}
 }
