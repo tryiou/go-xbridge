@@ -658,7 +658,7 @@ func TestDepositNativeScale(t *testing.T) {
 	takerSession.hub = hub
 	makerSecret := makerSession.secret
 
-	const fee = 520  // (192*1 + 34*2) * 2 sat/vB
+	const fee = 588  // (192*1 + 34*3) * 2 sat/vB (CRYPTO-F78: minTxFee1(nIn,3))
 	const fee2 = 452 // (192*1 + 34*1) * 2 sat/vB
 
 	// Maker deposit A (BTC): locks native(fromXBridgeAmt(2.5e6)) + fee2.

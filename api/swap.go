@@ -1248,7 +1248,10 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	} else {
 		copy(change[:], a.Hash)
 	}
-	fee := estimateFee(cc, len(funding), 2)
+	// CRYPTO-F78: the deposit network fee uses minTxFee1(nIn, 3) — C++ computes
+	// fee1 over the deposit with three outputs (p2sh + change + dust safety),
+	// xbridgesession.cpp:1994 (maker) / :2526 (taker).
+	fee := estimateFee(cc, len(funding), 3)
 	// fee2 is the p2sh redeem margin C++ locks into the HTLC output on top of
 	// the order amount (minTxFee2(1,1), xbridgesession.cpp:2094/:2615); it is
 	// collected when the deposit is claimed or refunded.
