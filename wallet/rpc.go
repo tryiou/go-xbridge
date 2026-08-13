@@ -592,6 +592,7 @@ func (c *RPCConnector) CheckDepositTransaction(depositTxID, expectedScriptHex st
 		wholeAmount := float64(expectedAmount) / xbridgeCoinScale
 		if wholeAmount <= whole+doubleEpsilon {
 			depositP2SHAmount = whole
+			dc.P2SHNative = out.Value
 			depositTxVout = uint32(i)
 		}
 		break // done searching

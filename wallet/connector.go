@@ -104,6 +104,7 @@ type PrevTx struct {
 type DepositCheck struct {
 	IsGood      bool
 	P2SHAmount  uint64 // matched p2sh output value, XBridge 1e6 base (C++ p2shAmount = whole × COIN)
+	P2SHNative  uint64 // the SAME matched output's exact value in the coin's native base (BTC sat). Exact, so the claim spend cannot round-trip past the deposit.
 	DepositVout uint32 // matched p2sh output index (C++ depositTxVout)
 	Excess      uint64 // value over the expected amount+fee2, XBridge 1e6 base (C++ excessAmount = oOverpayment)
 }

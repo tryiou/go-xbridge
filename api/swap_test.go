@@ -317,6 +317,7 @@ func (f *fakeConnector) CheckDepositTransaction(depositTxID, expectedScriptHex s
 		}
 		if float64(expectedAmount)/coinScale <= whole+dblEps {
 			depositP2SHAmount = whole
+			dc.P2SHNative = out.Value
 			depositTxVout = uint32(i)
 		}
 		break // done searching
@@ -676,12 +677,13 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("deposit A change = %d, want %d", got, 5e8-nativeAmt-fee-fee2)
 	}
 
-	// Pre-signed refund pays the full native amount (fee2 is the miner fee) and
-	// spends the deposit via its LOCALLY-derived txid (CRYPTO-F86: the refund
-	// is built from the local txid before the broadcast).
+	// Pre-signed refund pays the FULL nominal native amount (CRYPTO-F90: the
+	// deposit's locked fee2 is the refund's implicit miner fee; C++ refund output
+	// = outAmount, xbridgesession.cpp:2149) and spends the deposit via its
+	// LOCALLY-derived txid (CRYPTO-F86).
 	refund := deserializeHex(t, createdA.RefTx)
-	if got := refund.Outputs[0].Value; got != nativeAmt-fee2 {
-		t.Fatalf("refund output = %d, want native %d - fee2 %d = %d", got, nativeAmt, fee2, nativeAmt-fee2)
+	if got := refund.Outputs[0].Value; got != nativeAmt {
+		t.Fatalf("refund output = %d, want native %d (full nominal; fee2 is the implicit fee)", got, nativeAmt)
 	}
 	if rev, err := reverseTxidHex(createdA.ADepositTxID); err != nil || refund.Inputs[0].PrevOut.Hash != rev {
 		t.Fatalf("refund prevout does not reference the deposit txid %s (err %v)", createdA.ADepositTxID, err)
@@ -702,14 +704,16 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("deposit B p2sh value = %d, want %d", got, nativeTaker+fee2)
 	}
 
-	// Maker redeems deposit B: output = native(toAmount) − fee2.
+	// Maker redeems deposit B (CRYPTO-F90): output = validated p2sh value − fee2
+	// = the full nominal native amount (the deposit's locked fee2 is the claim's
+	// miner fee; the excess, here 0, would be retained by the redeemer).
 	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: createdB.BDepositTxID, BLockTime: createdB.BLockTime})
 	if err != nil {
 		t.Fatalf("maker OnConfirmA: %v", err)
 	}
 	payA := deserializeBroadcast(t, tkLtc, bodyCA.(*proto.ConfirmedABody).APayTxID)
-	if got := payA.Outputs[0].Value; got != nativeTaker-fee2 {
-		t.Fatalf("maker redeem output = %d, want native %d - fee2 %d = %d", got, nativeTaker, fee2, nativeTaker-fee2)
+	if got := payA.Outputs[0].Value; got != nativeTaker {
+		t.Fatalf("maker redeem output = %d, want native %d (p2sh 200000452 − fee2 452)", got, nativeTaker)
 	}
 
 	// Taker redeems deposit A: output = native(fromAmount) − fee2.
@@ -718,8 +722,8 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("taker OnConfirmB: %v", err)
 	}
 	payB := deserializeBroadcast(t, mkBtc, bodyCB.(*proto.ConfirmedBBody).BPayTxID)
-	if got := payB.Outputs[0].Value; got != nativeAmt-fee2 {
-		t.Fatalf("taker redeem output = %d, want native %d - fee2 %d = %d", got, nativeAmt, fee2, nativeAmt-fee2)
+	if got := payB.Outputs[0].Value; got != nativeAmt {
+		t.Fatalf("taker redeem output = %d, want native %d (p2sh 250000452 − fee2 452)", got, nativeAmt)
 	}
 	_ = makerSecret
 }
@@ -783,6 +787,87 @@ func TestDepositSpendsUsedCoins(t *testing.T) {
 	}
 	if got := hashToDisplayHex(dep.Inputs[0].PrevOut.Hash[:]); got != u1.TxID {
 		t.Fatalf("deposit input spends %s, want the recorded %s", got, u1.TxID)
+	}
+}
+
+// TestRedeemCounterpartyPayout (CRYPTO-F90) proves the claim spends the
+// VALIDATED counterparty deposit — the exact p2sh output value at its recorded
+// vout — and the redeemer keeps the excess: a B-deposit locked with a 0.001 LTC
+// excess over nominal+fee2 is claimed for the full p2sh minus the redeem fee.
+func TestRedeemCounterpartyPayout(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+
+	var orderID [32]byte
+	rcpH := hash20("redeem-payout-order")
+	copy(orderID[:], rcpH[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	mkMPriv, mkMPub := newKey(t)
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	_, bodyA, err := makerSession.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+
+	// Build the taker's B deposit with a 0.001 LTC excess over nominal+fee2 and
+	// seed it as the maker's target, so the check records the excess.
+	ltcCoin, _ := coins.Get("LTC")
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("bb", 32))
+	excess := uint64(100000) // 0.001 LTC
+	fee2 := estimateFee(confs["LTC"], 1, 1)
+	nativeTaker := fromXBridgeAmt(ltcCoin, 2e6)
+	inner := coins.BuildDepositUnlockScript(tkPub[:], mkMPub[:], createdA.HashedSecret[:], createdA.ALockTime)
+	bigB := &coins.Tx{Version: 1}
+	bigB.Inputs = append(bigB.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: nativeTaker + fee2 + excess, ScriptPubKey: coins.BuildP2SHScript(coins.KeyID(inner))})
+	bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: 5e8 - nativeTaker - fee2 - excess, ScriptPubKey: []byte{0x51}})
+	bigBTxID := strings.Repeat("ee", 32)
+	tkLtc.setRawTx(bigBTxID, hex.EncodeToString(bigB.Serialize()))
+
+	// The maker claims the excess-laden B deposit.
+	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: bigBTxID, BLockTime: createdA.ALockTime})
+	if err != nil {
+		t.Fatalf("maker OnConfirmA: %v", err)
+	}
+	payA := deserializeBroadcast(t, tkLtc, bodyCA.(*proto.ConfirmedABody).APayTxID)
+	want := nativeTaker + fee2 + excess - fee2 // p2sh − redeem fee; excess retained
+	if got := payA.Outputs[0].Value; got != want {
+		t.Fatalf("claim output = %d, want p2sh(%d) − fee2(%d) = %d (excess retained)", got, nativeTaker+fee2+excess, fee2, want)
+	}
+	if got := payA.Inputs[0].PrevOut.Index; got != 0 {
+		t.Fatalf("claim spends vout %d, want the validated vout 0", got)
+	}
+	// The order records the validated deposit (XBridge base).
+	o := makerNode.store.Get(hexEncode(orderID[:]))
+	if o == nil || o.OBinTxVout != 0 || o.OBinTxP2SHAmount != toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess) {
+		t.Fatalf("order OBinTxVout/P2SHAmount = %d/%d, want 0/%d", o.OBinTxVout, o.OBinTxP2SHAmount, toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess))
 	}
 }
 

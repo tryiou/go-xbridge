@@ -49,6 +49,15 @@ type Order struct {
 	RefundTx       string   // refund txid, for dxCancelOrder ("" when no deposit)
 	BinTxId        string   // our HTLC deposit txid (dxPartialOrderChainDetails p2sh_deposits)
 	OBinTxId       string   // counterparty HTLC deposit txid (p2sh_deposits_counterparty)
+	// Validated counterparty deposit out-params (CRYPTO-F90): the C++
+	// checkDepositTransaction results recorded when we accepted the
+	// counterparty's deposit — oBinTxVout (counterPartyVoutN), oBinTxP2SHAmount,
+	// oOverpayment (xbridgesession.cpp:2511/2571, 2973/2981). P2SHAmount and
+	// Overpayment are XBridge 1e6 base; the claim spend and p2sh_deposits*
+	// fidelity use them instead of the nominal amount / vout 0.
+	OBinTxVout       uint32
+	OBinTxP2SHAmount uint64
+	OOverpayment     uint64
 	// PrepTx is the partial-order prep/split transaction id (display hex) built
 	// by an autoSplit make. C++ TransactionDescr::orderPrepTx; the order stays
 	// pending ("open") until the split confirms and the lifecycle broadcasts it.

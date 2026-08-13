@@ -238,11 +238,14 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	n.newTakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}, []wallet.Utxo{ltcConn.funding}), TakeOrderParams{FromAddress: tkAddr, ToAddress: btcDest}, arr32(tkPriv), to33(tkPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	// Seed the counterparty deposit knowledge ConfirmB needs (normally learned
-	// via CreateB); the secret itself is deliberately NOT set.
+	// via CreateB); the secret itself is deliberately NOT set. The validated
+	// deposit out-params (CRYPTO-F90) feed the claim: vout 0, 2.5 BTC.
 	s.theirSecretHash = secretHash
 	s.theirDepositTxID = strings.Repeat("cc", 32) // the maker's BTC deposit
 	s.theirLockTime = 1030
 	s.theirPub = to33(mkPub)
+	s.theirDepositVout = 0
+	s.theirP2SHNative = 2.5e8
 
 	n.submit(func() {
 		if _, _, err := s.OnConfirmB(&proto.ConfirmBBody{HubAddress: [20]byte{}, ID: orderID, APayTxID: makerPayTxID}); err != nil {

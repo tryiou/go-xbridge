@@ -21,34 +21,37 @@ import (
 // default JSON codec (base64) and round-trip losslessly, so no bespoke
 // serializer is needed.
 type persistedSwap struct {
-	ID             [32]byte          `json:"id"`
-	IsMaker        bool              `json:"isMaker"`
-	Type           OrderType         `json:"type"`
-	From           [20]byte          `json:"from"`
-	To             [20]byte          `json:"to"`
-	FromCurrency   string            `json:"fromCurrency"`
-	ToCurrency     string            `json:"toCurrency"`
-	FromAmount     uint64            `json:"fromAmount"`
-	ToAmount       uint64            `json:"toAmount"`
-	OrigFromAmount uint64            `json:"origFromAmount"`
-	OrigToAmount   uint64            `json:"origToAmount"`
-	MinFromAmount  uint64            `json:"minFromAmount"`
-	PartialAllowed bool              `json:"partialAllowed"`
-	PartialRepost  bool              `json:"partialRepost"`
-	ParentID       [32]byte          `json:"parentID"`
-	Created        uint64            `json:"created"`
-	Updated        uint64            `json:"updated"`
-	BlockHash      [32]byte          `json:"blockHash"`
-	MakerPubkey    string            `json:"makerPubkey"`
-	MakerAddress   string            `json:"makerAddress"`
-	TakerAddress   string            `json:"takerAddress"`
-	BlockID        string            `json:"blockID"`
-	RefundTx       string            `json:"refundTx"`
-	BinTxId        string            `json:"binTxId"`
-	OBinTxId       string            `json:"oBinTxId"`
-	Status         string            `json:"status"`
-	Utxos          []proto.UtxoEntry `json:"utxos"`
-	UtxoCurrency   string            `json:"utxoCurrency"`
+	ID               [32]byte          `json:"id"`
+	IsMaker          bool              `json:"isMaker"`
+	Type             OrderType         `json:"type"`
+	From             [20]byte          `json:"from"`
+	To               [20]byte          `json:"to"`
+	FromCurrency     string            `json:"fromCurrency"`
+	ToCurrency       string            `json:"toCurrency"`
+	FromAmount       uint64            `json:"fromAmount"`
+	ToAmount         uint64            `json:"toAmount"`
+	OrigFromAmount   uint64            `json:"origFromAmount"`
+	OrigToAmount     uint64            `json:"origToAmount"`
+	MinFromAmount    uint64            `json:"minFromAmount"`
+	PartialAllowed   bool              `json:"partialAllowed"`
+	PartialRepost    bool              `json:"partialRepost"`
+	ParentID         [32]byte          `json:"parentID"`
+	Created          uint64            `json:"created"`
+	Updated          uint64            `json:"updated"`
+	BlockHash        [32]byte          `json:"blockHash"`
+	MakerPubkey      string            `json:"makerPubkey"`
+	MakerAddress     string            `json:"makerAddress"`
+	TakerAddress     string            `json:"takerAddress"`
+	BlockID          string            `json:"blockID"`
+	RefundTx         string            `json:"refundTx"`
+	BinTxId          string            `json:"binTxId"`
+	OBinTxId         string            `json:"oBinTxId"`
+	OBinTxVout       uint32            `json:"oBinTxVout"`
+	OBinTxP2SHAmount uint64            `json:"oBinTxP2SHAmount"`
+	OOverpayment     uint64            `json:"oOverpayment"`
+	Status           string            `json:"status"`
+	Utxos            []proto.UtxoEntry `json:"utxos"`
+	UtxoCurrency     string            `json:"utxoCurrency"`
 
 	SNodePubkey          string   `json:"sNodePubkey"`
 	HubAddress           [20]byte `json:"hubAddress"`
@@ -221,33 +224,36 @@ func (n *Node) persist() {
 // record (live sessions, order-only records, and history entries alike).
 func orderFields(o *Order) persistedSwap {
 	return persistedSwap{
-		ID:             o.ID,
-		Type:           o.Type,
-		From:           o.From,
-		To:             o.To,
-		FromCurrency:   o.FromCurrency,
-		ToCurrency:     o.ToCurrency,
-		FromAmount:     o.FromAmount,
-		ToAmount:       o.ToAmount,
-		OrigFromAmount: o.OrigFromAmount,
-		OrigToAmount:   o.OrigToAmount,
-		MinFromAmount:  o.MinFromAmount,
-		PartialAllowed: o.PartialAllowed,
-		PartialRepost:  o.PartialRepost,
-		ParentID:       o.ParentID,
-		Created:        o.Created,
-		Updated:        o.Updated,
-		BlockHash:      o.BlockHash,
-		MakerPubkey:    o.MakerPubkey,
-		MakerAddress:   o.MakerAddress,
-		TakerAddress:   o.TakerAddress,
-		BlockID:        o.BlockID,
-		RefundTx:       o.RefundTx,
-		BinTxId:        o.BinTxId,
-		OBinTxId:       o.OBinTxId,
-		Status:         o.Status,
-		Utxos:          o.Utxos,
-		UtxoCurrency:   o.UtxoCurrency,
+		ID:               o.ID,
+		Type:             o.Type,
+		From:             o.From,
+		To:               o.To,
+		FromCurrency:     o.FromCurrency,
+		ToCurrency:       o.ToCurrency,
+		FromAmount:       o.FromAmount,
+		ToAmount:         o.ToAmount,
+		OrigFromAmount:   o.OrigFromAmount,
+		OrigToAmount:     o.OrigToAmount,
+		MinFromAmount:    o.MinFromAmount,
+		PartialAllowed:   o.PartialAllowed,
+		PartialRepost:    o.PartialRepost,
+		ParentID:         o.ParentID,
+		Created:          o.Created,
+		Updated:          o.Updated,
+		BlockHash:        o.BlockHash,
+		MakerPubkey:      o.MakerPubkey,
+		MakerAddress:     o.MakerAddress,
+		TakerAddress:     o.TakerAddress,
+		BlockID:          o.BlockID,
+		RefundTx:         o.RefundTx,
+		BinTxId:          o.BinTxId,
+		OBinTxId:         o.OBinTxId,
+		OBinTxVout:       o.OBinTxVout,
+		OBinTxP2SHAmount: o.OBinTxP2SHAmount,
+		OOverpayment:     o.OOverpayment,
+		Status:           o.Status,
+		Utxos:            o.Utxos,
+		UtxoCurrency:     o.UtxoCurrency,
 
 		SNodePubkey:          o.SNodePubkey,
 		HubAddress:           o.HubAddress,
@@ -383,34 +389,37 @@ func hasSessionData(ps persistedSwap) bool {
 // buildOrder reconstructs the durable Order from a persisted record.
 func buildOrder(ps persistedSwap) *Order {
 	return &Order{
-		ID:             ps.ID,
-		Type:           ps.Type,
-		From:           ps.From,
-		To:             ps.To,
-		FromCurrency:   ps.FromCurrency,
-		ToCurrency:     ps.ToCurrency,
-		FromAmount:     ps.FromAmount,
-		ToAmount:       ps.ToAmount,
-		OrigFromAmount: ps.OrigFromAmount,
-		OrigToAmount:   ps.OrigToAmount,
-		MinFromAmount:  ps.MinFromAmount,
-		PartialAllowed: ps.PartialAllowed,
-		PartialRepost:  ps.PartialRepost,
-		ParentID:       ps.ParentID,
-		Created:        ps.Created,
-		Updated:        ps.Updated,
-		BlockHash:      ps.BlockHash,
-		MakerPubkey:    ps.MakerPubkey,
-		MakerAddress:   ps.MakerAddress,
-		TakerAddress:   ps.TakerAddress,
-		BlockID:        ps.BlockID,
-		RefundTx:       ps.RefundTx,
-		BinTxId:        ps.BinTxId,
-		OBinTxId:       ps.OBinTxId,
-		Status:         ps.Status,
-		Utxos:          ps.Utxos,
-		UtxoCurrency:   ps.UtxoCurrency,
-		Mine:           true,
+		ID:               ps.ID,
+		Type:             ps.Type,
+		From:             ps.From,
+		To:               ps.To,
+		FromCurrency:     ps.FromCurrency,
+		ToCurrency:       ps.ToCurrency,
+		FromAmount:       ps.FromAmount,
+		ToAmount:         ps.ToAmount,
+		OrigFromAmount:   ps.OrigFromAmount,
+		OrigToAmount:     ps.OrigToAmount,
+		MinFromAmount:    ps.MinFromAmount,
+		PartialAllowed:   ps.PartialAllowed,
+		PartialRepost:    ps.PartialRepost,
+		ParentID:         ps.ParentID,
+		Created:          ps.Created,
+		Updated:          ps.Updated,
+		BlockHash:        ps.BlockHash,
+		MakerPubkey:      ps.MakerPubkey,
+		MakerAddress:     ps.MakerAddress,
+		TakerAddress:     ps.TakerAddress,
+		BlockID:          ps.BlockID,
+		RefundTx:         ps.RefundTx,
+		BinTxId:          ps.BinTxId,
+		OBinTxId:         ps.OBinTxId,
+		OBinTxVout:       ps.OBinTxVout,
+		OBinTxP2SHAmount: ps.OBinTxP2SHAmount,
+		OOverpayment:     ps.OOverpayment,
+		Status:           ps.Status,
+		Utxos:            ps.Utxos,
+		UtxoCurrency:     ps.UtxoCurrency,
+		Mine:             true,
 
 		SNodePubkey:          ps.SNodePubkey,
 		HubAddress:           ps.HubAddress,

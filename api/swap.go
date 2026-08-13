@@ -127,9 +127,10 @@ type SwapSession struct {
 	// Validated counterparty deposit (CRYPTO-F90): the C++
 	// checkDepositTransaction out-params recorded when we accept the
 	// counterparty's deposit (CreateB for the taker's A-check, ConfirmA for the
-	// maker's B-check). P2SHAmount and Overpayment are XBridge 1e6 base.
+	// maker's B-check). P2SHNative is the exact matched output value in the
+	// coin's native base (the claim spend); Overpayment is XBridge 1e6 base.
 	theirDepositVout uint32
-	theirP2SHAmount  uint64
+	theirP2SHNative  uint64
 	theirOverpayment uint64
 
 	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
@@ -153,10 +154,13 @@ type depositOutcome struct {
 }
 
 // confirmOutcome is the worker-produced result of a claim (ConfirmA/B). secret
-// is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA).
+// is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA). check
+// carries the validated counterparty deposit (ConfirmA's F85 check; zero for
+// ConfirmB, whose check ran at CreateB).
 type confirmOutcome struct {
 	secret  [33]byte
 	payTxID string
+	check   wallet.DepositCheck
 }
 
 // selfCancelErr marks a worker failure that must broadcast a Cancel packet with
@@ -255,6 +259,14 @@ func (c *swapCtx) checkCounterpartyDeposit(hash [20]byte, expectedAmount uint64)
 	return conn.CheckDepositTransaction(c.theirDepositTxID, c.counterpartyDepositScriptHex(hash), expectedAmount, c.minConf(c.conf(c.dstCur)))
 }
 
+// counterpartyCoin returns the coin of the counterparty's deposit currency
+// (dstCur). The order's OBinTxP2SHAmount record is XBridge base (C++
+// oBinTxP2SHAmount = whole × COIN), derived from the exact native value.
+func counterpartyCoin(s *SwapSession) coins.Coin {
+	c, _ := coins.Get(s.dstCur)
+	return c
+}
+
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
 // stage-1 enqueue time. The two-phase handshake workers run the wallet-I/O
 // builders against THIS value (plus the node's lock-guarded config via c.n) and
@@ -281,7 +293,7 @@ type swapCtx struct {
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
 	theirDepositVout uint32
-	theirP2SHAmount  uint64
+	theirP2SHNative  uint64
 	theirOverpayment uint64
 	ourDepositTxID   string
 	ourLockTime      uint32
@@ -316,7 +328,7 @@ func (s *SwapSession) snapshot() swapCtx {
 		theirLockTime:    s.theirLockTime,
 		theirSecretHash:  s.theirSecretHash,
 		theirDepositVout: s.theirDepositVout,
-		theirP2SHAmount:  s.theirP2SHAmount,
+		theirP2SHNative:  s.theirP2SHNative,
 		theirOverpayment: s.theirOverpayment,
 		ourDepositTxID:   s.ourDepositTxID,
 		ourLockTime:      s.ourLockTime,
@@ -597,7 +609,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 				return nil, &selfCancelErr{reason: crBadADepositTx}
 			}
 			c.theirDepositVout = dcheck.DepositVout
-			c.theirP2SHAmount = dcheck.P2SHAmount
+			c.theirP2SHNative = dcheck.P2SHNative
 			c.theirOverpayment = dcheck.Excess
 			out, err := c.buildDeposit(false)
 			if err != nil {
@@ -638,7 +650,7 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	s.ourLockTime = out.out.lockTime
 	s.refundHex = out.out.refundHex
 	s.theirDepositVout = out.check.DepositVout
-	s.theirP2SHAmount = out.check.P2SHAmount
+	s.theirP2SHNative = out.check.P2SHNative
 	s.theirOverpayment = out.check.Excess
 	s.n.store.Update(orderID, func(o *Order) {
 		o.BinTxId = out.out.txid
@@ -646,6 +658,11 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	})
 	s.n.store.Update(orderID, func(o *Order) {
 		o.RefundTx = out.out.refundHex
+	})
+	s.n.store.Update(orderID, func(o *Order) {
+		o.OBinTxVout = out.check.DepositVout
+		o.OBinTxP2SHAmount = toXBridgeAmt(counterpartyCoin(s), out.check.P2SHNative)
+		o.OOverpayment = out.check.Excess
 	})
 	s.state = csCreatedB
 	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
@@ -716,7 +733,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 				return nil, &selfCancelErr{reason: crBadBDepositTx}
 			}
 			c.theirDepositVout = dcheck.DepositVout
-			c.theirP2SHAmount = dcheck.P2SHAmount
+			c.theirP2SHNative = dcheck.P2SHNative
 			xlog.Info("ConfirmA: redeeming taker deposit", "order", orderID, "takerDeposit", b.BDepositTxID)
 			payHex, cur, err := c.redeemCounterparty(true)
 			if err != nil {
@@ -731,7 +748,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
 			}
-			return confirmOutcome{payTxID: payTxID}, nil
+			return confirmOutcome{payTxID: payTxID, check: dcheck}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedA(v, terr) },
 	}
@@ -762,11 +779,18 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 		return nil
 	}
 	out := v.(confirmOutcome)
+	s.theirDepositVout = out.check.DepositVout
+	s.theirP2SHNative = out.check.P2SHNative
+	s.theirOverpayment = out.check.Excess
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
-	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
+	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()); the
+	// validated deposit out-params feed the F90 order record.
 	s.n.store.Update(orderID, func(o *Order) {
 		o.CounterpartyRedeemed = true
+		o.OBinTxVout = out.check.DepositVout
+		o.OBinTxP2SHAmount = toXBridgeAmt(counterpartyCoin(s), out.check.P2SHNative)
+		o.OOverpayment = out.check.Excess
 	})
 	body := responseBody(&proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: out.payTxID,
@@ -1338,9 +1362,6 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		return "", err
 	}
 	fee := estimateFee(c.conf(cur), 1, 1)
-	if fee >= spec.Amount {
-		return "", fmt.Errorf("api: deposit amount too small for refund fee")
-	}
 	h, err := reverseTxidHex(c.ourDepositTxID)
 	if err != nil {
 		return "", err
@@ -1358,7 +1379,11 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
 	})
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount - fee, ScriptPubKey: dest})
+	// CRYPTO-F90: the refund pays the FULL nominal amount — C++ refund output is
+	// outAmount (xbridgesession.cpp:2149), spending the deposit's outAmount+fee2
+	// output, so fee2 is the refund's implicit miner fee. Was spec.Amount - fee
+	// (a second fee2 deduction).
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount, ScriptPubKey: dest})
 
 	inner := spec.RedeemScript()
 	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
@@ -1400,7 +1425,18 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		return "", "", err
 	}
 	fee := estimateFee(c.conf(depositCur), 1, 1)
-	if fee >= theirSpec.Amount {
+	// CRYPTO-F90: spend the VALIDATED counterparty deposit (C++ oBinTxVout /
+	// oBinTxP2SHAmount, recorded by the F85 check) instead of the hardcoded
+	// vout 0 / nominal amount. The claim pays the exact deposit value − fee2;
+	// the excess over the nominal dstAmt (+fee2) is what the redeemer keeps
+	// (C++ output = outAmount + oOverpayment = depositP2SH − fee2,
+	// xbridgesession.cpp:3971). P2SHNative is the exact native value, so the
+	// spend can never round-trip past the deposit.
+	p2shNative := c.theirP2SHNative
+	if p2shNative == 0 {
+		return "", "", fmt.Errorf("api: counterparty deposit not validated (no p2sh amount)")
+	}
+	if fee >= p2shNative {
 		return "", "", fmt.Errorf("api: counterparty deposit amount too small for claim fee")
 	}
 	h, err := reverseTxidHex(c.theirDepositTxID)
@@ -1416,12 +1452,13 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		tx.TxTime = uint32(time.Now().Unix())
 	}
 	xlog.Debug("redeemCounterparty: plan", "order", c.orderID, "isMaker", isMaker,
-		"depositCur", depositCur, "deposit", c.theirDepositTxID, "amount", theirSpec.Amount, "fee", fee, "txVersion", c.txVersion(depositCur))
+		"depositCur", depositCur, "deposit", c.theirDepositTxID, "vout", c.theirDepositVout,
+		"nominal", theirSpec.Amount, "p2sh", p2shNative, "fee", fee, "txVersion", c.txVersion(depositCur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
-		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
+		PrevOut:  coins.OutPoint{Hash: h, Index: c.theirDepositVout},
 		Sequence: 0xffffffff,
 	})
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: theirSpec.Amount - fee, ScriptPubKey: dest})
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: p2shNative - fee, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
 	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
