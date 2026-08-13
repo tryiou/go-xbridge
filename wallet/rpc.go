@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -412,6 +413,225 @@ func (c *RPCConnector) GetRawTransaction(txid string) (string, error) {
 		return "", c.wrapErr("getrawtransaction", err)
 	}
 	return hexStr, nil
+}
+
+// xbridgeCoinScale is the XBridge base-unit scale (COIN, 1e6) used for all
+// order amounts and for checkDepositTransaction's p2shAmount/excess out-params
+// (TransactionDescr::COIN; C++ xbridgewalletconnectorbtc.cpp:2191).
+const xbridgeCoinScale = 1_000_000
+
+// seqFinal is the input sequence a valid deposit must use
+// (C++ xbridge::SEQUENCE_FINAL, xbridgewalletconnectorbtc.cpp:2078).
+const seqFinal = 0xffffffff
+
+// doubleEpsilon is std::numeric_limits<double>::epsilon() — the C++ tolerance
+// in the deposit amount check (xbridgewalletconnectorbtc.cpp:2159).
+const doubleEpsilon = 2.220446049250313e-16
+
+// chainScale returns this coin's native base scale (10^Decimals): 1e8 for
+// BTC/BLOCK, 1e6 for DGB-style, etc. C++ uses the native COIN in minTxFee1 and
+// createDepositTransaction.
+func (c *RPCConnector) chainScale() float64 {
+	s := 1.0
+	for i := 0; i < c.chain.Decimals; i++ {
+		s *= 10
+	}
+	if s <= 0 {
+		return 1
+	}
+	return s
+}
+
+// minTxFeeWhole mirrors C++ BtcWalletConnector::minTxFee1/minTxFee2
+// (xbridgewalletconnectorbtc.cpp:1949-1972): (192*nIn + 34*nOut)*FeePerByte
+// floored at MinTxFee, in whole-coin units (÷ native COIN).
+func (c *RPCConnector) minTxFeeWhole(nIn, nOut int) float64 {
+	fee := uint64(192*nIn+34*nOut) * c.chain.FeePerByte
+	if fee < c.chain.MinTxFee {
+		fee = c.chain.MinTxFee
+	}
+	return float64(fee) / c.chainScale()
+}
+
+// rpcRawTxVerbose is the shape of a verbose getrawtransaction result. Coinbase
+// vins surface as null "txid"/"sequence"; deposit txs never are coinbases, and
+// the pointer types let us mirror C++'s null-vs-present handling exactly.
+type rpcRawTxVerbose struct {
+	Confirmations *int `json:"confirmations"`
+	Vin           []struct {
+		TxID     *string `json:"txid"`
+		Vout     *uint32 `json:"vout"`
+		Sequence *uint64 `json:"sequence"`
+	} `json:"vin"`
+	Vout []struct {
+		Value        float64 `json:"value"`
+		N            uint32  `json:"n"`
+		ScriptPubKey struct {
+			Hex string `json:"hex"`
+		} `json:"scriptPubKey"`
+	} `json:"vout"`
+}
+
+// getRawTransactionVerbose calls getrawtransaction with verbosity 1 (the JSON
+// form C++ uses for prevout lookups, xbridgewalletconnectorbtc.cpp:2094).
+func (c *RPCConnector) getRawTransactionVerbose(txid string) (*rpcRawTxVerbose, error) {
+	var out rpcRawTxVerbose
+	if err := c.cli.Call("getrawtransaction", []interface{}{txid, 1}, &out); err != nil {
+		return nil, c.wrapErr("getrawtransaction", err)
+	}
+	return &out, nil
+}
+
+// getTxOutConfirmations fetches a tx output's confirmations via gettxout
+// (C++ checkDepositTransaction confirmation gate, :2025-2034). ok=false when the
+// output is unknown or carries no confirmation count (both are "wait").
+func (c *RPCConnector) getTxOutConfirmations(txid string, vout uint32) (confs int, ok bool) {
+	var out struct {
+		Confirmations *int `json:"confirmations"`
+	}
+	if err := c.cli.Call("gettxout", []interface{}{txid, vout}, &out); err != nil {
+		return 0, false
+	}
+	if out.Confirmations == nil {
+		return 0, false
+	}
+	return *out.Confirmations, true
+}
+
+// CheckDepositTransaction validates a counterparty deposit against the expected
+// p2sh script and amount. It is a 1:1 port of
+// BtcWalletConnector::checkDepositTransaction (xbridgewalletconnectorbtc.cpp:
+// 1981-2194); see the Connector contract for the tri-state semantics. The raw
+// tx is fetched with getrawtransaction (verbosity 0) and decoded locally —
+// exactly C++'s getrawtransaction + decoderawtransaction pair — so no wallet
+// verbosity support is required. expectedAmount is XBridge 1e6 base; the whole-
+// coin arithmetic inside mirrors the C++ writers (values / sequence / fee band).
+func (c *RPCConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (DepositCheck, error) {
+	dc := DepositCheck{}
+
+	rawHex, err := c.GetRawTransaction(depositTxID)
+	if err != nil {
+		xlog.Debug("checkDepositTransaction: no tx found ...waiting", "txid", depositTxID, "err", err)
+		return dc, fmt.Errorf("%w: %v", ErrDepositNotReady, err)
+	}
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		xlog.Debug("checkDepositTransaction: bad hex, decode transaction failed", "txid", depositTxID, "err", err)
+		return dc, nil // done: bad
+	}
+	tx, err := coins.DeserializeWithTime(raw, c.chain.TxWithTimeField)
+	if err != nil {
+		xlog.Debug("checkDepositTransaction: bad counterparty deposit, decode transaction failed", "txid", depositTxID, "err", err)
+		return dc, nil // done: bad
+	}
+
+	// Confirmation gate (C++ :2018-2045). The locally-decoded tx carries no
+	// "confirmations" field, so C++ falls through to gettxout; mirror that.
+	if requiredConfirmations > 0 {
+		confs, ok := c.getTxOutConfirmations(depositTxID, 0)
+		if !ok {
+			xlog.Debug("checkDepositTransaction: confirmations data not found in gettxout, may be stuck", "txid", depositTxID)
+			return dc, fmt.Errorf("%w: gettxout confirmations unknown", ErrDepositNotReady)
+		}
+		if confs < requiredConfirmations {
+			xlog.Debug("checkDepositTransaction: ...waiting", "txid", depositTxID, "confs", confs, "required", requiredConfirmations)
+			return dc, fmt.Errorf("%w: confirmations %d of %d", ErrDepositNotReady, confs, requiredConfirmations)
+		}
+	}
+
+	// Vin scan: sequence + prevout amounts (C++ :2049-2127).
+	if len(tx.Inputs) == 0 {
+		xlog.Debug("checkDepositTransaction: no vins", "txid", depositTxID)
+		return dc, nil // done: bad
+	}
+	if len(tx.Outputs) == 0 {
+		xlog.Debug("checkDepositTransaction: no vouts", "txid", depositTxID)
+		return dc, nil // done: bad
+	}
+	var totalVinAmount float64
+	for i := range tx.Inputs {
+		vin := &tx.Inputs[i]
+		if vin.Sequence != seqFinal {
+			xlog.Debug("checkDepositTransaction: bad sequence for input, expected SEQUENCE_FINAL", "txid", depositTxID, "sequence", vin.Sequence)
+			return dc, nil // done: bad
+		}
+		vinTxID := hex.EncodeToString(reverse32(vin.PrevOut.Hash[:]))
+		vinTx, err := c.getRawTransactionVerbose(vinTxID)
+		if err != nil {
+			xlog.Debug("checkDepositTransaction: vin tx not found ...waiting", "txid", depositTxID, "vin", vinTxID, "err", err)
+			return dc, fmt.Errorf("%w: vin tx %s: %v", ErrDepositNotReady, vinTxID, err)
+		}
+		vinAmount, found := 0.0, false
+		for _, vout := range vinTx.Vout {
+			if vout.N == vin.PrevOut.Index {
+				vinAmount, found = vout.Value, true
+				break
+			}
+		}
+		if !found {
+			xlog.Debug("checkDepositTransaction: bad prevout", "txid", depositTxID, "vin", vinTxID, "vout", vin.PrevOut.Index)
+			return dc, nil // done: bad
+		}
+		totalVinAmount += vinAmount
+	}
+
+	// Vout scan for the expected p2sh (C++ :2129-2170). totalVoutAmount accrues
+	// for every vout; the p2sh search breaks on the FIRST script match exactly
+	// like C++ (a later larger match is ignored).
+	var totalVoutAmount, depositP2SHAmount float64
+	var depositTxVout uint32
+	for i := range tx.Outputs {
+		out := &tx.Outputs[i]
+		whole := float64(out.Value) / c.chainScale()
+		totalVoutAmount += whole
+		scriptHex := hex.EncodeToString(out.ScriptPubKey)
+		if scriptHex != expectedScriptHex {
+			continue
+		}
+		// C++ :2159 — amount <= value + std::numeric_limits<double>::epsilon().
+		wholeAmount := float64(expectedAmount) / xbridgeCoinScale
+		if wholeAmount <= whole+doubleEpsilon {
+			depositP2SHAmount = whole
+			dc.P2SHNative = out.Value
+			depositTxVout = uint32(i)
+		}
+		break // done searching
+	}
+	if depositP2SHAmount == 0 {
+		xlog.Debug("checkDepositTransaction: no valid p2sh in deposit transaction", "txid", depositTxID)
+		return dc, nil // done: bad
+	}
+
+	// Fee checks (C++ :2172-2193).
+	counterpartyFees := totalVinAmount - totalVoutAmount
+	fee1 := c.minTxFeeWhole(len(tx.Inputs), len(tx.Outputs))
+	fee2 := c.minTxFeeWhole(1, 1)
+	wholeAmount := float64(expectedAmount) / xbridgeCoinScale
+	if counterpartyFees < 0 || counterpartyFees < fee1*0.95 {
+		xlog.Debug("checkDepositTransaction: not enough inputs to cover p2sh deposit fees", "txid", depositTxID, "min", fee1*0.95, "fees", counterpartyFees)
+		return dc, nil // done: bad
+	}
+	if depositP2SHAmount < wholeAmount+fee2*0.95 {
+		xlog.Debug("checkDepositTransaction: not enough inputs to cover p2sh redeem fees", "txid", depositTxID, "min", fee2*0.95, "amount", depositP2SHAmount)
+		return dc, nil // done: bad
+	}
+	if depositP2SHAmount > wholeAmount+fee2 {
+		dc.Excess = uint64(math.Round((depositP2SHAmount - wholeAmount - fee2) * xbridgeCoinScale))
+	}
+	dc.P2SHAmount = uint64(math.Round(depositP2SHAmount * xbridgeCoinScale))
+	dc.DepositVout = depositTxVout
+	dc.IsGood = true
+	return dc, nil
+}
+
+// reverse32 returns the 32-byte input reversed (display-order txid hex of an
+// internal little-endian hash).
+func reverse32(b []byte) []byte {
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return out
 }
 
 // SignMessage produces a BIP137 ownership proof. Bitcoin Core's signmessage

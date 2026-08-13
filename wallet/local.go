@@ -118,6 +118,14 @@ func (l *LocalConnector) GetRawTransaction(txid string) (string, error) {
 	return "", errors.New("wallet: LocalConnector has no block source")
 }
 
+// CheckDepositTransaction has no local blockchain source: a local-only
+// connector cannot fetch the counterparty's deposit tx or prevouts to validate
+// it. The api layer treats ErrNoChainSource as fatal (deposits cannot be
+// trusted), never as a "wait".
+func (l *LocalConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (DepositCheck, error) {
+	return DepositCheck{}, ErrNoChainSource
+}
+
 // SignMessage is unsupported for LocalConnector: BIP137 signing over locally
 // held keys (the Blockchain Message magic-prefixed double-SHA256) is a
 // follow-up. The RPCConnector path covers live wallets.

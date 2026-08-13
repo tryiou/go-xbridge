@@ -117,7 +117,7 @@ func TestTwoPhaseCreateAWorkerPool(t *testing.T) {
 	oid := hash20("order-id")
 	copy(orderID[:], oid[:])
 	mkAddr := addrFor(0, "maker-btc-dest")
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{btcConn.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 
 	// Stage 1 on the engine; the worker builds+broadcasts the deposit async.
@@ -235,14 +235,17 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	// dstCur = the maker's coin (BTC, whose deposit it claims).
 	tkAddr := addrFor(48, "taker-ltc-source")
 	btcDest := addrFor(0, "maker-btc-dest")
-	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}, TakeOrderParams{FromAddress: tkAddr, ToAddress: btcDest}, arr32(tkPriv), to33(tkPub))
+	n.newTakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}, []wallet.Utxo{ltcConn.funding}), TakeOrderParams{FromAddress: tkAddr, ToAddress: btcDest}, arr32(tkPriv), to33(tkPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	// Seed the counterparty deposit knowledge ConfirmB needs (normally learned
-	// via CreateB); the secret itself is deliberately NOT set.
+	// via CreateB); the secret itself is deliberately NOT set. The validated
+	// deposit out-params (CRYPTO-F90) feed the claim: vout 0, 2.5 BTC.
 	s.theirSecretHash = secretHash
 	s.theirDepositTxID = strings.Repeat("cc", 32) // the maker's BTC deposit
 	s.theirLockTime = 1030
 	s.theirPub = to33(mkPub)
+	s.theirDepositVout = 0
+	s.theirP2SHNative = 2.5e8
 
 	n.submit(func() {
 		if _, _, err := s.OnConfirmB(&proto.ConfirmBBody{HubAddress: [20]byte{}, ID: orderID, APayTxID: makerPayTxID}); err != nil {
@@ -325,10 +328,10 @@ func TestCreateAStateGuardDropsPostCompletionRetransmitE2E(t *testing.T) {
 	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
 	mkAddr := addrFor(0, "maker-btc-dest")
 	o := &Order{
-		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
-	n.newMakerSession(o, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, o, []wallet.Utxo{btcConn.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 
 	dispatch := func() {
@@ -473,10 +476,10 @@ func TestTwoPhaseAwaitDropsRetransmit(t *testing.T) {
 	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
 	mkAddr := addrFor(0, "maker-btc-dest")
 	o := &Order{
-		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
-	n.newMakerSession(o, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, o, []wallet.Utxo{btcConn.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 
 	// The live hub packet: CreateA signed by the pinned hub.

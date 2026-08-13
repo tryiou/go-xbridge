@@ -58,7 +58,7 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 	mPriv, mPub := newKey(t)
 	var aID [32]byte
 	copy(aID[:], []byte("concurrent-refund-a-order-000"))
-	n.newMakerSession(&Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8},
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{gated.funding}),
 		MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
 	n.submit(func() {
 		if _, _, err := n.sessions[hexEncode(aID[:])].OnCreateA(&proto.CreateABody{ID: aID, BPubKey: to33(mPub)}); err != nil {
@@ -208,7 +208,7 @@ func TestEngineLivenessSlowWallet(t *testing.T) {
 	mPriv, mPub := newKey(t)
 	var aID [32]byte
 	copy(aID[:], []byte("liveness-a-order-00000000000000"))
-	n.newMakerSession(&Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8},
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{gated.funding}),
 		MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
 	n.submit(func() {
 		if _, _, err := n.sessions[hexEncode(aID[:])].OnCreateA(&proto.CreateABody{ID: aID, BPubKey: to33(mPub)}); err != nil {
@@ -226,7 +226,7 @@ func TestEngineLivenessSlowWallet(t *testing.T) {
 	_, bPub := newKey(t)
 	var bID [32]byte
 	copy(bID[:], []byte("liveness-b-order-00000000000000"))
-	n.newMakerSession(&Order{ID: bID, FromCurrency: "LTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 1e8},
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: bID, FromCurrency: "LTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{ltc.funding}),
 		MakeOrderParams{MakerAddress: addrFor(48, "maker-b"), TakerAddress: addrFor(48, "taker-b")}, arr32(mPriv), toArr33(bPub))
 	n.submit(func() {
 		if _, _, err := n.sessions[hexEncode(bID[:])].OnCreateA(&proto.CreateABody{ID: bID, BPubKey: to33(bPub)}); err != nil {
@@ -262,7 +262,7 @@ func TestCloseDrainsInFlightTask(t *testing.T) {
 	mPriv, mPub := newKey(t)
 	var aID [32]byte
 	copy(aID[:], []byte("shutdown-a-order-0000000000000000"))
-	n.newMakerSession(&Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8},
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{gated.funding}),
 		MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
 	n.submit(func() {
 		if _, _, err := n.sessions[hexEncode(aID[:])].OnCreateA(&proto.CreateABody{ID: aID, BPubKey: to33(mPub)}); err != nil {
@@ -351,7 +351,7 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 	var oid [32]byte
 	copy(oid[:], []byte("concurrent-take-order-0000000000"))
 	o := &Order{
-		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
 	n.store.Add(o)
@@ -472,7 +472,7 @@ func TestConcurrentTakeOrderDistinctOrdersExclusiveReservation(t *testing.T) {
 		copy(oid[:], []byte(fmt.Sprintf("exclusive-order-%02d-0000000000", i)))
 		oids[i] = oid
 		o := &Order{
-			ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+			ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 			Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 		}
 		n.store.Add(o)
@@ -572,7 +572,7 @@ func TestConcurrentCancelOrderSingleSession(t *testing.T) {
 	var oid [32]byte
 	copy(oid[:], []byte("concurrent-cancel-order-00000000"))
 	o := &Order{
-		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		Status: "open",
 	}
 	n.store.Add(o)
@@ -678,10 +678,10 @@ func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
 	var aID [32]byte
 	copy(aID[:], []byte("liveness-dispatch-a-order-00000"))
 	aOrder := &Order{
-		ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: aID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
-	n.newMakerSession(aOrder, MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, aOrder, []wallet.Utxo{gated.funding}), MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
 	n.submit(func() {
 		if _, _, err := n.sessions[hexEncode(aID[:])].OnCreateA(&proto.CreateABody{ID: aID, BPubKey: to33(mPub)}); err != nil {
 			t.Errorf("A OnCreateA: %v", err)
@@ -701,10 +701,10 @@ func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
 	var bID [32]byte
 	copy(bID[:], []byte("liveness-dispatch-b-order-00000"))
 	bOrder := &Order{
-		ID: bID, FromCurrency: "LTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: bID, FromCurrency: "LTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
-	n.newMakerSession(bOrder, MakeOrderParams{MakerAddress: addrFor(48, "maker-b"), TakerAddress: addrFor(48, "taker-b")}, arr32(mPriv), toArr33(bPub))
+	n.newMakerSession(withUsedCoins(t, n, bOrder, []wallet.Utxo{ltc.funding}), MakeOrderParams{MakerAddress: addrFor(48, "maker-b"), TakerAddress: addrFor(48, "taker-b")}, arr32(mPriv), toArr33(bPub))
 	createA := hubSignedPkt(t, hubPriv, proto.XbcTransactionCreateA, &proto.CreateABody{
 		HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub),
 	})

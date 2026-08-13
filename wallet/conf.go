@@ -31,6 +31,9 @@ func NewConnectorFromConf(c *config.CoinConf) (Connector, error) {
 		ContentType:     c.ContentType,
 		OmitJSONVersion: c.OmitJSONVersion,
 		Confirmations:   c.Confirmations,
+		FeePerByte:      c.FeePerByte,
+		MinTxFee:        c.MinTxFee,
+		TxWithTimeField: c.TxWithTimeField,
 	}
 	return NewRPCConnector(chain), nil
 }

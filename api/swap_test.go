@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"strings"
 	"sync"
@@ -21,6 +22,24 @@ import (
 
 // b58alphabet is the Bitcoin base58 alphabet used by base58check.
 const b58alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+// CheckDepositTransaction test-twin constants (wallet package versions are
+// unexported): seqFinal is the deposit-input sequence requirement (C++
+// xbridge::SEQUENCE_FINAL) and dblEps is std::numeric_limits<double>::epsilon().
+const (
+	seqFinal = 0xffffffff
+	dblEps   = 2.220446049250313e-16
+)
+
+// hashToDisplayHex converts a 32-byte internal (little-endian) hash into its
+// display-order txid hex.
+func hashToDisplayHex(b []byte) string {
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return hex.EncodeToString(out)
+}
 
 func base58Encode(b []byte) string {
 	zeros := 0
@@ -82,6 +101,14 @@ type fakeConnector struct {
 	// funding utxo (the B2 funding path locks take #1's selection, so a
 	// single-utxo fixture starves later takes).
 	funders []wallet.Utxo
+
+	// CheckDepositTransaction knobs: confirmations maps a broadcast txid to its
+	// confirmations (a known tx without an entry fails the required-confirmations
+	// gate → ErrDepositNotReady); feePerByte/minTxFee drive the C++ fee-band
+	// checks (default 0 → no fee rejection).
+	confirmations map[string]int
+	feePerByte    uint64
+	minTxFee      uint64
 
 	mu         sync.Mutex
 	broadcasts []string
@@ -184,6 +211,141 @@ func (f *fakeConnector) GetRawTransaction(txid string) (string, error) {
 	return h, nil
 }
 
+// chainScale returns the coin's native base scale (10^Decimals), falling back
+// to 1e8 when the coin registry is not initialized (fixtures that never call
+// coins.InitFromConf).
+func (f *fakeConnector) chainScale() float64 {
+	dec := 8
+	if c, ok := coins.Get(f.ticker); ok && c.Decimals > 0 {
+		dec = c.Decimals
+	}
+	s := 1.0
+	for i := 0; i < dec; i++ {
+		s *= 10
+	}
+	return s
+}
+
+// minTxFeeWhole mirrors C++ minTxFee1/minTxFee2 in whole coins (the fake's
+// in-memory twin of RPCConnector.minTxFeeWhole).
+func (f *fakeConnector) minTxFeeWhole(nIn, nOut int) float64 {
+	fee := uint64(192*nIn+34*nOut) * f.feePerByte
+	if fee < f.minTxFee {
+		fee = f.minTxFee
+	}
+	return float64(fee) / f.chainScale()
+}
+
+// CheckDepositTransaction is the in-memory twin of RPCConnector.
+// CheckDepositTransaction: it validates a counterparty deposit against its own
+// broadcast log (plus the known funding UTXOs as prevout sources), so the F85
+// wiring tests can drive the full C++ tri-state (ready / bad / wait) without a
+// wallet.
+func (f *fakeConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (wallet.DepositCheck, error) {
+	dc := wallet.DepositCheck{}
+
+	f.mu.Lock()
+	rawHex, ok := f.rawTx[depositTxID]
+	confsOK := true
+	if ok && requiredConfirmations > 0 {
+		c, okc := f.confirmations[depositTxID]
+		confsOK = okc && c >= requiredConfirmations
+	}
+	known := make(map[string]wallet.Utxo, len(f.funders)+1)
+	if len(f.funders) > 0 {
+		for _, u := range f.funders {
+			known[u.TxID] = u
+		}
+	} else {
+		known[f.funding.TxID] = f.funding
+	}
+	rawLog := make(map[string]string, len(f.rawTx))
+	for k, v := range f.rawTx {
+		rawLog[k] = v
+	}
+	f.mu.Unlock()
+
+	if !ok || !confsOK {
+		return dc, wallet.ErrDepositNotReady
+	}
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return dc, nil // done: bad
+	}
+	tx, err := coins.Deserialize(raw)
+	if err != nil {
+		return dc, nil // done: bad
+	}
+	if len(tx.Inputs) == 0 || len(tx.Outputs) == 0 {
+		return dc, nil // done: bad
+	}
+
+	scale := f.chainScale()
+	// Vin scan: sequence + prevout amounts.
+	var totalVinAmount float64
+	for i := range tx.Inputs {
+		vin := &tx.Inputs[i]
+		if vin.Sequence != seqFinal {
+			return dc, nil // bad sequence
+		}
+		vinTxID := hashToDisplayHex(vin.PrevOut.Hash[:])
+		vinAmount, found := 0.0, false
+		if rawHex2, ok := rawLog[vinTxID]; ok {
+			if b, err := hex.DecodeString(rawHex2); err == nil {
+				if vtx, err := coins.Deserialize(b); err == nil && int(vin.PrevOut.Index) < len(vtx.Outputs) {
+					vinAmount, found = float64(vtx.Outputs[vin.PrevOut.Index].Value)/scale, true
+				}
+			}
+		} else if u, ok := known[vinTxID]; ok && u.Vout == vin.PrevOut.Index {
+			vinAmount, found = float64(u.Amount)/scale, true
+		}
+		if !found {
+			return dc, wallet.ErrDepositNotReady // vin tx not found ...waiting
+		}
+		totalVinAmount += vinAmount
+	}
+
+	// Vout scan for the expected p2sh.
+	var totalVoutAmount, depositP2SHAmount float64
+	var depositTxVout uint32
+	for i := range tx.Outputs {
+		out := &tx.Outputs[i]
+		whole := float64(out.Value) / scale
+		totalVoutAmount += whole
+		if hex.EncodeToString(out.ScriptPubKey) != expectedScriptHex {
+			continue
+		}
+		if float64(expectedAmount)/coinScale <= whole+dblEps {
+			depositP2SHAmount = whole
+			dc.P2SHNative = out.Value
+			depositTxVout = uint32(i)
+		}
+		break // done searching
+	}
+	if depositP2SHAmount == 0 {
+		return dc, nil // no valid p2sh
+	}
+
+	// Fee checks.
+	counterpartyFees := totalVinAmount - totalVoutAmount
+	fee1 := f.minTxFeeWhole(len(tx.Inputs), len(tx.Outputs))
+	fee2 := f.minTxFeeWhole(1, 1)
+	if counterpartyFees < 0 || counterpartyFees < fee1*0.95 {
+		return dc, nil // not enough to cover deposit fees
+	}
+	wholeAmount := float64(expectedAmount) / coinScale
+	if depositP2SHAmount < wholeAmount+fee2*0.95 {
+		return dc, nil // not enough to cover redeem fees
+	}
+	if depositP2SHAmount > wholeAmount+fee2 {
+		dc.Excess = uint64((depositP2SHAmount - wholeAmount - fee2) * coinScale)
+	}
+	dc.P2SHAmount = uint64(depositP2SHAmount * coinScale)
+	dc.DepositVout = depositTxVout
+	dc.IsGood = true
+	return dc, nil
+}
+
 func (f *fakeConnector) SignMessage(address, message string) ([]byte, error) {
 	// 65-byte placeholder compact signature for proof-attachment tests.
 	return []byte{
@@ -234,6 +396,17 @@ func toArr33(b []byte) [33]byte {
 	var a [33]byte
 	copy(a[:], b)
 	return a
+}
+
+// withUsedCoins stores o in n.store with its funding set recorded, mirroring
+// production MakeOrder/TakeOrder which populate Order.UsedCoins (CRYPTO-F87):
+// the deposit path consumes o.UsedCoins, never a fresh ListUnspent. Tests create
+// sessions directly, so they must seed the record.
+func withUsedCoins(t *testing.T, n *Node, o *Order, funding []wallet.Utxo) *Order {
+	t.Helper()
+	o.UsedCoins = funding
+	n.store.Add(o)
+	return o
 }
 
 // arr32 converts a 32-byte privkey slice to a fixed array.
@@ -306,11 +479,11 @@ func TestSwapHandshake(t *testing.T) {
 	mkAddr := addrFor(0, "maker-btc-dest")     // maker deposits BTC, receives LTC
 	ltcAddr := addrFor(48, "taker-ltc-source") // taker deposits LTC, receives BTC
 
-	makerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}
-	takerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}
+	makerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	takerOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
 
-	makerNode.newMakerSession(makerOrder, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
-	takerNode.newTakerSession(takerOrder, TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), toArr33(tkMPub))
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, makerOrder, []wallet.Utxo{btcFunding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, takerOrder, []wallet.Utxo{ltcFunding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), toArr33(tkMPub))
 
 	var hub [20]byte
 	hb := hash20("hub")
@@ -322,20 +495,31 @@ func TestSwapHandshake(t *testing.T) {
 	takerSession.hub = hub
 	makerSecret := makerSession.secret
 
-	// 1) Hold (hub→both) → HoldApply.
-	if _, _, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 1e8, ToAmount: 2e8}); err != nil {
+	// 1) Hold (hub→both) → HoldApply. The body carries the TAKER's give
+	// (FromAmount=order.to=2e6) and take (ToAmount=order.from=2.5e6); both
+	// parties' verifyHold accepts it (STATE-F71).
+	if _, _, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
 		t.Fatalf("maker OnHold: %v", err)
 	}
-	if _, _, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 1e8, ToAmount: 2e8}); err != nil {
+	if _, _, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
 		t.Fatalf("taker OnHold: %v", err)
 	}
 
-	// 2) Init (hub→each) → Initialized. ClientAddress is the destination address.
-	mkInit := &proto.InitBody{ClientAddress: ltcHash, HubAddress: hub, ID: orderID}
+	// 2) Init (hub→each) → Initialized. ClientAddress is the destination address;
+	// the full order details must match the session (STATE-F71 intended-OR).
+	mkInit := &proto.InitBody{
+		ClientAddress: ltcHash, HubAddress: hub, ID: orderID,
+		FromAddress: hash20("maker-btc-dest"), FromCurrency: "BTC", FromAmount: 2.5e6,
+		ToAddress: hash20("taker-ltc-source"), ToCurrency: "LTC", ToAmount: 2e6,
+	}
 	if _, _, err := makerSession.OnInit(mkInit); err != nil {
 		t.Fatalf("maker OnInit: %v", err)
 	}
-	tkInit := &proto.InitBody{ClientAddress: btcHash, HubAddress: hub, ID: orderID}
+	tkInit := &proto.InitBody{
+		ClientAddress: btcHash, HubAddress: hub, ID: orderID,
+		FromAddress: hash20("taker-ltc-source"), FromCurrency: "LTC", FromAmount: 2e6,
+		ToAddress: hash20("maker-btc-dest"), ToCurrency: "BTC", ToAmount: 2.5e6,
+	}
 	if _, _, err := takerSession.OnInit(tkInit); err != nil {
 		t.Fatalf("taker OnInit: %v", err)
 	}
@@ -432,6 +616,589 @@ func TestSwapHandshake(t *testing.T) {
 	}
 	if makerSession.state != csFinished || takerSession.state != csFinished {
 		t.Error("sessions did not reach csFinished")
+	}
+}
+
+// TestDepositNativeScale (W0) pins the deposit-path unit-scale fix: on-chain
+// output values must be in the coin's NATIVE base (10^Decimals), never the
+// XBridge 1e6 base of the order amounts. C++ locks outAmount+fee2 whole coins
+// and createDepositTransaction emits out.second*COIN(native)
+// (xbridgewalletconnectorbtc.cpp:2094, 2442-2450); for BTC (1e8) the pre-fix Go
+// deposit locked 100x too little. The order is 2.5e6→2e6 XBridge units (2.5 BTC
+// / 2 LTC), funded by 5e8-sat UTXOs; fees default to 2 sat/vB
+// (192/34 vsize: fee=(192*1+34*2)*2=520, fee2=(192+34)*2=452).
+func TestDepositNativeScale(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	btcCoin, _ := coins.Get("BTC")
+	ltcCoin, _ := coins.Get("LTC")
+
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+
+	mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+
+	var orderID [32]byte
+	nsHash := hash20("native-scale-order")
+	copy(orderID[:], nsHash[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	mkMPriv, mkMPub := newKey(t)
+	tkMPriv := tkPriv
+	tkMPub := tkPub
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkMPriv), to33(tkMPub))
+	var hub [20]byte
+	hubHash := hash20("hub")
+	copy(hub[:], hubHash[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+	makerSecret := makerSession.secret
+
+	const fee = 588  // (192*1 + 34*3) * 2 sat/vB (CRYPTO-F78: minTxFee1(nIn,3))
+	const fee2 = 452 // (192*1 + 34*1) * 2 sat/vB
+
+	// Maker deposit A (BTC): locks native(fromXBridgeAmt(2.5e6)) + fee2.
+	_, bodyA, err := makerSession.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+	depA := deserializeBroadcast(t, mkBtc, createdA.ADepositTxID)
+	nativeAmt := fromXBridgeAmt(btcCoin, 2.5e6)
+	if got := depA.Outputs[0].Value; got != nativeAmt+fee2 {
+		t.Fatalf("deposit A p2sh value = %d, want native %d + fee2 %d = %d (pre-fix: 100x under-lock)", got, nativeAmt, fee2, nativeAmt+fee2)
+	}
+	if got := depA.Outputs[1].Value; got != 5e8-nativeAmt-fee-fee2 {
+		t.Fatalf("deposit A change = %d, want %d", got, 5e8-nativeAmt-fee-fee2)
+	}
+
+	// Pre-signed refund pays the FULL nominal native amount (CRYPTO-F90: the
+	// deposit's locked fee2 is the refund's implicit miner fee; C++ refund output
+	// = outAmount, xbridgesession.cpp:2149) and spends the deposit via its
+	// LOCALLY-derived txid (CRYPTO-F86).
+	refund := deserializeHex(t, createdA.RefTx)
+	if got := refund.Outputs[0].Value; got != nativeAmt {
+		t.Fatalf("refund output = %d, want native %d (full nominal; fee2 is the implicit fee)", got, nativeAmt)
+	}
+	if rev, err := reverseTxidHex(createdA.ADepositTxID); err != nil || refund.Inputs[0].PrevOut.Hash != rev {
+		t.Fatalf("refund prevout does not reference the deposit txid %s (err %v)", createdA.ADepositTxID, err)
+	}
+
+	// Taker deposit B (LTC): locks native(fromXBridgeAmt(2e6)) + fee2.
+	_, bodyB, err := takerSession.OnCreateB(&proto.CreateBBody{
+		HubAddress: hub, ID: orderID, APubKey: makerSession.pubkey(),
+		ADepositTxID: createdA.ADepositTxID, HashedSecret: createdA.HashedSecret, ALockTime: createdA.ALockTime,
+	})
+	if err != nil {
+		t.Fatalf("taker OnCreateB: %v", err)
+	}
+	createdB := bodyB.(*proto.CreatedBBody)
+	depB := deserializeBroadcast(t, tkLtc, createdB.BDepositTxID)
+	nativeTaker := fromXBridgeAmt(ltcCoin, 2e6)
+	if got := depB.Outputs[0].Value; got != nativeTaker+fee2 {
+		t.Fatalf("deposit B p2sh value = %d, want %d", got, nativeTaker+fee2)
+	}
+
+	// Maker redeems deposit B (CRYPTO-F90): output = validated p2sh value − fee2
+	// = the full nominal native amount (the deposit's locked fee2 is the claim's
+	// miner fee; the excess, here 0, would be retained by the redeemer).
+	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: createdB.BDepositTxID, BLockTime: createdB.BLockTime})
+	if err != nil {
+		t.Fatalf("maker OnConfirmA: %v", err)
+	}
+	payA := deserializeBroadcast(t, tkLtc, bodyCA.(*proto.ConfirmedABody).APayTxID)
+	if got := payA.Outputs[0].Value; got != nativeTaker {
+		t.Fatalf("maker redeem output = %d, want native %d (p2sh 200000452 − fee2 452)", got, nativeTaker)
+	}
+
+	// Taker redeems deposit A: output = native(fromAmount) − fee2.
+	_, bodyCB, err := takerSession.OnConfirmB(&proto.ConfirmBBody{HubAddress: hub, ID: orderID, APayTxID: bodyCA.(*proto.ConfirmedABody).APayTxID})
+	if err != nil {
+		t.Fatalf("taker OnConfirmB: %v", err)
+	}
+	payB := deserializeBroadcast(t, mkBtc, bodyCB.(*proto.ConfirmedBBody).BPayTxID)
+	if got := payB.Outputs[0].Value; got != nativeAmt {
+		t.Fatalf("taker redeem output = %d, want native %d (p2sh 250000452 − fee2 452)", got, nativeAmt)
+	}
+	_ = makerSecret
+}
+
+func deserializeBroadcast(t *testing.T, conn *fakeConnector, txid string) *coins.Tx {
+	t.Helper()
+	raw, ok := conn.rawTx[txid]
+	if !ok {
+		t.Fatalf("tx %s not broadcast on %s", txid, conn.ticker)
+	}
+	return deserializeHex(t, raw)
+}
+
+func deserializeHex(t *testing.T, hexStr string) *coins.Tx {
+	t.Helper()
+	tx, err := coins.Deserialize(mustHex(hexStr))
+	if err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	return tx
+}
+
+// TestDepositSpendsUsedCoins (CRYPTO-F87) proves buildDeposit consumes the
+// recorded Order.UsedCoins (C++ xtx->usedCoins), never a fresh ListUnspent: the
+// connector reports TWO funders but the order records only one, so the deposit
+// must spend exactly the recorded one.
+func TestDepositSpendsUsedCoins(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mPriv, mPub := newKey(t)
+	_, tkPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	u1 := wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 3e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))}
+	u2 := wallet.Utxo{TxID: strings.Repeat("cc", 32), Vout: 0, Amount: 3e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))}
+	btc := &fakeConnector{
+		ticker: "BTC", funders: []wallet.Utxo{u1, u2}, fundingPriv: fundingPriv, fundingPub: fundingPub,
+		changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+
+	var orderID [32]byte
+	oscHash := hash20("used-coins-order")
+	copy(orderID[:], oscHash[:])
+	// Record ONLY u1 as the funding set, even though the wallet reports both.
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{u1}),
+		MakeOrderParams{MakerAddress: addrFor(0, "maker-a"), TakerAddress: addrFor(0, "taker-a")}, arr32(mPriv), toArr33(mPub))
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, body, err := s.OnCreateA(&proto.CreateABody{ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("OnCreateA: %v", err)
+	}
+	createdA := body.(*proto.CreatedABody)
+	dep := deserializeBroadcast(t, btc, createdA.ADepositTxID)
+	if len(dep.Inputs) != 1 {
+		t.Fatalf("deposit inputs = %d, want exactly 1 (the recorded UsedCoins, not the wallet's 2 funders)", len(dep.Inputs))
+	}
+	if got := hashToDisplayHex(dep.Inputs[0].PrevOut.Hash[:]); got != u1.TxID {
+		t.Fatalf("deposit input spends %s, want the recorded %s", got, u1.TxID)
+	}
+}
+
+// TestRedeemCounterpartyPayout (CRYPTO-F90) proves the claim spends the
+// VALIDATED counterparty deposit — the exact p2sh output value at its recorded
+// vout — and the redeemer keeps the excess: a B-deposit locked with a 0.001 LTC
+// excess over nominal+fee2 is claimed for the full p2sh minus the redeem fee.
+func TestRedeemCounterpartyPayout(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+
+	var orderID [32]byte
+	rcpH := hash20("redeem-payout-order")
+	copy(orderID[:], rcpH[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	mkMPriv, mkMPub := newKey(t)
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	_, bodyA, err := makerSession.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+
+	// Build the taker's B deposit with a 0.001 LTC excess over nominal+fee2 and
+	// seed it as the maker's target, so the check records the excess.
+	ltcCoin, _ := coins.Get("LTC")
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("bb", 32))
+	excess := uint64(100000) // 0.001 LTC
+	fee2 := estimateFee(confs["LTC"], 1, 1)
+	nativeTaker := fromXBridgeAmt(ltcCoin, 2e6)
+	inner := coins.BuildDepositUnlockScript(tkPub[:], mkMPub[:], createdA.HashedSecret[:], createdA.ALockTime)
+	bigB := &coins.Tx{Version: 1}
+	bigB.Inputs = append(bigB.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: nativeTaker + fee2 + excess, ScriptPubKey: coins.BuildP2SHScript(coins.KeyID(inner))})
+	bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: 5e8 - nativeTaker - fee2 - excess, ScriptPubKey: []byte{0x51}})
+	bigBTxID := strings.Repeat("ee", 32)
+	tkLtc.setRawTx(bigBTxID, hex.EncodeToString(bigB.Serialize()))
+
+	// The maker claims the excess-laden B deposit.
+	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: bigBTxID, BLockTime: createdA.ALockTime})
+	if err != nil {
+		t.Fatalf("maker OnConfirmA: %v", err)
+	}
+	payA := deserializeBroadcast(t, tkLtc, bodyCA.(*proto.ConfirmedABody).APayTxID)
+	want := nativeTaker + fee2 + excess - fee2 // p2sh − redeem fee; excess retained
+	if got := payA.Outputs[0].Value; got != want {
+		t.Fatalf("claim output = %d, want p2sh(%d) − fee2(%d) = %d (excess retained)", got, nativeTaker+fee2+excess, fee2, want)
+	}
+	if got := payA.Inputs[0].PrevOut.Index; got != 0 {
+		t.Fatalf("claim spends vout %d, want the validated vout 0", got)
+	}
+	// The order records the validated deposit (XBridge base).
+	o := makerNode.store.Get(hexEncode(orderID[:]))
+	if o == nil || o.OBinTxVout != 0 || o.OBinTxP2SHAmount != toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess) {
+		t.Fatalf("order OBinTxVout/P2SHAmount = %d/%d, want 0/%d", o.OBinTxVout, o.OBinTxP2SHAmount, toXBridgeAmt(ltcCoin, nativeTaker+fee2+excess))
+	}
+}
+
+// TestHoldInitVerification (STATE-F71) proves the hub-driven Hold/Init packets
+// are re-verified against the order: a mismatched amount (Hold) or ANY
+// single-field mismatch (Init, intended-OR) is dropped with NO response and no
+// state advance; matching packets pass and advance the state.
+func TestHoldInitVerification(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkMPriv, mkMPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}, "LTC": mkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}, "LTC": mkLtc})
+	var orderID [32]byte
+	hvHash := hash20("hold-init-order")
+	copy(orderID[:], hvHash[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkLtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{mkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	// --- Hold ---
+	// Maker: taker take (3e6) exceeds the maker's give (2.5e6) → dropped.
+	if cmd, body, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 3e6}); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("maker oversized-take Hold not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csMaker {
+		t.Fatalf("maker state advanced despite rejected Hold: %v", makerSession.state)
+	}
+	// Taker: take (3e6) mismatches its expected dstAmt (2.5e6) → dropped.
+	if cmd, body, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 3e6}); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("taker mismatched Hold not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	// Correct Hold (taker give/take = 2e6/2.5e6) → both apply.
+	if cmd, body, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil || cmd != proto.XbcTransactionHoldApply || body == nil {
+		t.Fatalf("maker good Hold failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csHoldApplied {
+		t.Fatalf("maker state = %v, want csHoldApplied", makerSession.state)
+	}
+	if cmd, body, err := takerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil || cmd != proto.XbcTransactionHoldApply || body == nil {
+		t.Fatalf("taker good Hold failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if takerSession.state != csHoldApplied {
+		t.Fatalf("taker state = %v, want csHoldApplied", takerSession.state)
+	}
+
+	// --- Init (intended OR: any single mismatch drops) ---
+	goodMk := &proto.InitBody{ClientAddress: hash20("taker-ltc-source"), HubAddress: hub, ID: orderID,
+		FromAddress: hash20("maker-btc-dest"), FromCurrency: "BTC", FromAmount: 2.5e6,
+		ToAddress: hash20("taker-ltc-source"), ToCurrency: "LTC", ToAmount: 2e6}
+	bad := *goodMk
+	bad.ToAmount = 1 // a SINGLE field mismatch must drop (the C++ && bug would accept it)
+	if cmd, body, err := makerSession.OnInit(&bad); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("Init with one mismatched field not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csHoldApplied {
+		t.Fatalf("maker state advanced despite rejected Init: %v", makerSession.state)
+	}
+	// Correct Init → Initialized.
+	if cmd, body, err := makerSession.OnInit(goodMk); err != nil || cmd != proto.XbcTransactionInitialized || body == nil {
+		t.Fatalf("maker good Init failed: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+	if makerSession.state != csInitialized {
+		t.Fatalf("maker state = %v, want csInitialized", makerSession.state)
+	}
+	// Duplicate Init → dropped by the state gate (C++ :1725-1732).
+	if cmd, body, err := makerSession.OnInit(goodMk); err != nil || cmd != 0 || body != nil {
+		t.Fatalf("duplicate Init not dropped: cmd=%v body=%v err=%v", cmd, body, err)
+	}
+}
+
+// TestDepositNotBroadcastWhenRefundFails (CRYPTO-F86) proves the build order:
+// the deposit must be signed and the CLTV refund pre-built BEFORE the broadcast,
+// so a refund-build failure never strands a broadcast deposit without an escape
+// hatch (C++ builds deposit → refund → then broadcasts). An undecodable
+// refund destination makes buildRefundTx fail after signing; the connector must
+// show zero broadcasts.
+func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	priv, pub := newKey(t)
+	_, tkPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+
+	var orderID [32]byte
+	rfoHash := hash20("refund-fails-order")
+	copy(orderID[:], rfoHash[:])
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{btc.funding}),
+		MakeOrderParams{MakerAddress: "not-a-valid-address", TakerAddress: addrFor(0, "taker-dest")}, arr32(priv), toArr33(pub))
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateA(&proto.CreateABody{ID: orderID, BPubKey: to33(tkPub)})
+	if err == nil {
+		t.Fatal("expected refund-build failure (bad refund destination)")
+	}
+	if got := len(btc.broadcasts); got != 0 {
+		t.Fatalf("deposit broadcast %d time(s) despite refund-build failure; the refund must be pre-built before broadcasting (CRYPTO-F86)", got)
+	}
+}
+
+// TestCreateBBadDepositCancels (CRYPTO-F85) proves the taker refuses a
+// definitively bad maker A-deposit: the check fails (no matching p2sh script),
+// so OnCreateB must wire-Cancel (crBadADepositTx=14) and roll back locally with
+// NO CreatedB response and NO deposit of our own.
+func TestCreateBBadDepositCancels(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	// A "deposit" that spends the known funding utxo but carries a P2PKH output
+	// instead of the expected p2sh → the p2sh scan finds nothing → IsGood=false.
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("aa", 32))
+	badDeposit := &coins.Tx{Version: 1}
+	badDeposit.Inputs = append(badDeposit.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	badDeposit.Outputs = append(badDeposit.Outputs, coins.TxOut{Value: 250000000, ScriptPubKey: coins.BuildP2PKHScript(hash20("not-a-p2sh"))})
+	badDepositTxID := strings.Repeat("cd", 32)
+	btc.setRawTx(badDepositTxID, hex.EncodeToString(badDeposit.Serialize()))
+
+	var orderID [32]byte
+	obdHash := hash20("bad-deposit-order")
+	copy(orderID[:], obdHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: badDepositTxID, HashedSecret: [20]byte{0x11}, ALockTime: 2000,
+	})
+	if err == nil {
+		t.Fatal("expected bad-deposit rejection")
+	}
+	var sce *selfCancelErr
+	if !errors.As(err, &sce) || sce.reason != crBadADepositTx {
+		t.Fatalf("err = %v, want selfCancelErr reason 14 (crBadADepositTx)", err)
+	}
+	// Cancel broadcast, signed with our M key; no CreatedB; no deposit of ours.
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("broadcast packets = %d, want exactly one Cancel", len(pkts))
+	}
+	var cancel proto.CancelBody
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil || cancel.Reason != crBadADepositTx {
+		t.Fatalf("cancel reason = %d (err %v), want 14", cancel.Reason, err)
+	}
+	if got := len(btc.broadcasts); got != 0 {
+		t.Fatalf("taker broadcast %d deposit(s) despite a bad counterparty deposit, want 0", got)
+	}
+	if h := n.store.HistoryOrder(hexEncode(orderID[:])); h == nil || h.Status != "canceled" {
+		t.Fatalf("history order = %+v, want canceled", h)
+	}
+}
+
+// TestCreateBWaitsOnNotReadyDeposit (CRYPTO-F85) proves the "wait" leg: an
+// A-deposit the connector cannot yet find is ErrDepositNotReady → OnCreateB
+// sends NO response (C++ processLater — the hub retransmits) and NO cancel, and
+// the order is left untouched.
+func TestCreateBWaitsOnNotReadyDeposit(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	var orderID [32]byte
+	owdHash := hash20("not-ready-deposit-order")
+	copy(orderID[:], owdHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: strings.Repeat("ef", 32), // not in the connector's log
+		HashedSecret: [20]byte{0x11}, ALockTime: 2000,
+	})
+	if err == nil {
+		t.Fatal("expected ErrDepositNotReady")
+	}
+	if !errors.Is(err, wallet.ErrDepositNotReady) {
+		t.Fatalf("err = %v, want ErrDepositNotReady", err)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatal("no response must be sent while the deposit is not ready (hub retransmits)")
+	}
+	if o := n.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "open" {
+		t.Fatalf("order status = %+v, want still open", o)
+	}
+}
+
+// TestCreateBBadLocktimeCancels proves the wire-Cancel path for a rejected
+// counterparty locktime: a CreateB whose ALockTime fails the drift check must
+// broadcast a signed Cancel packet (reason crBadALockTime=18) AND roll the
+// order back locally (status "canceled"), never responding with CreatedB.
+func TestCreateBBadLocktimeCancels(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	var orderID [32]byte
+	bloHash := hash20("bad-locktime-order")
+	copy(orderID[:], bloHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	// Seed the store order (the taker's copy) so the self-cancel's local rollback
+	// can find it and cancel it. MakerKey = OUR per-trade M pubkey (order.go:96).
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: strings.Repeat("bb", 32), HashedSecret: [20]byte{0x11},
+		ALockTime: 0, // fails the drift check (expected ~blockTime+2h)
+	})
+	if err == nil {
+		t.Fatal("expected locktime-drift rejection")
+	}
+	var sce *selfCancelErr
+	if !errors.As(err, &sce) || sce.reason != crBadALockTime {
+		t.Fatalf("err = %v, want selfCancelErr reason 18 (crBadALockTime)", err)
+	}
+	// A Cancel packet must have been broadcast, signed with our M key.
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("broadcast packets = %d (cmd %v), want exactly one Cancel", len(pkts), pkts[0].Command)
+	}
+	var cancel proto.CancelBody
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("cancel body: %v", err)
+	}
+	if cancel.Reason != crBadALockTime {
+		t.Fatalf("cancel reason = %d, want 18", cancel.Reason)
+	}
+	if ok, _ := n.signer.VerifyAgainst(pkts[0], hexEncode(tkPub[:])); !ok {
+		t.Fatal("cancel packet not signed with our per-trade M key")
+	}
+	// Local rollback: the pre-deposit order is canceled (moved to history with
+	// the cancel reason), never a CreatedB.
+	if h := n.store.HistoryOrder(hexEncode(orderID[:])); h == nil || h.Status != "canceled" {
+		t.Fatalf("history order = %+v, want canceled", h)
+	}
+	if n.store.Get(hexEncode(orderID[:])) != nil {
+		t.Fatal("order must be removed from the live store after the self-cancel")
 	}
 }
 
@@ -648,7 +1415,7 @@ func setupSwapPair(t *testing.T) (*Node, *SwapSession, *fakeConnector) {
 	oid := hash20("order-id")
 	copy(orderID[:], oid[:])
 	mkAddr := addrFor(0, "maker-btc-dest")
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(withUsedCoins(t, n, &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, []wallet.Utxo{btcFunding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	hub := hash20("hub")
 	s.hub = hub

@@ -180,14 +180,17 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 
 	// The inbound Hold must be signed by the session's pinned hub key (pinned at
 	// newMakerSession from the order's SNodePubkey, STATE-F78).
-	hubPkt := proto.NewPacket(proto.XbcTransactionHold, (&proto.HoldBody{}).Marshal())
+	// OnHold drives the maker's response to a hub xbcTransactionHold. The body
+	// carries the TAKER's give/take (order.to/order.from = 2e8/1e8); verifyHold
+	// (STATE-F71) accepts it for this 1e8→2e8 maker order.
+	hubPkt := proto.NewPacket(proto.XbcTransactionHold, (&proto.HoldBody{HubAddress: coins.KeyID(hubPub[:]), ID: id, FromAmount: 2e8, ToAmount: 1e8}).Marshal())
 	if err := crypto.NewBtcSigner().Sign(hubPkt, hubPriv); err != nil {
 		t.Fatal(err)
 	}
 
 	// OnHold drives the maker's response to a hub xbcTransactionHold.
 	n.dispatchSwap(hubPkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-		return s.OnHold(&proto.HoldBody{})
+		return s.OnHold(&proto.HoldBody{HubAddress: coins.KeyID(hubPub[:]), ID: id, FromAmount: 2e8, ToAmount: 1e8})
 	})
 
 	pkts := cc.snapshot()

@@ -26,6 +26,10 @@ type stubConn struct {
 	ticker string
 	addr   string
 	utxos  []wallet.Utxo
+	// depositCheck / depositCheckErr canned the CheckDepositTransaction result
+	// (default IsGood:true when neither is set).
+	depositCheck    *wallet.DepositCheck
+	depositCheckErr error
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -55,6 +59,15 @@ func (s *stubConn) GetBlockHash(height int64) ([32]byte, error) {
 }
 func (s *stubConn) GetRawTransaction(txid string) (string, error) {
 	return "", errStub
+}
+func (s *stubConn) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (wallet.DepositCheck, error) {
+	if s.depositCheckErr != nil {
+		return wallet.DepositCheck{}, s.depositCheckErr
+	}
+	if s.depositCheck != nil {
+		return *s.depositCheck, nil
+	}
+	return wallet.DepositCheck{IsGood: true}, nil
 }
 func (s *stubConn) SignMessage(address, message string) ([]byte, error) {
 	// 65-byte placeholder compact signature.

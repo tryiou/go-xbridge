@@ -234,7 +234,13 @@ Steps (params shown positionally — wrap them in the `"params"` array as above)
     (chosen at `dxMakeOrder`; `dxTakeOrder` adopts the order's hub), and every
     inbound handshake packet is re-verified against that hub's pinned key — a
     forged packet can never disable the auto-refund watcher. An order with no
-    trusted hub cannot be taken (`NO_SERVICE_NODE`).
+    trusted hub cannot be taken (`NO_SERVICE_NODE`). Before committing our own
+    deposit (or redeeming the counterparty's), the counterparty HTLC deposit is
+    validated on-chain against its expected p2sh script, amount, confirmations,
+    sequences, prevouts, and fees (`wallet.CheckDepositTransaction`, C++
+    `checkDepositTransaction` parity); a bad deposit is wire-cancelled and rolled
+    back, so a never-established trust basis cannot be turned into theft (B3,
+    CRYPTO-F85/F90, SEC-F03).
  5. **Cancel** an open order: `dxCancelOrder <order_id>`.
 
 Full field/param contracts for every `dx*` command (positional params, response

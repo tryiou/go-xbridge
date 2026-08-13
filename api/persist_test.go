@@ -55,6 +55,10 @@ func TestPersistRoundTrip(t *testing.T) {
 		Mine:         true,
 		SNodePubkey:  hexPub(t, hubPriv),
 		HubAddress:   coins.KeyID(hubPub[:]),
+		// CRYPTO-F90: the validated counterparty deposit out-params.
+		OBinTxVout:       3,
+		OBinTxP2SHAmount: 2001004,
+		OOverpayment:     1005,
 	}
 	n.store.Add(o)
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
@@ -89,6 +93,11 @@ func TestPersistRoundTrip(t *testing.T) {
 		t.Errorf("hub anchor did not round-trip: got %q/%x want %q/%x",
 			got.SNodePubkey, got.HubAddress, o.SNodePubkey, o.HubAddress)
 	}
+	// CRYPTO-F90: the validated deposit out-params round-trip.
+	if got.OBinTxVout != o.OBinTxVout || got.OBinTxP2SHAmount != o.OBinTxP2SHAmount || got.OOverpayment != o.OOverpayment {
+		t.Errorf("F90 deposit out-params did not round-trip: got %d/%d/%d want %d/%d/%d",
+			got.OBinTxVout, got.OBinTxP2SHAmount, got.OOverpayment, o.OBinTxVout, o.OBinTxP2SHAmount, o.OOverpayment)
+	}
 
 	// restoreSwap must reconstruct the order with the same hub anchor.
 	n2 := newPersistNode(t, dir)
@@ -97,6 +106,9 @@ func TestPersistRoundTrip(t *testing.T) {
 		t.Fatal("restoreSwap did not re-add the order")
 	} else if ro.SNodePubkey != o.SNodePubkey || ro.HubAddress != o.HubAddress {
 		t.Errorf("restored order hub anchor lost: got %q/%x", ro.SNodePubkey, ro.HubAddress)
+	} else if ro.OBinTxVout != o.OBinTxVout || ro.OBinTxP2SHAmount != o.OBinTxP2SHAmount || ro.OOverpayment != o.OOverpayment {
+		t.Errorf("restored order F90 deposit out-params lost: got %d/%d/%d",
+			ro.OBinTxVout, ro.OBinTxP2SHAmount, ro.OOverpayment)
 	}
 }
 

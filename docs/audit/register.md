@@ -9,7 +9,7 @@ detail behind each row lives in `findings.md` (per-finding cards) and
 ## Numbering & status legend
 
 - **Canonical IDs** — every finding has exactly one axis-prefixed ID:
-  `RPC-F01..F59`, `WIRE-F57..F71`, `STATE-F71..F79`, `CRYPTO-F77..F96`,
+  `RPC-F01..F59`, `WIRE-F57..F71`, `STATE-F71..F79`, `CRYPTO-F77..F97`,
   `CFG-F84..F91`, `CONC-F92..F102`, `INV-F97..F100`, `SEC-F01..F04`. The 2026
   full audit (`F01–F99`) supplied the core; prior audits' `F1–F27`, `S2/S3/S4`
   and `S1-A…D` findings were folded in — duplicates mapped onto the surviving
@@ -121,7 +121,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| STATE-F71 | S2 | OnHold/OnInit skip the C++ amount/identity/price verification | OPEN | B3 |
+| STATE-F71 | S2 | OnHold/OnInit skip the C++ amount/identity/price verification | FIXED | B3 `fix/deposit-path`: `verifyHold` (C++ `processTransactionHold` :1404-1471) + `verifyInit` with the intended-OR order-detail check + state gate; `TestHoldInitVerification` |
 | STATE-F72 | S2 | Expiry pruning never wired in Go (IsExpired has no production caller) | OPEN | B8 |
 | STATE-F73 | S3 | TxCancelReason enum + text table not ported (incl. C++ bugs) | OPEN | B8 |
 | STATE-F74 | S3 | `trRollbackFailed` never set (refund broadcast failure) | OPEN | B8 |
@@ -131,30 +131,31 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | STATE-F78 | S2 | Handshake inbound packets re-verified against pinned hub key, no TOFU | FIXED | hub-key pinning (`swap.go`) |
 | STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | OPEN | B7 |
 
-### CRYPTO axis (`CRYPTO-F77`–`CRYPTO-F96`) — evidence: `evidence/crypto.md`
+### CRYPTO axis (`CRYPTO-F77`–`CRYPTO-F97`) — evidence: `evidence/crypto.md`
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
 | CRYPTO-F77 | S1 | BCH forkid `0x41` sighash missing in Go local signing | OPEN | B9 |
-| CRYPTO-F78 | S2 | Deposit tx fee formula `minTxFee1(nIn,3)` vs Go `estimateFee(nIn,2)` | OPEN | B3 |
+| CRYPTO-F78 | S2 | Deposit tx fee formula `minTxFee1(nIn,3)` vs Go `estimateFee(nIn,2)` | FIXED | B3 `fix/deposit-path`: `estimateFee(cc, nIn, 3)` at `api/swap.go` (`(192nIn+102)·FeePerByte`, C++ `xbridgesession.cpp:1994/:2526`); `TestEstimateFeeMatchesCppVsize` |
 | CRYPTO-F79 | S3 | Fee fallback: C++ 0 vs Go 2 sat/vB when FeePerByte unset | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
 | CRYPTO-F80 | S3 | Go honors `DustAmount` conf key C++ never reads | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
 | CRYPTO-F81 | S3 | Address decoding strictness differs (base58check version byte, cashaddr) | DOCUMENTED | deliberate hardening (`api.md` Tier-3) |
 | CRYPTO-F82 | S4 | RNG top-bit bias in Go private-key generation | OPEN | B9 |
 | CRYPTO-F83 | S3 | Block-hash byte order assumption unverified end-to-end | OPEN | B9 |
 | CRYPTO-F84 | S2 | `TakeOrder` emits `AcceptingBody` with empty fee/utxos (156 B < 188 B) | FIXED | B2 `fix/wire-acceptingbody` |
-| CRYPTO-F85 | S2 | No `checkDepositTransaction` in the Connector contract | OPEN | B3 |
-| CRYPTO-F86 | S2 | `buildDeposit` broadcasts before building the refund | OPEN | B3 |
-| CRYPTO-F87 | S2 | Deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | OPEN | B3 |
+| CRYPTO-F85 | S2 | No `checkDepositTransaction` in the Connector contract | FIXED | B3 `fix/deposit-path`: `wallet.CheckDepositTransaction` (interface + RPCConnector 1:1 port of `xbridgewalletconnectorbtc.cpp:1981-2194` + LocalConnector `ErrNoChainSource`) wired into `OnCreateB`/`OnConfirmA` with tri-state (wait→no reply / bad→Cancel / good→record); `wallet/rpc_test.go` goldens + `TestCreateBBadDepositCancels`/`TestCreateBWaitsOnNotReadyDeposit` |
+| CRYPTO-F86 | S2 | `buildDeposit` broadcasts before building the refund | FIXED | B3 `fix/deposit-path`: sign → local txid → refund → broadcast; `TestDepositNotBroadcastWhenRefundFails` |
+| CRYPTO-F87 | S2 | Deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | FIXED | B3 `fix/deposit-path`: `Order.UsedCoins` recorded at make/take, `swapCtx.funding` snapshot consumed by `buildDeposit`; `TestDepositSpendsUsedCoins` |
 | CRYPTO-F88 | S3 | Segwit/BIP143 signing dead code; bech32 re-encoded legacy | OPEN | B9 |
 | CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | OPEN | B7 |
-| CRYPTO-F90 | S3 | Refund/payment payout model (fee2 margin, oOverpayment) | OPEN | B3 |
+| CRYPTO-F90 | S3 | Refund/payment payout model (fee2 margin, oOverpayment) | FIXED | B3 `fix/deposit-path`: claim spends the validated deposit (exact `P2SHNative` at `DepositVout`), refund pays full nominal (fee2 implicit); `OBinTxVout/OBinTxP2SHAmount/OOverpayment` persisted; `TestRedeemCounterpartyPayout` |
 | CRYPTO-F91 | S3 | `signrawtransaction` param payload ("ALL" in privkeys slot) | OPEN | B9 |
 | CRYPTO-F92 | S3 | `secretFromScriptSig` requires 33-byte push | OPEN | B9 |
 | CRYPTO-F93 | S3 | UTXO ownership-proof challenge stream format | FIXED | `TestWholeCoinOstreamMatchesCppStream` |
 | CRYPTO-F94 | S3 | Deposit inputs `SEQUENCE_FINAL`; refund spend `SEQUENCE_FINAL-1` | FIXED | `checkDepositTransaction` parity |
 | CRYPTO-F95 | S3 | Deposit locks `Amount + fee2` (`minTxFee2(1,1)`); change after fee+fee2 | FIXED | `TestDepositLocksAmountPlusFee2` |
 | CRYPTO-F96 | S3 | `nTime` committed in sighash on `TxWithTimeField` coins | FIXED | `TestHashForSigningWithTimeField` |
+| CRYPTO-F97 | S1 | Deposit path mixed XBridge 1e6 and native base units (locked 100× too little for COIN≠1e6; BLOCK masked it) | FIXED | B3 `fix/deposit-path` (promoted from planning): `fromXBridgeAmt` at the `api/swap.go` boundary; `TestDepositNativeScale` |
 
 ### CONFIG axis (`CFG-F84`–`CFG-F91`) — evidence: `evidence/config.md`
 
@@ -200,7 +201,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 |---|---|---|---|---|
 | SEC-F01 | S2 | RPC binds to loopback by default (auth only when both creds set) | FIXED | loopback bind |
 | SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B7 |
-| SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | OPEN | closed by B3 (composite) |
+| SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | FIXED | B3 `fix/deposit-path` (composite): validated-deposit refusal kills the theft end-to-end — `TestSecF03CompositeRefusal` (taker refuses a bad A-deposit → Cancel + no B deposit; maker refuses a bad B-deposit at ConfirmA → Cancel + refund rollback). Attacker model corrected: the hostile outcome is **theft**, not recoverable lockup. |
 | SEC-F04 | S2 | Plaintext secrets + debug-log leakage | FIXED | B6 `fix/secrets-hygiene`: `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`. |
 
 ---
@@ -228,13 +229,13 @@ namespace is the Current register above.
 | F18 | CONC-F102 | force-refund double-broadcast — FIXED |
 | F19 | CRYPTO-F84 | AcceptingBody empty fee/utxos — FIXED (B2) |
 | F20 | WIRE-F71 | registration integrity — FIXED (B1) |
-| F21 | CRYPTO-F85 | `checkDepositTransaction` absent — OPEN (B3) |
-| F22 | SEC-F03 | taker-trust composite — OPEN (closed by B3) |
-| F23 | CRYPTO-F86 | `buildDeposit` broadcast order — OPEN (B3) |
+| F21 | CRYPTO-F85 | `checkDepositTransaction` absent — FIXED (B3 `fix/deposit-path`) |
+| F22 | SEC-F03 | taker-trust composite — FIXED (B3 `fix/deposit-path`) |
+| F23 | CRYPTO-F86 | `buildDeposit` broadcast order — FIXED (B3 `fix/deposit-path`) |
 | F24 | RPC-F58 | HTTP auth/timeout hardening — OPEN (B4) |
 | F25 | WIRE-F57/F63 | P2P addr/varint DoS — OPEN (B5) |
 | F26 | SEC-F04 | plaintext secrets — FIXED (B6 `fix/secrets-hygiene`) |
-| F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — OPEN (B3) |
+| F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — FIXED (B3 `fix/deposit-path`) |
 | S1-A | CRYPTO-F93 | ownership-proof challenge stream — FIXED |
 | S1-B | CRYPTO-F94 | deposit `SEQUENCE_FINAL` — FIXED |
 | S1-C | CRYPTO-F95 | deposit locks `Amount + fee2` — FIXED |
@@ -253,7 +254,7 @@ namespace is the Current register above.
 | S3-D | RPC-F28 | `p2sh_deposits` alignment — OPEN (B7) |
 | S3-E | RPC-F55 | new-token-address `[]` vs error — OPEN (B7) |
 | S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
-| S3-G | CRYPTO-F90 | payout model (fee2 margin) — OPEN (B3) |
+| S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |
 | S3-I | CRYPTO-F92 | `secretFromScriptSig` 33-byte push — OPEN (B9) |
 | S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B7) |

@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,6 +33,16 @@ const (
 	// refundCheckInterval is how often the background watcher scans live sessions
 	// for refunds whose deposit lockTime has passed. Overridable in tests.
 	refundCheckInterval = 60 * time.Second
+)
+
+// TxCancelReason values used by this branch's wire-Cancel paths. Only the B3
+// subset is defined here; the full enum (crUnknown..crBadFeeTx,
+// xbridgepacket.h:21-48) is STATE-F73's (B8) concern.
+const (
+	crBadADepositTx uint32 = 14
+	crBadBDepositTx uint32 = 15
+	crBadALockTime  uint32 = 18
+	crBadBLockTime  uint32 = 19
 )
 
 // clientState tracks the local client's progress through the hub-driven swap.
@@ -113,6 +124,15 @@ type SwapSession struct {
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
 
+	// Validated counterparty deposit (CRYPTO-F90): the C++
+	// checkDepositTransaction out-params recorded when we accept the
+	// counterparty's deposit (CreateB for the taker's A-check, ConfirmA for the
+	// maker's B-check). P2SHNative is the exact matched output value in the
+	// coin's native base (the claim spend); Overpayment is XBridge 1e6 base.
+	theirDepositVout uint32
+	theirP2SHNative  uint64
+	theirOverpayment uint64
+
 	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
 	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (STATE-F78)
 	state  clientState
@@ -134,10 +154,117 @@ type depositOutcome struct {
 }
 
 // confirmOutcome is the worker-produced result of a claim (ConfirmA/B). secret
-// is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA).
+// is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA). check
+// carries the validated counterparty deposit (ConfirmA's F85 check; zero for
+// ConfirmB, whose check ran at CreateB).
 type confirmOutcome struct {
 	secret  [33]byte
 	payTxID string
+	check   wallet.DepositCheck
+}
+
+// selfCancelErr marks a worker failure that must broadcast a Cancel packet with
+// the given TxCancelReason and roll back locally — C++ sendCancelTransaction
+// (crBadADepositTx/crBadBDepositTx/crBadALockTime/crBadBLockTime) + the
+// immediately-following processTransactionCancel. The resume (engine side)
+// recognizes it via errors.As and calls SwapSession.sendSelfCancel.
+type selfCancelErr struct {
+	reason uint32
+}
+
+func (e *selfCancelErr) Error() string {
+	return fmt.Sprintf("api: self-cancel (TxCancelReason %d)", e.reason)
+}
+
+// sendSelfCancel broadcasts a signed xbcTransactionCancel for OUR OWN rejection
+// of the counterparty's deposit/locktime and rolls back locally, mirroring C++
+// sendCancelTransaction + processTransactionCancel + sendPacketBroadcast
+// (xbridgesession.cpp:3525-3576). Must run on the engine goroutine (it mutates
+// the store/order): the callers are the two-phase resumes, which execute on the
+// engine. The packet is signed with the session's per-trade M key; since
+// Order.MakerKey is OUR M pubkey (order.go:96-99), handleRemoteCancel's
+// iCanceled check accepts it and performs the state transition (cancel if no
+// deposit sent, refund-broadcast rollback otherwise).
+func (s *SwapSession) sendSelfCancel(reason uint32) {
+	orderID := hexEncode(s.id[:])
+	if s.n == nil || s.n.conn == nil {
+		xlog.Error("selfCancel: no network connector", "order", orderID, "reason", reason)
+		return
+	}
+	body := &proto.CancelBody{ID: s.id, Reason: reason}
+	pkt := proto.NewPacket(proto.XbcTransactionCancel, body.Marshal())
+	if err := s.n.signer.Sign(pkt, s.privKey[:]); err != nil {
+		xlog.Error("selfCancel: sign failed", "order", orderID, "err", err)
+		return
+	}
+	xlog.Warn("selfCancel: counterparty deposit rejected", "order", orderID, "reason", reason)
+	// Local rollback first (C++ processTransactionCancel(reply)), then broadcast.
+	s.n.handleRemoteCancel(pkt, body)
+	if err := s.n.conn.WritePacket(pkt, [20]byte{}); err != nil {
+		xlog.Error("selfCancel: broadcast failed", "order", orderID, "err", err)
+	}
+}
+
+// failSelfCancel recognizes a selfCancelErr returned by a worker task and
+// performs the wire-Cancel + local rollback. It returns true when handled.
+// Engine-side (called from the resumes).
+func (s *SwapSession) failSelfCancel(terr error) bool {
+	var sce *selfCancelErr
+	if !errors.As(terr, &sce) {
+		return false
+	}
+	s.sendSelfCancel(sce.reason)
+	return true
+}
+
+// createdBOutcome is the worker result of the taker's CreateB task: the built
+// deposit plus the validated counterparty A-deposit (CRYPTO-F90 — the resume
+// records DepositVout/P2SHAmount/Excess on the session for the F90 redeem).
+type createdBOutcome struct {
+	out   depositOutcome
+	check wallet.DepositCheck
+}
+
+// counterpartyDepositScriptHex returns the P2SH output script the counterparty's
+// deposit must carry: OP_HASH160 <HASH160(unlockScript)> OP_EQUAL, where the
+// unlock script is createDepositUnlockScript(DepositorPub=theirPub,
+// CounterpartyPub=ourKey, hash, opponentLockTime) (xbridgesession.cpp:2484,
+// 2946). For the taker checking A, hash = the maker's HashedSecret
+// (theirSecretHash); for the maker checking B, hash = OUR secretHash (both
+// deposits share it).
+func (c *swapCtx) counterpartyDepositScriptHex(hash [20]byte) string {
+	spec := swap.DepositSpec{
+		Currency:        c.dstCur,
+		DepositorPub:    c.theirPub,
+		CounterpartyPub: c.pubKey,
+		Hash:            hash,
+		LockTime:        c.theirLockTime,
+	}
+	return hex.EncodeToString(spec.P2SHScript())
+}
+
+// checkCounterpartyDeposit validates the counterparty's deposit against the
+// expected p2sh script and amount before we commit our own deposit or redeem
+// theirs (CRYPTO-F85 — C++ checkDepositTransaction call sites
+// xbridgesession.cpp:2495/2957). expectedAmount is XBridge 1e6 base. Tri-state:
+// ErrDepositNotReady and ErrNoChainSource are returned as errors (the caller
+// sends NO response — C++ processLater / the connector cannot judge); a
+// returned DepositCheck with IsGood=false is a definitively bad deposit (the
+// caller must wire-Cancel, crBadADepositTx/crBadBDepositTx).
+func (c *swapCtx) checkCounterpartyDeposit(hash [20]byte, expectedAmount uint64) (wallet.DepositCheck, error) {
+	conn := c.n.cfg().Connectors[c.dstCur]
+	if conn == nil {
+		return wallet.DepositCheck{}, fmt.Errorf("api: no connector for %s", c.dstCur)
+	}
+	return conn.CheckDepositTransaction(c.theirDepositTxID, c.counterpartyDepositScriptHex(hash), expectedAmount, c.minConf(c.conf(c.dstCur)))
+}
+
+// counterpartyCoin returns the coin of the counterparty's deposit currency
+// (dstCur). The order's OBinTxP2SHAmount record is XBridge base (C++
+// oBinTxP2SHAmount = whole × COIN), derived from the exact native value.
+func counterpartyCoin(s *SwapSession) coins.Coin {
+	c, _ := coins.Get(s.dstCur)
+	return c
 }
 
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
@@ -165,9 +292,17 @@ type swapCtx struct {
 	theirDepositTxID string
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
+	theirDepositVout uint32
+	theirP2SHNative  uint64
+	theirOverpayment uint64
 	ourDepositTxID   string
 	ourLockTime      uint32
 	refundHex        string
+
+	// funding is the deposit's exact funding set — the make/take-time selection
+	// recorded as Order.UsedCoins (CRYPTO-F87, C++ xtx->usedCoins). buildDeposit
+	// spends exactly this, never a fresh ListUnspent.
+	funding []wallet.Utxo
 }
 
 // snapshot copies the session's fields a worker task needs. It runs on the
@@ -192,10 +327,26 @@ func (s *SwapSession) snapshot() swapCtx {
 		theirDepositTxID: s.theirDepositTxID,
 		theirLockTime:    s.theirLockTime,
 		theirSecretHash:  s.theirSecretHash,
+		theirDepositVout: s.theirDepositVout,
+		theirP2SHNative:  s.theirP2SHNative,
+		theirOverpayment: s.theirOverpayment,
 		ourDepositTxID:   s.ourDepositTxID,
 		ourLockTime:      s.ourLockTime,
 		refundHex:        s.refundHex,
+		funding:          s.n.orderFunding(s.id),
 	}
+}
+
+// orderFunding returns the order's recorded funding set (Order.UsedCoins) for
+// the deposit to spend — C++ xtx->usedCoins, populated at make/take time
+// (CRYPTO-F87). store.Get returns a deep copy, so the worker can hold this
+// without racing the engine.
+func (n *Node) orderFunding(id [32]byte) []wallet.Utxo {
+	o := n.store.Get(hexEncode(id[:]))
+	if o == nil {
+		return nil
+	}
+	return o.UsedCoins
 }
 
 // newMakerSession registers the client-side maker for a freshly created order and
@@ -281,9 +432,17 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 
 // OnHold (hub→both) → HoldApply (7): echo our source address as the client's own.
 func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseBody, error) {
+	orderID := hexEncode(s.id[:])
 	c, ok := coins.Get(s.srcCur)
 	if !ok {
 		return 0, nil, fmt.Errorf("api: unknown coin %s", s.srcCur)
+	}
+	// STATE-F71: re-verify the hub-relayed give/take amounts against the order
+	// (C++ processTransactionHold, xbridgesession.cpp:1404-1471). Any mismatch
+	// is dropped with NO reply (C++ return true) — the hub retransmits.
+	if err := s.verifyHold(b); err != nil {
+		xlog.Warn("hold rejected", "order", orderID, "err", err)
+		return 0, nil, nil
 	}
 	a, err := c.DecodeAddress(s.ourSourceAddr)
 	if err != nil {
@@ -292,19 +451,129 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 	src := [20]byte{}
 	copy(src[:], a.Hash)
 	s.state = csHoldApplied
-	xlog.Info("hold applied", "order", hexEncode(s.id[:]), "state", s.state.String())
+	xlog.Info("hold applied", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionHoldApply, &proto.HoldApplyBody{
 		HubAddress: s.hub, ClientAddress: src, ID: s.id,
 	}, nil
 }
 
+// verifyHold ports the C++ processTransactionHold amount/price re-verification
+// (xbridgesession.cpp:1404-1471). The Hold body carries the TAKER's give
+// (FromAmount) and take (ToAmount) — for the maker that is (dstAmt, srcAmt),
+// for the taker (srcAmt, dstAmt). Returns nil on success; the caller drops the
+// packet without a reply on failure.
+func (s *SwapSession) verifyHold(b *proto.HoldBody) error {
+	if s.isMaker {
+		// role 'A' (C++ :1425-1461): the taker cannot take more than the maker
+		// holds, cannot offer more than the maker wants, and cannot take below a
+		// partial order's minimum.
+		if b.ToAmount > s.srcAmt {
+			return fmt.Errorf("taker requesting an amount that is too large")
+		}
+		if b.FromAmount > s.dstAmt {
+			return fmt.Errorf("taker sending an amount that is too large")
+		}
+		if o := s.order(); o != nil && o.PartialAllowed && b.ToAmount < o.MinFromAmount {
+			return fmt.Errorf("taker requesting an amount that is too small")
+		}
+		if !swap.PartialOrderDriftCheck(s.srcAmt, s.dstAmt, b.FromAmount, b.ToAmount) {
+			return fmt.Errorf("taker price doesn't match maker expected price")
+		}
+		return nil
+	}
+	// role 'B' (C++ :1404-1424): the taker's give/take must match exactly.
+	if b.FromAmount != s.srcAmt {
+		return fmt.Errorf("taker from amount from snode should match expected amount")
+	}
+	if b.ToAmount != s.dstAmt {
+		return fmt.Errorf("taker to amount from snode should match expected amount")
+	}
+	// Drift against the order's original (maker-facing) pair; for a taker the
+	// orig pair is (dstAmt, srcAmt) when no store order is present.
+	origFrom, origTo := s.dstAmt, s.srcAmt
+	if o := s.order(); o != nil && o.OrigFromAmount > 0 {
+		origFrom, origTo = o.OrigFromAmount, o.OrigToAmount
+	}
+	if !swap.PartialOrderDriftCheck(origFrom, origTo, s.srcAmt, s.dstAmt) {
+		return fmt.Errorf("taker price doesn't match maker expected price")
+	}
+	return nil
+}
+
 // OnInit (hub→each) → Initialized (9): echo back our destination address.
 func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseBody, error) {
+	orderID := hexEncode(s.id[:])
+	// STATE-F71: C++ processTransactionInit drops once already initialized
+	// (xbridgesession.cpp:1725-1732).
+	if s.state >= csInitialized {
+		xlog.Info("Init ignored: swap already initialized", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	// STATE-F71: full order-detail re-verification with the INTENDED OR
+	// semantics (reject on ANY single-field mismatch). C++ :1750-1756 uses a
+	// buggy && (only rejects when EVERY field differs); the intended — and
+	// secure — behavior is to reject on any mismatch. Documented divergence.
+	if err := s.verifyInit(b); err != nil {
+		xlog.Warn("init rejected", "order", orderID, "err", err)
+		return 0, nil, nil
+	}
 	s.state = csInitialized
-	xlog.Info("initialized", "order", hexEncode(s.id[:]), "state", s.state.String())
+	xlog.Info("initialized", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionInitialized, &proto.InitializedBody{
 		HubAddress: s.hub, ClientAddress: b.ClientAddress, ID: s.id,
 	}, nil
+}
+
+// verifyInit re-verifies the Init packet's order details against the session
+// (intended OR semantics — see OnInit).
+func (s *SwapSession) verifyInit(b *proto.InitBody) error {
+	if b.ID != s.id {
+		return fmt.Errorf("order id mismatch")
+	}
+	if b.FromAddress != decodeAddrHash(s.srcCur, s.ourSourceAddr) {
+		return fmt.Errorf("from address mismatch")
+	}
+	if b.FromCurrency != s.srcCur {
+		return fmt.Errorf("from currency mismatch")
+	}
+	if b.FromAmount != s.srcAmt {
+		return fmt.Errorf("from amount mismatch")
+	}
+	if b.ToAddress != decodeAddrHash(s.dstCur, s.ourDestAddr) {
+		return fmt.Errorf("to address mismatch")
+	}
+	if b.ToCurrency != s.dstCur {
+		return fmt.Errorf("to currency mismatch")
+	}
+	if b.ToAmount != s.dstAmt {
+		return fmt.Errorf("to amount mismatch")
+	}
+	return nil
+}
+
+// order returns the session's store order, or nil when the node has no store
+// (raw test nodes) or the order is absent.
+func (s *SwapSession) order() *Order {
+	if s.n == nil || s.n.store == nil {
+		return nil
+	}
+	return s.n.store.Get(hexEncode(s.id[:]))
+}
+
+// decodeAddrHash decodes addrStr on cur into its 20-byte HASH160 (zero on an
+// unknown coin / undecodable address).
+func decodeAddrHash(cur, addrStr string) [20]byte {
+	c, ok := coins.Get(cur)
+	if !ok {
+		return [20]byte{}
+	}
+	a, err := c.DecodeAddress(addrStr)
+	if err != nil {
+		return [20]byte{}
+	}
+	var h [20]byte
+	copy(h[:], a.Hash)
+	return h
 }
 
 // OnCreateA (hub→maker) → CreatedA (11): build + broadcast our deposit A.
@@ -345,6 +614,10 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume: the apply always runs, so a
+			// selfCancelErr (bad counterparty deposit/locktime) still broadcasts
+			// the Cancel and rolls back.
+			s.applyCreatedA(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionCreatedA, s.applyCreatedA(v, nil), nil
@@ -441,15 +714,34 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 			// by ~90 blocks.
 			expLT := c.computeLockTimeFor(c.dstCur, true)
 			if !acceptableLockTimeDrift(expLT, b.ALockTime, c.blockTimeFor(c.dstCur)) {
-				return nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", orderID, b.ALockTime, expLT)
+				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
+				return nil, &selfCancelErr{reason: crBadALockTime}
 			}
-			return c.buildDeposit(false)
+			// CRYPTO-F85: validate the maker's A deposit BEFORE committing ours
+			// (C++ :2495). Wait → no response (hub retransmits); bad → Cancel.
+			dcheck, err := c.checkCounterpartyDeposit(c.theirSecretHash, c.dstAmt)
+			if err != nil {
+				return nil, err
+			}
+			if !dcheck.IsGood {
+				return nil, &selfCancelErr{reason: crBadADepositTx}
+			}
+			c.theirDepositVout = dcheck.DepositVout
+			c.theirP2SHNative = dcheck.P2SHNative
+			c.theirOverpayment = dcheck.Excess
+			out, err := c.buildDeposit(false)
+			if err != nil {
+				return nil, err
+			}
+			return createdBOutcome{out: out, check: dcheck}, nil
 		},
 		apply: func(v any, terr error) { s.applyCreatedB(v, terr) },
 	}
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyCreatedB(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionCreatedB, s.applyCreatedB(v, nil), nil
@@ -465,28 +757,39 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	s.await = false
 	if terr != nil {
+		if s.failSelfCancel(terr) {
+			return nil
+		}
 		xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
 		return nil
 	}
-	out := v.(depositOutcome)
-	s.ourDepositTxID = out.txid
-	s.ourLockTime = out.lockTime
-	s.refundHex = out.refundHex
+	out := v.(createdBOutcome)
+	s.ourDepositTxID = out.out.txid
+	s.ourLockTime = out.out.lockTime
+	s.refundHex = out.out.refundHex
+	s.theirDepositVout = out.check.DepositVout
+	s.theirP2SHNative = out.check.P2SHNative
+	s.theirOverpayment = out.check.Excess
 	s.n.store.Update(orderID, func(o *Order) {
-		o.BinTxId = out.txid
+		o.BinTxId = out.out.txid
 		o.DepositSent = true
 	})
 	s.n.store.Update(orderID, func(o *Order) {
-		o.RefundTx = out.refundHex
+		o.RefundTx = out.out.refundHex
+	})
+	s.n.store.Update(orderID, func(o *Order) {
+		o.OBinTxVout = out.check.DepositVout
+		o.OBinTxP2SHAmount = toXBridgeAmt(counterpartyCoin(s), out.check.P2SHNative)
+		o.OOverpayment = out.check.Excess
 	})
 	s.state = csCreatedB
-	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.txid,
-		"lockTime", out.lockTime, "makerDeposit", s.theirDepositTxID)
+	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
+		"lockTime", out.out.lockTime, "makerDeposit", s.theirDepositTxID)
 	xlog.Debug("deposit B refund pre-signed", "order", orderID)
 	body := responseBody(&proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
-		BDepositTxID: out.txid, BLockTime: out.lockTime,
-		RefTx: out.refundHex,
+		BDepositTxID: out.out.txid, BLockTime: out.out.lockTime,
+		RefTx: out.out.refundHex,
 	})
 	if s.n.engineRunning.Load() {
 		s.n.persist()
@@ -535,8 +838,20 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			// proceed to redeem.
 			expLT := c.computeLockTimeFor(c.dstCur, false)
 			if !acceptableLockTimeDrift(expLT, b.BLockTime, c.blockTimeFor(c.dstCur)) {
-				return nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", orderID, b.BLockTime, expLT)
+				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
+				return nil, &selfCancelErr{reason: crBadBLockTime}
 			}
+			// CRYPTO-F85: validate the taker's B deposit before redeeming it
+			// (C++ :2957). Wait → no response (hub retransmits); bad → Cancel.
+			dcheck, err := c.checkCounterpartyDeposit(c.secretHash, c.dstAmt)
+			if err != nil {
+				return nil, err
+			}
+			if !dcheck.IsGood {
+				return nil, &selfCancelErr{reason: crBadBDepositTx}
+			}
+			c.theirDepositVout = dcheck.DepositVout
+			c.theirP2SHNative = dcheck.P2SHNative
 			xlog.Info("ConfirmA: redeeming taker deposit", "order", orderID, "takerDeposit", b.BDepositTxID)
 			payHex, cur, err := c.redeemCounterparty(true)
 			if err != nil {
@@ -551,13 +866,15 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
 			}
-			return confirmOutcome{payTxID: payTxID}, nil
+			return confirmOutcome{payTxID: payTxID, check: dcheck}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedA(v, terr) },
 	}
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyConfirmedA(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionConfirmedA, s.applyConfirmedA(v, nil), nil
@@ -573,15 +890,25 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	s.await = false
 	if terr != nil {
+		if s.failSelfCancel(terr) {
+			return nil
+		}
 		xlog.Error("ConfirmA claim task failed", "order", orderID, "err", terr)
 		return nil
 	}
 	out := v.(confirmOutcome)
+	s.theirDepositVout = out.check.DepositVout
+	s.theirP2SHNative = out.check.P2SHNative
+	s.theirOverpayment = out.check.Excess
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
-	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
+	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()); the
+	// validated deposit out-params feed the F90 order record.
 	s.n.store.Update(orderID, func(o *Order) {
 		o.CounterpartyRedeemed = true
+		o.OBinTxVout = out.check.DepositVout
+		o.OBinTxP2SHAmount = toXBridgeAmt(counterpartyCoin(s), out.check.P2SHNative)
+		o.OOverpayment = out.check.Excess
 	})
 	body := responseBody(&proto.ConfirmedABody{
 		HubAddress: s.hub, ID: s.id, APayTxID: out.payTxID,
@@ -663,6 +990,8 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyConfirmedB(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionConfirmedB, s.applyConfirmedB(v, nil), nil
@@ -1027,11 +1356,12 @@ func (c *swapCtx) computeLockTime(isMaker bool) uint32 {
 }
 
 // buildDeposit builds the local participant's HTLC deposit, funds it from the
-// wallet connector, signs the funding inputs via the wallet, broadcasts it, and
-// pre-builds the CLTV refund. It returns the broadcast deposit txid + lockTime
-// and the pre-signed refund hex as a depositOutcome. Runs on a worker in the
-// two-phase handshake; it reads only this snapshot and lock-guarded config, and
-// performs no session/order mutation — those happen in the engine-side resume.
+// wallet connector, signs the funding inputs via the wallet, pre-builds the CLTV
+// refund, and only then broadcasts (CRYPTO-F86 — C++ builds deposit → refund →
+// broadcast). It returns the broadcast deposit txid + lockTime and the
+// pre-signed refund hex as a depositOutcome. Runs on a worker in the two-phase
+// handshake; it reads only this snapshot and lock-guarded config, and performs
+// no session/order mutation — those happen in the engine-side resume.
 func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	cur := c.srcCur
 	amt := c.srcAmt
@@ -1044,12 +1374,11 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !ok {
 		return depositOutcome{}, fmt.Errorf("api: unknown coin %s", cur)
 	}
-	funding, err := conn.ListUnspent(c.minConf(cc))
-	if err != nil {
-		return depositOutcome{}, err
-	}
+	// CRYPTO-F87: spend the recorded make/take-time selection (Order.UsedCoins,
+	// C++ xtx->usedCoins), never a fresh ListUnspent.
+	funding := c.funding
 	if len(funding) == 0 {
-		return depositOutcome{}, fmt.Errorf("api: no funding UTXOs for %s", cur)
+		return depositOutcome{}, fmt.Errorf("api: no funding UTXOs for %s (order has no used coins)", cur)
 	}
 	changeStr, err := conn.GetNewAddress()
 	if err != nil {
@@ -1061,23 +1390,34 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	} else {
 		copy(change[:], a.Hash)
 	}
-	fee := estimateFee(cc, len(funding), 2)
+	// CRYPTO-F78: the deposit network fee uses minTxFee1(nIn, 3) — C++ computes
+	// fee1 over the deposit with three outputs (p2sh + change + dust safety),
+	// xbridgesession.cpp:1994 (maker) / :2526 (taker).
+	fee := estimateFee(cc, len(funding), 3)
 	// fee2 is the p2sh redeem margin C++ locks into the HTLC output on top of
 	// the order amount (minTxFee2(1,1), xbridgesession.cpp:2094/:2615); it is
 	// collected when the deposit is claimed or refunded.
 	fee2 := estimateFee(cc, 1, 1)
 	lockTime := c.computeLockTime(isMaker)
 	xlog.Debug("buildDeposit: plan", "order", c.orderID, "isMaker", isMaker,
-		"cur", cur, "amount", amt, "lockTime", lockTime, "txVersion", c.txVersion(cur),
+		"cur", cur, "amountXB", amt, "lockTime", lockTime, "txVersion", c.txVersion(cur),
 		"utxos", len(funding), "fee", fee, "fee2", fee2)
 
 	hash := c.secretHash
 	if !isMaker {
 		hash = c.theirSecretHash
 	}
+	// W0 (CRYPTO-F90 prerequisite): the on-chain deposit locks NATIVE base units.
+	// c.srcAmt is XBridge 1e6 base; convert at this boundary so the swap
+	// package (BuildDepositTx output = Amount+fee2, change = total−Amount−fee−fee2)
+	// never mixes scales. C++ converts outAmount = fromAmount/COIN(XBridge) to
+	// whole coins and createDepositTransaction emits out.second*COIN(native)
+	// (xbridgewalletconnectorbtc.cpp:2442-2450). For COIN=1e6 coins this is a
+	// no-op; for BTC (1e8) it fixes the 100× under-lock.
+	nativeAmt := fromXBridgeAmt(coin, amt)
 	spec := &swap.DepositSpec{
 		Currency:        cur,
-		Amount:          amt,
+		Amount:          nativeAmt,
 		DepositorPub:    c.pubKey,
 		CounterpartyPub: c.theirPub,
 		Hash:            hash,
@@ -1101,19 +1441,34 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !complete {
 		return depositOutcome{}, fmt.Errorf("api: deposit signing incomplete for %s", cur)
 	}
-	txid, err := conn.SendRawTransaction(signed)
+	// CRYPTO-F86: derive the deposit txid LOCALLY (C++ binTxId comes from
+	// createDepositTransaction, xbridgewalletconnectorbtc.cpp:2410) and
+	// pre-build the CLTV refund BEFORE broadcasting. C++ builds deposit →
+	// refund → then broadcasts (processTransactionCreateA/B); the old order
+	// broadcast first, so a refund-build failure stranded a live deposit with
+	// no escape hatch. The refund spends the locally-derived txid.
+	localTxID, err := txIDFromHex(signed)
 	if err != nil {
 		return depositOutcome{}, err
 	}
-	c.ourDepositTxID = txid
+	c.ourDepositTxID = localTxID
 	c.ourLockTime = lockTime
-
 	refundHex, err := c.buildRefundTx(spec, cur)
 	if err != nil {
 		return depositOutcome{}, err
 	}
 	c.refundHex = refundHex
-	return depositOutcome{txid: txid, lockTime: lockTime, refundHex: refundHex}, nil
+
+	sentID, err := conn.SendRawTransaction(signed)
+	if err != nil {
+		return depositOutcome{}, err
+	}
+	// The wallet's returned id is logged (C++ :2187-2191) but never adopted:
+	// C++ keeps binTxId (the locally-derived txid) as authoritative.
+	if sentID != "" && sentID != localTxID {
+		xlog.Warn("buildDeposit: wallet reported a different sent txid", "order", c.orderID, "local", localTxID, "sent", sentID)
+	}
+	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex}, nil
 }
 
 // buildRefundTx pre-signs the IF-branch (CLTV) refund that returns the deposit to
@@ -1125,9 +1480,6 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		return "", err
 	}
 	fee := estimateFee(c.conf(cur), 1, 1)
-	if fee >= spec.Amount {
-		return "", fmt.Errorf("api: deposit amount too small for refund fee")
-	}
 	h, err := reverseTxidHex(c.ourDepositTxID)
 	if err != nil {
 		return "", err
@@ -1145,7 +1497,11 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
 	})
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount - fee, ScriptPubKey: dest})
+	// CRYPTO-F90: the refund pays the FULL nominal amount — C++ refund output is
+	// outAmount (xbridgesession.cpp:2149), spending the deposit's outAmount+fee2
+	// output, so fee2 is the refund's implicit miner fee. Was spec.Amount - fee
+	// (a second fee2 deduction).
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount, ScriptPubKey: dest})
 
 	inner := spec.RedeemScript()
 	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
@@ -1164,9 +1520,13 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 // handshake (reads only this snapshot + config); ConfirmB sets c.secret to the
 // recovered preimage before calling.
 func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, err error) {
+	depositCoin, ok := coins.Get(c.dstCur)
+	if !ok {
+		return "", "", fmt.Errorf("api: unknown coin %s", c.dstCur)
+	}
 	theirSpec := swap.DepositSpec{
 		Currency:        c.dstCur,
-		Amount:          c.dstAmt,
+		Amount:          fromXBridgeAmt(depositCoin, c.dstAmt), // W0: native base units
 		DepositorPub:    c.theirPub,
 		CounterpartyPub: c.pubKey,
 		LockTime:        c.theirLockTime,
@@ -1183,7 +1543,18 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		return "", "", err
 	}
 	fee := estimateFee(c.conf(depositCur), 1, 1)
-	if fee >= theirSpec.Amount {
+	// CRYPTO-F90: spend the VALIDATED counterparty deposit (C++ oBinTxVout /
+	// oBinTxP2SHAmount, recorded by the F85 check) instead of the hardcoded
+	// vout 0 / nominal amount. The claim pays the exact deposit value − fee2;
+	// the excess over the nominal dstAmt (+fee2) is what the redeemer keeps
+	// (C++ output = outAmount + oOverpayment = depositP2SH − fee2,
+	// xbridgesession.cpp:3971). P2SHNative is the exact native value, so the
+	// spend can never round-trip past the deposit.
+	p2shNative := c.theirP2SHNative
+	if p2shNative == 0 {
+		return "", "", fmt.Errorf("api: counterparty deposit not validated (no p2sh amount)")
+	}
+	if fee >= p2shNative {
 		return "", "", fmt.Errorf("api: counterparty deposit amount too small for claim fee")
 	}
 	h, err := reverseTxidHex(c.theirDepositTxID)
@@ -1199,12 +1570,13 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		tx.TxTime = uint32(time.Now().Unix())
 	}
 	xlog.Debug("redeemCounterparty: plan", "order", c.orderID, "isMaker", isMaker,
-		"depositCur", depositCur, "deposit", c.theirDepositTxID, "amount", theirSpec.Amount, "fee", fee, "txVersion", c.txVersion(depositCur))
+		"depositCur", depositCur, "deposit", c.theirDepositTxID, "vout", c.theirDepositVout,
+		"nominal", theirSpec.Amount, "p2sh", p2shNative, "fee", fee, "txVersion", c.txVersion(depositCur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
-		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
+		PrevOut:  coins.OutPoint{Hash: h, Index: c.theirDepositVout},
 		Sequence: 0xffffffff,
 	})
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: theirSpec.Amount - fee, ScriptPubKey: dest})
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: p2shNative - fee, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
 	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
