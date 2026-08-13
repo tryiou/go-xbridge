@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,6 +33,16 @@ const (
 	// refundCheckInterval is how often the background watcher scans live sessions
 	// for refunds whose deposit lockTime has passed. Overridable in tests.
 	refundCheckInterval = 60 * time.Second
+)
+
+// TxCancelReason values used by this branch's wire-Cancel paths. Only the B3
+// subset is defined here; the full enum (crUnknown..crBadFeeTx,
+// xbridgepacket.h:21-48) is STATE-F73's (B8) concern.
+const (
+	crBadADepositTx uint32 = 14
+	crBadBDepositTx uint32 = 15
+	crBadALockTime  uint32 = 18
+	crBadBLockTime  uint32 = 19
 )
 
 // clientState tracks the local client's progress through the hub-driven swap.
@@ -138,6 +149,60 @@ type depositOutcome struct {
 type confirmOutcome struct {
 	secret  [33]byte
 	payTxID string
+}
+
+// selfCancelErr marks a worker failure that must broadcast a Cancel packet with
+// the given TxCancelReason and roll back locally — C++ sendCancelTransaction
+// (crBadADepositTx/crBadBDepositTx/crBadALockTime/crBadBLockTime) + the
+// immediately-following processTransactionCancel. The resume (engine side)
+// recognizes it via errors.As and calls SwapSession.sendSelfCancel.
+type selfCancelErr struct {
+	reason uint32
+}
+
+func (e *selfCancelErr) Error() string {
+	return fmt.Sprintf("api: self-cancel (TxCancelReason %d)", e.reason)
+}
+
+// sendSelfCancel broadcasts a signed xbcTransactionCancel for OUR OWN rejection
+// of the counterparty's deposit/locktime and rolls back locally, mirroring C++
+// sendCancelTransaction + processTransactionCancel + sendPacketBroadcast
+// (xbridgesession.cpp:3525-3576). Must run on the engine goroutine (it mutates
+// the store/order): the callers are the two-phase resumes, which execute on the
+// engine. The packet is signed with the session's per-trade M key; since
+// Order.MakerKey is OUR M pubkey (order.go:96-99), handleRemoteCancel's
+// iCanceled check accepts it and performs the state transition (cancel if no
+// deposit sent, refund-broadcast rollback otherwise).
+func (s *SwapSession) sendSelfCancel(reason uint32) {
+	orderID := hexEncode(s.id[:])
+	if s.n == nil || s.n.conn == nil {
+		xlog.Error("selfCancel: no network connector", "order", orderID, "reason", reason)
+		return
+	}
+	body := &proto.CancelBody{ID: s.id, Reason: reason}
+	pkt := proto.NewPacket(proto.XbcTransactionCancel, body.Marshal())
+	if err := s.n.signer.Sign(pkt, s.privKey[:]); err != nil {
+		xlog.Error("selfCancel: sign failed", "order", orderID, "err", err)
+		return
+	}
+	xlog.Warn("selfCancel: counterparty deposit rejected", "order", orderID, "reason", reason)
+	// Local rollback first (C++ processTransactionCancel(reply)), then broadcast.
+	s.n.handleRemoteCancel(pkt, body)
+	if err := s.n.conn.WritePacket(pkt, [20]byte{}); err != nil {
+		xlog.Error("selfCancel: broadcast failed", "order", orderID, "err", err)
+	}
+}
+
+// failSelfCancel recognizes a selfCancelErr returned by a worker task and
+// performs the wire-Cancel + local rollback. It returns true when handled.
+// Engine-side (called from the resumes).
+func (s *SwapSession) failSelfCancel(terr error) bool {
+	var sce *selfCancelErr
+	if !errors.As(terr, &sce) {
+		return false
+	}
+	s.sendSelfCancel(sce.reason)
+	return true
 }
 
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
@@ -345,6 +410,10 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume: the apply always runs, so a
+			// selfCancelErr (bad counterparty deposit/locktime) still broadcasts
+			// the Cancel and rolls back.
+			s.applyCreatedA(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionCreatedA, s.applyCreatedA(v, nil), nil
@@ -441,7 +510,8 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 			// by ~90 blocks.
 			expLT := c.computeLockTimeFor(c.dstCur, true)
 			if !acceptableLockTimeDrift(expLT, b.ALockTime, c.blockTimeFor(c.dstCur)) {
-				return nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", orderID, b.ALockTime, expLT)
+				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
+				return nil, &selfCancelErr{reason: crBadALockTime}
 			}
 			return c.buildDeposit(false)
 		},
@@ -450,6 +520,8 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyCreatedB(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionCreatedB, s.applyCreatedB(v, nil), nil
@@ -465,6 +537,9 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	s.await = false
 	if terr != nil {
+		if s.failSelfCancel(terr) {
+			return nil
+		}
 		xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
 		return nil
 	}
@@ -535,7 +610,8 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			// proceed to redeem.
 			expLT := c.computeLockTimeFor(c.dstCur, false)
 			if !acceptableLockTimeDrift(expLT, b.BLockTime, c.blockTimeFor(c.dstCur)) {
-				return nil, fmt.Errorf("api: swap %s rejected: counterparty lockTime %d fails drift check (expected ~%d)", orderID, b.BLockTime, expLT)
+				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
+				return nil, &selfCancelErr{reason: crBadBLockTime}
 			}
 			xlog.Info("ConfirmA: redeeming taker deposit", "order", orderID, "takerDeposit", b.BDepositTxID)
 			payHex, cur, err := c.redeemCounterparty(true)
@@ -558,6 +634,8 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyConfirmedA(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionConfirmedA, s.applyConfirmedA(v, nil), nil
@@ -573,6 +651,9 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	s.await = false
 	if terr != nil {
+		if s.failSelfCancel(terr) {
+			return nil
+		}
 		xlog.Error("ConfirmA claim task failed", "order", orderID, "err", terr)
 		return nil
 	}
@@ -663,6 +744,8 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
+			// Mirror the started-mode resume (selfCancelErr must still fire).
+			s.applyConfirmedB(nil, terr)
 			return 0, nil, terr
 		}
 		return proto.XbcTransactionConfirmedB, s.applyConfirmedB(v, nil), nil
@@ -1027,11 +1110,12 @@ func (c *swapCtx) computeLockTime(isMaker bool) uint32 {
 }
 
 // buildDeposit builds the local participant's HTLC deposit, funds it from the
-// wallet connector, signs the funding inputs via the wallet, broadcasts it, and
-// pre-builds the CLTV refund. It returns the broadcast deposit txid + lockTime
-// and the pre-signed refund hex as a depositOutcome. Runs on a worker in the
-// two-phase handshake; it reads only this snapshot and lock-guarded config, and
-// performs no session/order mutation — those happen in the engine-side resume.
+// wallet connector, signs the funding inputs via the wallet, pre-builds the CLTV
+// refund, and only then broadcasts (CRYPTO-F86 — C++ builds deposit → refund →
+// broadcast). It returns the broadcast deposit txid + lockTime and the
+// pre-signed refund hex as a depositOutcome. Runs on a worker in the two-phase
+// handshake; it reads only this snapshot and lock-guarded config, and performs
+// no session/order mutation — those happen in the engine-side resume.
 func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	cur := c.srcCur
 	amt := c.srcAmt
@@ -1109,19 +1193,34 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !complete {
 		return depositOutcome{}, fmt.Errorf("api: deposit signing incomplete for %s", cur)
 	}
-	txid, err := conn.SendRawTransaction(signed)
+	// CRYPTO-F86: derive the deposit txid LOCALLY (C++ binTxId comes from
+	// createDepositTransaction, xbridgewalletconnectorbtc.cpp:2410) and
+	// pre-build the CLTV refund BEFORE broadcasting. C++ builds deposit →
+	// refund → then broadcasts (processTransactionCreateA/B); the old order
+	// broadcast first, so a refund-build failure stranded a live deposit with
+	// no escape hatch. The refund spends the locally-derived txid.
+	localTxID, err := txIDFromHex(signed)
 	if err != nil {
 		return depositOutcome{}, err
 	}
-	c.ourDepositTxID = txid
+	c.ourDepositTxID = localTxID
 	c.ourLockTime = lockTime
-
 	refundHex, err := c.buildRefundTx(spec, cur)
 	if err != nil {
 		return depositOutcome{}, err
 	}
 	c.refundHex = refundHex
-	return depositOutcome{txid: txid, lockTime: lockTime, refundHex: refundHex}, nil
+
+	sentID, err := conn.SendRawTransaction(signed)
+	if err != nil {
+		return depositOutcome{}, err
+	}
+	// The wallet's returned id is logged (C++ :2187-2191) but never adopted:
+	// C++ keeps binTxId (the locally-derived txid) as authoritative.
+	if sentID != "" && sentID != localTxID {
+		xlog.Warn("buildDeposit: wallet reported a different sent txid", "order", c.orderID, "local", localTxID, "sent", sentID)
+	}
+	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex}, nil
 }
 
 // buildRefundTx pre-signs the IF-branch (CLTV) refund that returns the deposit to

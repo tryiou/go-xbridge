@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"strings"
 	"sync"
@@ -664,10 +665,15 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("deposit A change = %d, want %d", got, 5e8-nativeAmt-fee-fee2)
 	}
 
-	// Pre-signed refund pays the full native amount (fee2 is the miner fee).
+	// Pre-signed refund pays the full native amount (fee2 is the miner fee) and
+	// spends the deposit via its LOCALLY-derived txid (CRYPTO-F86: the refund
+	// is built from the local txid before the broadcast).
 	refund := deserializeHex(t, createdA.RefTx)
 	if got := refund.Outputs[0].Value; got != nativeAmt-fee2 {
 		t.Fatalf("refund output = %d, want native %d - fee2 %d = %d", got, nativeAmt, fee2, nativeAmt-fee2)
+	}
+	if rev, err := reverseTxidHex(createdA.ADepositTxID); err != nil || refund.Inputs[0].PrevOut.Hash != rev {
+		t.Fatalf("refund prevout does not reference the deposit txid %s (err %v)", createdA.ADepositTxID, err)
 	}
 
 	// Taker deposit B (LTC): locks native(fromXBridgeAmt(2e6)) + fee2.
@@ -723,6 +729,117 @@ func deserializeHex(t *testing.T, hexStr string) *coins.Tx {
 		t.Fatalf("deserialize: %v", err)
 	}
 	return tx
+}
+
+// TestDepositNotBroadcastWhenRefundFails (CRYPTO-F86) proves the build order:
+// the deposit must be signed and the CLTV refund pre-built BEFORE the broadcast,
+// so a refund-build failure never strands a broadcast deposit without an escape
+// hatch (C++ builds deposit → refund → then broadcasts). An undecodable
+// refund destination makes buildRefundTx fail after signing; the connector must
+// show zero broadcasts.
+func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	priv, pub := newKey(t)
+	_, tkPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+
+	var orderID [32]byte
+	rfoHash := hash20("refund-fails-order")
+	copy(orderID[:], rfoHash[:])
+	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		MakeOrderParams{MakerAddress: "not-a-valid-address", TakerAddress: addrFor(0, "taker-dest")}, arr32(priv), toArr33(pub))
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateA(&proto.CreateABody{ID: orderID, BPubKey: to33(tkPub)})
+	if err == nil {
+		t.Fatal("expected refund-build failure (bad refund destination)")
+	}
+	if got := len(btc.broadcasts); got != 0 {
+		t.Fatalf("deposit broadcast %d time(s) despite refund-build failure; the refund must be pre-built before broadcasting (CRYPTO-F86)", got)
+	}
+}
+
+// TestCreateBBadLocktimeCancels proves the wire-Cancel path for a rejected
+// counterparty: a CreateB whose ALockTime fails the drift check must broadcast
+// a signed Cancel packet (reason crBadALockTime=18, C++ :2464-2472) AND roll
+// the order back locally (no deposit was sent → status "canceled"), and must
+// NOT respond with CreatedB.
+func TestCreateBBadLocktimeCancels(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	var orderID [32]byte
+	bloHash := hash20("bad-locktime-order")
+	copy(orderID[:], bloHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	// Seed the store order (the taker's copy) so the self-cancel's local rollback
+	// can find it and cancel it. MakerKey = OUR per-trade M pubkey (order.go:96).
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: strings.Repeat("bb", 32), HashedSecret: [20]byte{0x11},
+		ALockTime: 0, // fails the drift check (expected ~blockTime+2h)
+	})
+	if err == nil {
+		t.Fatal("expected locktime-drift rejection")
+	}
+	var sce *selfCancelErr
+	if !errors.As(err, &sce) || sce.reason != crBadALockTime {
+		t.Fatalf("err = %v, want selfCancelErr reason 18 (crBadALockTime)", err)
+	}
+	// A Cancel packet must have been broadcast, signed with our M key.
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("broadcast packets = %d (cmd %v), want exactly one Cancel", len(pkts), pkts[0].Command)
+	}
+	var cancel proto.CancelBody
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("cancel body: %v", err)
+	}
+	if cancel.Reason != crBadALockTime {
+		t.Fatalf("cancel reason = %d, want 18", cancel.Reason)
+	}
+	if ok, _ := n.signer.VerifyAgainst(pkts[0], hexEncode(tkPub[:])); !ok {
+		t.Fatal("cancel packet not signed with our per-trade M key")
+	}
+	// Local rollback: the pre-deposit order is canceled (moved to history with
+	// the cancel reason), never a CreatedB.
+	if h := n.store.HistoryOrder(hexEncode(orderID[:])); h == nil || h.Status != "canceled" {
+		t.Fatalf("history order = %+v, want canceled", h)
+	}
+	if n.store.Get(hexEncode(orderID[:])) != nil {
+		t.Fatal("order must be removed from the live store after the self-cancel")
+	}
 }
 
 func (s *SwapSession) pubkey() [33]byte { return s.pubKey }
