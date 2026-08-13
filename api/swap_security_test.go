@@ -2,13 +2,18 @@ package api
 
 import (
 	"bytes"
+	"encoding/hex"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"go-xbridge/coins"
+	"go-xbridge/config"
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an
@@ -303,5 +308,121 @@ func TestDispatchSwapTakerRejectsUnpinnedHub(t *testing.T) {
 	})
 	if s.hubKey != [33]byte{} {
 		t.Fatal("unpinned taker session was pinned by a hub packet")
+	}
+}
+
+// TestSecF03CompositeRefusal is the SEC-F03 composite acceptance: the HTLC
+// composition is sound, and with B3's validated-deposit gate the taker AND the
+// maker refuse an unvalidated counterparty deposit end-to-end — the hostile
+// outcome (theft, not recoverable lockup) is killed on both legs.
+func TestSecF03CompositeRefusal(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	makerCC := &captureXConn{}
+	takerCC := &captureXConn{}
+	makerNode.conn = makerCC
+	takerNode.conn = takerCC
+	var orderID [32]byte
+	s3h := hash20("sec-f03-order")
+	copy(orderID[:], s3h[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6, Status: "created"}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6, Status: "created"}
+	mkMPriv, mkMPub := newKey(t)
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	// The store orders must carry OUR per-trade M pubkey (Order.MakerKey,
+	// order.go:96) so the self-signed Cancel packets pass handleRemoteCancel's
+	// iCanceled check and the local rollback actually runs.
+	makerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(mkMPub[:]) })
+	takerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(tkPub[:]) })
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	// --- Leg 1 (taker): a maker A-deposit that is not a valid HTLC p2sh must
+	// be refused: wire-Cancel crBadADepositTx, NO CreatedB, NO B deposit of ours.
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("aa", 32))
+	fakeA := &coins.Tx{Version: 1}
+	fakeA.Inputs = append(fakeA.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	fakeA.Outputs = append(fakeA.Outputs, coins.TxOut{Value: 250000000, ScriptPubKey: coins.BuildP2PKHScript(hash20("evil"))}) // P2PKH, not the HTLC p2sh
+	fakeATxID := strings.Repeat("ef", 32)
+	tkLtc.setRawTx(fakeATxID, hex.EncodeToString(fakeA.Serialize()))
+	// The taker checks the maker's A deposit on its DST currency (BTC).
+	mkBtc.setRawTx(fakeATxID, hex.EncodeToString(fakeA.Serialize()))
+
+	_, _, err := takerSession.OnCreateB(&proto.CreateBBody{
+		HubAddress: hub, ID: orderID, APubKey: to33(mkMPub),
+		ADepositTxID: fakeATxID, HashedSecret: [20]byte{0x11}, ALockTime: 2000,
+	})
+	var sce *selfCancelErr
+	if !errors.As(err, &sce) || sce.reason != crBadADepositTx {
+		t.Fatalf("taker CreateB err = %v, want crBadADepositTx self-cancel", err)
+	}
+	if got := len(tkLtc.broadcasts); got != 0 {
+		t.Fatalf("taker broadcast %d deposit(s) despite an unvalidated A-deposit, want 0 (theft killed)", got)
+	}
+	// A Cancel (crBadADepositTx) must be on the wire, and NO CreatedB.
+	pkts := takerCC.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("taker wrote %d packets (cmd %v), want exactly one Cancel", len(pkts), pkts[0].Command)
+	}
+	// The taker's pre-deposit order is canceled locally (status "canceled").
+	if o := takerNode.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "canceled" {
+		t.Fatalf("taker order status = %+v, want canceled", o)
+	}
+
+	// --- Leg 2 (maker): a taker B-deposit that is not the valid HTLC p2sh must
+	// be refused at ConfirmA: wire-Cancel crBadBDepositTx, NO ConfirmedA, and the
+	// maker's own deposit rolls back via its pre-signed refund.
+	_, bodyA, err := makerSession.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+	fakeB := &coins.Tx{Version: 1}
+	fundingLtc, _ := reverseTxidHex(strings.Repeat("bb", 32))
+	fakeB.Inputs = append(fakeB.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingLtc, Index: 0}, Sequence: seqFinal})
+	fakeB.Outputs = append(fakeB.Outputs, coins.TxOut{Value: 200000000, ScriptPubKey: coins.BuildP2PKHScript(hash20("evil-b"))})
+	fakeBTxID := strings.Repeat("fe", 32)
+	tkLtc.setRawTx(fakeBTxID, hex.EncodeToString(fakeB.Serialize()))
+
+	_, _, err = makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: fakeBTxID, BLockTime: createdA.ALockTime})
+	if !errors.As(err, &sce) || sce.reason != crBadBDepositTx {
+		t.Fatalf("maker ConfirmA err = %v, want crBadBDepositTx self-cancel", err)
+	}
+	// The maker's A deposit rolls back: status "rolled back" and the pre-signed
+	// refund is enqueued (C++ processLater; in production the wallet rejects the
+	// pre-lockTime CLTV spend and the background sweep retries once the
+	// deposit's lockTime passes — never a second deposit).
+	if o := makerNode.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "rolled back" {
+		t.Fatalf("maker order status = %+v, want rolled back", o)
+	}
+	if got := len(mkBtc.broadcasts); got != 2 {
+		t.Fatalf("maker BTC broadcasts = %d, want 2 (deposit A + its enqueued refund)", got)
+	}
+	// The maker's Cancel (crBadBDepositTx) is on the wire; NO ConfirmedA.
+	mkPkts := makerCC.snapshot()
+	if len(mkPkts) != 1 || mkPkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("maker wrote %d packets (cmd %v), want exactly one Cancel", len(mkPkts), mkPkts[0].Command)
 	}
 }
