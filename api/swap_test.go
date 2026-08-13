@@ -769,11 +769,132 @@ func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
 	}
 }
 
+// TestCreateBBadDepositCancels (CRYPTO-F85) proves the taker refuses a
+// definitively bad maker A-deposit: the check fails (no matching p2sh script),
+// so OnCreateB must wire-Cancel (crBadADepositTx=14) and roll back locally with
+// NO CreatedB response and NO deposit of our own.
+func TestCreateBBadDepositCancels(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	// A "deposit" that spends the known funding utxo but carries a P2PKH output
+	// instead of the expected p2sh → the p2sh scan finds nothing → IsGood=false.
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("aa", 32))
+	badDeposit := &coins.Tx{Version: 1}
+	badDeposit.Inputs = append(badDeposit.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	badDeposit.Outputs = append(badDeposit.Outputs, coins.TxOut{Value: 250000000, ScriptPubKey: coins.BuildP2PKHScript(hash20("not-a-p2sh"))})
+	badDepositTxID := strings.Repeat("cd", 32)
+	btc.setRawTx(badDepositTxID, hex.EncodeToString(badDeposit.Serialize()))
+
+	var orderID [32]byte
+	obdHash := hash20("bad-deposit-order")
+	copy(orderID[:], obdHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: badDepositTxID, HashedSecret: [20]byte{0x11}, ALockTime: 2000,
+	})
+	if err == nil {
+		t.Fatal("expected bad-deposit rejection")
+	}
+	var sce *selfCancelErr
+	if !errors.As(err, &sce) || sce.reason != crBadADepositTx {
+		t.Fatalf("err = %v, want selfCancelErr reason 14 (crBadADepositTx)", err)
+	}
+	// Cancel broadcast, signed with our M key; no CreatedB; no deposit of ours.
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("broadcast packets = %d, want exactly one Cancel", len(pkts))
+	}
+	var cancel proto.CancelBody
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil || cancel.Reason != crBadADepositTx {
+		t.Fatalf("cancel reason = %d (err %v), want 14", cancel.Reason, err)
+	}
+	if got := len(btc.broadcasts); got != 0 {
+		t.Fatalf("taker broadcast %d deposit(s) despite a bad counterparty deposit, want 0", got)
+	}
+	if h := n.store.HistoryOrder(hexEncode(orderID[:])); h == nil || h.Status != "canceled" {
+		t.Fatalf("history order = %+v, want canceled", h)
+	}
+}
+
+// TestCreateBWaitsOnNotReadyDeposit (CRYPTO-F85) proves the "wait" leg: an
+// A-deposit the connector cannot yet find is ErrDepositNotReady → OnCreateB
+// sends NO response (C++ processLater — the hub retransmits) and NO cancel, and
+// the order is left untouched.
+func TestCreateBWaitsOnNotReadyDeposit(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tkPriv, tkPub := newKey(t)
+	_, makerPub := newKey(t)
+	fundingPriv, fundingPub := newKey(t)
+	btc := &fakeConnector{
+		ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(fundingPub)))},
+		fundingPriv: fundingPriv, fundingPub: fundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{},
+	}
+	confs := map[string]*config.CoinConf{"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60}}
+	n := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btc})
+	cc := &captureXConn{}
+	n.conn = cc
+
+	var orderID [32]byte
+	owdHash := hash20("not-ready-deposit-order")
+	copy(orderID[:], owdHash[:])
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
+		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
+	n.store.Add(&Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", MakerKey: hexEncode(tkPub[:]),
+	})
+	s := n.sessions[hexEncode(orderID[:])]
+
+	_, _, err := s.OnCreateB(&proto.CreateBBody{
+		HubAddress: [20]byte{}, ID: orderID, APubKey: to33(makerPub),
+		ADepositTxID: strings.Repeat("ef", 32), // not in the connector's log
+		HashedSecret: [20]byte{0x11}, ALockTime: 2000,
+	})
+	if err == nil {
+		t.Fatal("expected ErrDepositNotReady")
+	}
+	if !errors.Is(err, wallet.ErrDepositNotReady) {
+		t.Fatalf("err = %v, want ErrDepositNotReady", err)
+	}
+	if len(cc.snapshot()) != 0 {
+		t.Fatal("no response must be sent while the deposit is not ready (hub retransmits)")
+	}
+	if o := n.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "open" {
+		t.Fatalf("order status = %+v, want still open", o)
+	}
+}
+
 // TestCreateBBadLocktimeCancels proves the wire-Cancel path for a rejected
-// counterparty: a CreateB whose ALockTime fails the drift check must broadcast
-// a signed Cancel packet (reason crBadALockTime=18, C++ :2464-2472) AND roll
-// the order back locally (no deposit was sent → status "canceled"), and must
-// NOT respond with CreatedB.
+// counterparty locktime: a CreateB whose ALockTime fails the drift check must
+// broadcast a signed Cancel packet (reason crBadALockTime=18) AND roll the
+// order back locally (status "canceled"), never responding with CreatedB.
 func TestCreateBBadLocktimeCancels(t *testing.T) {
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},

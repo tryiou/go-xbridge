@@ -124,6 +124,14 @@ type SwapSession struct {
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
 
+	// Validated counterparty deposit (CRYPTO-F90): the C++
+	// checkDepositTransaction out-params recorded when we accept the
+	// counterparty's deposit (CreateB for the taker's A-check, ConfirmA for the
+	// maker's B-check). P2SHAmount and Overpayment are XBridge 1e6 base.
+	theirDepositVout uint32
+	theirP2SHAmount  uint64
+	theirOverpayment uint64
+
 	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
 	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (STATE-F78)
 	state  clientState
@@ -205,6 +213,48 @@ func (s *SwapSession) failSelfCancel(terr error) bool {
 	return true
 }
 
+// createdBOutcome is the worker result of the taker's CreateB task: the built
+// deposit plus the validated counterparty A-deposit (CRYPTO-F90 — the resume
+// records DepositVout/P2SHAmount/Excess on the session for the F90 redeem).
+type createdBOutcome struct {
+	out   depositOutcome
+	check wallet.DepositCheck
+}
+
+// counterpartyDepositScriptHex returns the P2SH output script the counterparty's
+// deposit must carry: OP_HASH160 <HASH160(unlockScript)> OP_EQUAL, where the
+// unlock script is createDepositUnlockScript(DepositorPub=theirPub,
+// CounterpartyPub=ourKey, hash, opponentLockTime) (xbridgesession.cpp:2484,
+// 2946). For the taker checking A, hash = the maker's HashedSecret
+// (theirSecretHash); for the maker checking B, hash = OUR secretHash (both
+// deposits share it).
+func (c *swapCtx) counterpartyDepositScriptHex(hash [20]byte) string {
+	spec := swap.DepositSpec{
+		Currency:        c.dstCur,
+		DepositorPub:    c.theirPub,
+		CounterpartyPub: c.pubKey,
+		Hash:            hash,
+		LockTime:        c.theirLockTime,
+	}
+	return hex.EncodeToString(spec.P2SHScript())
+}
+
+// checkCounterpartyDeposit validates the counterparty's deposit against the
+// expected p2sh script and amount before we commit our own deposit or redeem
+// theirs (CRYPTO-F85 — C++ checkDepositTransaction call sites
+// xbridgesession.cpp:2495/2957). expectedAmount is XBridge 1e6 base. Tri-state:
+// ErrDepositNotReady and ErrNoChainSource are returned as errors (the caller
+// sends NO response — C++ processLater / the connector cannot judge); a
+// returned DepositCheck with IsGood=false is a definitively bad deposit (the
+// caller must wire-Cancel, crBadADepositTx/crBadBDepositTx).
+func (c *swapCtx) checkCounterpartyDeposit(hash [20]byte, expectedAmount uint64) (wallet.DepositCheck, error) {
+	conn := c.n.cfg().Connectors[c.dstCur]
+	if conn == nil {
+		return wallet.DepositCheck{}, fmt.Errorf("api: no connector for %s", c.dstCur)
+	}
+	return conn.CheckDepositTransaction(c.theirDepositTxID, c.counterpartyDepositScriptHex(hash), expectedAmount, c.minConf(c.conf(c.dstCur)))
+}
+
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
 // stage-1 enqueue time. The two-phase handshake workers run the wallet-I/O
 // builders against THIS value (plus the node's lock-guarded config via c.n) and
@@ -230,6 +280,9 @@ type swapCtx struct {
 	theirDepositTxID string
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
+	theirDepositVout uint32
+	theirP2SHAmount  uint64
+	theirOverpayment uint64
 	ourDepositTxID   string
 	ourLockTime      uint32
 	refundHex        string
@@ -257,6 +310,9 @@ func (s *SwapSession) snapshot() swapCtx {
 		theirDepositTxID: s.theirDepositTxID,
 		theirLockTime:    s.theirLockTime,
 		theirSecretHash:  s.theirSecretHash,
+		theirDepositVout: s.theirDepositVout,
+		theirP2SHAmount:  s.theirP2SHAmount,
+		theirOverpayment: s.theirOverpayment,
 		ourDepositTxID:   s.ourDepositTxID,
 		ourLockTime:      s.ourLockTime,
 		refundHex:        s.refundHex,
@@ -513,7 +569,23 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadALockTime}
 			}
-			return c.buildDeposit(false)
+			// CRYPTO-F85: validate the maker's A deposit BEFORE committing ours
+			// (C++ :2495). Wait → no response (hub retransmits); bad → Cancel.
+			dcheck, err := c.checkCounterpartyDeposit(c.theirSecretHash, c.dstAmt)
+			if err != nil {
+				return nil, err
+			}
+			if !dcheck.IsGood {
+				return nil, &selfCancelErr{reason: crBadADepositTx}
+			}
+			c.theirDepositVout = dcheck.DepositVout
+			c.theirP2SHAmount = dcheck.P2SHAmount
+			c.theirOverpayment = dcheck.Excess
+			out, err := c.buildDeposit(false)
+			if err != nil {
+				return nil, err
+			}
+			return createdBOutcome{out: out, check: dcheck}, nil
 		},
 		apply: func(v any, terr error) { s.applyCreatedB(v, terr) },
 	}
@@ -543,25 +615,28 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 		xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
 		return nil
 	}
-	out := v.(depositOutcome)
-	s.ourDepositTxID = out.txid
-	s.ourLockTime = out.lockTime
-	s.refundHex = out.refundHex
+	out := v.(createdBOutcome)
+	s.ourDepositTxID = out.out.txid
+	s.ourLockTime = out.out.lockTime
+	s.refundHex = out.out.refundHex
+	s.theirDepositVout = out.check.DepositVout
+	s.theirP2SHAmount = out.check.P2SHAmount
+	s.theirOverpayment = out.check.Excess
 	s.n.store.Update(orderID, func(o *Order) {
-		o.BinTxId = out.txid
+		o.BinTxId = out.out.txid
 		o.DepositSent = true
 	})
 	s.n.store.Update(orderID, func(o *Order) {
-		o.RefundTx = out.refundHex
+		o.RefundTx = out.out.refundHex
 	})
 	s.state = csCreatedB
-	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.txid,
-		"lockTime", out.lockTime, "makerDeposit", s.theirDepositTxID)
+	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
+		"lockTime", out.out.lockTime, "makerDeposit", s.theirDepositTxID)
 	xlog.Debug("deposit B refund pre-signed", "order", orderID)
 	body := responseBody(&proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
-		BDepositTxID: out.txid, BLockTime: out.lockTime,
-		RefTx: out.refundHex,
+		BDepositTxID: out.out.txid, BLockTime: out.out.lockTime,
+		RefTx: out.out.refundHex,
 	})
 	if s.n.engineRunning.Load() {
 		s.n.persist()
@@ -613,6 +688,17 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadBLockTime}
 			}
+			// CRYPTO-F85: validate the taker's B deposit before redeeming it
+			// (C++ :2957). Wait → no response (hub retransmits); bad → Cancel.
+			dcheck, err := c.checkCounterpartyDeposit(c.secretHash, c.dstAmt)
+			if err != nil {
+				return nil, err
+			}
+			if !dcheck.IsGood {
+				return nil, &selfCancelErr{reason: crBadBDepositTx}
+			}
+			c.theirDepositVout = dcheck.DepositVout
+			c.theirP2SHAmount = dcheck.P2SHAmount
 			xlog.Info("ConfirmA: redeeming taker deposit", "order", orderID, "takerDeposit", b.BDepositTxID)
 			payHex, cur, err := c.redeemCounterparty(true)
 			if err != nil {
