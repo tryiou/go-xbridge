@@ -11,8 +11,15 @@ const cmdSize = 12
 // MaxPayloadSize bounds the declared payload length of a P2P message. Peer-
 // supplied lengths are untrusted; this cap prevents a huge m.Length from
 // allocating an enormous Payload (and avoids uint32 overflow in the length
-// check). 64 MiB is far beyond any real Bitcoin/XBridge message.
-const MaxPayloadSize = 1 << 26
+// check). It matches C++ MAX_PROTOCOL_MESSAGE_LENGTH = 4,000,000 (src/net.h:55),
+// which disconnects any peer declaring more (src/net.cpp:583-585).
+const MaxPayloadSize = 4_000_000
+
+// ErrChecksum is returned by UnmarshalMessage when a frame's checksum does not
+// match its payload. It is non-fatal by design: C++ logs a bad-checksum frame
+// and drops it without disconnecting (net_processing.cpp:3138-3145), so
+// conn.readMessage continues to the next frame on this sentinel.
+var ErrChecksum = errors.New("p2p: checksum mismatch")
 
 // Message is a Bitcoin-style P2P message:
 //
@@ -76,7 +83,7 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 	m.Payload = make([]byte, m.Length)
 	copy(m.Payload, data[4+cmdSize+8:4+cmdSize+8+m.Length])
 	if Checksum(m.Payload) != m.Checksum {
-		return nil, errors.New("p2p: checksum mismatch")
+		return nil, ErrChecksum
 	}
 	return m, nil
 }

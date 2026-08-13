@@ -191,19 +191,39 @@ func (c *Conn) WritePacket(p *proto.Packet, dest [20]byte) error {
 }
 
 func (c *Conn) readMessage() (*Message, error) {
-	hdr := make([]byte, 4+cmdSize+8)
-	if _, err := io.ReadFull(c.reader, hdr); err != nil {
-		return nil, err
+	for {
+		hdr := make([]byte, 4+cmdSize+8)
+		if _, err := io.ReadFull(c.reader, hdr); err != nil {
+			return nil, err
+		}
+		length := binary.LittleEndian.Uint32(hdr[4+cmdSize : 4+cmdSize+4])
+		if length > MaxPayloadSize {
+			// C++ disconnects a peer declaring more than
+			// MAX_PROTOCOL_MESSAGE_LENGTH (net.cpp:583-585).
+			return nil, errors.New("p2p: implausible message length")
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(c.reader, payload); err != nil {
+			return nil, err
+		}
+		msg, err := UnmarshalMessage(append(hdr, payload...))
+		if err != nil {
+			if errors.Is(err, ErrChecksum) {
+				// C++ logs and drops a bad-checksum frame without disconnecting
+				// (net_processing.cpp:3138-3145); keep the connection and read
+				// the next frame.
+				xlog.Debug("p2p: dropping frame with bad checksum")
+				continue
+			}
+			return nil, err
+		}
+		if msg.Magic != c.magic {
+			// C++ disconnects on an invalid message start
+			// (net_processing.cpp:3117-3121).
+			return nil, errors.New("p2p: unexpected network magic")
+		}
+		return msg, nil
 	}
-	length := binary.LittleEndian.Uint32(hdr[4+cmdSize : 4+cmdSize+4])
-	if length > 64*1024*1024 {
-		return nil, errors.New("p2p: implausible message length")
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.reader, payload); err != nil {
-		return nil, err
-	}
-	return UnmarshalMessage(append(hdr, payload...))
 }
 
 // PeerVersion returns the peer's advertised version message, captured during
