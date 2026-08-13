@@ -2,14 +2,20 @@ package wallet
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"go-xbridge/coins"
 )
 
 // mockMsgSigB64 is a fixed base64 BIP137 signature (65 raw bytes) the mock
@@ -477,4 +483,323 @@ func TestRPCConnectorSignMessage(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("VerifyMessage ok=%v err=%v", ok, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// CheckDepositTransaction goldens — fixtures mirror the C++ writers
+// (xbridgewalletconnectorbtc.cpp:1981-2194), not comments.
+// ---------------------------------------------------------------------------
+
+// testTxID returns the display-order txid of a serialized tx.
+func testTxID(b []byte) string {
+	h1 := sha256.Sum256(b)
+	h2 := sha256.Sum256(h1[:])
+	var out [32]byte
+	for i := 0; i < 32; i++ {
+		out[i] = h2[31-i]
+	}
+	return hex.EncodeToString(out[:])
+}
+
+// depositFixtures builds the RPC fixtures for the goldens. The funding prevout
+// tx carries a single 3.0 BTC output; the deposit spends it (SEQUENCE_FINAL),
+// locking 2.500226 BTC into the expected p2sh (2.5 amount + minTxFee2(1,1)
+// 0.000226) with 0.4995 BTC change. Note the C++ totalVoutAmount accrual quirk:
+// the vout loop breaks on the FIRST p2sh script match, so vouts after it (the
+// change) are excluded; counterpartyFees = totalVin − p2sh = 0.499774 clears
+// the fee1 band trivially. Fixed chain: FeePerByte=100 sat/vB (whole 1e-6),
+// MinTxFee=0, scale 1e8.
+type depositFixtures struct {
+	fundingHex    string
+	fundingTxID   string
+	depositHex    string
+	depositTxID   string
+	p2shScriptHex string
+}
+
+func buildDepositFixtures(t *testing.T) *depositFixtures {
+	t.Helper()
+	// Funding prevout: 3.0 BTC in output 0.
+	funding := &coins.Tx{Version: 1}
+	funding.Outputs = append(funding.Outputs, coins.TxOut{Value: 300000000, ScriptPubKey: []byte{0x51}})
+	fundingHex := hex.EncodeToString(funding.Serialize())
+	fundingTxID := testTxID(funding.Serialize())
+	fundingInternal, err := revHashHex(fundingTxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p2sh := coins.BuildP2SHScript([20]byte{0xde, 0xad, 0xbe, 0xef})
+
+	// Deposit: spend funding:0, output0 = 2.500226 p2sh, output1 = 0.4995 change.
+	deposit := &coins.Tx{Version: 1}
+	deposit.Inputs = append(deposit.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	deposit.Outputs = append(deposit.Outputs,
+		coins.TxOut{Value: 250022600, ScriptPubKey: p2sh},
+		coins.TxOut{Value: 49950000, ScriptPubKey: []byte{0x51}},
+	)
+	return &depositFixtures{
+		fundingHex:    fundingHex,
+		fundingTxID:   fundingTxID,
+		depositHex:    hex.EncodeToString(deposit.Serialize()),
+		depositTxID:   testTxID(deposit.Serialize()),
+		p2shScriptHex: hex.EncodeToString(p2sh),
+	}
+}
+
+// checkDepositServer serves the RPCs CheckDepositTransaction issues. The
+// deposit's raw hex is fully controlled per test (depositRaw); the funding
+// prevout's verbose JSON is served only for the fixture funding txid, so any
+// other vin txid lookup fails as "vin tx not found ...waiting".
+type checkDepositServer struct {
+	fx           *depositFixtures
+	depositRaw   string // getrawtransaction [txid,0] raw hex
+	depositErr   bool   // getrawtransaction fails (tx not found)
+	confs        string // gettxout result body ("" → default 6 confirmations)
+	confsNull    bool   // gettxout returns null (unknown output)
+	fundingValue string // prevout value (whole BTC); "" → "3.0"
+	calls        []string
+}
+
+func newCheckDepositServer(t *testing.T, cfg *checkDepositServer) *httptest.Server {
+	t.Helper()
+	fx := cfg.fx
+	fv := cfg.fundingValue
+	if fv == "" {
+		fv = "3.0"
+	}
+	fundingVerbose := fmt.Sprintf(`{"txid":%q,"vin":[{"txid":null,"sequence":4294967295}],"vout":[{"value":%s,"n":0,"scriptPubKey":{"hex":"51"}}]}`, fx.fundingTxID, fv)
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		cfg.calls = append(cfg.calls, req.Method)
+		enc := json.NewEncoder(w)
+		respond := func(res string) { enc.Encode(rpcResponse{Result: json.RawMessage(res), ID: req.ID}) }
+		respondErr := func(msg string) {
+			enc.Encode(rpcResponse{Error: &rpcError{Code: -5, Message: msg}, ID: req.ID})
+		}
+		switch req.Method {
+		case "getrawtransaction":
+			if cfg.depositErr {
+				respondErr("No such mempool or blockchain transaction.")
+				return
+			}
+			if len(req.Params) > 1 {
+				if v, ok := req.Params[1].(float64); ok && v == 1 {
+					if txid, _ := req.Params[0].(string); txid == fx.fundingTxID {
+						respond(fundingVerbose)
+						return
+					}
+					respondErr("vin tx not found")
+					return
+				}
+			}
+			respond(`"` + cfg.depositRaw + `"`)
+		case "gettxout":
+			if cfg.confsNull {
+				respond(`null`)
+				return
+			}
+			if cfg.confs == "" {
+				respond(`{"confirmations":6}`)
+				return
+			}
+			respond(cfg.confs)
+		default:
+			respond(`null`)
+		}
+	}))
+}
+
+// checkDepositConn builds an RPCConnector for a checkDepositServer with the
+// fixed fee/scale settings the goldens assert against (FeePerByte=100 sat/vB
+// → whole 1e-6; MinTxFee=0; BTC scale 1e8).
+func checkDepositConn(srvURL string) *RPCConnector {
+	return NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srvURL, User: "u", Pass: "p",
+		Decimals: 8, FeePerByte: 100, MinTxFee: 0})
+}
+
+const depositAmountXB = 2500000 // 2.5 in XBridge 1e6 base
+
+func TestCheckDepositTransaction(t *testing.T) {
+	fx := buildDepositFixtures(t)
+
+	// newDeposit returns the fixture deposit with a per-test mutation applied,
+	// rewires the server's depositRaw, and yields (conn, callLog).
+	newDeposit := func(cfg *checkDepositServer, mutate func(*coins.Tx)) (*RPCConnector, *checkDepositServer) {
+		cfg.fx = fx
+		cfg.depositRaw = fx.depositHex
+		if mutate != nil {
+			raw, err := hex.DecodeString(fx.depositHex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := coins.Deserialize(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(tx)
+			cfg.depositRaw = hex.EncodeToString(tx.Serialize())
+		}
+		srv := newCheckDepositServer(t, cfg)
+		t.Cleanup(srv.Close)
+		return checkDepositConn(srv.URL), cfg
+	}
+
+	t.Run("good", func(t *testing.T) {
+		c, cfg := newDeposit(&checkDepositServer{}, nil)
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("CheckDepositTransaction: %v", err)
+		}
+		if !dc.IsGood || dc.P2SHAmount != 2500226 || dc.DepositVout != 0 || dc.Excess != 0 {
+			t.Fatalf("verdict = %+v, want IsGood with P2SHAmount 2500226 vout 0 excess 0", dc)
+		}
+		// Call order mirrors C++: raw getrawtransaction → gettxout gate →
+		// verbose getrawtransaction (prevout).
+		want := []string{"getrawtransaction", "gettxout", "getrawtransaction"}
+		if len(cfg.calls) != len(want) {
+			t.Fatalf("call log = %v, want %v", cfg.calls, want)
+		}
+		for i := range want {
+			if cfg.calls[i] != want[i] {
+				t.Fatalf("call log = %v, want %v", cfg.calls, want)
+			}
+		}
+	})
+
+	t.Run("not found waits", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{depositErr: true}, nil)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+
+	t.Run("insufficient confirmations waits", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{confs: `{"confirmations":1}`}, nil)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+
+	t.Run("gettxout unknown waits", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{confsNull: true}, nil)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+
+	t.Run("missing prevout waits", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{}, func(tx *coins.Tx) {
+			tx.Inputs[0].PrevOut.Hash = [32]byte{} // spend an unknown funding txid
+		})
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+
+	t.Run("bad sequence is bad", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{}, func(tx *coins.Tx) {
+			tx.Inputs[0].Sequence = seqFinal - 1
+		})
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v, want bad (nil)", err)
+		}
+		if dc.IsGood {
+			t.Fatalf("expected IsGood=false, got %+v", dc)
+		}
+	})
+
+	t.Run("decode failure is bad", func(t *testing.T) {
+		c, cfg := newDeposit(&checkDepositServer{}, nil)
+		cfg.depositRaw = "zznothex"
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v, want bad (nil)", err)
+		}
+		if dc.IsGood {
+			t.Fatalf("expected IsGood=false, got %+v", dc)
+		}
+	})
+
+	t.Run("no valid p2sh is bad", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{}, func(tx *coins.Tx) {
+			tx.Outputs[0].ScriptPubKey = []byte{0x51} // wrong script
+		})
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v, want bad (nil)", err)
+		}
+		if dc.IsGood {
+			t.Fatalf("expected IsGood=false, got %+v", dc)
+		}
+	})
+
+	t.Run("fee1 shortfall is bad", func(t *testing.T) {
+		// Funding input only just covers the p2sh (2.5003 vs 2.500226), so the
+		// C++ counterpartyFees (totalVin minus the vouts up to the matched p2sh,
+		// which excludes the change output after the break) = 0.000074 <
+		// 0.95*fee1 (0.000247).
+		c, _ := newDeposit(&checkDepositServer{fundingValue: "2.5003"}, func(tx *coins.Tx) {
+			tx.Outputs = tx.Outputs[:1] // p2sh only, no change
+		})
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v, want bad (nil)", err)
+		}
+		if dc.IsGood {
+			t.Fatalf("expected IsGood=false, got %+v", dc)
+		}
+	})
+
+	t.Run("fee2 shortfall is bad", func(t *testing.T) {
+		// P2SH lowered to 2.5 < 2.5 + 0.95*fee2.
+		c, _ := newDeposit(&checkDepositServer{}, func(tx *coins.Tx) {
+			tx.Outputs[0].Value = 250000000
+			tx.Outputs[1].Value = 49900000 // keep totals: fee stays 0.000274 ≥ fee1 band
+		})
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v, want bad (nil)", err)
+		}
+		if dc.IsGood {
+			t.Fatalf("expected IsGood=false, got %+v", dc)
+		}
+	})
+
+	t.Run("excess computed", func(t *testing.T) {
+		// P2SH 2.510226 = 2.5 + fee2 + 0.01 excess.
+		c, _ := newDeposit(&checkDepositServer{}, func(tx *coins.Tx) {
+			tx.Outputs[0].Value = 251022600
+			tx.Outputs[1].Value = 48950000 // keep fee constant 0.000274
+		})
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !dc.IsGood {
+			t.Fatalf("expected good, got %+v", dc)
+		}
+		if dc.Excess != 10000 || dc.P2SHAmount != 2510226 {
+			t.Fatalf("Excess/P2SHAmount = %d/%d, want 10000/2510226", dc.Excess, dc.P2SHAmount)
+		}
+	})
+
+	t.Run("no confirmation gate when required=0", func(t *testing.T) {
+		c, _ := newDeposit(&checkDepositServer{confsNull: true}, nil)
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 0)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !dc.IsGood {
+			t.Fatalf("expected good (gate skipped), got %+v", dc)
+		}
+	})
 }

@@ -22,6 +22,24 @@ import (
 // b58alphabet is the Bitcoin base58 alphabet used by base58check.
 const b58alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+// CheckDepositTransaction test-twin constants (wallet package versions are
+// unexported): seqFinal is the deposit-input sequence requirement (C++
+// xbridge::SEQUENCE_FINAL) and dblEps is std::numeric_limits<double>::epsilon().
+const (
+	seqFinal = 0xffffffff
+	dblEps   = 2.220446049250313e-16
+)
+
+// hashToDisplayHex converts a 32-byte internal (little-endian) hash into its
+// display-order txid hex.
+func hashToDisplayHex(b []byte) string {
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return hex.EncodeToString(out)
+}
+
 func base58Encode(b []byte) string {
 	zeros := 0
 	for zeros < len(b) && b[zeros] == 0 {
@@ -82,6 +100,14 @@ type fakeConnector struct {
 	// funding utxo (the B2 funding path locks take #1's selection, so a
 	// single-utxo fixture starves later takes).
 	funders []wallet.Utxo
+
+	// CheckDepositTransaction knobs: confirmations maps a broadcast txid to its
+	// confirmations (a known tx without an entry fails the required-confirmations
+	// gate → ErrDepositNotReady); feePerByte/minTxFee drive the C++ fee-band
+	// checks (default 0 → no fee rejection).
+	confirmations map[string]int
+	feePerByte    uint64
+	minTxFee      uint64
 
 	mu         sync.Mutex
 	broadcasts []string
@@ -182,6 +208,140 @@ func (f *fakeConnector) GetRawTransaction(txid string) (string, error) {
 		return "", errNotFound
 	}
 	return h, nil
+}
+
+// chainScale returns the coin's native base scale (10^Decimals), falling back
+// to 1e8 when the coin registry is not initialized (fixtures that never call
+// coins.InitFromConf).
+func (f *fakeConnector) chainScale() float64 {
+	dec := 8
+	if c, ok := coins.Get(f.ticker); ok && c.Decimals > 0 {
+		dec = c.Decimals
+	}
+	s := 1.0
+	for i := 0; i < dec; i++ {
+		s *= 10
+	}
+	return s
+}
+
+// minTxFeeWhole mirrors C++ minTxFee1/minTxFee2 in whole coins (the fake's
+// in-memory twin of RPCConnector.minTxFeeWhole).
+func (f *fakeConnector) minTxFeeWhole(nIn, nOut int) float64 {
+	fee := uint64(192*nIn+34*nOut) * f.feePerByte
+	if fee < f.minTxFee {
+		fee = f.minTxFee
+	}
+	return float64(fee) / f.chainScale()
+}
+
+// CheckDepositTransaction is the in-memory twin of RPCConnector.
+// CheckDepositTransaction: it validates a counterparty deposit against its own
+// broadcast log (plus the known funding UTXOs as prevout sources), so the F85
+// wiring tests can drive the full C++ tri-state (ready / bad / wait) without a
+// wallet.
+func (f *fakeConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (wallet.DepositCheck, error) {
+	dc := wallet.DepositCheck{}
+
+	f.mu.Lock()
+	rawHex, ok := f.rawTx[depositTxID]
+	confsOK := true
+	if ok && requiredConfirmations > 0 {
+		c, okc := f.confirmations[depositTxID]
+		confsOK = okc && c >= requiredConfirmations
+	}
+	known := make(map[string]wallet.Utxo, len(f.funders)+1)
+	if len(f.funders) > 0 {
+		for _, u := range f.funders {
+			known[u.TxID] = u
+		}
+	} else {
+		known[f.funding.TxID] = f.funding
+	}
+	rawLog := make(map[string]string, len(f.rawTx))
+	for k, v := range f.rawTx {
+		rawLog[k] = v
+	}
+	f.mu.Unlock()
+
+	if !ok || !confsOK {
+		return dc, wallet.ErrDepositNotReady
+	}
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return dc, nil // done: bad
+	}
+	tx, err := coins.Deserialize(raw)
+	if err != nil {
+		return dc, nil // done: bad
+	}
+	if len(tx.Inputs) == 0 || len(tx.Outputs) == 0 {
+		return dc, nil // done: bad
+	}
+
+	scale := f.chainScale()
+	// Vin scan: sequence + prevout amounts.
+	var totalVinAmount float64
+	for i := range tx.Inputs {
+		vin := &tx.Inputs[i]
+		if vin.Sequence != seqFinal {
+			return dc, nil // bad sequence
+		}
+		vinTxID := hashToDisplayHex(vin.PrevOut.Hash[:])
+		vinAmount, found := 0.0, false
+		if rawHex2, ok := rawLog[vinTxID]; ok {
+			if b, err := hex.DecodeString(rawHex2); err == nil {
+				if vtx, err := coins.Deserialize(b); err == nil && int(vin.PrevOut.Index) < len(vtx.Outputs) {
+					vinAmount, found = float64(vtx.Outputs[vin.PrevOut.Index].Value)/scale, true
+				}
+			}
+		} else if u, ok := known[vinTxID]; ok && u.Vout == vin.PrevOut.Index {
+			vinAmount, found = float64(u.Amount)/scale, true
+		}
+		if !found {
+			return dc, wallet.ErrDepositNotReady // vin tx not found ...waiting
+		}
+		totalVinAmount += vinAmount
+	}
+
+	// Vout scan for the expected p2sh.
+	var totalVoutAmount, depositP2SHAmount float64
+	var depositTxVout uint32
+	for i := range tx.Outputs {
+		out := &tx.Outputs[i]
+		whole := float64(out.Value) / scale
+		totalVoutAmount += whole
+		if hex.EncodeToString(out.ScriptPubKey) != expectedScriptHex {
+			continue
+		}
+		if float64(expectedAmount)/coinScale <= whole+dblEps {
+			depositP2SHAmount = whole
+			depositTxVout = uint32(i)
+		}
+		break // done searching
+	}
+	if depositP2SHAmount == 0 {
+		return dc, nil // no valid p2sh
+	}
+
+	// Fee checks.
+	counterpartyFees := totalVinAmount - totalVoutAmount
+	fee1 := f.minTxFeeWhole(len(tx.Inputs), len(tx.Outputs))
+	fee2 := f.minTxFeeWhole(1, 1)
+	if counterpartyFees < 0 || counterpartyFees < fee1*0.95 {
+		return dc, nil // not enough to cover deposit fees
+	}
+	wholeAmount := float64(expectedAmount) / coinScale
+	if depositP2SHAmount < wholeAmount+fee2*0.95 {
+		return dc, nil // not enough to cover redeem fees
+	}
+	if depositP2SHAmount > wholeAmount+fee2 {
+		dc.Excess = uint64((depositP2SHAmount - wholeAmount - fee2) * coinScale)
+	}
+	dc.P2SHAmount = uint64(depositP2SHAmount * coinScale)
+	dc.DepositVout = depositTxVout
+	dc.IsGood = true
+	return dc, nil
 }
 
 func (f *fakeConnector) SignMessage(address, message string) ([]byte, error) {
