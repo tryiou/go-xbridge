@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 // versionPayloadForTest marshals a minimal version payload with the given
@@ -138,4 +139,63 @@ func TestConnHandshakeOK(t *testing.T) {
 		t.Fatalf("peerVersion = %+v, want version %d", c.PeerVersion(), BitcoinProtocolVersion)
 	}
 	_ = c.Close()
+}
+
+// TestConnVersionBelowMinimum asserts a peer advertising a version below
+// MIN_PEER_PROTO_VERSION is disconnected (C++ net_processing.cpp:1617-1626).
+func TestConnVersionBelowMinimum(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		if _, err := readFrame(server); err != nil { // our version
+			return
+		}
+		writeFrame(server, Message{
+			Magic:    MainnetMagic,
+			Command:  "version",
+			Payload:  versionPayloadForTest(MinPeerProtoVersion - 1),
+			Checksum: Checksum(versionPayloadForTest(MinPeerProtoVersion - 1)),
+		})
+	}()
+	if _, err := NewConn(client, MainnetMagic); err == nil {
+		t.Fatal("expected handshake error for obsolete peer version")
+	}
+}
+
+// TestConnDuplicateVersion asserts a second version message is fatal
+// (C++ disconnects on a duplicate version, net_processing.cpp:1574-1582).
+func TestConnDuplicateVersion(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		if _, err := readFrame(server); err != nil { // our version
+			return
+		}
+		writeFrame(server, Message{
+			Magic:    MainnetMagic,
+			Command:  "version",
+			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+		})
+		if _, err := readFrame(server); err != nil { // our verack (after version 1)
+			return
+		}
+		writeFrame(server, Message{
+			Magic:    MainnetMagic,
+			Command:  "version",
+			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+		})
+	}()
+	if _, err := NewConn(client, MainnetMagic); err == nil {
+		t.Fatal("expected handshake error for duplicate version message")
+	}
+}
+
+// TestHandshakeTimeout asserts the deadline matches the C++
+// DEFAULT_PEER_CONNECT_TIMEOUT (net.h:83).
+func TestHandshakeTimeout(t *testing.T) {
+	if handshakeTimeout != 60*time.Second {
+		t.Fatalf("handshakeTimeout = %v, want 60s (C++ DEFAULT_PEER_CONNECT_TIMEOUT)", handshakeTimeout)
+	}
 }

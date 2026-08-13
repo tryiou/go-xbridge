@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -22,8 +23,9 @@ var dialDedup = xlog.NewDedupe(60*time.Second, func(addr string, total int, elap
 })
 
 // handshakeTimeout bounds the version/verack exchange so a misbehaving peer
-// cannot hang Dial indefinitely.
-const handshakeTimeout = 30 * time.Second
+// cannot hang Dial indefinitely. It mirrors C++ DEFAULT_PEER_CONNECT_TIMEOUT =
+// 60 s (net.h:83), the deadline C++ gives a peer to send its first message.
+const handshakeTimeout = 60 * time.Second
 
 // Conn is a thin XBridge peer connection over the Bitcoin P2P transport.
 // It performs the version/verack handshake and streams decoded XBridge packets.
@@ -99,10 +101,22 @@ func (c *Conn) handshake() error {
 		}
 		switch msg.Command {
 		case "version":
-			seenVersion = true
-			if v, err := UnmarshalVersion(msg.Payload); err == nil {
-				c.peerVersion = v
+			if seenVersion {
+				// C++ disconnects on a duplicate version message
+				// (net_processing.cpp:1574-1582).
+				return errors.New("p2p: duplicate version message")
 			}
+			seenVersion = true
+			v, err := UnmarshalVersion(msg.Payload)
+			if err != nil {
+				return err
+			}
+			if v.Version < MinPeerProtoVersion {
+				// C++ disconnects peers below MIN_PEER_PROTO_VERSION
+				// (net_processing.cpp:1617-1626).
+				return fmt.Errorf("p2p: peer version %d below minimum %d", v.Version, MinPeerProtoVersion)
+			}
+			c.peerVersion = v
 			if err := c.writeVerack(); err != nil {
 				return err
 			}

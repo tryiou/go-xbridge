@@ -15,6 +15,11 @@ const (
 	// The node rejects peers advertising a lower version.
 	BitcoinProtocolVersion = 70713
 
+	// MinPeerProtoVersion is MIN_PEER_PROTO_VERSION (src/version.h:27). C++
+	// disconnects a peer advertising a lower version
+	// (net_processing.cpp:1617-1626); the Go handshake enforces the same gate.
+	MinPeerProtoVersion = 70712
+
 	// ServiceNodeNone — a thin client advertises no services.
 	ServiceNodeNone uint64 = 0
 
