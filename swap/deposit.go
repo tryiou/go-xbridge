@@ -46,7 +46,11 @@ func (r Role) String() string {
 // The depositor chooses Secret; revealing SecretHash to the counterparty (in
 // the init packet) lets them build the matching claim.
 type DepositSpec struct {
-	Currency        string
+	Currency string
+	// Amount is the deposit's on-chain value in NATIVE base units of Currency
+	// (10^Decimals; satoshis for BTC/BLOCK). The api layer converts the order's
+	// XBridge 1e6-base amount at the boundary (api.swapCtx.buildDeposit); this
+	// package never mixes scales.
 	Amount          uint64
 	DepositorPub    [33]byte
 	CounterpartyPub [33]byte

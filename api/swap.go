@@ -1068,16 +1068,24 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	fee2 := estimateFee(cc, 1, 1)
 	lockTime := c.computeLockTime(isMaker)
 	xlog.Debug("buildDeposit: plan", "order", c.orderID, "isMaker", isMaker,
-		"cur", cur, "amount", amt, "lockTime", lockTime, "txVersion", c.txVersion(cur),
+		"cur", cur, "amountXB", amt, "lockTime", lockTime, "txVersion", c.txVersion(cur),
 		"utxos", len(funding), "fee", fee, "fee2", fee2)
 
 	hash := c.secretHash
 	if !isMaker {
 		hash = c.theirSecretHash
 	}
+	// W0 (CRYPTO-F90 prerequisite): the on-chain deposit locks NATIVE base units.
+	// c.srcAmt is XBridge 1e6 base; convert at this boundary so the swap
+	// package (BuildDepositTx output = Amount+fee2, change = total−Amount−fee−fee2)
+	// never mixes scales. C++ converts outAmount = fromAmount/COIN(XBridge) to
+	// whole coins and createDepositTransaction emits out.second*COIN(native)
+	// (xbridgewalletconnectorbtc.cpp:2442-2450). For COIN=1e6 coins this is a
+	// no-op; for BTC (1e8) it fixes the 100× under-lock.
+	nativeAmt := fromXBridgeAmt(coin, amt)
 	spec := &swap.DepositSpec{
 		Currency:        cur,
-		Amount:          amt,
+		Amount:          nativeAmt,
 		DepositorPub:    c.pubKey,
 		CounterpartyPub: c.theirPub,
 		Hash:            hash,
@@ -1164,9 +1172,13 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 // handshake (reads only this snapshot + config); ConfirmB sets c.secret to the
 // recovered preimage before calling.
 func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, err error) {
+	depositCoin, ok := coins.Get(c.dstCur)
+	if !ok {
+		return "", "", fmt.Errorf("api: unknown coin %s", c.dstCur)
+	}
 	theirSpec := swap.DepositSpec{
 		Currency:        c.dstCur,
-		Amount:          c.dstAmt,
+		Amount:          fromXBridgeAmt(depositCoin, c.dstAmt), // W0: native base units
 		DepositorPub:    c.theirPub,
 		CounterpartyPub: c.pubKey,
 		LockTime:        c.theirLockTime,

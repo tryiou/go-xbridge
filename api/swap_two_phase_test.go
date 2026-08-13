@@ -117,7 +117,7 @@ func TestTwoPhaseCreateAWorkerPool(t *testing.T) {
 	oid := hash20("order-id")
 	copy(orderID[:], oid[:])
 	mkAddr := addrFor(0, "maker-btc-dest")
-	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.newMakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6}, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
 	s := n.sessions[hexEncode(orderID[:])]
 
 	// Stage 1 on the engine; the worker builds+broadcasts the deposit async.
@@ -235,7 +235,7 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	// dstCur = the maker's coin (BTC, whose deposit it claims).
 	tkAddr := addrFor(48, "taker-ltc-source")
 	btcDest := addrFor(0, "maker-btc-dest")
-	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8}, TakeOrderParams{FromAddress: tkAddr, ToAddress: btcDest}, arr32(tkPriv), to33(tkPub))
+	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}, TakeOrderParams{FromAddress: tkAddr, ToAddress: btcDest}, arr32(tkPriv), to33(tkPub))
 	s := n.sessions[hexEncode(orderID[:])]
 	// Seed the counterparty deposit knowledge ConfirmB needs (normally learned
 	// via CreateB); the secret itself is deliberately NOT set.
@@ -325,7 +325,7 @@ func TestCreateAStateGuardDropsPostCompletionRetransmitE2E(t *testing.T) {
 	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
 	mkAddr := addrFor(0, "maker-btc-dest")
 	o := &Order{
-		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
@@ -473,7 +473,7 @@ func TestTwoPhaseAwaitDropsRetransmit(t *testing.T) {
 	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
 	mkAddr := addrFor(0, "maker-btc-dest")
 	o := &Order{
-		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 1e8, ToAmount: 1e8,
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	}
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
