@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +22,22 @@ import (
 // string params.
 func jstr(s string) json.RawMessage {
 	return json.RawMessage([]byte(`"` + s + `"`))
+}
+
+// mustJSONMap marshals a handler result and unmarshals it into a string-keyed
+// map so tests can inspect JSON field values regardless of the concrete result
+// type (ordered structs marshal the same wire shape as the maps they replaced).
+func mustJSONMap(t *testing.T, v interface{}) map[string]interface{} {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	m := map[string]interface{}{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal result %s: %v", b, err)
+	}
+	return m
 }
 
 // jnum wraps a Go int64 as a JSON-RawMessage number param. C++ reads int params
@@ -147,6 +165,120 @@ func TestDxGetMyOrdersRead(t *testing.T) {
 	if arr, ok := res.([]orderDetailResult); !ok || len(arr) != 1 {
 		t.Fatalf("dxGetMyOrders = %v (%T)", res, res)
 	}
+}
+
+// TestDxGetMyOrdersDedupAndSort locks in the RPC-F26 behaviors: an order
+// present in BOTH the live book and history renders once (C++ seen[] dedup,
+// rpcxbridge.cpp:2133-2138), and rows are ordered ascending by the raw
+// microsecond updated time, not the ISO-rendered millisecond string.
+func TestDxGetMyOrdersDedupAndSort(t *testing.T) {
+	ctx := newWalletTestCtx()
+	oldest := seedOrder(ctx) // ID {0x01}, Mine, Updated: 1
+	oldest.Updated = 1000
+
+	dup := &Order{ID: oldest.ID, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "finished", Mine: true,
+		Created: 1, Updated: 1000}
+	ctx.Store.AddToHistory(dup, "finished", 0, 1000)
+
+	mid := &Order{ID: [32]byte{0x02}, FromCurrency: "BTC", FromAmount: 200,
+		ToCurrency: "BTC", ToAmount: 100, Status: "canceled", Mine: true, Created: 2, Updated: 1500}
+	ctx.Store.AddToHistory(mid, "canceled", 1, 1500)
+
+	latest := &Order{ID: [32]byte{0x03}, FromCurrency: "BTC", FromAmount: 300,
+		ToCurrency: "BTC", ToAmount: 150, Status: "open", Mine: true, Created: 3, Updated: 500}
+	ctx.Store.Add(latest)
+
+	res, err := ctx.dxGetMyOrders(nil)
+	if err != nil {
+		t.Fatalf("dxGetMyOrders: %v", err)
+	}
+	arr := res.([]orderDetailResult)
+	if len(arr) != 3 {
+		t.Fatalf("dxGetMyOrders = %d rows, want 3 (dup deduped): %+v", len(arr), arr)
+	}
+	// Ascending by Updated: latest(500) < oldest(1000) < mid(1500).
+	if arr[0].ID != dispID(latest.ID) || arr[1].ID != dispID(oldest.ID) || arr[2].ID != dispID(mid.ID) {
+		t.Fatalf("rows not sorted by µs updated: %+v", arr)
+	}
+}
+
+// TestDxGetMyOrdersFieldOrder locks in the RPC-F26 fix: maker_address /
+// taker_address are emitted at JSON positions 3/6 (rpcxbridge.cpp:2151-2171),
+// not appended after orderBase.
+func TestDxGetMyOrdersFieldOrder(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx)
+	o.MakerAddress, o.TakerAddress = "mk1", "tk1"
+	res, err := ctx.dxGetMyOrders(nil)
+	if err != nil {
+		t.Fatalf("dxGetMyOrders: %v", err)
+	}
+	b, _ := json.Marshal(res)
+	want := []string{
+		"id", "maker", "maker_size", "maker_address", "taker", "taker_size",
+		"taker_address", "updated_at", "created_at", "order_type",
+		"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
+		"partial_repost", "partial_parent_id", "status",
+	}
+	if got := firstObjectKeys(b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dxGetMyOrders key order = %v, want %v (C++ 2151-2171)", got, want)
+	}
+}
+
+// TestDxPartialOrderChainDetailsKeyOrder locks in the RPC-F30 fix: the details
+// object emits keys in C++ pushKV insertion order (rpcxbridge.cpp:2460-2480),
+// not Go-map alphabetical order.
+func TestDxPartialOrderChainDetailsKeyOrder(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx)
+	o.PartialAllowed = true
+	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(dispID(o.ID))})
+	if err != nil {
+		t.Fatalf("dxPartialOrderChainDetails: %v", err)
+	}
+	b, _ := json.Marshal(res)
+	want := []string{
+		"first_order_id", "maker", "maker_address", "taker", "taker_address",
+		"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
+		"first_order_time", "last_order_time", "total_reported_sent",
+		"total_reported_received", "total_reported_notsent",
+		"total_reported_notreceived", "total_orders_open", "total_orders_finished",
+		"total_orders_canceled", "orders", "p2sh_deposits", "p2sh_deposits_counterparty",
+	}
+	if got := firstObjectKeys(b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("details key order = %v, want %v (C++ 2460-2480)", got, want)
+	}
+}
+
+// TestDxPartialOrderChainDetailsBadId locks in the RPC-F29 fix: the malformed /
+// null id error text is C++'s "bad order id" (rpcxbridge.cpp:2414), not
+// "Invalid order id [<id>]".
+func TestDxPartialOrderChainDetailsBadId(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(strings.Repeat("0", 64))})
+	if err == nil || err.Code != errInvalidParameters {
+		t.Fatalf("dxPartialOrderChainDetails(null id) = %v, want INVALID_PARAMETERS", err)
+	}
+	if !strings.Contains(err.Error, "bad order id") {
+		t.Fatalf("error text = %q, want it to contain %q", err.Error, "bad order id")
+	}
+}
+
+// firstObjectKeys returns the JSON key order of the FIRST object in b, for flat
+// objects (no nested braces), matching how encoding/json serializes ordered
+// structs. Used to lock C++ insertion order byte-for-byte.
+func firstObjectKeys(b []byte) []string {
+	s := string(b)
+	start := strings.IndexByte(s, '{')
+	end := strings.IndexByte(s[start+1:], '}')
+	obj := s[start : start+1+end]
+	re := regexp.MustCompile(`"([a-zA-Z_0-9]+)":`)
+	var keys []string
+	for _, m := range re.FindAllStringSubmatch(obj, -1) {
+		keys = append(keys, m[1])
+	}
+	return keys
 }
 
 func TestDxGetOrderBookEmptyPairEmitsArrays(t *testing.T) {
@@ -692,6 +824,9 @@ func TestDxGetTradingDataFills(t *testing.T) {
 func TestDxPartialChainRead(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx)
+	// C++ getPartialOrderChain filters to local partial/partial-child orders
+	// (xbridgeapp.cpp:3922): a parent-less exact order is not part of any chain.
+	o.PartialAllowed = true
 
 	res, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
@@ -705,7 +840,8 @@ func TestDxPartialChainRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
-	if m, ok := res.(map[string]interface{}); !ok || m["first_order_id"] == nil {
+	m := mustJSONMap(t, res)
+	if m["first_order_id"] == nil {
 		t.Fatalf("dxPartialOrderChainDetails = %v (%T)", res, res)
 	}
 
@@ -724,17 +860,25 @@ func TestDxPartialChainRead(t *testing.T) {
 }
 
 // TestDxPartialOrderChainDetailsAggregate locks in C++ dxPartialOrderChainDetails'
-// aggregate schema: a full chain (ancestors + self + descendants) rooted at the
+// aggregate schema: a full lineage (ancestors + self + descendants) rooted at the
 // oldest order, with per-status sent/received/notsent/notreceived totals and the
-// orders field rendered as a hex-id array (not order objects).
+// orders field rendered as a hex-id array (not order objects). The chain is
+// filtered to local partial/partial-child orders (xbridgeapp.cpp:3922) and
+// sorted by created time (xbridgeapp.cpp:3985-3988), so the fixture uses
+// monotonic created values to yield a root-first chain.
 func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	ctx := newWalletTestCtx()
 	parent := &Order{ID: [32]byte{0xaa}, FromCurrency: "BTC", ToCurrency: "BTC",
-		FromAmount: 100, ToAmount: 50, Status: "finished", Created: 10, Updated: 10}
+		FromAmount: 100, ToAmount: 50, Status: "finished", Created: 10, Updated: 10,
+		Mine: true, PartialAllowed: true}
 	mid := seedOrder(ctx) // ID {0x01}, BTC/BTC, open
 	mid.ParentID = [32]byte{0xaa}
+	// Created order must be monotonic (parent < mid < child) so the C++
+	// created-time sort yields a root-first chain.
+	mid.Created, mid.Updated = 20, 20
 	child := &Order{ID: [32]byte{0xbb}, FromCurrency: "BTC", ToCurrency: "BTC",
-		FromAmount: 200, ToAmount: 100, Status: "canceled", Created: 30, Updated: 30}
+		FromAmount: 200, ToAmount: 100, Status: "canceled", Created: 30, Updated: 30,
+		Mine: true}
 	child.ParentID = [32]byte{0x01}
 	ctx.Store.Add(parent)
 	ctx.Store.Add(child)
@@ -743,21 +887,19 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
-	m, ok := res.(map[string]interface{})
-	if !ok {
-		t.Fatalf("result = %v (%T)", res, res)
-	}
+	m := mustJSONMap(t, res)
 	if m["first_order_id"] != dispID(parent.ID) {
 		t.Errorf("first_order_id = %v, want %v", m["first_order_id"], dispID(parent.ID))
 	}
-	orders, ok := m["orders"].([]string)
+	orders, ok := m["orders"].([]interface{})
 	if !ok || len(orders) != 3 {
 		t.Fatalf("orders = %v (%T), want 3 hex ids", m["orders"], m["orders"])
 	}
+	// Final chain is sorted ascending by created time -> root first.
 	if orders[0] != dispID(parent.ID) || orders[2] != dispID(child.ID) {
 		t.Errorf("orders not root-first: %v", orders)
 	}
-	if m["total_orders_open"] != 1 || m["total_orders_finished"] != 1 || m["total_orders_canceled"] != 1 {
+	if m["total_orders_open"] != float64(1) || m["total_orders_finished"] != float64(1) || m["total_orders_canceled"] != float64(1) {
 		t.Errorf("counts wrong: open=%v finished=%v canceled=%v",
 			m["total_orders_open"], m["total_orders_finished"], m["total_orders_canceled"])
 	}
@@ -767,8 +909,10 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	if m["total_reported_notsent"] != formatXAmount(1500000+200) {
 		t.Errorf("total_reported_notsent = %v, want %v", m["total_reported_notsent"], formatXAmount(1500200))
 	}
-	if p, _ := m["p2sh_deposits"].([]string); len(p) != 0 {
-		t.Errorf("p2sh_deposits should be empty, got %v", p)
+	// RPC-F28: p2sh_deposits carries ONE entry per chain order, empty strings
+	// included, so callers can index by position against `orders`.
+	if p, _ := m["p2sh_deposits"].([]interface{}); len(p) != 3 {
+		t.Errorf("p2sh_deposits should have 3 per-order entries, got %v", m["p2sh_deposits"])
 	}
 }
 

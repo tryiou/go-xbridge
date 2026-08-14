@@ -62,11 +62,11 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F23 | S2 | `dxGetTokenBalances` `"Wallet"` key derivation/presence differ | DOCUMENTED | no synthesized `Wallet` key — thin client exposes the BLOCK connector balance under its ticker (deliberate, `B7-rpc.md`) |
 | RPC-F24 | S3 | `dxGetTokenBalances` key order (Go map-sorted, Wallet last) | DOCUMENTED | C++ ticker order is race-dependent thread-completion order (non-conformable; same decision as F23) |
 | RPC-F25 | S3 | `dxGetTokenBalances` precision (C++ per-UTXO double sum vs Go exact integer) | FIXED | B7 `fix/rpc-surface` (golden `TestDxGetTokenBalancesSum`; agreement to the 6th decimal) |
-| RPC-F26 | S3 | `dxGetMyOrders` field order, param rejection, dedup, sort | OPEN | B7 |
-| RPC-F27 | S2 | `dxGetMyPartialOrderChain` chain membership differs (filters/sort) | OPEN | B7 |
-| RPC-F28 | S2 | `dxPartialOrderChainDetails` `p2sh_deposits` array length ≠ chain length | OPEN | B7 |
-| RPC-F29 | S3 | `dxPartialOrderChainDetails` bad-id error text differs | OPEN | B7 |
-| RPC-F30 | S3 | `dxPartialOrderChainDetails` key order alphabetized (Go map) | OPEN | B7 |
+| RPC-F26 | S3 | `dxGetMyOrders` field order, param rejection, dedup, sort | FIXED | B7 `fix/rpc-surface` (`orderDetailResult` addresses at 3/6; `seen` dedup; µs sort — `TestDxGetMyOrdersDedupAndSort`, `TestDxGetMyOrdersFieldOrder`; arity already gated params) |
+| RPC-F27 | S2 | `dxGetMyPartialOrderChain` chain membership differs (filters/sort) | FIXED | B7 `fix/rpc-surface` (ported `getPartialOrderChain` filter: local partial/partial-child in live+history; created-time sort; full-lineage walk as documented deviation from the C++ utxo-count child-walk — `TestDxPartialOrderChainDetailsAggregate`, `TestPartialOrderChainResolvesHistoryParent`) |
+| RPC-F28 | S2 | `dxPartialOrderChainDetails` `p2sh_deposits` array length ≠ chain length | FIXED | B7 `fix/rpc-surface` (one entry per chain order incl. empty strings — `TestDxPartialOrderChainDetailsAggregate`) |
+| RPC-F29 | S3 | `dxPartialOrderChainDetails` bad-id error text differs | FIXED | B7 `fix/rpc-surface` (`"bad order id"` — `TestDxPartialOrderChainDetailsBadId`) |
+| RPC-F30 | S3 | `dxPartialOrderChainDetails` key order alphabetized (Go map) | FIXED | B7 `fix/rpc-surface` (ordered `partialChainDetailsResult` struct, C++ 2460-2480 — `TestDxPartialOrderChainDetailsKeyOrder`) |
 | RPC-F31 | S3 | `dxGetLockedUtxos` amount encoding (default-float vs fixed-6/native) | OPEN | B7 |
 | RPC-F32 | S2 | `dxGetLockedUtxos` 1021 trigger too narrow in Go | OPEN | B7 |
 | RPC-F33 | S3 | `dxGetLockedUtxos` per-order key selection (status ordinal vs map membership) | OPEN | B7 |

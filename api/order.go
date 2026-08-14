@@ -249,10 +249,25 @@ func (o *Order) toTakeDryrunResult(fromSize, toSize uint64) orderListResult {
 }
 
 func (o *Order) toDetailResult() orderDetailResult {
+	// Field order mirrors the C++ writer (addresses at 3/6), so this builds
+	// orderDetailResult directly rather than embedding orderBase first.
 	return orderDetailResult{
-		orderBase:    o.toOrderBase(),
-		MakerAddress: o.MakerAddress,
-		TakerAddress: o.TakerAddress,
+		ID:                   orderIDString(o.ID),
+		Maker:                o.FromCurrency,
+		MakerSize:            formatXAmount(o.FromAmount),
+		MakerAddress:         o.MakerAddress,
+		Taker:                o.ToCurrency,
+		TakerSize:            formatXAmount(o.ToAmount),
+		TakerAddress:         o.TakerAddress,
+		UpdatedAt:            iso8601(o.Updated),
+		CreatedAt:            iso8601(o.Created),
+		OrderType:            orderTypeString(o.PartialAllowed),
+		PartialMinimum:       formatXAmount(o.MinFromAmount),
+		PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
+		PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
+		PartialRepost:        o.PartialRepost,
+		PartialParentID:      parentIDString(o.ParentID),
+		Status:               statusString(o.Status),
 	}
 }
 

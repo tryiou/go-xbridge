@@ -47,11 +47,57 @@ type orderListResult struct {
 	orderBase
 }
 
-// orderDetailResult is used by dxGetMyOrders (adds maker/taker addresses).
+// orderDetailResult is used by dxGetMyOrders / dxGetMyPartialOrderChain. Field
+// ORDER matches the C++ writers exactly (rpcxbridge.cpp:2151-2171 /
+// :2298-2319): maker_address/taker_address at positions 3/6 (after maker_size /
+// taker_size), NOT appended after orderBase — encoding/json emits struct fields
+// in declaration order.
 type orderDetailResult struct {
-	orderBase
-	MakerAddress string `json:"maker_address"`
-	TakerAddress string `json:"taker_address"`
+	ID                   string `json:"id"`
+	Maker                string `json:"maker"`
+	MakerSize            string `json:"maker_size"`
+	MakerAddress         string `json:"maker_address"`
+	Taker                string `json:"taker"`
+	TakerSize            string `json:"taker_size"`
+	TakerAddress         string `json:"taker_address"`
+	UpdatedAt            string `json:"updated_at"`
+	CreatedAt            string `json:"created_at"`
+	OrderType            string `json:"order_type"`
+	PartialMinimum       string `json:"partial_minimum"`
+	PartialOrigMakerSize string `json:"partial_orig_maker_size"`
+	PartialOrigTakerSize string `json:"partial_orig_taker_size"`
+	PartialRepost        bool   `json:"partial_repost"`
+	PartialParentID      string `json:"partial_parent_id"`
+	Status               string `json:"status"`
+}
+
+// partialChainDetailsResult is the dxPartialOrderChainDetails success object.
+// Field ORDER matches the C++ pushKV sequence (rpcxbridge.cpp:2460-2480) so
+// byte-level JSON order is 1:1 (encoding/json emits fields in declaration
+// order). p2sh_deposits / p2sh_deposits_counterparty carry one entry PER CHAIN
+// ORDER (empty string when an order has no deposit txid) so callers can index
+// them against `orders` (RPC-F28).
+type partialChainDetailsResult struct {
+	FirstOrderID             string   `json:"first_order_id"`
+	Maker                    string   `json:"maker"`
+	MakerAddress             string   `json:"maker_address"`
+	Taker                    string   `json:"taker"`
+	TakerAddress             string   `json:"taker_address"`
+	PartialMinimum           string   `json:"partial_minimum"`
+	PartialOrigMakerSize     string   `json:"partial_orig_maker_size"`
+	PartialOrigTakerSize     string   `json:"partial_orig_taker_size"`
+	FirstOrderTime           string   `json:"first_order_time"`
+	LastOrderTime            string   `json:"last_order_time"`
+	TotalReportedSent        string   `json:"total_reported_sent"`
+	TotalReportedReceived    string   `json:"total_reported_received"`
+	TotalReportedNotsent     string   `json:"total_reported_notsent"`
+	TotalReportedNotreceived string   `json:"total_reported_notreceived"`
+	TotalOrdersOpen          int      `json:"total_orders_open"`
+	TotalOrdersFinished      int      `json:"total_orders_finished"`
+	TotalOrdersCanceled      int      `json:"total_orders_canceled"`
+	Orders                   []string `json:"orders"`
+	P2SHDeposits             []string `json:"p2sh_deposits"`
+	P2SHDepositsCounterparty []string `json:"p2sh_deposits_counterparty"`
 }
 
 // makeOrderResult is the dxMakeOrder / dxMakePartialOrder SUCCESS response

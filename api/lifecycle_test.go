@@ -308,10 +308,12 @@ func TestDxGetOrderHistoryFallback(t *testing.T) {
 func TestPartialOrderChainResolvesHistoryParent(t *testing.T) {
 	ctx := newWalletTestCtx()
 	parent := &Order{ID: [32]byte{0xaa}, FromCurrency: "BTC", FromAmount: 100,
-		ToCurrency: "BTC", ToAmount: 50, Status: "finished", Mine: true, Created: 10, Updated: 10}
+		ToCurrency: "BTC", ToAmount: 50, Status: "finished", Mine: true, Created: 10, Updated: 10,
+		PartialAllowed: true} // the chain root is a partial order (RPC-F27 filter)
 	ctx.Store.AddToHistory(parent, "finished", 0, 10)
 	child := seedOrder(ctx) // ID {0x01}
 	child.ParentID = [32]byte{0xaa}
+	child.Created, child.Updated = 20, 20 // created order: parent < child
 	ctx.Store.Add(child)
 
 	chain := ctx.partialOrderChain(hexEncode(child.ID[:]))

@@ -373,27 +373,23 @@ func TestRPCResponseShape(t *testing.T) {
 		// See register.md F23/F24.
 		{method: "dxGetTokenBalances", mode: "set", div: true, id: "dxGetTokenBalances/key-order", refKeys: []string{
 			"BLOCK", "LTC"}},
-		// dxGetMyOrders: 16 keys; C++ puts maker_address/taker_address at 3/6
-		// (rpcxbridge.cpp:2151-2171); CAND flattens the embedded orderBase first,
-		// emitting the addresses at 14/15 (response.go:50-54). DIVERGENT
-		// (Group-3 finding dxGetMyOrders/field-order).
-		{method: "dxGetMyOrders", mode: "set", div: true, id: "dxGetMyOrders/field-order", refKeys: []string{
+		// dxGetMyOrders: 16 keys in C++ order (rpcxbridge.cpp:2151-2171) —
+		// maker_address/taker_address at 3/6. CONFORMANT (RPC-F26 fixed).
+		{method: "dxGetMyOrders", mode: "exact", refKeys: []string{
 			"id", "maker", "maker_size", "maker_address", "taker", "taker_size",
 			"taker_address", "updated_at", "created_at", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"partial_repost", "partial_parent_id", "status"}},
-		// dxGetMyPartialOrderChain: same 16-key C++ order (rpcxbridge.cpp:2298-2319);
-		// CAND addresses at end. DIVERGENT (Group-4 finding).
-		{method: "dxGetMyPartialOrderChain", mode: "set", div: true, id: "dxGetMyPartialOrderChain/field-order", refKeys: []string{
+		// dxGetMyPartialOrderChain: same 16-key C++ order (rpcxbridge.cpp:2298-2319).
+		// CONFORMANT (RPC-F26 fix shared the orderDetailResult shape).
+		{method: "dxGetMyPartialOrderChain", mode: "exact", refKeys: []string{
 			"id", "maker", "maker_size", "maker_address", "taker", "taker_size",
 			"taker_address", "updated_at", "created_at", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"partial_repost", "partial_parent_id", "status"}},
-		// dxPartialOrderChainDetails: 21 keys in C++ insertion order
-		// (rpcxbridge.cpp:2460-2480). CAND builds a map[string]interface{} ->
-		// fully alphabetized (handlers.go:1015-1036). DIVERGENT (Group-4 finding
-		// dxPartialOrderChainDetails/key-order).
-		{method: "dxPartialOrderChainDetails", mode: "set", div: true, id: "dxPartialOrderChainDetails/key-order", refKeys: []string{
+		// dxPartialOrderChainDetails: 20 keys in C++ insertion order
+		// (rpcxbridge.cpp:2460-2480). CONFORMANT (RPC-F30 fixed: ordered struct).
+		{method: "dxPartialOrderChainDetails", mode: "exact", refKeys: []string{
 			"first_order_id", "maker", "maker_address", "taker", "taker_address",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"first_order_time", "last_order_time", "total_reported_sent",

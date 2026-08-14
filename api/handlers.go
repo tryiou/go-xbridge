@@ -1029,9 +1029,14 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetMyOrders(params []json.RawMessage) (interface{}, *rpcError) {
-	out := []orderDetailResult{}
+	// C++ builds a combined live+history vector, sorts by txtime, then renders
+	// with a `seen` dedup (rpcxbridge.cpp:2103-2138). Sort on the raw µs value,
+	// not the ISO-rendered string, so microsecond ordering is exact (RPC-F26).
+	orders := []*Order{}
+	seen := map[string]bool{}
 	for _, o := range h.Store.Mine() {
-		out = append(out, o.toDetailResult())
+		seen[hexEncode(o.ID[:])] = true
+		orders = append(orders, o)
 	}
 	// C++ dxGetMyOrders merges live local orders with historical local orders
 	// in a terminal state (rpcxbridge.cpp:2110-2121): finished/cancelled orders
@@ -1043,13 +1048,26 @@ func (h *HandlerCtx) dxGetMyOrders(params []json.RawMessage) (interface{}, *rpcE
 		}
 		switch statusString(e.Status) {
 		case "finished", "canceled":
-			out = append(out, o.toDetailResult())
+			// Dedup against the live set: an order still in the live book must
+			// not appear twice (C++ seen[t->id.GetHex()]). C++ sorts by txtime
+			// and keeps the smallest-txtime record; the thin client keeps the
+			// LIVE record (it is the current one) — they can only differ when
+			// the same id is both live and in history with different Updated.
+			if seen[hexEncode(o.ID[:])] {
+				continue
+			}
+			seen[hexEncode(o.ID[:])] = true
+			orders = append(orders, o)
 		}
 	}
-	// C++ dxGetMyOrders sorts ascending by txtime (updated time).
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].UpdatedAt < out[j].UpdatedAt
+	// C++ dxGetMyOrders sorts ascending by txtime (updated time, µs).
+	sort.SliceStable(orders, func(i, j int) bool {
+		return orders[i].Updated < orders[j].Updated
 	})
+	out := make([]orderDetailResult, 0, len(orders))
+	for _, o := range orders {
+		out = append(out, o.toDetailResult())
+	}
 	return out, nil
 }
 
@@ -1086,70 +1104,87 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 // dxPartialOrderChainDetails — aggregate details for a partial chain.
 // ---------------------------------------------------------------------------
 
-// partialOrderChain returns the full partial order chain for id — the root
-// (oldest ancestor) first, then the queried order, then all descendants,
-// matching C++ xbridge::App::getPartialOrderChain, which walks both live
-// transactions() and history() so a finished parent stays resolvable.
+// partialOrderChain returns the partial repost lineage for id. It mirrors
+// xbridge::App::getPartialOrderChain (xbridgeapp.cpp:3913-3991) for the parts
+// that are deterministic and contract-visible:
+//
+//  1. Filter: only LOCAL orders that are partial or partial-children — an exact
+//     order with no parent is excluded (xbridgeapp.cpp:3922,3934). Applied to
+//     both the live book and history, with the same `seen` dedup the writers
+//     use. The queried id must be in the filtered set, else the chain is empty.
+//  2. Walk the FULL lineage: every ancestor up via ParentID and every
+//     descendant down via parent links. (The C++ child-walk only scans orders
+//     with fewer utxos than the queried id and never descends to grandchildren
+//     — xbridgeapp.cpp:3958-3967 — but that is sort-order dependent and is a
+//     latent C++ bug; the parity oracle and the audit intent model the full
+//     lineage, so the port is deterministic here.)
+//  3. The final chain is sorted ascending by created time so the oldest order
+//     is first (xbridgeapp.cpp:3985-3988).
 func (h *HandlerCtx) partialOrderChain(id string) []*Order {
 	idx := map[string]*Order{}
+	add := func(o *Order) {
+		hex := hexEncode(o.ID[:])
+		if _, ok := idx[hex]; ok {
+			return
+		}
+		// Local partial order, or an exact order that is a child of a partial
+		// order (has a parent). Exact parent-less orders are excluded.
+		if !isZeroID(o.ParentID) || o.PartialAllowed {
+			idx[hex] = o
+		}
+	}
 	for _, o := range h.Store.List() {
-		idx[hexEncode(o.ID[:])] = o
+		if o.Mine {
+			add(o)
+		}
 	}
 	for _, e := range h.Store.History() {
-		if e.Order == nil || !e.Order.Mine {
-			continue // C++ getPartialOrderChain walks isLocal() only
-		}
-		if _, ok := idx[e.ID]; !ok {
-			idx[e.ID] = e.Order
+		if e.Order != nil && e.Order.Mine {
+			add(e.Order)
 		}
 	}
-	get := func(idHex string) *Order { return idx[idHex] }
-
-	cur := get(id)
-	if cur == nil {
+	if _, ok := idx[id]; !ok {
 		return nil
 	}
-	chain := []*Order{cur}
+
+	// Ancestors: walk up via ParentID to the chain root.
+	chain := []*Order{}
 	seen := map[string]bool{id: true}
-	// Walk up to the root via ParentID.
+	cur := idx[id]
 	for !isZeroID(cur.ParentID) {
 		pid := hexEncode(cur.ParentID[:])
-		p := get(pid)
-		if p == nil || seen[pid] {
+		p, ok := idx[pid]
+		if !ok || seen[pid] {
 			break
 		}
-		chain = append([]*Order{p}, chain...)
 		seen[pid] = true
+		chain = append([]*Order{p}, chain...)
 		cur = p
 	}
-	// Index parent -> children and walk down to descendants.
-	children := map[string][]string{}
-	for oid, o := range idx {
-		if isZeroID(o.ParentID) {
-			continue
-		}
-		children[hexEncode(o.ParentID[:])] = append(children[hexEncode(o.ParentID[:])], oid)
-	}
+	chain = append(chain, idx[id])
+
+	// Descendants: walk down via parent links from the queried order (a
+	// descendant of an ancestor that is not also a descendant of id is a
+	// sibling branch and stays out of this chain).
 	var descend func(pid string)
 	descend = func(pid string) {
-		for _, cid := range children[pid] {
-			if seen[cid] {
+		for oid, o := range idx {
+			if seen[oid] {
 				continue
 			}
-			c := get(cid)
-			if c == nil {
-				continue
+			if hexEncode(o.ParentID[:]) == pid {
+				seen[oid] = true
+				chain = append(chain, o)
+				descend(oid)
 			}
-			chain = append(chain, c)
-			seen[cid] = true
-			descend(cid)
 		}
 	}
-	// Descend from every node already in the chain (the queried order sits
-	// between its ancestors and descendants, so both directions must be walked).
-	for _, c := range chain {
-		descend(hexEncode(c.ID[:]))
-	}
+	descend(id)
+
+	// Sort ascending by created time so the root (oldest) order is first.
+	sort.SliceStable(chain, func(i, j int) bool {
+		return chain[i].Created < chain[j].Created
+	})
 	return chain
 }
 
@@ -1163,7 +1198,7 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 	// C++ validates the order id up front (uint256S(sid).IsNull()).
 	raw := parseOrderIDS(id)
 	if idIsNull(raw) {
-		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "Invalid order id ["+id+"]")
+		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "bad order id")
 	}
 	chain := h.partialOrderChain(orderIDKey(id))
 	// C++ returns an empty object `{}` for an unknown / empty chain (not an error).
@@ -1198,38 +1233,34 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 			}
 		}
 		orderIDs = append(orderIDs, orderIDString(t.ID))
-		// C++ pushes each order's deposit txids (binTxId / oBinTxId) into these
-		// arrays so a caller can see the on-chain HTLC deposits for the chain.
-		if t.BinTxId != "" {
-			deposits = append(deposits, t.BinTxId)
-		}
-		if t.OBinTxId != "" {
-			counter = append(counter, t.OBinTxId)
-		}
+		// C++ pushes ONE entry per chain order — the deposit txids or an empty
+		// string — so callers can index p2sh_deposits against `orders` by
+		// position (rpcxbridge.cpp:2456-2457; RPC-F28).
+		deposits = append(deposits, t.BinTxId)
+		counter = append(counter, t.OBinTxId)
 	}
-	details := map[string]interface{}{
-		"first_order_id":             orderIDString(first.ID),
-		"maker":                      first.FromCurrency,
-		"maker_address":              first.MakerAddress,
-		"taker":                      first.ToCurrency,
-		"taker_address":              first.TakerAddress,
-		"partial_minimum":            formatXAmount(first.MinFromAmount),
-		"partial_orig_maker_size":    formatXAmount(first.OrigFromAmount),
-		"partial_orig_taker_size":    formatXAmount(first.OrigToAmount),
-		"first_order_time":           iso8601(first.Created),
-		"last_order_time":            iso8601(last.Updated),
-		"total_reported_sent":        formatXAmount(totalSent),
-		"total_reported_received":    formatXAmount(totalReceived),
-		"total_reported_notsent":     formatXAmount(totalNotSent),
-		"total_reported_notreceived": formatXAmount(totalNotReceived),
-		"total_orders_open":          totalOpen,
-		"total_orders_finished":      totalFinished,
-		"total_orders_canceled":      totalCanceled,
-		"orders":                     orderIDs,
-		"p2sh_deposits":              deposits,
-		"p2sh_deposits_counterparty": counter,
-	}
-	return details, nil
+	return partialChainDetailsResult{
+		FirstOrderID:             orderIDString(first.ID),
+		Maker:                    first.FromCurrency,
+		MakerAddress:             first.MakerAddress,
+		Taker:                    first.ToCurrency,
+		TakerAddress:             first.TakerAddress,
+		PartialMinimum:           formatXAmount(first.MinFromAmount),
+		PartialOrigMakerSize:     formatXAmount(first.OrigFromAmount),
+		PartialOrigTakerSize:     formatXAmount(first.OrigToAmount),
+		FirstOrderTime:           iso8601(first.Created),
+		LastOrderTime:            iso8601(last.Updated),
+		TotalReportedSent:        formatXAmount(totalSent),
+		TotalReportedReceived:    formatXAmount(totalReceived),
+		TotalReportedNotsent:     formatXAmount(totalNotSent),
+		TotalReportedNotreceived: formatXAmount(totalNotReceived),
+		TotalOrdersOpen:          totalOpen,
+		TotalOrdersFinished:      totalFinished,
+		TotalOrdersCanceled:      totalCanceled,
+		Orders:                   orderIDs,
+		P2SHDeposits:             deposits,
+		P2SHDepositsCounterparty: counter,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

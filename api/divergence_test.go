@@ -93,23 +93,25 @@ func TestDxPartialOrderChainDetailsInvalidId(t *testing.T) {
 }
 
 // TestDxPartialOrderChainDetailsDeposits verifies the per-order deposit txids
-// (BinTxId / OBinTxId) are emitted in p2sh_deposits / p2sh_deposits_counterparty.
+// (BinTxId / OBinTxId) are emitted in p2sh_deposits / p2sh_deposits_counterparty,
+// one entry per chain order (empty strings included — RPC-F28).
 // T2.3.
 func TestDxPartialOrderChainDetailsDeposits(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx) // BTC/BTC, open
+	o.PartialAllowed = true
 	o.BinTxId = "aa" + strings.Repeat("0", 62)
 	o.OBinTxId = "bb" + strings.Repeat("0", 62)
 	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(dispID(o.ID))})
 	if err != nil {
 		t.Fatalf("dxPartialOrderChainDetails: %v", err)
 	}
-	m := res.(map[string]interface{})
-	p, ok := m["p2sh_deposits"].([]string)
+	m := mustJSONMap(t, res)
+	p, ok := m["p2sh_deposits"].([]interface{})
 	if !ok || len(p) != 1 || p[0] != o.BinTxId {
 		t.Errorf("p2sh_deposits = %v, want [%s]", m["p2sh_deposits"], o.BinTxId)
 	}
-	c, ok := m["p2sh_deposits_counterparty"].([]string)
+	c, ok := m["p2sh_deposits_counterparty"].([]interface{})
 	if !ok || len(c) != 1 || c[0] != o.OBinTxId {
 		t.Errorf("p2sh_deposits_counterparty = %v, want [%s]", m["p2sh_deposits_counterparty"], o.OBinTxId)
 	}
