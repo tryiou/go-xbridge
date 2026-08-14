@@ -89,10 +89,10 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F50 | S2 | auth model: Go open-by-default vs C++ always-auth | FIXED | B4 `fix/http-hardening` (always-auth when creds configured, 401 empty body, 250 ms delay; `TestServerRPCAuth`, `TestServerRpcAuthMultiUser`, `TestServerRpcAuthDelay`) — residual: no auto-cookie file, loopback-open when unconfigured (documented) |
 | RPC-F51 | S3 | batch / named params / -32600 unsupported | FIXED | B4 `fix/http-hardening` (batch supported, named → −8; `TestServerBatch`, `TestServerNamedParamsRejected`) |
 | RPC-F52 | S3 | extra positional params accepted where C++ errors (business 1025) | FIXED | B4 `fix/http-hardening` (arity registry + C++ help-text 1025; `TestArityBusinessMethods`, `TestArityThrowMethods`) |
-| RPC-F53 | S3 | `dxGetLocalTokens` returns unconnected/duplicate tickers | OPEN | B7 |
-| RPC-F54 | S3 | `dxGetNetworkTokens` membership: Go unions config; C++ pure SN service union | OPEN | B7 |
-| RPC-F55 | S3 | `dxGetNewTokenAddress` error path returns `[]` in C++, business 1002 in Go | OPEN | B7 |
-| RPC-F56 | S3 | `dxLoadXBridgeConf` reload failure shape and side effects differ | OPEN | B7 |
+| RPC-F53 | S3 | `dxGetLocalTokens` returns unconnected/duplicate tickers | FIXED | B7 `fix/rpc-surface` (returns the loaded connector map keys, deduplicated — C++ `availableCurrencies()` (xbridgeapp.cpp:808-821) — `TestDxGetLocalTokensConnectedOnly`) |
+| RPC-F54 | S3 | `dxGetNetworkTokens` membership: Go unions config; C++ pure SN service union | FIXED | B7 `fix/rpc-surface` (pure SN service union via `Registry.WalletServices()`; config `NetworkTokens`/`ExchangeWallets` no longer contribute — `TestDxTokenListsFromConf`, `TestDxGetNetworkTokensLive`) |
+| RPC-F55 | S3 | `dxGetNewTokenAddress` error path returns `[]` in C++, business 1002 in Go | FIXED | B7 `fix/rpc-surface` (GetNewAddress failure -> empty array, C++ `getNewTokenAddress()` empty-string (rpcxbridge.cpp:186-190) — `TestDxGetNewTokenAddressGetNewAddrError`) |
+| RPC-F56 | S3 | `dxLoadXBridgeConf` reload failure shape and side effects differ | FIXED | B7 `fix/rpc-surface` (reload failure returns `false` result, not a business error — C++ `uret(success)` (rpcxbridge.cpp:229-234) — `TestDxLoadConfFailureFalse`, `TestDxLoadConfHotReloadMissingPath`); coin/connector rebuild side effects in `Node.reloadConf`; non-local-order clearing (`clearNonLocalOrders`, :232-233) tracked under B10 `fix/config-parity` |
 | RPC-F57 | S2 | `dxGetOrderBook` detail-4 nesting `[[…]]` vs flat | OPEN | B7 |
 | RPC-F58 | S2 | HTTP auth/timeout hardening missing | FIXED | B4 `fix/http-hardening` (`-rpcservertimeout` + `http.Server` read/write/header/idle timeouts) |
 | RPC-F59 | S3 | `dxGetMyPartialOrderChain` unknown/malformed id handling | FIXED | B7 (bad-order-id) |
@@ -252,7 +252,7 @@ namespace is the Current register above.
 | S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — FIXED (B7) |
 | S3-C | RPC-F31 | locked-utxos amount format — OPEN (B7) |
 | S3-D | RPC-F28 | `p2sh_deposits` alignment — OPEN (B7) |
-| S3-E | RPC-F55 | new-token-address `[]` vs error — OPEN (B7) |
+| S3-E | RPC-F55 | new-token-address `[]` vs error — FIXED (B7) |
 | S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
 | S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |

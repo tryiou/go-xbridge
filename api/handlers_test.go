@@ -1009,16 +1009,61 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 
 func TestDxLoadConfAndTokens(t *testing.T) {
 	ctx := newWalletTestCtx()
-	if res, err := ctx.dxLoadXBridgeConf(nil); err != nil || res != true {
-		t.Fatalf("dxLoadXBridgeConf = %v %v", res, err)
-	}
 	lt, _ := ctx.dxGetLocalTokens(nil)
 	if ls, _ := lt.([]string); len(ls) != 1 || ls[0] != "BTC" {
 		t.Errorf("dxGetLocalTokens = %v", lt)
 	}
+	// RPC-F54: the network list is the pure SN service union; with no connected
+	// servicenodes it is empty (no config fallback).
 	nt, _ := ctx.dxGetNetworkTokens(nil)
-	if ns, _ := nt.([]string); len(ns) != 1 || ns[0] != "BTC" {
-		t.Errorf("dxGetNetworkTokens = %v", nt)
+	if ns, _ := nt.([]string); len(ns) != 0 {
+		t.Errorf("dxGetNetworkTokens = %v, want []", nt)
+	}
+	// Reload from the same conf succeeds and rebuilds the connectors
+	// (the fixture conf now carries Ip/Port), so dxGetLocalTokens keeps
+	// reflecting the loaded wallet connectors (F53).
+	if res, err := ctx.dxLoadXBridgeConf(nil); err != nil || res != true {
+		t.Fatalf("dxLoadXBridgeConf = %v %v", res, err)
+	}
+	lt, _ = ctx.dxGetLocalTokens(nil)
+	if ls, _ := lt.([]string); len(ls) != 1 || ls[0] != "BTC" {
+		t.Errorf("dxGetLocalTokens after reload = %v, want [BTC]", lt)
+	}
+}
+
+// TestDxGetLocalTokensConnectedOnly locks RPC-F53: dxGetLocalTokens reflects
+// the loaded wallet connectors, not the config's ExchangeWallets list (which
+// may name unconnected/duplicate tickers).
+func TestDxGetLocalTokensConnectedOnly(t *testing.T) {
+	ctx := newWalletTestCtx()
+	// Config names DOGE in ExchangeWallets but no DOGE connector is loaded.
+	ctx.Node.config.ExchangeWallets = []string{"BTC", "DOGE", "BTC"}
+	lt, err := ctx.dxGetLocalTokens(nil)
+	if err != nil {
+		t.Fatalf("dxGetLocalTokens: %v", err)
+	}
+	ls, ok := lt.([]string)
+	if !ok {
+		t.Fatalf("dxGetLocalTokens = %v (%T)", lt, lt)
+	}
+	if len(ls) != 1 || ls[0] != "BTC" {
+		t.Errorf("dxGetLocalTokens = %v, want [BTC] (connected connectors only)", ls)
+	}
+}
+
+// TestDxLoadConfFailureFalse locks RPC-F56: a reload failure is a successful
+// envelope whose bool result is false (C++ uret(success), rpcxbridge.cpp:229-234),
+// not a business error.
+func TestDxLoadConfFailureFalse(t *testing.T) {
+	ctx := newWalletTestCtx()
+	// No ConfPath configured -> reloadConf fails (node.go:307-310).
+	ctx.Node.config.ConfPath = ""
+	res, err := ctx.dxLoadXBridgeConf(nil)
+	if err != nil {
+		t.Fatalf("dxLoadXBridgeConf(fail) should not be a business error: %v", err)
+	}
+	if b, ok := res.(bool); !ok || b {
+		t.Fatalf("dxLoadXBridgeConf(fail) = %v (%T), want false", res, res)
 	}
 }
 
@@ -1196,8 +1241,8 @@ func TestDxLoadConfHotReload(t *testing.T) {
 	dir := t.TempDir()
 	confPath := filepath.Join(dir, "xbridge.conf")
 
-	const btcOnly = "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n"
-	const withDoge = "[Main]\nExchangeWallets=BTC,DOGE\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n\n[DOGE]\nTitle=Dogecoin\nCreateTxMethod=BTC\nAddressPrefix=30\nScriptPrefix=22\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=60\nFeePerByte=1\nConfirmations=2\n"
+	const btcOnly = "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\nIp=127.0.0.1\nPort=8332\n"
+	const withDoge = "[Main]\nExchangeWallets=BTC,DOGE\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\nIp=127.0.0.1\nPort=8332\n\n[DOGE]\nTitle=Dogecoin\nCreateTxMethod=BTC\nAddressPrefix=30\nScriptPrefix=22\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=60\nFeePerByte=1\nConfirmations=2\nIp=127.0.0.1\nPort=22555\n"
 
 	if err := os.WriteFile(confPath, []byte(btcOnly), 0o600); err != nil {
 		t.Fatal(err)
@@ -1236,23 +1281,37 @@ func TestDxLoadConfHotReload(t *testing.T) {
 	if !coins.Has("BTC") || !coins.Has("DOGE") {
 		t.Errorf("after reload: coins.Has BTC=%v DOGE=%v", coins.Has("BTC"), coins.Has("DOGE"))
 	}
+	// The reload rebuilt connectors for both coins, so dxGetLocalTokens reflects
+	// the connected wallet set (F53).
+	lt, _ := ctx.dxGetLocalTokens(nil)
+	gotLocal := map[string]bool{}
+	for _, tk := range lt.([]string) {
+		gotLocal[tk] = true
+	}
+	if !gotLocal["BTC"] || !gotLocal["DOGE"] {
+		t.Errorf("dxGetLocalTokens after reload = %v, want [BTC DOGE]", lt)
+	}
+	// dxGetNetworkTokens stays the pure SN union (empty: no connected SNs).
 	nt, _ := ctx.dxGetNetworkTokens(nil)
 	got := map[string]bool{}
 	for _, tk := range nt.([]string) {
 		got[tk] = true
 	}
-	if !got["BTC"] || !got["DOGE"] {
-		t.Errorf("dxGetNetworkTokens after reload = %v", nt)
+	if len(got) != 0 {
+		t.Errorf("dxGetNetworkTokens after reload = %v, want [] (pure SN union)", nt)
 	}
 }
 
 // TestDxLoadConfHotReloadMissingPath verifies that a node started without a
-// conf path (ConfPath empty) reports a clean error instead of reloading.
+// conf path (ConfPath empty) reports the failure as a false result — not an
+// error — mirroring C++ uret(success) (RPC-F56).
 func TestDxLoadConfHotReloadMissingPath(t *testing.T) {
 	node := &Node{config: &Config{}, store: NewStore(), signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
 	ctx := &HandlerCtx{Store: NewStore(), Node: node}
-	if res, rerr := ctx.dxLoadXBridgeConf(nil); rerr == nil {
-		t.Fatalf("expected error for empty ConfPath, got res=%v", res)
+	if res, rerr := ctx.dxLoadXBridgeConf(nil); rerr != nil {
+		t.Fatalf("dxLoadXBridgeConf(empty ConfPath) should not be a business error: %v", rerr)
+	} else if b, ok := res.(bool); !ok || b {
+		t.Fatalf("dxLoadXBridgeConf(empty ConfPath) = %v (%T), want false", res, res)
 	}
 }
 

@@ -38,6 +38,9 @@ type stubConn struct {
 	// listUnspentErr, when set, makes ListUnspent fail (dxGetUtxos
 	// listunspent-failure case, RPC-F45).
 	listUnspentErr error
+	// getNewAddrErr, when set, makes GetNewAddress fail (dxGetNewTokenAddress
+	// empty-array case, RPC-F55).
+	getNewAddrErr error
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -45,6 +48,9 @@ func (s *stubConn) GetBalance() (uint64, error) {
 	return 100000000, nil
 }
 func (s *stubConn) GetNewAddress() (string, error) {
+	if s.getNewAddrErr != nil {
+		return "", s.getNewAddrErr
+	}
 	return s.addr, nil
 }
 func (s *stubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
@@ -135,7 +141,7 @@ func newWalletTestCtx() *HandlerCtx {
 		panic(err)
 	}
 	confPath := filepath.Join(td, "xbridge.conf")
-	confBody := "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\n"
+	confBody := "[Main]\nExchangeWallets=BTC\n\n[BTC]\nTitle=Bitcoin\nCreateTxMethod=BTC\nAddressPrefix=0\nScriptPrefix=5\nCOIN=100000000\nTxVersion=1\nDustAmount=546\nMinTxFee=1000\nBlockTime=600\nFeePerByte=2\nConfirmations=2\nIp=127.0.0.1\nPort=8332\n"
 	if err := os.WriteFile(confPath, []byte(confBody), 0o600); err != nil {
 		panic(err)
 	}
@@ -167,6 +173,21 @@ func TestDxGetNewTokenAddressNoConnector(t *testing.T) {
 	}
 	if arr, ok := res.([]string); !ok || len(arr) != 0 {
 		t.Fatalf("dxGetNewTokenAddress(no connector) = %v (%T), want []", res, res)
+	}
+}
+
+// TestDxGetNewTokenAddressGetNewAddrError locks RPC-F55: a GetNewAddress
+// failure yields an empty array (C++ getNewTokenAddress() returns an empty
+// string, rpcxbridge.cpp:186-190), never a business error.
+func TestDxGetNewTokenAddressGetNewAddrError(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Node.config.Connectors["BTC"].(*stubConn).getNewAddrErr = stubErr("rpc down")
+	res, err := ctx.dxGetNewTokenAddress([]json.RawMessage{json.RawMessage(`"BTC"`)})
+	if err != nil {
+		t.Fatalf("dxGetNewTokenAddress(GetNewAddress fail) should not error: %v", err)
+	}
+	if arr, ok := res.([]string); !ok || len(arr) != 0 {
+		t.Fatalf("dxGetNewTokenAddress(GetNewAddress fail) = %v (%T), want []", res, res)
 	}
 }
 
@@ -443,18 +464,21 @@ func TestDxTokenListsFromConf(t *testing.T) {
 	if ls, _ := local.([]string); len(ls) != 1 || ls[0] != "BTC" {
 		t.Errorf("local tokens = %v", local)
 	}
+	// RPC-F54: dxGetNetworkTokens is the pure SN service union — the config's
+	// NetworkTokens/ExchangeWallets do NOT contribute, so with no connected
+	// servicenodes it is empty even though the config names BTC.
 	net, err := ctx.dxGetNetworkTokens(nil)
 	if err != nil {
 		t.Fatalf("dxGetNetworkTokens: %v", err)
 	}
-	if ns, _ := net.([]string); len(ns) != 1 || ns[0] != "BTC" {
-		t.Errorf("network tokens = %v", net)
+	if ns, _ := net.([]string); len(ns) != 0 {
+		t.Errorf("network tokens = %v, want [] (pure SN union, no config fallback)", net)
 	}
 }
 
 // TestDxGetNetworkTokensLive verifies the live servicenode union: tokens
 // learned from SNREGISTER / SNPING messages (the same wire source a core
-// XBridge wallet uses) are unioned with the config's local tokens.
+// XBridge wallet uses) are returned as the network list (RPC-F54).
 func TestDxGetNetworkTokensLive(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// Simulate two SPV servicenodes advertising their supported tokens via

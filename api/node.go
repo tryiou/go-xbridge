@@ -100,7 +100,8 @@ type Config struct {
 	DataDir string
 	// ConfPath is the path the daemon loaded xbridge.conf from. dxLoadXBridgeConf
 	// hot-reloads from this path, mirroring C++'s reload-from-the-same-conf
-	// behaviour. Empty disables hot-reload (the call returns an error).
+	// behaviour. Empty disables hot-reload: the RPC returns a false result
+	// (C++ uret(success), RPC-F56).
 	ConfPath string
 	// PersistSecrets controls whether each trade's per-trade M keypair, HTLC
 	// secret, and pre-signed refund are written to the swap-state file. On by
@@ -189,8 +190,8 @@ type Node struct {
 
 	// snReg is the servicenode registry learned from SNREGISTER / SNPING /
 	// SNLISTPING P2P messages (the same wire source a core XBridge wallet
-	// uses). dxGetNetworkTokens unions snReg.WalletServices() (the live network
-	// token set, C++ walletServices()) with the local config tokens.
+	// uses). dxGetNetworkTokens is the pure union of its WalletServices()
+	// (the live network token set, C++ walletServices(), RPC-F54).
 	snReg *servicenode.Registry
 
 	// exchangeStarted mirrors C++ Exchange::instance().isStarted(). It is true
@@ -669,37 +670,22 @@ func (n *Node) logNetworkStatus() {
 		"tokens", strings.Join(n.NetworkTokens(), ","))
 }
 
-// NetworkTokens returns the union of tokens advertised by servicenodes on the
-// P2P network (C++ walletServices(), xbridgeapp.cpp:2758) with the locally
-// known tokens from xbridge.conf. The servicenode set is learned from
+// NetworkTokens returns the tokens advertised by servicenodes on the P2P
+// network (C++ walletServices(), xbridgeapp.cpp:2758) — the pure SN service
+// union with NO config fallback (RPC-F54). The servicenode set is learned from
 // SNREGISTER / SNPING / SNLISTPING messages via the registry; only SPV-tier
-// xbridge tokens matching ^[^:]+$ (excluding xr/xrs) from servicenodes
-// pinged within the 5-minute running window are included. When no servicenodes
-// are seen it reduces to the config list (static fallback).
+// xbridge tokens matching ^[^:]+$ (excluding xr/xrs) from servicenodes pinged
+// within the 5-minute running window are included. Empty when no servicenodes
+// are connected.
 func (n *Node) NetworkTokens() []string {
-	set := map[string]bool{}
-	if reg := n.snReg; reg != nil {
-		if ws := reg.WalletServices(); ws != nil {
-			for _, t := range ws {
-				set[t] = true
-			}
-		}
-	}
-	for _, t := range n.cfg().NetworkTokens {
-		set[t] = true
-	}
-	for _, t := range n.cfg().ExchangeWallets {
-		set[t] = true
-	}
-	if len(set) == 0 {
+	if n.snReg == nil {
 		return []string{}
 	}
-	out := make([]string, 0, len(set))
-	for s := range set {
-		out = append(out, s)
+	ws := n.snReg.WalletServices()
+	if len(ws) == 0 {
+		return []string{}
 	}
-	sort.Strings(out)
-	return out
+	return ws
 }
 
 // responseBody is implemented by every proto body the swap driver returns.

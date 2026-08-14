@@ -214,25 +214,29 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *rpcError) {
-	return knownTokens(h.Config().ExchangeWallets), nil
+	// C++ returns the loaded wallet connectors (availableCurrencies(),
+	// xbridgeapp.cpp:808-821) — the connector map, so never unconnected or
+	// duplicated (RPC-F53). The config's ExchangeWallets may list tickers that
+	// failed to load.
+	if h.Node == nil || h.Node.cfg() == nil || h.Node.cfg().Connectors == nil {
+		return []string{}, nil
+	}
+	out := make([]string, 0, len(h.Node.cfg().Connectors))
+	for t := range h.Node.cfg().Connectors {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, *rpcError) {
-	// C++ returns the live union of tokens servicenodes advertise
-	// (walletServices()); we derive that from the connected servicenodes'
-	// XbcServicesPing advertisements, falling back to config when none are
-	// connected.
+	// C++ returns the pure union of tokens running servicenodes advertise
+	// (walletServices(), xbridgeapp.cpp:2758; rpcxbridge.cpp:319-326) — no
+	// config fallback (RPC-F54). Empty when no servicenodes are connected.
 	if h.Node == nil {
-		return knownTokens(h.Config().NetworkTokens), nil
+		return []string{}, nil
 	}
 	return h.Node.NetworkTokens(), nil
-}
-
-func knownTokens(tickers []string) []string {
-	out := make([]string, 0, len(tickers))
-	out = append(out, tickers...)
-	sort.Strings(out)
-	return out
 }
 
 // connector returns the wallet connector configured for ticker, or a no-session
@@ -259,7 +263,10 @@ func (h *HandlerCtx) dxLoadXBridgeConf(params []json.RawMessage) (interface{}, *
 		return true, nil
 	}
 	if err := h.Node.reloadConf(); err != nil {
-		return nil, makeError(errInvalidParameters, "dxLoadXBridgeConf", err.Error())
+		// C++ returns uret(success) with success=false when loadSettings()
+		// fails (rpcxbridge.cpp:229-234) — the envelope succeeds with a false
+		// result, it is NOT a business error (RPC-F56).
+		return false, nil
 	}
 	return true, nil
 }
@@ -288,7 +295,10 @@ func (h *HandlerCtx) dxGetNewTokenAddress(params []json.RawMessage) (interface{}
 	}
 	addr, err := conn.GetNewAddress()
 	if err != nil {
-		return nil, makeError(errUnknown, "dxGetNewTokenAddress", err.Error())
+		// C++ getNewTokenAddress() returns an empty string on failure, leaving
+		// the result array empty (rpcxbridge.cpp:186-190) — not a business
+		// error (RPC-F55).
+		return []string{}, nil
 	}
 	return []string{addr}, nil
 }
