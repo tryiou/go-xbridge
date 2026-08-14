@@ -374,6 +374,73 @@ func TestDxLockedUtxoNativeAmount(t *testing.T) {
 	}
 }
 
+// TestDxGetLockedUtxosNoReserved locks in RPC-F32: C++ getUtxoItems(id) fails
+// (-> 1021 TRANSACTION_NOT_FOUND, rpcxbridge.cpp:2637) when the id has no locked
+// utxos reserved (m_utxoTxMap miss). A live order with nothing reserved must
+// error 1021, not return [].
+func TestDxGetLockedUtxosNoReserved(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx) // open, Mine, no Utxos reserved
+	_, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(dispID(o.ID))})
+	if err == nil || err.Code != errTxNotFound {
+		t.Fatalf("dxGetLockedUtxos(no reserved utxos) = %v, want TRANSACTION_NOT_FOUND", err)
+	}
+}
+
+// TestDxGetLockedUtxosIdEchoNormalized locks in RPC-F34: the echoed id is the
+// C++ display-hex (GetHex) of the parsed value, never the raw param
+// (rpcxbridge.cpp:2672). A short id left-pads to the full 64-hex form.
+func TestDxGetLockedUtxosIdEchoNormalized(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrderWithUtxo(ctx, [32]byte{}) // ID {0x01}, reserves the stub utxo
+	res, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr("01")})
+	if err != nil {
+		t.Fatalf("dxGetLockedUtxos(short id): %v", err)
+	}
+	m := mustJSONMap(t, res)
+	if m["id"] != dispID(o.ID) {
+		t.Errorf("echoed id = %v, want normalized %v", m["id"], dispID(o.ID))
+	}
+}
+
+// TestDxGetLockedUtxosAmountDefaultDouble locks in RPC-F31: the amount is the
+// native whole-coin double streamed with the C++ default precision 6
+// (UtxoEntry::toString, xbridgewalletconnector.cpp:25-30), so 0.1234567 renders
+// "0.123457" — NOT the registry fixed-decimals / XBridge 1e6 forms the previous
+// port emitted.
+func TestDxGetLockedUtxosAmountDefaultDouble(t *testing.T) {
+	ctx := newWalletTestCtx()
+	seedOrderWithUtxo(ctx, [32]byte{}) // reserves the stub BTC utxo
+	btc := ctx.Node.config.Connectors["BTC"].(*stubConn)
+	btc.utxos[0].Value = 0.1234567
+	res, err := ctx.dxGetLockedUtxos(nil)
+	if err != nil {
+		t.Fatalf("dxGetLockedUtxos: %v", err)
+	}
+	m := mustJSONMap(t, res)
+	all := m["all_locked_utxo"].([]interface{})
+	if len(all) != 1 || !strings.Contains(all[0].(string), ":0.123457:") {
+		t.Fatalf("all_locked_utxo = %v, want ...:0.123457:...", m["all_locked_utxo"])
+	}
+}
+
+// TestDxGetLockedUtxosTerminalOrder locks in RPC-F32 for a finished/canceled
+// order still in the live store (status flipped, MoveToHistory not yet run):
+// lockedInfoLocked skips terminal orders (store.go:378-380) so the id has no
+// locked utxos -> 1021, matching C++ where a finished transaction is in
+// neither the pending nor the accepted map.
+func TestDxGetLockedUtxosTerminalOrder(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrderWithUtxo(ctx, [32]byte{})
+	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) { ord.Status = "finished" }) {
+		t.Fatal("order not found")
+	}
+	_, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(dispID(o.ID))})
+	if err == nil || err.Code != errTxNotFound {
+		t.Fatalf("dxGetLockedUtxos(finished live order) = %v, want TRANSACTION_NOT_FOUND", err)
+	}
+}
+
 // TestFlushCancelledUnderflow verifies a huge ageMillis does not underflow uint64
 // (it prunes everything) and age 0 prunes all remaining entries. T1.4.
 func TestFlushCancelledUnderflow(t *testing.T) {

@@ -67,10 +67,10 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F28 | S2 | `dxPartialOrderChainDetails` `p2sh_deposits` array length ≠ chain length | FIXED | B7 `fix/rpc-surface` (one entry per chain order incl. empty strings — `TestDxPartialOrderChainDetailsAggregate`) |
 | RPC-F29 | S3 | `dxPartialOrderChainDetails` bad-id error text differs | FIXED | B7 `fix/rpc-surface` (`"bad order id"` — `TestDxPartialOrderChainDetailsBadId`) |
 | RPC-F30 | S3 | `dxPartialOrderChainDetails` key order alphabetized (Go map) | FIXED | B7 `fix/rpc-surface` (ordered `partialChainDetailsResult` struct, C++ 2460-2480 — `TestDxPartialOrderChainDetailsKeyOrder`) |
-| RPC-F31 | S3 | `dxGetLockedUtxos` amount encoding (default-float vs fixed-6/native) | OPEN | B7 |
-| RPC-F32 | S2 | `dxGetLockedUtxos` 1021 trigger too narrow in Go | OPEN | B7 |
-| RPC-F33 | S3 | `dxGetLockedUtxos` per-order key selection (status ordinal vs map membership) | OPEN | B7 |
-| RPC-F34 | S3 | `dxGetLockedUtxos` id echo un-normalized | OPEN | B7 |
+| RPC-F31 | S3 | `dxGetLockedUtxos` amount encoding (default-float vs fixed-6/native) | FIXED | B7 `fix/rpc-surface` (`nativeAmountString`: C++ default-double prec 6 via `UtxoEntry::toString` — `TestDxGetLockedUtxosAmountDefaultDouble`, `TestDxLockedUtxoNativeAmount`) |
+| RPC-F32 | S2 | `dxGetLockedUtxos` 1021 trigger too narrow in Go | FIXED | B7 `fix/rpc-surface` (1021 on no-reserved-utxos `getUtxoItems` miss + expired-state validity — `TestDxGetLockedUtxosNoReserved`) |
+| RPC-F33 | S3 | `dxGetLockedUtxos` per-order key selection (status ordinal vs map membership) | FIXED | B7 `fix/rpc-surface` (pending/accepted map membership: `o.Mine || st >= accepting` → maker_and_taker — `TestDxGetLockedUtxosKeyByState`) |
+| RPC-F34 | S3 | `dxGetLockedUtxos` id echo un-normalized | FIXED | B7 `fix/rpc-surface` (echo `orderIDString(parseOrderIDS(id))` — `TestDxGetLockedUtxosIdEchoNormalized`) |
 | RPC-F35 | S2 | `dxFlushCancelledOrders` flushes only the cancelled ledger, not book/history | OPEN | B7 |
 | RPC-F36 | S3 | `dxFlushCancelledOrders` use_count/ordering/key order | OPEN | B7 |
 | RPC-F37 | S2 | `gettradingdata` (lowercase) missing from Go dispatch | RE-DECIDE | B7 (prior: deliberate removal) |

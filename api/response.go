@@ -336,6 +336,16 @@ func formatXAmount(amt uint64) string {
 	return strconv.FormatUint(q, 10) + "." + fmt.Sprintf("%06d", r)
 }
 
+// nativeAmountString renders a native whole-coin amount (wallet.Utxo.Value) the
+// way C++ UtxoEntry::toString() streams it (xbridgewalletconnector.cpp:25-30):
+// the double with the stream's default precision 6 (defaultfloat, not fixed), so
+// "0.1", "1", "0.123457". strconv 'g' 6 matches defaultfloat/6 including the
+// %e threshold (exponent >= 6). Used by dxGetLockedUtxos (RPC-F31); registry
+// scale is irrelevant because C++ streams the raw wallet double.
+func nativeAmountString(v float64) string {
+	return strconv.FormatFloat(v, 'g', 6, 64)
+}
+
 // formatBalanceNative renders a wallet balance from its native base-unit amount
 // (e.g. BTC satoshis) as the fixed 6-decimal string Blocknet returns. It is
 // faithful to C++ dxGetTokenBalances, which sums native UTXO amounts as a double
