@@ -1168,7 +1168,7 @@ func TestCreateBBadDepositCancels(t *testing.T) {
 		t.Fatalf("broadcast packets = %d, want exactly one Cancel", len(pkts))
 	}
 	var cancel proto.CancelBody
-	if err := cancel.Unmarshal(pkts[0].Body); err != nil || cancel.Reason != crBadADepositTx {
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil || cancel.Reason != uint32(crBadADepositTx) {
 		t.Fatalf("cancel reason = %d (err %v), want 14", cancel.Reason, err)
 	}
 	if got := len(btc.broadcasts); got != 0 {
@@ -1287,7 +1287,7 @@ func TestCreateBBadLocktimeCancels(t *testing.T) {
 	if err := cancel.Unmarshal(pkts[0].Body); err != nil {
 		t.Fatalf("cancel body: %v", err)
 	}
-	if cancel.Reason != crBadALockTime {
+	if cancel.Reason != uint32(crBadALockTime) {
 		t.Fatalf("cancel reason = %d, want 18", cancel.Reason)
 	}
 	if ok, _ := n.signer.VerifyAgainst(pkts[0], hexEncode(tkPub[:])); !ok {

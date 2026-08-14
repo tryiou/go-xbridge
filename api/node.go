@@ -2098,6 +2098,9 @@ func (n *Node) sendCancelTransaction(idHex string, reason uint32) *rpcError {
 	if err := n.conn.WritePacket(pkt, [20]byte{}); err != nil {
 		return makeError(errUnknown, "dxCancelOrder", err.Error())
 	}
+	// C++ sendCancelTransaction logs the reason via TxCancelReasonText
+	// (xbridgesession.cpp:3536); mirror that field for parity.
+	xlog.Info("cancel: cancel packet sent", "order", idHex, "reason", reason, "reasonText", TxCancelReasonText(reason))
 	return nil
 }
 
@@ -2195,7 +2198,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		return
 	} else if stateOrdinal(o.Status) < 6 { // no deposits yet (C++ :3384-3388)
 		n.store.MoveToHistoryU32(idHex, "canceled", b.Reason, NowMicro())
-		xlog.Info("cancel: counterparty cancel request", "order", idHex)
+		xlog.Info("cancel: counterparty cancel request", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 		return
 	} else if o.Status == "canceled" { // already canceled (C++ :3389-3391)
 		xlog.Info("cancel: already canceled", "order", idHex)
@@ -2237,7 +2240,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		n.enqueueRefund(idHex, nil)
 		// C++ processLater; the background sweep retries on locktime.
 	}
-	xlog.Info("cancel: rollback initiated", "order", idHex)
+	xlog.Info("cancel: rollback initiated", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 	n.persist()
 }
 
@@ -2271,7 +2274,7 @@ func (n *Node) handleRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
 	n.store.Update(idHex, func(o *Order) {
 		o.Reason = b.Reason
 	})
-	xlog.Info("reject: order rejected by servicenode", "order", idHex)
+	xlog.Info("reject: order rejected by servicenode", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 
 	// Restore state on rejection (C++ :3463-3482). All field rewrites happen
 	// under the store lock so a concurrent render never sees a torn order.

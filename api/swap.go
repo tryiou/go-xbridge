@@ -43,16 +43,6 @@ const (
 	expirySweepInterval = 15 * time.Second
 )
 
-// TxCancelReason values used by this branch's wire-Cancel paths. Only the B3
-// subset is defined here; the full enum (crUnknown..crBadFeeTx,
-// xbridgepacket.h:21-48) is STATE-F73's (B8) concern.
-const (
-	crBadADepositTx uint32 = 14
-	crBadBDepositTx uint32 = 15
-	crBadALockTime  uint32 = 18
-	crBadBLockTime  uint32 = 19
-)
-
 // clientState tracks the local client's progress through the hub-driven swap.
 // The hub owns the authoritative Transaction state; this is just our side's view
 // of which handshake step we have completed.
@@ -177,11 +167,11 @@ type confirmOutcome struct {
 // immediately-following processTransactionCancel. The resume (engine side)
 // recognizes it via errors.As and calls SwapSession.sendSelfCancel.
 type selfCancelErr struct {
-	reason uint32
+	reason TxCancelReason
 }
 
 func (e *selfCancelErr) Error() string {
-	return fmt.Sprintf("api: self-cancel (TxCancelReason %d)", e.reason)
+	return fmt.Sprintf("api: self-cancel (TxCancelReason %d: %s)", e.reason, TxCancelReasonText(uint32(e.reason)))
 }
 
 // sendSelfCancel broadcasts a signed xbcTransactionCancel for OUR OWN rejection
@@ -193,19 +183,19 @@ func (e *selfCancelErr) Error() string {
 // Order.MakerKey is OUR M pubkey (order.go:96-99), handleRemoteCancel's
 // iCanceled check accepts it and performs the state transition (cancel if no
 // deposit sent, refund-broadcast rollback otherwise).
-func (s *SwapSession) sendSelfCancel(reason uint32) {
+func (s *SwapSession) sendSelfCancel(reason TxCancelReason) {
 	orderID := hexEncode(s.id[:])
 	if s.n == nil || s.n.conn == nil {
-		xlog.Error("selfCancel: no network connector", "order", orderID, "reason", reason)
+		xlog.Error("selfCancel: no network connector", "order", orderID, "reason", reason, "reasonText", TxCancelReasonText(uint32(reason)))
 		return
 	}
-	body := &proto.CancelBody{ID: s.id, Reason: reason}
+	body := &proto.CancelBody{ID: s.id, Reason: uint32(reason)}
 	pkt := proto.NewPacket(proto.XbcTransactionCancel, body.Marshal())
 	if err := s.n.signer.Sign(pkt, s.privKey[:]); err != nil {
 		xlog.Error("selfCancel: sign failed", "order", orderID, "err", err)
 		return
 	}
-	xlog.Warn("selfCancel: counterparty deposit rejected", "order", orderID, "reason", reason)
+	xlog.Warn("selfCancel: counterparty deposit rejected", "order", orderID, "reason", reason, "reasonText", TxCancelReasonText(uint32(reason)))
 	// Local rollback first (C++ processTransactionCancel(reply)), then broadcast.
 	s.n.handleRemoteCancel(pkt, body)
 	if err := s.n.conn.WritePacket(pkt, [20]byte{}); err != nil {
