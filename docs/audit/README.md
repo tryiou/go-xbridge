@@ -56,9 +56,10 @@ status strings, envelope); the 2026 full audit (`findings.md`, `register.md`)
 found **130 divergences** (1×S1, 61×S2, 61×S3, 7×S4) across the RPC, wire,
 state, crypto, config, and concurrency axes, including prior-audit findings
 folded into the same namespace. The B1 (servicenode-registry), B2
-(wire-acceptingbody), B3 (deposit-path), B6 (secrets-hygiene), and B5
-(wire-hardening) branches are merged to `main`; B4, B7–B11 execute the
-remaining open rows per [`remediation-plan.md`](remediation-plan.md).
+(wire-acceptingbody), B3 (deposit-path), B6 (secrets-hygiene), B5
+(wire-hardening), and B4 (http-hardening) branches are merged to `main`;
+B7–B11 execute the remaining open rows per
+[`remediation-plan.md`](remediation-plan.md).
 
 ## Attacker model
 
@@ -90,7 +91,7 @@ audit's hostile outcome is **theft**, not recoverable lockup — see
 | Area | Rating |
 |---|---|
 | Wire protocol & transport fidelity | 9 / 10 |
-| RPC / `dx*` surface parity | 7 / 10 |
+| RPC / `dx*` surface parity | 8 / 10 |
 | Swap state machine (machine/scripts) | 8 / 10 |
 | Swap deposit/execution path | 9 / 10 (CRYPTO-F93…F96 fixed) |
 | Config / coins / crypto / wallet | 7 / 10 |
@@ -106,5 +107,8 @@ audit's hostile outcome is **theft**, not recoverable lockup — see
    split fee formula, order-history encoding/data sources.
 4. ~~WIRE hardening (B5)~~ **done** — caps, magic/version gates, checksum handling
    merged on B5.
-5. **CFG startup hazards (B10)** `[Rpc]` section, missing-conf, admission gates.
-6. Per-branch detail: see [`remediation-plan.md`](remediation-plan.md).
+5. ~~HTTP/RPC hardening (B4)~~ **done** — transport status routing, bare
+   method-not-found, 32 MiB cap, always-auth + rpcauth, batch/named, strict
+   params + arity gates merged on B4.
+6. **CFG startup hazards (B10)** `[Rpc]` section, missing-conf, admission gates.
+7. Per-branch detail: see [`remediation-plan.md`](remediation-plan.md).

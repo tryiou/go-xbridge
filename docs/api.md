@@ -19,11 +19,55 @@ curl -s http://127.0.0.1:41414 \
 
 - Request: `{"method":"<name>","params":[<pos0>,<pos1>,…],"id":<any>}`.
 - Response: `{"result":…,"error":null,"id":<echo>}` (no `jsonrpc` field).
-- **Auth:** HTTP Basic auth is enforced **only when both `-rpcuser` and
-  `-rpcpassword` are set**; then a request without valid credentials answers
-  `401` with `WWW-Authenticate: Basic realm="jsonrpc"` and an envelope error
-  `-401`. With either credential unset, auth is disabled and every request is
-  accepted (the daemon's default is a loopback-only bind).
+- **Auth:** HTTP Basic auth is enforced whenever **any** credential is
+  configured — `-rpcuser`/`-rpcpassword` or one or more `-rpcauth`
+  `user:salt$hash` entries (HMAC-SHA256). A request without valid credentials
+  answers `401` with an **empty body** and `WWW-Authenticate:
+  Basic realm="jsonrpc"` (no JSON envelope). A presented bad credential waits
+  250 ms before the 401 (C++ brute-force deterrence `MilliSleep(250)`,
+  `httprpc.cpp:168-171`; a missing header fails immediately). With **no**
+  credentials configured the daemon is default-open on its loopback bind — a
+  documented divergence (Go never auto-creates a cookie file; C++ always
+  authenticates via `~/.cookie`). See [Transport](#transport).
+
+## Transport
+
+The HTTP transport matches the C++ `httprpc.cpp` conventions (audit branch B4
+`fix/http-hardening`; details in
+[`audit/remediation/B4-http.md`](audit/remediation/B4-http.md)).
+
+- **POST only.** `GET` and other verbs answer `405 Method Not Allowed` (C++ is
+  POST-only).
+- **HTTP status routing** (C++ `JSONErrorReply`, `httprpc.cpp:70-85`): envelope
+  `-32600` → `400`, `-32601` → `404`, all other envelope errors → `500`.
+  Business errors ride in `result` and always return `200`.
+- **Envelope error codes:** `-32700` parse error, `-32600` invalid request
+  (`"Missing method"`, `"Method must be a string"`, `"Params must be an array
+  or object"`), `-32601` `"Method not found"` (bare message — no method-name
+  suffix), `-32603` internal, `-8` `"Unknown named parameter <key>"`.
+- **Request id** is parsed before dispatch and echoed on the pre-dispatch
+  errors where it is parseable (`-32600`, `-32601`, `-8`); an unparseable body
+  yields a null id on `-32700` (as in C++).
+- **Body cap:** 32 MiB (`rpcMaxBodyBytes`, matching C++ libevent). An oversized
+  request answers a non-envelope `413` (empty body).
+- **Batch requests** are supported: a top-level JSON array runs each element as
+  its own RPC call (C++ `JSONRPCExecBatch`); each element's `id` is echoed
+  independently and the response is an array. The overall HTTP status is `200`.
+- **Named parameters** are rejected: the first named key produces `-8`
+  `"Unknown named parameter <key>"` (C++ `transformNamedArguments`; `dx*`
+  methods have empty argNames, so every named param is unknown).
+- **Strict parameter typing.** No string coercion: `dx*` parameters must match
+  the C++ types (`json_spirit`/UniValue parse and `RPCTypeCheck`). Type errors
+  surface as envelope `-1` (`get_value< T > called on V Value` / `JSON value is
+  not a X as expected`) on the throw methods and `-3` `Expected type t, got n`
+  on the RPCTypeCheck-checked methods (e.g. `dxGetMyPartialOrderChain`,
+  `dxPartialOrderChainDetails`, `dxGetTradingData`).
+- **Extra positional parameters** are rejected exactly as C++ arity checks do:
+  business methods answer `1025` `Invalid parameters: <arg>` in `result`; the
+  throw methods answer an envelope `-1` with the method's `RPCHelpMan` help
+  text.
+- **Timeouts:** the HTTP server applies read/write/header/idle timeouts
+  (`-rpcservertimeout`, default 30 s, mirroring C++ `DEFAULT_HTTP_SERVER_TIMEOUT`).
 
 ## Response conventions
 
@@ -83,9 +127,11 @@ envelope `error` stays `null`:
 {"result":{"error":"Transaction <id> not found","code":1021,"name":"dxGetOrder"},"error":null,"id":1}
 ```
 
-**Transport failures** (parse error, unknown method, auth failure, oversized
-body) use the envelope `error`: `-32700` parse, `-32601` method not found,
-`-32603` internal, `-401` auth, and a `413` HTTP status for oversized bodies.
+**Transport failures** (parse error, invalid request, unknown method, internal
+error) use the envelope `error`: `-32700` parse, `-32600` invalid request,
+`-32601` method not found, `-32603` internal — with HTTP status `400`/`404`/
+`500` respectively. Auth failure is an empty-body `401` (no envelope). An
+oversized body is a non-envelope `413`. See [Transport](#transport).
 
 ### Error codes
 
