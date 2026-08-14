@@ -6,6 +6,7 @@ import (
 	"time"
 
 	xlog "go-xbridge/log"
+	"go-xbridge/p2p"
 	"go-xbridge/proto"
 )
 
@@ -13,6 +14,12 @@ import (
 // from stage 4, the deposit/claim two-phase handshake) offload wallet I/O here
 // so the engine goroutine never blocks on a slow RPC.
 const engineWorkers = 4
+
+// hubBanThreshold is the misbehaviour score at which the DIRECT hub connection
+// is dropped. Mirrors C++ -banscore (default 100); each malformed/undersized
+// xbridge envelope scores +10 (C++ Misbehaving, net_processing.cpp:2874-2878).
+// In discovery mode the PeerManager enforces its own per-peer penalties instead.
+const hubBanThreshold = 100
 
 // inboundPacket is a raw P2P packet plus the reader-computed values that
 // replace re-verifying on the engine goroutine.
@@ -108,6 +115,16 @@ func (n *Node) start() {
 func (n *Node) readerLoop() {
 	defer n.wg.Done()
 	var lastErr error
+	// Hub misbehaviour score (STATE-F75). For a DIRECT hub connection, an
+	// xbridge envelope that fails transport decode accumulates +10 — the analog
+	// of C++'s Misbehaving +10 for a sub-min-size xbridge packet
+	// (net_processing.cpp:2874-2878) — and the connection is dropped at the ban
+	// threshold. Sized-but-undecodable packet BODIES are dropped without a
+	// penalty (C++ DoS 0, xbridgesession.cpp:312), matching the discovery
+	// path. In discovery mode the PeerManager enforces its own per-peer
+	// penalties (readLoop), so the direct score applies only to *p2p.Conn.
+	_, direct := n.conn.(*p2p.Conn)
+	hubScore := 0
 	for {
 		select {
 		case <-n.stop:
@@ -116,7 +133,15 @@ func (n *Node) readerLoop() {
 		}
 		pkt, peer, err := n.conn.ReadPacket()
 		if err != nil {
-			if !errors.Is(err, lastErr) {
+			if direct && errors.Is(err, p2p.ErrMalformedXBridge) {
+				hubScore += 10
+				if hubScore >= hubBanThreshold {
+					xlog.Error("hub banned: malformed xbridge envelope flood", "peer", peer)
+					n.conn.Close()
+					return
+				}
+				xlog.Warn("hub misbehaving", "peer", peer, "score", hubScore, "err", err)
+			} else if !errors.Is(err, lastErr) {
 				xlog.Debug("peer read failed", "peer", peer, "err", err)
 				lastErr = err
 			}
@@ -129,6 +154,8 @@ func (n *Node) readerLoop() {
 		}
 		lastErr = nil
 		if _, err := proto.DecodeBody(pkt.Command, pkt.Body); err != nil {
+			// Sized-but-undecodable body: dropped, no penalty (C++ DoS 0,
+			// xbridgesession.cpp:312).
 			xlog.Warn("packet body decode skipped", "command", pkt.Command.String(), "err", err)
 			continue
 		}

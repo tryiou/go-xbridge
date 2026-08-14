@@ -28,6 +28,14 @@ type Options struct {
 	// DialCooldown is how long a failed/used address is skipped before being
 	// re-candidated. Defaults to 2 minutes.
 	DialCooldown time.Duration
+	// BanThreshold is the misbehaviour score at which a peer is disconnected
+	// and excluded from re-candidating (C++ -banscore, default 100). A peer
+	// scores +10 per malformed/undersized XBRIDGE envelope and +20 per rejected
+	// addr payload (net_processing.cpp:2877, :1825-1830). Defaults to 100.
+	BanThreshold int
+	// BanDuration is how long a banned peer is excluded. Defaults to 24 hours
+	// (C++ default -bantime).
+	BanDuration time.Duration
 	// Dialer optionally overrides the connect function (used by tests). The
 	// default is p2p.Dial.
 	Dialer func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
@@ -75,6 +83,14 @@ type PeerManager struct {
 	// dialCooldown is how long a failed/used address is skipped before being
 	// re-candidated, so unreachable peers are not dialed every maintain tick.
 	dialCooldown time.Duration
+
+	// banThreshold / banDuration are the misbehaviour gate (C++ -banscore /
+	// -bantime). misbehave is the per-peer score map; banned holds the ban
+	// expiry for disqualified peers so nextCandidate never re-dials them.
+	banThreshold int
+	banDuration  time.Duration
+	misbehavior  map[string]int
+	banned       map[string]time.Time
 }
 
 // peerPacket couples an XBridge packet with the TCP peer address it arrived
@@ -107,6 +123,14 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 	if dialCooldown <= 0 {
 		dialCooldown = 2 * time.Minute
 	}
+	banThreshold := opts.BanThreshold
+	if banThreshold <= 0 {
+		banThreshold = 100
+	}
+	banDuration := opts.BanDuration
+	if banDuration <= 0 {
+		banDuration = 24 * time.Hour
+	}
 	return &PeerManager{
 		magic:         magic,
 		network:       network,
@@ -123,6 +147,10 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		snReg:         servicenode.NewRegistry(),
 		rawPings:      make(map[[33]byte][]byte),
 		dialCooldown:  dialCooldown,
+		banThreshold:  banThreshold,
+		banDuration:   banDuration,
+		misbehavior:   make(map[string]int),
+		banned:        make(map[string]time.Time),
 	}
 }
 
@@ -183,6 +211,21 @@ func (m *PeerManager) maintain(ctx context.Context) {
 			// afterwards so the static bootstrap set is never pruned away (which
 			// would also wipe its dial-cooldown state).
 			m.seedAddrMan()
+			// Drop expired ban entries so a long-running daemon's maps stay
+			// bounded (reconnecting peers are also cleared in connectOne).
+			m.pruneBans()
+		}
+	}
+}
+
+// pruneBans removes ban entries whose window has expired.
+func (m *PeerManager) pruneBans() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := now()
+	for addr, exp := range m.banned {
+		if !n.Before(exp) {
+			delete(m.banned, addr)
 		}
 	}
 }
@@ -224,6 +267,9 @@ func (m *PeerManager) nextCandidate() string {
 		idx := (m.rr + i) % len(cands)
 		c := cands[idx]
 		if _, ok := m.peers[c]; ok {
+			continue
+		}
+		if m.bannedLocked(c) {
 			continue
 		}
 		if m.explicitSet[c] {
@@ -271,6 +317,12 @@ func (m *PeerManager) connectOne(ctx context.Context, addr string) {
 	}
 	m.mu.Lock()
 	m.peers[addr] = conn
+	// C++ nMisbehavior is per-connection and resets on reconnect; only the
+	// BanMan list persists, for the ban window. Clearing both here means a
+	// peer that reconnects after its 24 h ban starts clean (and prunes the
+	// stale entries so the maps stay bounded).
+	delete(m.misbehavior, addr)
+	delete(m.banned, addr)
 	m.mu.Unlock()
 	xlog.Info("peer connected", "peer", addr)
 
@@ -291,6 +343,10 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		conn.Close()
 		m.mu.Lock()
 		delete(m.peers, addr)
+		// nMisbehavior is per-connection: a disconnect (even a clean one) drops
+		// the tally, so a reconnecting peer starts clean and the map stays
+		// bounded.
+		delete(m.misbehavior, addr)
 		m.mu.Unlock()
 		xlog.Info("peer disconnected", "peer", addr)
 	}()
@@ -311,11 +367,16 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 		case p2p.XBridgeNetCommand:
 			pktBytes, derr := p2p.DecodeXBridgePayload(msg.Payload)
 			if derr != nil {
+				// Undersized/malformed xbridge envelope: C++ Misbehaves +10
+				// (net_processing.cpp:2874-2878, raw.size() < 28).
 				xlog.Debug("peer xbridge payload decode failed", "peer", addr, "err", derr)
+				m.misbehave(addr, 10)
 				continue
 			}
 			pkt, perr := proto.Unmarshal(pktBytes)
 			if perr != nil {
+				// Sized-but-undecodable body: C++ drops without a penalty (the
+				// session DoS is 0, xbridgesession.cpp:312).
 				xlog.Debug("peer xbridge packet unmarshal failed", "peer", addr, "err", perr)
 				continue
 			}
@@ -328,8 +389,9 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 			entries, aerr := p2p.ParseAddr(msg.Payload)
 			if aerr != nil {
 				// Includes the >1000-record cap, which C++ answers with
-				// Misbehaving (net_processing.cpp:1825-1830).
+				// Misbehaving +20 (net_processing.cpp:1825-1830).
 				xlog.Warn("p2p: addr payload rejected", "peer", addr, "err", aerr)
+				m.misbehave(addr, 20)
 				break
 			}
 			m.addrMan.AddSlice(entries)
@@ -453,6 +515,42 @@ func (m *PeerManager) AddrCount() int {
 // token set for dxGetNetworkTokens (mirroring C++ walletServices()).
 func (m *PeerManager) ServiceNodes() *servicenode.Registry {
 	return m.snReg
+}
+
+// misbehave adds score to a peer's misbehaviour tally and, at the ban
+// threshold (C++ -banscore), disconnects it and excludes it from
+// re-candidating for the ban window. Mirrors C++ Misbehaving
+// (net_processing.cpp:2877, :1825-1830); unlike C++, the disconnect is
+// immediate (a thin client has no ban-score checkpoints).
+func (m *PeerManager) misbehave(addr string, score int) {
+	m.mu.Lock()
+	m.misbehavior[addr] += score
+	total := m.misbehavior[addr]
+	banned := total >= m.banThreshold
+	if banned {
+		m.banned[addr] = now().Add(m.banDuration)
+	}
+	conn := m.peers[addr]
+	m.mu.Unlock()
+	xlog.Warn("peer misbehaving", "peer", addr, "score", score, "total", total, "banned", banned)
+	if banned && conn != nil {
+		// Closing unblocks readLoop; its defer removes the peer from the pool.
+		conn.Close()
+	}
+}
+
+// bannedLocked reports whether addr is inside its ban window. Caller must hold
+// m.mu (used by nextCandidate inside its critical section).
+func (m *PeerManager) bannedLocked(addr string) bool {
+	exp, ok := m.banned[addr]
+	return ok && now().Before(exp)
+}
+
+// isBanned reports whether addr is inside its ban window.
+func (m *PeerManager) isBanned(addr string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bannedLocked(addr)
 }
 
 // liveCount returns the number of fully-connected peers.

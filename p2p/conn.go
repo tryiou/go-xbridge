@@ -158,6 +158,12 @@ func (c *Conn) write(buf []byte) error {
 	return err
 }
 
+// ErrMalformedXBridge marks an xbridge transport envelope that failed decode
+// (undersized / length mismatch) — the case C++ answers with Misbehaving +10
+// (net_processing.cpp:2874-2878, raw.size() < 28). ReadPacket returns it so the
+// caller can distinguish a malformed envelope from an ordinary I/O error.
+var ErrMalformedXBridge = errors.New("p2p: malformed xbridge envelope")
+
 // ReadPacket reads the next XBridge packet from the stream, skipping any
 // non-XBridge P2P messages (ping/pong, addr, etc.). The `xbridge` payload is
 // unwrapped from its transport envelope (varint length + 20-byte dest addr + 8-byte
@@ -177,10 +183,12 @@ func (c *Conn) ReadPacket() (*proto.Packet, string, error) {
 		}
 		pktBytes, err := DecodeXBridgePayload(msg.Payload)
 		if err != nil {
-			return nil, "", err
+			return nil, "", fmt.Errorf("%w: %v", ErrMalformedXBridge, err)
 		}
 		pkt, err := proto.Unmarshal(pktBytes)
 		if err != nil {
+			// Sized-but-undecodable body: C++ drops it with DoS 0
+			// (xbridgesession.cpp:312) — not a misbehaviour offense.
 			return nil, "", err
 		}
 		return pkt, c.netConn.RemoteAddr().String(), nil
