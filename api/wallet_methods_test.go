@@ -176,11 +176,9 @@ func TestDxGetUtxos(t *testing.T) {
 	if arr[0]["orderid"] != "" {
 		t.Errorf("orderid = %v, want \"\"", arr[0]["orderid"])
 	}
-	// Too many params -> error.
-	if _, err := ctx.dxGetUtxos([]json.RawMessage{
-		json.RawMessage(`"BTC"`), json.RawMessage("true"), json.RawMessage("x"),
-	}); err == nil {
-		t.Error("dxGetUtxos(3 params) should error")
+	// Too many params -> error (arity gate moved to checkArity, dispatch.go).
+	if rerr := checkArity("dxGetUtxos", 3); rerr == nil || !rerr.envelope || rerr.Code != -1 {
+		t.Errorf("checkArity(dxGetUtxos, 3) = %v, want envelope -1 (throw method)", rerr)
 	}
 }
 

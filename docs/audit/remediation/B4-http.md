@@ -53,6 +53,7 @@ Business 1025 (HTTP 200, result-error, exact message):
 | dxGetTokenBalances | !=0 | `This function does not accept any parameters.` |
 | dxGetLockedUtxos | >1 | `Too many parameters.` |
 | dxFlushCancelledOrders | >1 | `ageMillis must be an integer >= 0` |
+| dxGetMyOrders | >0 | `This function does not accept any parameters.` |
 
 Envelope -1 (HTTP 500, thrown help text) — 9 of the 10 C++ methods exist in the
 Go dispatch (gettradingdata is B7/F37):
@@ -69,12 +70,13 @@ Go dispatch (gettradingdata is B7/F37):
 | dxGetUtxos | not 1/2 | help constant |
 | dxGetTradingData | >2 | help constant |
 
-**dxGetMyOrders has NO arity gate in C++** (only `fHelp` throws) — extra params
-silently ignored; F52's mention is incorrect, we match C++ (no gate).
+**dxGetMyOrders** gates non-empty params with business 1025
+(`rpcxbridge.cpp:2083-2093`), matching the other zero-arg methods.
 
 Go arity bugs fixed by the registry: dxMakePartialOrder `<7`→`<6`;
 dxSplitInputs `!=7`→`3..7`; dxGetOrderFills no gate→`2|3`;
-dxGetOrderHistory message missing `default=2147483647`.
+dxGetMyOrders no gate→`==0`; dxGetOrderHistory message missing
+`default=2147483647`.
 
 ## Design notes / decisions
 
@@ -128,7 +130,8 @@ dxGetOrderHistory message missing `default=2147483647`.
   parser, exact json_spirit messages); null-tolerant optionals.
 - `api/arity_test.go` — per-method arity: business exact 1025 text; throw
   methods envelope `-1` with help constant (byte equality); boundaries; the
-  three Go arity-bug fixes; dxGetMyOrders extras ignored.
+  four Go arity-bug fixes (dxMakePartialOrder `<7`→`<6`, dxSplitInputs
+  `!=7`→`3..7`, dxGetOrderFills no gate→`2|3`, dxGetMyOrders no gate→`==0`).
 - `api/handlers_test.go` — NO_SESSION `name` per affected handler.
 - `conformance/conformance_suite_test.go` — promote the 6 DIVERGENT
   `envelope/…` transport rows to strict.

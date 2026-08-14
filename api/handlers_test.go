@@ -74,9 +74,9 @@ func TestDxGetOrdersRead(t *testing.T) {
 		t.Errorf("dxGetOrders entry = %+v", arr[0])
 	}
 
-	// dxGetOrders rejects params.
-	if _, err := ctx.dxGetOrders([]json.RawMessage{jstr("x")}); err == nil {
-		t.Error("dxGetOrders should reject params")
+	// dxGetOrders rejects params (arity gate moved to checkArity, dispatch.go).
+	if rerr := checkArity("dxGetOrders", 1); rerr == nil || rerr.Code != errInvalidParameters {
+		t.Errorf("checkArity(dxGetOrders, 1) = %v, want business 1025", rerr)
 	}
 }
 

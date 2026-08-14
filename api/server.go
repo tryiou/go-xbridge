@@ -289,6 +289,14 @@ func (s *Server) dispatchOne(raw rawRequest) rpcResponse {
 		xlog.Warn("rpc transport error", "code", -32601, "method", method)
 		return envelopeResponse(makeEnvelopeError(-32601, "Method not found"), id)
 	}
+	// Arity gate (RPC-F52): business 1025 for the old-style methods, envelope
+	// -1 with the C++ help text for the throw methods.
+	if aerr := checkArity(method, len(params)); aerr != nil {
+		if aerr.envelope {
+			return envelopeResponse(aerr, id)
+		}
+		return businessResponse(aerr, id)
+	}
 	xlog.Debug("rpc request", "method", method)
 	result, rpcErr := s.call(handler, params, id)
 	if rpcErr != nil {

@@ -67,6 +67,81 @@ func Lookup(method string) Handler {
 }
 
 // ---------------------------------------------------------------------------
+// Arity gates (RPC-F52).
+//
+// C++ enforces each dx* method's param count up front. The old-style methods
+// return a business 1025 result error with the exact param-list string
+// (uret(makeError(INVALID_PARAMETERS, __FUNCTION__, <msg>))); the throw
+// methods throw the full RPCHelpMan help text as an envelope error code -1
+// (rpc/server.cpp:584-586). checkArity runs before the handler so the gates are
+// centralized and match C++ per method (see remediation/B4-http.md).
+// ---------------------------------------------------------------------------
+
+type arityKind int
+
+const (
+	arityBusiness arityKind = iota // 1025 result-error
+	arityThrow                     // envelope -1 with the RPCHelpMan help text
+)
+
+// maxArity marks an unbounded upper param count (C++ ignores extras past the
+// last read index for dxMakeOrder / dxMakePartialOrder).
+const maxArity = -1
+
+type aritySpec struct {
+	min, max int
+	kind     arityKind
+	msg      string
+}
+
+var arity = map[string]aritySpec{
+	// Business 1025 gates (exact C++ makeError arg).
+	"dxGetNewTokenAddress":   {1, 1, arityBusiness, "(ticker)"},
+	"dxLoadXBridgeConf":      {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetLocalTokens":       {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetNetworkTokens":     {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrders":            {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrderFills":        {2, 3, arityBusiness, "(maker) (taker) (combined, default=true)[optional]"},
+	"dxGetOrderHistory":      {5, 8, arityBusiness, "(maker) (taker) (start time) (end time) (granularity) (order_ids, default=false)[optional] (with_inverse, default=false)[optional] (limit, default=2147483647)[optional]"},
+	"dxGetOrder":             {1, 1, arityBusiness, "(id)"},
+	"dxCancelOrder":          {1, 1, arityBusiness, "(id)"},
+	"dxGetOrderBook":         {3, 4, arityBusiness, "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]"},
+	"dxGetTokenBalances":     {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetLockedUtxos":       {0, 1, arityBusiness, "Too many parameters."},
+	"dxFlushCancelledOrders": {0, 1, arityBusiness, "ageMillis must be an integer >= 0"},
+	"dxGetMyOrders":          {0, 0, arityBusiness, "This function does not accept any parameters."},
+
+	// Throw methods (envelope -1 with the byte-for-byte RPCHelpMan help text).
+	"dxMakeOrder":                {7, maxArity, arityThrow, helpDxMakeOrder},
+	"dxMakePartialOrder":         {6, maxArity, arityThrow, helpDxMakePartialOrder},
+	"dxTakeOrder":                {3, 5, arityThrow, helpDxTakeOrder},
+	"dxGetMyPartialOrderChain":   {1, 1, arityThrow, helpDxGetMyPartialOrderChain},
+	"dxPartialOrderChainDetails": {1, 1, arityThrow, helpDxPartialOrderChainDetails},
+	"dxSplitAddress":             {3, 6, arityThrow, helpDxSplitAddress},
+	"dxSplitInputs":              {3, 7, arityThrow, helpDxSplitInputs},
+	"dxGetUtxos":                 {1, 2, arityThrow, helpDxGetUtxos},
+	"dxGetTradingData":           {0, 2, arityThrow, helpDxGetTradingData},
+	// getnetworkinfo is a Go shim with its own gate (B7/F46).
+}
+
+// checkArity returns the C++ arity violation for method with n params, or nil
+// when the count is within bounds. Methods without a registry entry (and
+// unbounded maxima) are never gated.
+func checkArity(method string, n int) *rpcError {
+	spec, ok := arity[method]
+	if !ok {
+		return nil
+	}
+	if n >= spec.min && (spec.max == maxArity || n <= spec.max) {
+		return nil
+	}
+	if spec.kind == arityThrow {
+		return makeEnvelopeError(-1, spec.msg)
+	}
+	return makeError(errInvalidParameters, method, spec.msg)
+}
+
+// ---------------------------------------------------------------------------
 // Strict positional parameter parsing (RPC-F01).
 //
 // C++ reads dx* params either through json_spirit (Array params; a wrong/null

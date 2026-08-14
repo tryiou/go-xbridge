@@ -112,9 +112,7 @@ func (h *HandlerCtx) dxGetOrderFills(params []json.RawMessage) (interface{}, *rp
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetOrders(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) != 0 {
-		return nil, makeError(errInvalidParameters, "dxGetOrders", "This function does not accept any parameters.")
-	}
+	// arity (==0) is enforced by checkArity (dispatch.go).
 	now := NowMicro()
 	out := []orderListResult{}
 	for _, o := range h.Store.List() {
@@ -271,10 +269,8 @@ func (h *HandlerCtx) dxGetNewTokenAddress(params []json.RawMessage) (interface{}
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxMakeOrder(params []json.RawMessage) (interface{}, *rpcError) {
-	// (maker, maker_size, maker_address, taker, taker_size, taker_address, type, [use_all_funds=true], [dryrun])
-	if len(params) < 7 {
-		return nil, makeError(errInvalidParameters, "dxMakeOrder", "(maker) (maker_size) (maker_address) (taker) (taker_size) (taker_address) (type) (use_all_funds, default=true)[optional] (dryrun)[optional]")
-	}
+	// (maker, maker_size, maker_address, taker, taker_size, taker_address, type, [use_all_funds=true], [dryrun]);
+	// arity (7..) is enforced by checkArity (dispatch.go).
 	var err *rpcError
 	var maker, makerSize, makerAddr, taker, takerSize, takerAddr, typ string
 	if maker, _, err = spStr(params, 0); err != nil {
@@ -336,10 +332,8 @@ func (h *HandlerCtx) dxMakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 }
 
 func (h *HandlerCtx) dxMakePartialOrder(params []json.RawMessage) (interface{}, *rpcError) {
-	// (maker, maker_size, maker_address, taker, taker_size, taker_address, minimum_size, [repost=true], [use_all_funds=true], [auto_split=true], [dryrun])
-	if len(params) < 7 {
-		return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "(maker) (maker_size) (maker_address) (taker) (taker_size) (taker_address) (minimum_size) (repost, default=true)[optional] (use_all_funds, default=true)[optional] (auto_split, default=true)[optional] (dryrun)[optional]")
-	}
+	// (maker, maker_size, maker_address, taker, taker_size, taker_address, minimum_size, [repost=true], [use_all_funds=true], [auto_split=true], [dryrun]);
+	// arity (6..) is enforced by checkArity (dispatch.go).
 	var err *rpcError
 	var maker, makerSize, makerAddr, taker, takerSize, takerAddr, minSize string
 	if maker, err = uvStr(params, 0); err != nil {
@@ -413,10 +407,8 @@ func (h *HandlerCtx) dxMakePartialOrder(params []json.RawMessage) (interface{}, 
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcError) {
-	// (id, from_address, to_address, [amount], [dryrun])
-	if len(params) < 3 {
-		return nil, makeError(errInvalidParameters, "dxTakeOrder", "(id) (from_address) (to_address) (amount)[optional] (dryrun)[optional]")
-	}
+	// (id, from_address, to_address, [amount], [dryrun]); arity (3..5) is
+	// enforced by checkArity (dispatch.go).
 	var err *rpcError
 	var id, fromAddr, toAddr, amount string
 	if id, err = uvStr(params, 0); err != nil {
@@ -459,9 +451,7 @@ func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) != 1 {
-		return nil, makeError(errInvalidParameters, "dxCancelOrder", "(id)")
-	}
+	// arity (==1) is enforced by checkArity (dispatch.go).
 	id, _, perr := spStr(params, 0)
 	if perr != nil {
 		return nil, perr
@@ -500,9 +490,7 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) < 5 || len(params) > 8 {
-		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "(maker) (taker) (start time) (end time) (granularity) (order_ids, default=false)[optional] (with_inverse, default=false)[optional] (limit)[optional]")
-	}
+	// arity (5..8) is enforced by checkArity (dispatch.go).
 	var err *rpcError
 	var maker, taker string
 	if maker, _, err = spStr(params, 0); err != nil {
@@ -690,9 +678,7 @@ func idsAtPrice(list []obEntry, best obEntry) []string {
 }
 
 func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) < 3 || len(params) > 4 {
-		return nil, makeError(errInvalidParameters, "dxGetOrderBook", "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]")
-	}
+	// arity (3..4) is enforced by checkArity (dispatch.go).
 	detail, _, err := spInt(params, 0)
 	if err != nil {
 		return nil, err
@@ -1116,9 +1102,7 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) > 1 {
-		return nil, makeError(errInvalidParameters, "dxGetLockedUtxos", "Too many parameters.")
-	}
+	// arity (0..1) is enforced by checkArity (dispatch.go).
 	// C++ gates on the Exchange (Service Node) being started; a thin client with
 	// no configured exchange wallets cannot serve locked-utxo data. Guard the nil
 	// Node/Config so an unconfigured handler returns the business error instead of
@@ -1275,9 +1259,7 @@ func (h *HandlerCtx) dxGetTradingData(params []json.RawMessage) (interface{}, *r
 	// blocknetd block index, so we surface the same 8-field record schema built
 	// from the local fills this node has seen. `blocks`/`errors` are accepted for
 	// contract compatibility but cannot bound a BLOCK block scan here.
-	if len(params) > 2 {
-		return nil, makeError(errInvalidParameters, "dxGetTradingData", "(blocks, default=43200)[optional] (errors, default=false)[optional]")
-	}
+	// arity (0..2) is enforced by checkArity (dispatch.go).
 	// C++ runs RPCTypeCheck on the present params (rpcxbridge.cpp:2847-2854):
 	// params[0] must be a number when present, params[1] a bool when there are
 	// exactly 2. The thin client ignores the values but must still reject wrong
@@ -1315,10 +1297,8 @@ func (h *HandlerCtx) dxGetTradingData(params []json.RawMessage) (interface{}, *r
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpcError) {
-	// (token, splitamount, address, include_fees[default=true], show_rawtx[default=false], submit[default=true])
-	if len(params) < 3 || len(params) > 6 {
-		return nil, makeError(errInvalidParameters, "dxSplitAddress", "(token) (splitamount) (address) (include_fees, default=true)[optional] (show_rawtx, default=false)[optional] (submit, default=true)[optional]")
-	}
+	// (token, splitamount, address, include_fees[default=true], show_rawtx[default=false], submit[default=true]);
+	// arity (3..6) is enforced by checkArity (dispatch.go).
 	var err *rpcError
 	var ticker, splitAmt, address string
 	if ticker, err = uvStr(params, 0); err != nil {
@@ -1347,16 +1327,8 @@ func (h *HandlerCtx) dxSplitAddress(params []json.RawMessage) (interface{}, *rpc
 }
 
 func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcError) {
-	// C++ advertises 3-7 params (rpcxbridge.cpp:3295) but then reads params[3]
-	// through params[6] unconditionally via get_bool()/get_array(); on a missing
-	// index UniValue::operator[] yields NullUniValue and get_bool()/get_array()
-	// throw. So C++ only actually succeeds with all 7 params present — the 3-6
-	// range throws a generic type error at the first missing param. We therefore
-	// require exactly 7: (token, splitamount, address, include_fees, show_rawtx,
-	// submit, utxos).
-	if len(params) != 7 {
-		return nil, makeError(errInvalidParameters, "dxSplitInputs", "(token) (splitamount) (address) (include_fees) (show_rawtx) (submit) (utxos)")
-	}
+	// arity (3..7) is enforced by checkArity (dispatch.go). C++ reads params[3..6]
+	// unconditionally, so a short call throws at the first missing index.
 	var err *rpcError
 	var ticker, splitAmt, address string
 	if ticker, err = uvStr(params, 0); err != nil {
@@ -1768,9 +1740,7 @@ func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcError) {
-	if len(params) < 1 || len(params) > 2 {
-		return nil, makeError(errInvalidParameters, "dxGetUtxos", "(token) (include_used, default=false)[optional]")
-	}
+	// arity (1..2) is enforced by checkArity (dispatch.go).
 	ticker, perr := uvStr(params, 0)
 	if perr != nil {
 		return nil, perr
