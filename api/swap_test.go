@@ -146,12 +146,17 @@ func (f *fakeConnector) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx
 	if err != nil {
 		return "", false, err
 	}
+	// Dispatch on the coin's SignatureKind so a BCH fixture signs the P2PKH
+	// funding input with the forkid digest (CRYPTO-F77), like a real BCH wallet.
+	// coins.Get on an unseeded registry returns the zero coin (SigLegacy), so
+	// legacy-family tests are unaffected.
+	coin, _ := coins.Get(f.ticker)
 	for i := range tx.Inputs {
 		if i >= len(prevTxs) {
 			return "", false, err
 		}
 		prevScript, _ := hex.DecodeString(prevTxs[i].ScriptPubKey)
-		sig, serr := coins.SignTxInput(tx, i, prevScript, f.fundingPriv)
+		sig, serr := coins.SignTxInputForCoin(tx, i, prevScript, prevTxs[i].Amount, f.fundingPriv, coin)
 		if serr != nil {
 			return "", false, serr
 		}
@@ -1005,6 +1010,102 @@ func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
 	}
 	if got := len(btc.broadcasts); got != 0 {
 		t.Fatalf("deposit broadcast %d time(s) despite refund-build failure; the refund must be pre-built before broadcasting (CRYPTO-F86)", got)
+	}
+}
+
+// TestBCHRefundForkidSigned (CRYPTO-F77) proves the maker's pre-signed BCH CLTV
+// refund is produced with the BCH forkid sighash: the DER signature carries the
+// 0x41 (SIGHASH_ALL|SIGHASH_FORKID) byte and verifies against the forkid BIP143
+// digest committing fork value 0xffdead (live mainnet replay protection,
+// bch.cpp:203-209/497-499) and the deposit's exact P2SH value. A legacy (0x01)
+// verifier must reject it — the byte alone differs — so the signature cannot be
+// a mis-sighashed legacy signature that BCH nodes would refuse.
+func TestBCHRefundForkidSigned(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BCH": {Ticker: "BCH", Title: "BitcoinCash", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BCH", BlockTime: 60},
+		"BTC": {Ticker: "BTC", Title: "Bitcoin", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bchCoin, _ := coins.Get("BCH")
+
+	mkPriv, mkPub := newKey(t)
+	_, tkPub := newKey(t)
+	// BCH destinations must be cashaddr (FamilyUTXOBCH decodes cashaddr only).
+	mkAddrHash := hash20("maker-bch-dest")
+	mkAddr := coins.Address{Coin: bchCoin, Kind: coins.P2PKH, Hash: mkAddrHash[:]}.String()
+	btcAddr := addrFor(0, "taker-btc-source")
+
+	bchFundingPriv, bchFundingPub := newKey(t)
+	bchFunding := wallet.Utxo{TxID: strings.Repeat("cc", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(bchFundingPub)))}
+	bchChangeHash := hash20("bch-change")
+	bchChange := coins.Address{Coin: bchCoin, Kind: coins.P2PKH, Hash: bchChangeHash[:]}.String()
+	bchConn := &fakeConnector{ticker: "BCH", funding: bchFunding, fundingPriv: bchFundingPriv, fundingPub: bchFundingPub, changeAddr: bchChange, blockHeight: 1000, rawTx: map[string]string{}}
+
+	var orderID [32]byte
+	oidHash := hash20("bch-forkid-order")
+	copy(orderID[:], oidHash[:])
+	confs := map[string]*config.CoinConf{
+		"BCH": {Ticker: "BCH", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BCH", BlockTime: 60},
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BCH": bchConn})
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, &Order{ID: orderID, FromCurrency: "BCH", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2e6}, []wallet.Utxo{bchFunding}),
+		MakeOrderParams{MakerAddress: mkAddr, TakerAddress: btcAddr}, arr32(mkPriv), toArr33(mkPub))
+
+	var hub [20]byte
+	hubHash := hash20("hub")
+	copy(hub[:], hubHash[:])
+	s := makerNode.sessions[hexEncode(orderID[:])]
+	s.hub = hub
+
+	if _, _, err := s.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
+		t.Fatalf("maker OnHold: %v", err)
+	}
+	if _, _, err := s.OnInit(&proto.InitBody{
+		ClientAddress: hash20("taker-btc-source"), HubAddress: hub, ID: orderID,
+		FromAddress: hash20("maker-bch-dest"), FromCurrency: "BCH", FromAmount: 2.5e6,
+		ToAddress: hash20("taker-btc-source"), ToCurrency: "BTC", ToAmount: 2e6,
+	}); err != nil {
+		t.Fatalf("maker OnInit: %v", err)
+	}
+	_, bodyA, err := s.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+	if createdA.RefTx == "" {
+		t.Fatal("no BCH refund produced at deposit time")
+	}
+
+	refundTx, err := coins.Deserialize(mustHex(createdA.RefTx))
+	if err != nil {
+		t.Fatalf("deserialize BCH refund: %v", err)
+	}
+	if len(refundTx.Inputs) == 0 {
+		t.Fatal("BCH refund has no inputs")
+	}
+	pushes, _ := decodeScriptPushes(t, refundTx.Inputs[0].ScriptSig)
+	if len(pushes) != 3 {
+		t.Fatalf("BCH refund scriptSig wants <sig> <pub> OP_1 <inner>, got %d pushes", len(pushes))
+	}
+	sig, inner := pushes[0], pushes[2]
+	if sig[len(sig)-1] != coins.SigHashForkID|coins.SigHashAll {
+		t.Errorf("BCH refund sig trailing byte = %#x, want 0x41 (SIGHASH_ALL|SIGHASH_FORKID)", sig[len(sig)-1])
+	}
+
+	// The forkid digest commits the exact spent value: the deposit's P2SH output.
+	depTx, err := coins.Deserialize(mustHex(bchConn.rawTx[createdA.ADepositTxID]))
+	if err != nil {
+		t.Fatalf("deserialize BCH deposit: %v", err)
+	}
+	p2sh := depTx.Outputs[0].Value
+	if ok, err := coins.VerifyTxInputForkID(refundTx, 0, inner, mkPub, p2sh, 0xffdead, sig); err != nil || !ok {
+		t.Fatalf("BCH refund failed forkid-0xffdead verification: ok=%v err=%v", ok, err)
+	}
+	// The legacy verifier rejects it on the 0x41 byte alone.
+	if _, err := coins.VerifyTxInput(refundTx, 0, inner, mkPub, sig); err == nil {
+		t.Error("legacy verifier accepted a BCH forkid refund signature")
 	}
 }
 

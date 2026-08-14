@@ -299,6 +299,13 @@ type swapCtx struct {
 	ourLockTime      uint32
 	refundHex        string
 
+	// ourDepositP2SH is the exact value of OUR deposit's P2SH output as built by
+	// BuildDepositTx (Amount+fee2, output 0). buildRefundTx commits it to the
+	// forkid digest (CRYPTO-F77), so the committed value is structural rather
+	// than recomputed — immune to a conf hot-reload landing between buildDeposit
+	// and buildRefundTx.
+	ourDepositP2SH uint64
+
 	// funding is the deposit's exact funding set — the make/take-time selection
 	// recorded as Order.UsedCoins (CRYPTO-F87, C++ xtx->usedCoins). buildDeposit
 	// spends exactly this, never a fresh ListUnspent.
@@ -1428,6 +1435,12 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if err != nil {
 		return depositOutcome{}, err
 	}
+	// The P2SH HTLC is always output 0; record its exact value so buildRefundTx
+	// can commit it to the forkid digest without recomputing fee2 (CRYPTO-F77).
+	if len(tx.Outputs) == 0 {
+		return depositOutcome{}, fmt.Errorf("api: deposit tx has no outputs for %s", cur)
+	}
+	c.ourDepositP2SH = tx.Outputs[0].Value
 	xlog.Debug("buildDeposit: unsigned tx built", "order", c.orderID, "txVersion", tx.Version, "outputs", len(tx.Outputs))
 	prevTxs := make([]wallet.PrevTx, 0, len(funding))
 	for _, u := range funding {
@@ -1475,11 +1488,22 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 // our source address, spendable only after the deposit's lockTime. Runs on a
 // worker in the two-phase handshake (reads only this snapshot + config).
 func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, error) {
+	coin, ok := coins.Get(cur)
+	if !ok {
+		return "", fmt.Errorf("api: unknown coin %s", cur)
+	}
 	dest, err := c.destScript(cur, c.ourSourceAddr)
 	if err != nil {
 		return "", err
 	}
-	fee := estimateFee(c.conf(cur), 1, 1)
+	// CRYPTO-F77: for forkid coins the digest commits the spent output's exact
+	// value. The refund spends our deposit's P2SH output (outAmount+fee2,
+	// xbridgesession.cpp:2135), whose value was recorded at build time as
+	// c.ourDepositP2SH (never recomputed, so a conf hot-reload can't skew it).
+	depositP2SH := c.ourDepositP2SH
+	if depositP2SH == 0 {
+		return "", fmt.Errorf("api: no recorded deposit P2SH value for %s", cur)
+	}
 	h, err := reverseTxidHex(c.ourDepositTxID)
 	if err != nil {
 		return "", err
@@ -1492,7 +1516,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		tx.TxTime = uint32(time.Now().Unix())
 	}
 	xlog.Debug("buildRefundTx: plan", "order", c.orderID, "cur", cur,
-		"deposit", c.ourDepositTxID, "lockTime", spec.LockTime, "amount", spec.Amount, "fee", fee, "txVersion", c.txVersion(cur))
+		"deposit", c.ourDepositTxID, "lockTime", spec.LockTime, "amount", spec.Amount, "depositP2SH", depositP2SH, "txVersion", c.txVersion(cur))
 	tx.Inputs = append(tx.Inputs, coins.TxIn{
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
@@ -1504,7 +1528,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: spec.Amount, ScriptPubKey: dest})
 
 	inner := spec.RedeemScript()
-	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
+	sig, err := coins.SignTxInputForCoin(tx, 0, inner, depositP2SH, c.privKey[:], coin)
 	if err != nil {
 		return "", err
 	}
@@ -1579,7 +1603,10 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: p2shNative - fee, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
-	sig, err := coins.SignTxInput(tx, 0, inner, c.privKey[:])
+	// CRYPTO-F77: for forkid coins the digest commits the exact spent value —
+	// the validated deposit P2SH amount (C++ oBinTxP2SHAmount,
+	// xbridgesession.cpp:3967) — not the nominal order amount.
+	sig, err := coins.SignTxInputForCoin(tx, 0, inner, p2shNative, c.privKey[:], depositCoin)
 	if err != nil {
 		return "", "", err
 	}

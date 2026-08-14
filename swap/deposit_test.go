@@ -76,7 +76,7 @@ func TestDepositBuildAndSign(t *testing.T) {
 	}
 
 	// Sign the funding input with the local priv key.
-	sig, err := spec.SignInput(tx, 0, fundScript, localPriv)
+	sig, err := spec.SignInput(tx, 0, fundScript, funding[0].Amount, localPriv, c)
 	if err != nil {
 		t.Fatalf("SignInput: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestRefundScriptSig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
-	sig, err := spec.SignInput(tx, 0, fundScript, localPriv)
+	sig, err := spec.SignInput(tx, 0, fundScript, funding[0].Amount, localPriv, c)
 	if err != nil {
 		t.Fatalf("SignInput: %v", err)
 	}

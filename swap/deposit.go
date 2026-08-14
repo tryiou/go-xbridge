@@ -151,10 +151,13 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 }
 
 // SignInput signs funding input idx of the deposit tx with priv (the funding
-// UTXO is the depositor's own P2PKH output), returning the DER+SIGHASH_ALL sig.
-// prevScript is that funding output's scriptPubKey.
-func (d *DepositSpec) SignInput(tx *coins.Tx, idx int, prevScript []byte, priv []byte) ([]byte, error) {
-	return coins.SignTxInput(tx, idx, prevScript, priv)
+// UTXO is the depositor's own P2PKH output), returning the DER+SIGHASH sig.
+// prevScript is that funding output's scriptPubKey; amount its value (needed
+// by the forkid digest — CRYPTO-F77). Dispatch happens on the coin's
+// SignatureKind: forkid coins (BCH/DEVAULT/BTG) use the BIP143 forkid digest
+// and 0x41 sighash byte, everything else the legacy SIGHASH_ALL digest.
+func (d *DepositSpec) SignInput(tx *coins.Tx, idx int, prevScript []byte, amount uint64, priv []byte, c coins.Coin) ([]byte, error) {
+	return coins.SignTxInputForCoin(tx, idx, prevScript, amount, priv, c)
 }
 
 // RefundScriptSig assembles the scriptSig to claim the deposit's refund (IF)
