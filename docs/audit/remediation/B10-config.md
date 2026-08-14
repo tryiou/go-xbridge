@@ -1,7 +1,7 @@
 # B10 — Config-parity (CFG-F84–F91)
 
 Branch: `fix/config-parity` (off `main` @ B9 merge `639cd28`).
-Status: MERGED into `main` @ `<merge-commit-hash>`.
+Status: MERGED into `main` @ `537d316` (fast-forward).
 C++ reference: Blocknet Core @ `e9ddbc2bd` (v4.4.1 era).
 Go subject: `config/conf.go`, `config/admit.go`, `cmd/xbridged/main.go`,
 `coins/coin.go`, `wallet/conf.go`, `wallet/activate.go`, `api/node.go`,
