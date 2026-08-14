@@ -123,6 +123,51 @@ func TestTryJoinPartial(t *testing.T) {
 	}
 }
 
+// TestTryJoinPartialMinSizeGuard CONFIRMS the partial-order minimum-size guard
+// against C++ Transaction::tryJoin (xbridgetransaction.cpp:527:
+// `other->m_destAmount < m_minPartialAmount` — the taker's receive amount must
+// clear the maker's minimum). STATE-F79. The earlier TestTryJoinPartial cases
+// that assert "below min" actually reject on the drift check, not this guard;
+// here the taker price is an exact 2:1 (LTC:BTC) match of the maker's quote, so
+// the only possible reject is the min-size guard. All comparisons are strict
+// < (a taker receiving EXACTLY the minimum joins).
+func TestTryJoinPartialMinSizeGuard(t *testing.T) {
+	maker := func(min uint64) *Transaction {
+		return NewTransaction([32]byte{7}, "BTC", "LTC", 100, 200,
+			Member{Source: aMakerSrc, Dest: aMakerDst}, true, min, time.Unix(1000, 0))
+	}
+	// taker gives src LTC for dst BTC at an exact 2:1 (maker offers 100 BTC for
+	// 200 LTC), so the price/drift check always passes.
+	taker := func(src, dst uint64) *Transaction {
+		id := [32]byte{8}
+		return NewTransaction(id, "LTC", "BTC", src, dst,
+			Member{Source: aTakerSrc, Dest: aTakerDst}, true, 0, time.Unix(1000, 0))
+	}
+
+	cases := []struct {
+		name string
+		min  uint64
+		give uint64
+		recv uint64
+		want bool
+	}{
+		{"full take clears min", 50, 200, 100, true},
+		{"receive exactly the minimum joins", 50, 100, 50, true},
+		{"receive above the minimum joins", 50, 120, 60, true},
+		{"receive one below the minimum rejected", 50, 98, 49, false},
+		{"minimum zero (exact-order default) full take", 0, 200, 100, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mk := maker(tc.min)
+			if got := mk.TryJoin(taker(tc.give, tc.recv)); got != tc.want {
+				t.Fatalf("TryJoin(min=%d, give=%d, recv=%d) = %v, want %v (C++ xbridgetransaction.cpp:527)",
+					tc.min, tc.give, tc.recv, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestIncreaseStateCounterProgression walks both participants through every
 // phase and asserts the state advances only after the second confirmation.
 func TestIncreaseStateCounterProgression(t *testing.T) {
