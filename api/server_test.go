@@ -1,11 +1,15 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"go-xbridge/proto"
 )
@@ -137,16 +141,16 @@ func callRPC(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder 
 	return rec
 }
 
-// TestServerRPCAuth verifies SEC-F01: with -rpcuser/-rpcpassword configured, the
-// JSON-RPC server requires valid HTTP Basic credentials (401 + challenge
-// otherwise) and rejects with constant-time semantics; without credentials
-// configured, requests pass through unchanged (the loopback-default contract).
+// TestServerRPCAuth verifies RPC-F50: with -rpcuser/-rpcpassword configured, the
+// JSON-RPC server requires valid HTTP Basic credentials — an empty-body 401 +
+// WWW-Authenticate challenge otherwise; without credentials configured, requests
+// pass through unchanged (the loopback-default contract; no cookie).
 func TestServerRPCAuth(t *testing.T) {
 	ctx := newTestCtx()
 	srv := NewServer(ctx)
 	srv.SetAuth("alice", "s3cret")
 
-	// Missing Authorization header -> 401 + WWW-Authenticate challenge.
+	// Missing Authorization header -> 401 + WWW-Authenticate challenge, EMPTY body.
 	rec := callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":1}`)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("missing creds status = %d, want 401", rec.Code)
@@ -154,8 +158,12 @@ func TestServerRPCAuth(t *testing.T) {
 	if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Basic") {
 		t.Errorf("missing WWW-Authenticate challenge, got %q", rec.Header().Get("WWW-Authenticate"))
 	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("unauthorized reply must have an empty body (C++ sends none), got %q", rec.Body.String())
+	}
 
-	// Wrong password -> 401.
+	// Wrong password -> 401 (no body).
+	srv.failDelay = 0
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"method":"dxGetOrder","params":[],"id":2}`))
 	req.SetBasicAuth("alice", "wrong")
 	rec = httptest.NewRecorder()
@@ -179,11 +187,101 @@ func TestServerRPCAuth(t *testing.T) {
 		t.Errorf("authenticated request should reach the handler: %+v", env)
 	}
 
-	// SetAuth with only one of user/pass disables auth (both required).
+	// SetAuth with only one of user/pass disables that credential pair (open).
 	srv.SetAuth("alice", "")
 	rec = callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":4}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("partial creds should disable auth, status = %d", rec.Code)
+		t.Fatalf("partial creds should leave auth open, status = %d", rec.Code)
+	}
+}
+
+// TestServerRpcAuthDelay verifies the C++ 250 ms brute-force deterrence sleep
+// (httprpc.cpp:171): it applies to bad (present) credentials but not to a
+// missing Authorization header.
+func TestServerRpcAuthDelay(t *testing.T) {
+	if NewServer(newTestCtx()).failDelay != 250*time.Millisecond {
+		t.Errorf("default failDelay != 250ms (C++ MilliSleep(250))")
+	}
+	ctx := newTestCtx()
+	srv := NewServer(ctx)
+	srv.SetAuth("alice", "s3cret")
+	srv.failDelay = 30 * time.Millisecond
+
+	start := time.Now()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"id":1}`))
+	req.SetBasicAuth("alice", "wrong")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if elapsed := time.Since(start); elapsed < srv.failDelay {
+		t.Errorf("bad-cred request returned after %v, want >= %v (sleep)", elapsed, srv.failDelay)
+	}
+
+	start = time.Now()
+	rec = callRPC(t, srv, `{"id":2}`) // missing Authorization header
+	if elapsed := time.Since(start); elapsed >= srv.failDelay {
+		t.Errorf("missing-header request slept %v, want immediate 401", elapsed)
+	}
+}
+
+func TestServerRpcAuthMultiUser(t *testing.T) {
+	ctx := newTestCtx()
+	srv := NewServer(ctx)
+
+	mkEntry := func(user, salt, pass string) string {
+		mac := hmac.New(sha256.New, []byte(salt))
+		_, _ = mac.Write([]byte(pass))
+		return user + ":" + salt + "$" + hex.EncodeToString(mac.Sum(nil))
+	}
+	srv.SetRpcAuth([]string{
+		mkEntry("bob", "abc123", "hunter2"),
+		mkEntry("carol", "feedface", "s3cret"),
+		"malformed-entry", // skipped
+	})
+
+	// Valid rpcauth user -> request proceeds.
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"method":"dxGetOrder","params":[],"id":1}`))
+	req.SetBasicAuth("bob", "hunter2")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob status = %d, want 200", rec.Code)
+	}
+
+	// Second user works too.
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"method":"dxGetOrder","params":[],"id":2}`))
+	req.SetBasicAuth("carol", "s3cret")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("carol status = %d, want 200", rec.Code)
+	}
+
+	// Wrong password for an rpcauth user -> 401.
+	srv.failDelay = 0
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"id":3}`))
+	req.SetBasicAuth("bob", "wrong")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bob wrong-password status = %d, want 401", rec.Code)
+	}
+
+	// Unknown user -> 401.
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"id":4}`))
+	req.SetBasicAuth("mallory", "anything")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown user status = %d, want 401", rec.Code)
+	}
+}
+
+func TestServerNoCredsOpen(t *testing.T) {
+	ctx := newTestCtx()
+	srv := NewServer(ctx) // no credentials
+	rec := callRPC(t, srv, `{"method":"dxGetOrder","params":[],"id":1}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-creds status = %d, want 200 (loopback-default open)", rec.Code)
 	}
 }
 

@@ -2,13 +2,17 @@ package api
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	xlog "go-xbridge/log"
 )
@@ -60,13 +64,26 @@ type Server struct {
 	ctx    *HandlerCtx
 	verify bool // when true, signatures are verified before storing orders
 
-	// user/pass are the HTTP Basic credentials RPC callers must present.
+	// user/pass are the HTTP Basic credentials RPC callers must present
+	// (-rpcuser/-rpcpassword).
 	user, pass string
+	// authUsers holds -rpcauth multi-user entries (user -> salt/hash).
+	authUsers map[string]rpcauthEntry
+	// failDelay mirrors C++ MilliSleep(250) on failed auth (httprpc.cpp:171).
+	failDelay time.Duration
+}
+
+// rpcauthEntry is one -rpcauth "user:salt$hash" entry; the password check is
+// HMAC-SHA256(salt, password) hex-compared to hash (httprpc.cpp:89-126).
+type rpcauthEntry struct {
+	user string
+	salt string
+	hash string
 }
 
 // NewServer builds a Server from a handler context.
 func NewServer(ctx *HandlerCtx) *Server {
-	return &Server{ctx: ctx}
+	return &Server{ctx: ctx, failDelay: 250 * time.Millisecond}
 }
 
 // SetAuth enables HTTP Basic authentication on every RPC request. It is only
@@ -81,25 +98,69 @@ func (s *Server) SetAuth(user, pass string) {
 	s.user, s.pass = user, pass
 }
 
+// SetRpcAuth configures -rpcauth multi-user entries ("user:salt$hash").
+// Malformed entries are skipped (httprpc.cpp:97-104).
+func (s *Server) SetRpcAuth(entries []string) {
+	s.authUsers = make(map[string]rpcauthEntry, len(entries))
+	for _, e := range entries {
+		u, salt, hash, ok := parseRpcAuthEntry(e)
+		if !ok {
+			continue
+		}
+		s.authUsers[u] = rpcauthEntry{user: u, salt: salt, hash: hash}
+	}
+}
+
+// parseRpcAuthEntry splits a "user:salt$hash" entry into its three fields.
+func parseRpcAuthEntry(entry string) (user, salt, hash string, ok bool) {
+	v := strings.FieldsFunc(entry, func(r rune) bool { return r == ':' || r == '$' })
+	if len(v) != 3 {
+		return "", "", "", false
+	}
+	return v[0], v[1], v[2], true
+}
+
 // basicRealm is the "realm" served in the WWW-Authenticate challenge.
 const basicRealm = "jsonrpc"
 
-// authorized reports whether the request carries valid HTTP Basic credentials
-// matching the configured rpcuser/rpcpassword. The comparison is constant-time
-// (crypto/subtle), mirroring C++ RPCAuthorized's TimingResistantEqual
-// (httprpc.cpp:128-146). With no auth configured it accepts everything (the
-// daemon's default: localhost-only bind).
+// authConfigured reports whether any credentials are configured. When none are,
+// the daemon is open (loopback-default bind; documented divergence — C++ would
+// auto-generate a cookie, which go-xbridge deliberately does not).
+func (s *Server) authConfigured() bool {
+	return s.user != "" || len(s.authUsers) > 0
+}
+
+// authorized reports whether the request carries valid credentials: the single
+// -rpcuser/-rpcpassword pair or any -rpcauth entry. Comparisons are
+// constant-time (crypto/subtle), mirroring C++ TimingResistantEqual
+// (httprpc.cpp:128-146).
 func (s *Server) authorized(r *http.Request) bool {
-	if s.user == "" {
+	if !s.authConfigured() {
 		return true
 	}
 	u, p, ok := parseBasicAuth(r.Header.Get("Authorization"))
 	if !ok {
 		return false
 	}
-	ou := subtle.ConstantTimeCompare([]byte(u), []byte(s.user))
-	op := subtle.ConstantTimeCompare([]byte(p), []byte(s.pass))
-	return ou&op == 1
+	if s.user != "" {
+		ou := subtle.ConstantTimeCompare([]byte(u), []byte(s.user))
+		op := subtle.ConstantTimeCompare([]byte(p), []byte(s.pass))
+		if ou&op == 1 {
+			return true
+		}
+	}
+	for _, e := range s.authUsers {
+		if subtle.ConstantTimeCompare([]byte(u), []byte(e.user)) != 1 {
+			continue
+		}
+		mac := hmac.New(sha256.New, []byte(e.salt))
+		_, _ = mac.Write([]byte(p))
+		want := hex.EncodeToString(mac.Sum(nil))
+		if subtle.ConstantTimeCompare([]byte(want), []byte(e.hash)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // parseBasicAuth decodes the "Basic <base64 user:pass>" Authorization header.
@@ -134,9 +195,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("JSONRPC server handles only POST requests"))
 		return
 	}
-	// RPC auth gate (SEC-F01): reject without a 401 + challenge when credentials
-	// are configured, before any handler runs.
+	// RPC auth gate (SEC-F01 / RPC-F50): authentication is always enforced when
+	// credentials are configured (the daemon is never open-by-default in that
+	// case). A failed attempt is met with an empty-body 401 + challenge; bad
+	// (present) credentials additionally trigger the C++ 250 ms sleep that
+	// deters brute-forcing (httprpc.cpp:166-174).
 	if !s.authorized(r) {
+		if r.Header.Get("Authorization") != "" {
+			xlog.Warn("rpc incorrect password attempt", "remote", r.RemoteAddr)
+			if s.failDelay > 0 {
+				time.Sleep(s.failDelay)
+			}
+		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+basicRealm+`"`)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
