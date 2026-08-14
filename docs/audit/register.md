@@ -135,27 +135,29 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| CRYPTO-F77 | S1 | BCH forkid `0x41` sighash missing in Go local signing | OPEN | B9 |
+| CRYPTO-F77 | S1 | BCH forkid `0x41` sighash missing in Go local signing | FIXED | B9 `fix/crypto-connectors`: parameterized BIP143 digest + forkid signing (fork value 0xffdead for live BCH mainnet replay protection, bch.cpp:203-209/497-499; DEVAULT 0, BTG 79) wired into `buildRefundTx`/`redeemCounterparty`/`DepositSpec.SignInput` via `SignTxInputForCoin`; DER byte 0x41; `TestBCHRefundForkidSigned`, `TestHashForSigningForkID`, `TestSignTxInputForCoinDispatch`, `TestForkidSignatureHashMatchesCpp` (parity oracle transcription of bch.cpp:191-256/btg.cpp:118-207) |
 | CRYPTO-F78 | S2 | Deposit tx fee formula `minTxFee1(nIn,3)` vs Go `estimateFee(nIn,2)` | FIXED | B3 `fix/deposit-path`: `estimateFee(cc, nIn, 3)` at `api/swap.go` (`(192nIn+102)·FeePerByte`, C++ `xbridgesession.cpp:1994/:2526`); `TestEstimateFeeMatchesCppVsize` |
 | CRYPTO-F79 | S3 | Fee fallback: C++ 0 vs Go 2 sat/vB when FeePerByte unset | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
 | CRYPTO-F80 | S3 | Go honors `DustAmount` conf key C++ never reads | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
 | CRYPTO-F81 | S3 | Address decoding strictness differs (base58check version byte, cashaddr) | DOCUMENTED | deliberate hardening (`api.md` Tier-3) |
-| CRYPTO-F82 | S4 | RNG top-bit bias in Go private-key generation | OPEN | B9 |
-| CRYPTO-F83 | S3 | Block-hash byte order assumption unverified end-to-end | OPEN | B9 |
+| CRYPTO-F82 | S4 | RNG top-bit bias in Go private-key generation | FIXED | B9: `crypto.NewPrivateKey` full-range 256-bit with retry into [1, N-1] (C++ `makeNewKey`, xbridgecryptoproviderbtc.cpp:204-210); `TestNewPrivateKeyFullRange` |
+| CRYPTO-F83 | S3 | Block-hash byte order assumption unverified end-to-end | FIXED | B9: `wallet.revHashHex` pinned against a captured real block hash (Bitcoin genesis) = C++ `base_blob<256>::SetHex` internal bytes (uint256.cpp:27-53); `TestRevHashHexCapturedBlockHash` + parity `TestBlockHashByteOrderMatchesCpp` (oracle transcription) |
 | CRYPTO-F84 | S2 | `TakeOrder` emits `AcceptingBody` with empty fee/utxos (156 B < 188 B) | FIXED | B2 `fix/wire-acceptingbody` |
 | CRYPTO-F85 | S2 | No `checkDepositTransaction` in the Connector contract | FIXED | B3 `fix/deposit-path`: `wallet.CheckDepositTransaction` (interface + RPCConnector 1:1 port of `xbridgewalletconnectorbtc.cpp:1981-2194` + LocalConnector `ErrNoChainSource`) wired into `OnCreateB`/`OnConfirmA` with tri-state (wait→no reply / bad→Cancel / good→record); `wallet/rpc_test.go` goldens + `TestCreateBBadDepositCancels`/`TestCreateBWaitsOnNotReadyDeposit` |
 | CRYPTO-F86 | S2 | `buildDeposit` broadcasts before building the refund | FIXED | B3 `fix/deposit-path`: sign → local txid → refund → broadcast; `TestDepositNotBroadcastWhenRefundFails` |
 | CRYPTO-F87 | S2 | Deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | FIXED | B3 `fix/deposit-path`: `Order.UsedCoins` recorded at make/take, `swapCtx.funding` snapshot consumed by `buildDeposit`; `TestDepositSpendsUsedCoins` |
-| CRYPTO-F88 | S3 | Segwit/BIP143 signing dead code; bech32 re-encoded legacy | OPEN | B9 |
-| CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | OPEN | B9 |
+| CRYPTO-F88 | S3 | Segwit/BIP143 signing dead code | FIXED | B9: the BIP143 digest is now LIVE — it is the base of the forkid signing path (`HashForSigningBIP143`). The "bech32 re-encoded legacy" sub-claim is unsubstantiated: the only bech32 codec usage is the documented per-coin segwit address path (`coins/address.go`), which tries base58check first and only accepts bech32 when the HRP matches the coin |
+| CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | FIXED | B9 (partial, residual new rows below): BTG classified forkid-79 + bech32 "btg"; DEVAULT classified BCH-family (cashaddr "devault", fork value 0); `TestBTGAddressRoundTrip`, `TestDevaultAddressCashaddr`. DCR is not in the live manifest (no `[DCR]` in blockchain-configuration-files); PART (`CRYPTO-F98`) and BCD (`CRYPTO-F99`) are non-portable tx formats, documented/deferred |
 | CRYPTO-F90 | S3 | Refund/payment payout model (fee2 margin, oOverpayment) | FIXED | B3 `fix/deposit-path`: claim spends the validated deposit (exact `P2SHNative` at `DepositVout`), refund pays full nominal (fee2 implicit); `OBinTxVout/OBinTxP2SHAmount/OOverpayment` persisted; `TestRedeemCounterpartyPayout` |
-| CRYPTO-F91 | S3 | `signrawtransaction` param payload ("ALL" in privkeys slot) | OPEN | B9 |
-| CRYPTO-F92 | S3 | `secretFromScriptSig` requires 33-byte push | OPEN | B9 |
+| CRYPTO-F91 | S3 | `signrawtransaction` payload: Go sent `"ALL"` in the privkeys slot, C++ sends null | FIXED | B9: payload now `[rawtx, prevtxs|null, keys|null]` (xbridgewalletconnectorbtc.cpp:1055-1089), same for the `signrawtransactionwithwallet` fallback; `TestSignRawTransactionPayloadMatchesCpp` |
+| CRYPTO-F92 | S3 | `secretFromPayTx` read only input 0; C++ scans all vins | FIXED | B9: `secretFromPayTx` scans every input's scriptSig for a KeyID-matching push (C++ `getSecretFromPaymentTransaction`, btc.cpp:2241-2276); `TestSecretFromPayTxScansAllInputs` |
 | CRYPTO-F93 | S3 | UTXO ownership-proof challenge stream format | FIXED | `TestWholeCoinOstreamMatchesCppStream` |
 | CRYPTO-F94 | S3 | Deposit inputs `SEQUENCE_FINAL`; refund spend `SEQUENCE_FINAL-1` | FIXED | `checkDepositTransaction` parity |
 | CRYPTO-F95 | S3 | Deposit locks `Amount + fee2` (`minTxFee2(1,1)`); change after fee+fee2 | FIXED | `TestDepositLocksAmountPlusFee2` |
 | CRYPTO-F96 | S3 | `nTime` committed in sighash on `TxWithTimeField` coins | FIXED | `TestHashForSigningWithTimeField` |
 | CRYPTO-F97 | S1 | Deposit path mixed XBridge 1e6 and native base units (locked 100× too little for COIN≠1e6; BLOCK masked it) | FIXED | B3 `fix/deposit-path` (promoted from planning): `fromXBridgeAmt` at the `api/swap.go` boundary; `TestDepositNativeScale` |
+| CRYPTO-F98 | S3 | PART (Particl) connector: `XParticlTransaction` serialization + confidential outputs + amount-committing digest not portable to `coins.Tx` | DOCUMENTED | deferred (B9 decision): a thin client cannot serialize PART txs faithfully; trading a `[PART]` conf would broadcast malformed txs. Non-portable tier (`B9-crypto.md`) |
+| CRYPTO-F99 | S3 | BCD (Bitcoin Diamond) connector: fork-version serialization (`CURRENT_VERSION_FORK` `preBlockHash` field) not portable to `coins.Tx` | DOCUMENTED | deferred (B9 decision): exotic single-coin format; port would need a per-coin conditional-serialize flag. Non-portable tier (`B9-crypto.md`) |
 
 ### CONFIG axis (`CFG-F84`–`CFG-F91`) — evidence: `evidence/config.md`
 
@@ -220,7 +222,7 @@ namespace is the Current register above.
 | F5/F9 | CONC-F99 | bounded growth — FIXED |
 | F6 | CONC-F100 | no wallet I/O under lock — FIXED |
 | F7 | SEC-F02 | inbound UTXO proofs unverified — OPEN |
-| F8 | CRYPTO-F88 | segwit dead code — OPEN |
+| F8 | CRYPTO-F88 | segwit dead code — FIXED (B9) |
 | F10 | RPC-F49 | 4 MiB body cap — FIXED (B4 `fix/http-hardening`: 32 MiB `rpcMaxBodyBytes`, non-envelope 413) |
 | F11–F14 | INV-F100 | vestigial helpers — FIXED |
 | F15 | CONC-F101 | live `*Order` race — FIXED |
@@ -246,8 +248,8 @@ namespace is the Current register above.
 | S2-D | STATE-F72 | expiry sweep unwired — OPEN (B8) |
 | S2-E | STATE-F78 | hub-key pinning, no TOFU — FIXED |
 | S2-H | CRYPTO-F81 | base58check strictness — DOCUMENTED |
-| S2-I | CRYPTO-F77 | BCH forkid sighash — OPEN (B9) |
-| S2-J | CRYPTO-F89 | coin-family misclassification — OPEN (B9) |
+| S2-I | CRYPTO-F77 | BCH forkid sighash — FIXED (B9, fork value 0xffdead) |
+| S2-J | CRYPTO-F89 | coin-family misclassification — FIXED (B9: BTG/DEVAULT; PART/BCD deferred to CRYPTO-F98/F99) |
 | S3-A | RPC-F11 | partial fields `"0"` literal — FIXED (B7) |
 | S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — FIXED (B7) |
 | S3-C | RPC-F31 | locked-utxos amount format — FIXED (B7) |
@@ -255,8 +257,8 @@ namespace is the Current register above.
 | S3-E | RPC-F55 | new-token-address `[]` vs error — FIXED (B7) |
 | S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
 | S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
-| S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |
-| S3-I | CRYPTO-F92 | `secretFromScriptSig` 33-byte push — OPEN (B9) |
+| S3-H | CRYPTO-F91 | `signrawtransaction` payload — FIXED (B9) |
+| S3-I | CRYPTO-F92 | secret-from-payTx input scan — FIXED (B9) |
 | S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B8) |
 | S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 

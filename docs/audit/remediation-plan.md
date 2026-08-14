@@ -52,7 +52,7 @@ here can lag the code.
 | B6 | `fix/secrets-hygiene` | **SEC-F04** | `api/persist.go`, `wallet/rpc.go`, `api/swap.go` (log lines only) | — |
 | B7 | `fix/rpc-surface` | **RPC-F03–F59** (+ re-decide F37) | `api/handlers.go`, `api/response.go`, `api/order.go`, `api/utxo_select.go`, `api/store.go`, `coins/amount.go`, `api/node.go` | B3, B4 |
 | B8 | `fix/state-machinery` | **STATE-F72–F75** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `swap/transaction.go` | B3 |
-| B9 | `fix/crypto-connectors` | **CRYPTO-F77 (S1), F82, F83, F88, F91, F92** | `coins/tx.go`, `coins/cashaddr.go`, `coins/base58check.go`, `crypto/signer.go`, `api/handlers.go`, `api/utxo_select.go` | B3 |
+| B9 | `fix/crypto-connectors` | **CRYPTO-F77 (S1), F82, F83, F88, F89, F91, F92** (F98/F99 DOCUMENTED residual: PART/BCD non-portable) | `coins/tx.go`, `coins/coin.go`, `coins/cashaddr.go`, `coins/base58check.go`, `crypto/signer.go`, `api/swap.go`, `api/handlers.go`, `api/utxo_select.go`, `wallet/rpc.go`, `swap/deposit.go` | B3 |
 | B10 | `fix/config-parity` | **CFG-F84–F91** | `config/conf.go`, `cmd/main.go`, `coins/coin.go`, `wallet/conf.go`, `api/node.go`, `api/handlers.go` | B4 |
 | B11 | `fix/concurrency` | **CONC-F92–F94** | `api/node.go`, `api/engine.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/persist.go` | B5 |
 
@@ -80,7 +80,10 @@ always-auth + rpcauth, batch/named, strict params + NO_SESSION name, arity
 gates). **B7 merged** (RPC response-surface: RPC-F03–F57, F59 — order/filter,
 cancel codes, make/take shape, order-history OHLCV, order-book bump/nesting,
 split fee model, utxos fixed-8, tokens/conf, getnetworkinfo, gettradingdata
-documented). B8–B11 pending.
+documented). **B9 merged** (crypto-connectors: CRYPTO-F77 S1 forkid sighash —
+BCH 0xffdead/BTG 79/DEVAULT 0 — F82 RNG, F83 block-hash byte order, F88 BIP143
+live, F89 BTG/DEVAULT classification; F91/F92 RPC payloads; F98/F99 PART/BCD
+documented non-portable). B8, B10, B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -249,11 +252,22 @@ transaction.go:219-255`); port `TxCancelReason` enum + `TxCancelReasonText`
 incl. the C++ rendering bugs; set `trRollbackFailed` on refund-broadcast
 failure; add a peer penalty/ban analogue.
 
-### B9 — `fix/crypto-connectors` — CRYPTO-F77, F82, F83, F88, F91, F92
+### B9 — `fix/crypto-connectors` — CRYPTO-F77, F82, F83, F88, F89, F91, F92 — **DONE, merged to `main`**
 
-BCH forkid `0x41` sighash + replay protection for the BCH connector local
-signing path (`coins/tx.go`); full-range RNG retry (`crypto/signer.go`); block
-hash byte-order conformance test.
+BCH forkid sighash + replay protection for the connector local-signing path:
+parameterized BIP143 digest + forkid signing (`HashForSigningBIP143`,
+`SignTxInputForkID`, `SignTxInputForCoin`); per-coin `SignatureKind`/`ForkValue`
+derived from `CreateTxMethod` (BCH `0xffdead` — live mainnet replay protection,
+DEVAULT 0, BTG 79); wired into `buildRefundTx` (commits the recorded deposit
+P2SH value) / `redeemCounterparty` (validated deposit amount) /
+`DepositSpec.SignInput`; DER byte `0x41`. Parity oracle transcribes the C++
+forkid `SignatureHash` (bch.cpp:191-256 / btg.cpp:118-207). Coin-agnostic:
+`signrawtransaction` payload (F91), all-inputs secret scan (F92), full-range
+RNG retry (F82), block-hash byte-order pin (F83, oracle transcribes
+`base_blob::SetHex`). BTG/DEVAULT classification + address codecs (F89).
+PART/BCD tx formats are non-portable → `CRYPTO-F98`/`CRYPTO-F99` DOCUMENTED
+(deferred); DCR is not in the live manifest (dropped). Branch doc:
+`B9-crypto.md`.
 
 ### B10 — `fix/config-parity` — CFG-F84–F91
 

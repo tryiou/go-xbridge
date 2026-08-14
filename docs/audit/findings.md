@@ -495,10 +495,10 @@ Every finding was double-checked by a verification subagent that re-traced the f
 ## D. CRYPTO / FEES / UTXO AXIS
 
 ### CRYPTO-F77 · S1 · CRYPTO · BCH forkid sighash missing in Go
-- REF: `xbridgewalletconnectorbch.cpp:396,405,454,463` — signs BCH refund/payment with forkid sighash `0x41` + replay protection.
-- CAND: `coins/tx.go` emits only `0x01` (legacy/BIP143), no forkid handling; Go signs the HTLC refund/claim via `SignTxInput` (`api/swap.go:1151,1210`).
-- IMPACT: a locally-signed BCH refund/claim commits with the wrong sighash and would be rejected on-chain (fund-loss risk).
-- FIX: implement forkid `0x41` sighash + replay protection for the BCH connector path.
+- REF: `xbridgewalletconnectorbch.cpp:391-406` — signs BCH refund/payment with `SigHashType(SIGHASH_ALL).withForkId()` = `0x41`, digest via the BIP143 branch of `SignatureHash` (`:191-256`), then `push_back(0x41)`. Live mainnet replay protection (`:203-209,497-499`) rewrites the fork value to `0xffdead` (median time ≥ 1605441600, permanent since the 2020-11-15 upgrade), so the digest commits hashType `0xffdead41` while the DER byte stays `0x41`. BTG uses fork value 79 (`btg.cpp:69`, digest hashType `0x4F41`, DER byte `0x41`).
+- CAND: `coins/tx.go` emitted only `0x01`; the HTLC refund/claim signed via `SignTxInput` (`api/swap.go:1507,1582`).
+- IMPACT: a locally-signed BCH refund/claim committed the wrong sighash and would be rejected on-chain (fund-loss risk).
+- FIX (B9): parameterized `HashForSigningBIP143(idx, scriptCode, amount, hashType)` + `SignTxInputForkID`/`VerifyTxInputForkID`/`SignTxInputForCoin`; per-coin `SignatureKind`/`ForkValue` derived from `CreateTxMethod` (BCH `0xffdead`, DEVAULT `0` — replay protection disabled per `devault.cpp:171`, BTG `79`). `buildRefundTx` commits the deposit's recorded P2SH value, `redeemCounterparty` the validated deposit amount. Parity oracle transcribes the C++ forkid `SignatureHash`; `TestBCHRefundForkidSigned`, `TestForkidSignatureHashMatchesCpp`.
 
 ### CRYPTO-F78 · S2 · CRYPTO · Deposit tx fee formula differs
 - REF: `xbridgesession.cpp:1993,2526` — `minTxFee1(nIn,3)` = `(192·nIn + 102)·feePerByte` (3 outputs).
@@ -527,14 +527,14 @@ Every finding was double-checked by a verification subagent that re-traced the f
 
 ### CRYPTO-F82 · S4 · CRYPTO · RNG top-bit bias in Go private-key generation
 - REF: C++ uses full-range random with secp retry.
-- CAND: `crypto/signer.go` `NewPrivateKey` clears the top bit.
+- CAND: `crypto/signer.go` `NewPrivateKey` cleared the top bit.
 - IMPACT: 1-bit entropy reduction; no interop impact (keys are local).
-- FIX: generate full-range and retry.
+- FIX (B9): full-range 256-bit with retry into [1, N-1]; `TestNewPrivateKeyFullRange`.
 
 ### CRYPTO-F83 · S3 · CRYPTO · Block-hash byte order assumption unverified end-to-end
 - REF/CAND: both sides assume internal-LE for the block hash in the packet body; not verified against a live getblockhash (display order) source.
 - IMPACT: potential body divergence if a wallet RPC ever returns display-order hashes.
-- FIX: add a conformance test that drives a captured block hash through both codecs.
+- FIX (B9): `wallet.revHashHex` pinned against a captured real block hash (Bitcoin genesis) — the internal bytes equal `base_blob<256>::SetHex` (uint256.cpp:27-53, display reversed); `TestRevHashHexCapturedBlockHash` + parity `TestBlockHashByteOrderMatchesCpp` (oracle transcription of SetHex).
 
 ---
 
@@ -693,20 +693,35 @@ appendix maps every old ID to its canonical home.
 - C++ spends the maker's `xtx->usedCoins`; Go re-lists unspent. OPEN (B3).
 
 ### CRYPTO-F88 · S3 · Segwit/BIP143 signing dead code
-- Go `coins/tx.go` carries unused segwit/BIP143 paths; bech32 re-encoded legacy.
-  OPEN (B9).
+- Go `coins/tx.go` carried unused segwit/BIP143 signing paths. The "bech32
+  re-encoded legacy" sub-claim is unsubstantiated: the only bech32 codec usage
+  is the documented per-coin segwit address path (`coins/address.go`), which
+  tries base58check first and accepts bech32 only when the HRP matches the
+  coin. FIXED (B9): the BIP143 digest is now LIVE — it is the base of the
+  forkid signing path (`HashForSigningBIP143`).
 
 ### CRYPTO-F89 · S3 · Coin-family misclassification
-- DEVAULT/DCR/PART/BTG connectors missing or misfiled as BTC family. OPEN.
+- DEVAULT/DCR/PART/BTG connectors missing or misfiled as BTC family.
+  FIXED (B9, partial): BTG classified forkid-79 + bech32 "btg"
+  (`TestBTGAddressRoundTrip`); DEVAULT classified BCH-family, cashaddr
+  "devault", fork value 0 (`TestDevaultAddressCashaddr`). Residuals split into
+  new rows: DCR is not in the live manifest (no `[DCR]` in
+  blockchain-configuration-files), PART → `CRYPTO-F98`, BCD → `CRYPTO-F99`.
 
 ### CRYPTO-F90 · S3 · Refund/payment payout model
-- C++ fee2 margin / `oOverpayment` handling not ported. OPEN (B3).
+- C++ fee2 margin / `oOverpayment` handling not ported. FIXED (B3).
 
 ### CRYPTO-F91 · S3 · signrawtransaction param payload
-- C++ puts `"ALL"` in the privkeys slot; Go differs. OPEN (B9).
+- The pre-fix Go sent `"ALL"` (a sighash string) in the privkeys slot; C++
+  sends `null` there (`[rawtx, prevtxs|null, keys|null]`,
+  xbridgewalletconnectorbtc.cpp:1055-1089). FIXED (B9): payload aligned;
+  `TestSignRawTransactionPayloadMatchesCpp`.
 
-### CRYPTO-F92 · S3 · secretFromScriptSig requires 33-byte push
-- C++ requires a 33-byte push; Go tolerance differs. OPEN (B9).
+### CRYPTO-F92 · S3 · secret-from-payTx scans only input 0
+- Go `secretFromPayTx` read only `Inputs[0]`; C++
+  `getSecretFromPaymentTransaction` scans every vin's scriptSig for a push
+  whose getKeyId equals the secret hash (btc.cpp:2241-2276). FIXED (B9):
+  all inputs scanned; `TestSecretFromPayTxScansAllInputs`.
 
 ### CRYPTO-F93 · S3 · Ownership-proof challenge stream format
 - `UtxoEntry::toString()` golden-vector parity
@@ -723,6 +738,23 @@ appendix maps every old ID to its canonical home.
 ### CRYPTO-F96 · S3 · nTime committed in sighash
 - 4-byte LE `TxTime` after `nVersion` in `HashForSigning` on time-field coins.
   FIXED (`TestHashForSigningWithTimeField`).
+
+### CRYPTO-F98 · S3 · PART (Particl) connector non-portable
+- `XParticlTransaction` serialization (version marker 0xA0), confidential
+  outputs (`vpout` vector-of-pointers) and the amount-committing digest
+  (`xbridgewalletconnectorpart.cpp:113-195`) cannot be faithfully reproduced
+  by `coins.Tx`; a thin client broadcasting a PART deposit/refund in BTC format
+  would put malformed bytes on-chain. DOCUMENTED (B9): deferred, non-portable
+  tier (`B9-crypto.md`); `[PART]` is one conf in the live manifest
+  (particl--v0.19.2.5.conf).
+
+### CRYPTO-F99 · S3 · BCD (Bitcoin Diamond) connector non-portable
+- `BCDTransaction` serialization writes an extra `preBlockHash` (uint256) field
+  when `nVersion == CURRENT_VERSION_FORK` (`xbridgewalletconnectorbcd.cpp:106-108`),
+  and its `SignatureHash` mirrors that; `coins.Tx` has no conditional-serialize
+  flag. DOCUMENTED
+  (B9): deferred, non-portable tier (`B9-crypto.md`); `[BCD]` is one conf in the
+  live manifest (bitcoindiamond--v1.3.0.conf).
 
 ### CONC-F97 · S2 · SwapSession fields single-owner
 - Engine-only ownership; race-covered. FIXED.
