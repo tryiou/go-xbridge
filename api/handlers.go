@@ -800,6 +800,24 @@ func idsAtPrice(list []obEntry, best obEntry) []string {
 	return ids
 }
 
+// bestOf returns the side's best entry (lowest-price ask / highest-price bid);
+// ties are broken by the smallest raw id (orderIDLess, LSB-first), mirroring
+// C++ std::min_element / std::max_element over the id-sorted TransactionMap
+// (RPC-F21). list must be non-empty.
+func bestOf(list []obEntry, highest bool) obEntry {
+	best := list[0]
+	for _, e := range list[1:] {
+		better := e.price > best.price
+		if !highest {
+			better = e.price < best.price
+		}
+		if better || (e.price == best.price && orderIDLess(e.rawID, best.rawID)) {
+			best = e
+		}
+	}
+	return best
+}
+
 func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpcError) {
 	// arity (3..4) is enforced by checkArity (dispatch.go).
 	detail, _, err := spInt(params, 0)
@@ -838,21 +856,38 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 			continue
 		}
 		if strings.EqualFold(o.FromCurrency, maker) && strings.EqualFold(o.ToCurrency, taker) {
-			// ask: from=maker (sold), to=taker; price = to/from (taker per maker)
-			p := float64(o.ToAmount) / float64(o.FromAmount)
+			// ask: from=maker (sold), to=taker; C++ price =
+			// xBridgeValueFromAmount(to) / xBridgeValueFromAmount(from) — the
+			// +1/::COIN bump on each amount (xutil.cpp:293-302, RPC-F20).
+			p := xBridgeValueFromAmount(o.ToAmount) / xBridgeValueFromAmount(o.FromAmount)
 			asks = append(asks, obEntry{price: p, priceStr: formatXPrice(p), amount: o.FromAmount, id: orderIDString(o.ID), rawID: o.ID})
 		}
 		if strings.EqualFold(o.FromCurrency, taker) && strings.EqualFold(o.ToCurrency, maker) {
-			// bid: from=taker, to=maker; priceBid = from/to (taker per maker)
-			p := float64(o.FromAmount) / float64(o.ToAmount)
+			// bid: from=taker, to=maker; C++ priceBid =
+			// xBridgeValueFromAmount(from) / xBridgeValueFromAmount(to)
+			// (xutil.cpp:303-312).
+			p := xBridgeValueFromAmount(o.FromAmount) / xBridgeValueFromAmount(o.ToAmount)
 			bids = append(bids, obEntry{price: p, priceStr: formatXPrice(p), amount: o.ToAmount, id: orderIDString(o.ID), rawID: o.ID})
 		}
 	}
 
-	// Sort both sides descending by price: best bid is at the front (highest),
-	// best ask is at the back (lowest).
-	sort.Slice(asks, func(i, j int) bool { return asks[i].price > asks[j].price })
-	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price })
+	// Sort both sides descending by price; equal prices are ordered by the
+	// smallest raw id (orderIDLess, LSB-first). For detail 1/4 this mirrors C++'
+	// min/max_element over the id-sorted TransactionMap exactly (RPC-F21); for
+	// detail 2/3 C++ std::sort leaves the within-price-group order unspecified,
+	// so the ascending-id tie-break is a deterministic superset guarantee.
+	sort.Slice(asks, func(i, j int) bool {
+		if asks[i].price != asks[j].price {
+			return asks[i].price > asks[j].price
+		}
+		return orderIDLess(asks[i].rawID, asks[j].rawID)
+	})
+	sort.Slice(bids, func(i, j int) bool {
+		if bids[i].price != bids[j].price {
+			return bids[i].price > bids[j].price
+		}
+		return orderIDLess(bids[i].rawID, bids[j].rawID)
+	})
 
 	// Initialize the side arrays to empty (non-nil) slices so they serialize
 	// as "[]" rather than "null", matching C++ dxGetOrderBook which emits
@@ -865,11 +900,11 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 	case 1:
 		// Best bid and ask only, with the count of orders at that best price.
 		if len(asks) > 0 {
-			best := asks[len(asks)-1] // lowest-price ask
+			best := bestOf(asks, false) // lowest-price ask
 			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(asks, best.price)})
 		}
 		if len(bids) > 0 {
-			best := bids[0] // highest-price bid
+			best := bestOf(bids, true) // highest-price bid
 			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), countAtPrice(bids, best.price)})
 		}
 	case 2:
@@ -923,11 +958,11 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 	case 4:
 		// Best bid and ask only, with the array of order ids at that price.
 		if len(asks) > 0 {
-			best := asks[len(asks)-1]
+			best := bestOf(asks, false)
 			res.Asks = append(res.Asks, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(asks, best)})
 		}
 		if len(bids) > 0 {
-			best := bids[0]
+			best := bestOf(bids, true)
 			res.Bids = append(res.Bids, []interface{}{best.priceStr, formatXAmount(best.amount), idsAtPrice(bids, best)})
 		}
 	}

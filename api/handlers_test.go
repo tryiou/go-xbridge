@@ -1399,3 +1399,89 @@ func TestDxGetOrderHistoryLimitTail(t *testing.T) {
 		t.Errorf("limit=1 tail bucket = %v, want open/close 8.0 (ddd only)", row)
 	}
 }
+
+// TestDxGetOrderBookPriceBump locks in RPC-F20: dxGetOrderBook prices use
+// C++'s xBridgeValueFromAmount formula — a/COIN + 1/::COIN on each amount
+// before dividing (xutil.cpp:293-312). Observable only for tiny base-unit
+// amounts: an ask from=3, to=1 renders 0.335548 (the plain ratio would be
+// 0.333333) and the inverse bid from=3, to=1 renders 2.980198 (plain 3.000000).
+func TestDxGetOrderBookPriceBump(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Store.Add(&Order{
+		ID: [32]byte{0x20}, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 3,
+		ToCurrency: "LTC", ToAmount: 1, Status: "open",
+	})
+	// Bid-side bump: the LTC->BTC order lands in bids for the BTC/LTC query.
+	ctx.Store.Add(&Order{
+		ID: [32]byte{0x21}, Type: OrderTypeMaker, FromCurrency: "LTC", FromAmount: 3,
+		ToCurrency: "BTC", ToAmount: 1, Status: "open",
+	})
+	res, err := ctx.dxGetOrderBook([]json.RawMessage{jnum(1), jstr("BTC"), jstr("LTC")})
+	if err != nil {
+		t.Fatalf("dxGetOrderBook: %v", err)
+	}
+	ob := res.(orderBookResult)
+	if len(ob.Asks) != 1 {
+		t.Fatalf("asks = %v, want 1", ob.Asks)
+	}
+	if ob.Asks[0][0] != "0.335548" {
+		t.Errorf("ask price = %v, want 0.335548 (C++ +1/COIN formula)", ob.Asks[0][0])
+	}
+	if len(ob.Bids) != 1 {
+		t.Fatalf("bids = %v, want 1", ob.Bids)
+	}
+	if ob.Bids[0][0] != "2.980198" {
+		t.Errorf("bid price = %v, want 2.980198 (C++ +1/COIN formula)", ob.Bids[0][0])
+	}
+}
+
+// TestDxGetOrderBookTieBreak locks in RPC-F21: equal-price best orders are
+// broken by the smallest raw id (orderIDLess), so detail 4's first id is the
+// smallest-id order regardless of insertion order.
+func TestDxGetOrderBookTieBreak(t *testing.T) {
+	ctx := newWalletTestCtx()
+	big := [32]byte{0x02}
+	small := [32]byte{0x01}
+	for _, id := range [][32]byte{big, small} {
+		ctx.Store.Add(&Order{
+			ID: id, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1500000,
+			ToCurrency: "LTC", ToAmount: 300000, Status: "open", // same price 0.2
+		})
+	}
+	res, err := ctx.dxGetOrderBook([]json.RawMessage{jnum(4), jstr("BTC"), jstr("LTC")})
+	if err != nil {
+		t.Fatalf("dxGetOrderBook: %v", err)
+	}
+	ob := res.(orderBookResult)
+	if len(ob.Asks) != 1 {
+		t.Fatalf("asks = %v, want 1", ob.Asks)
+	}
+	ids, ok := ob.Asks[0][2].([]string)
+	if !ok || len(ids) != 2 {
+		t.Fatalf("detail4 ask ids = %v (%T), want 2 ids", ob.Asks[0][2], ob.Asks[0][2])
+	}
+	if ids[0] != dispID(small) {
+		t.Errorf("best tie-break id = %s, want %s (smallest raw id)", ids[0], dispID(small))
+	}
+}
+
+// TestDxGetOrderBookDetail4Golden locks in RPC-F57: detail 4 rows are
+// [[price, amount, [ids]]] — the ids array NESTED inside the row array
+// (rpcxbridge.cpp:1905-1926).
+func TestDxGetOrderBookDetail4Golden(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx) // BTC/BTC open order; a BTC/BTC ask (maker==taker) and bid
+	res, err := ctx.dxGetOrderBook([]json.RawMessage{jnum(4), jstr("BTC"), jstr("BTC")})
+	if err != nil {
+		t.Fatalf("dxGetOrderBook: %v", err)
+	}
+	b, merr := json.Marshal(res)
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	id := dispID(o.ID)
+	want := `{"detail":4,"maker":"BTC","taker":"BTC","asks":[["0.200000","1.500000",["` + id + `"]]],"bids":[["5.000000","0.300000",["` + id + `"]]]}`
+	if string(b) != want {
+		t.Errorf("detail4 JSON:\n got %s\nwant %s", string(b), want)
+	}
+}
