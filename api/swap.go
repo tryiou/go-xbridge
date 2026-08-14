@@ -1093,6 +1093,25 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 			}
 			if err != nil {
 				xlog.Warn("refund broadcast failed", "order", orderID, "err", err)
+				// C++ redeemOrderDeposit (xbridgesession.cpp:3852-3908): a failed
+				// refund broadcast sets trRollbackFailed for any order at state >=
+				// trCreated, then the watcher retries later (:3875-3888). The same
+				// function serves both the cancel rollback path (:3415) and the
+				// fund-safety deposit-spend watch (xbridgeapp.cpp:3441). Go's
+				// scanRefunds is its analog and only sweeps sessions that have
+				// broadcast a deposit (csCreatedA+).
+				if n.rollbackGate(orderID) {
+					n.store.Update(orderID, func(o *Order) {
+						// Never clobber a user-canceled/terminal order (C++
+						// never produces trRollbackFailed for trCancelled), and
+						// stay idempotent across repeated failed retries.
+						if !isOrderTerminal(o.Status) && o.Status != "rollback failed" {
+							o.Status = "rollback failed"
+							o.Updated = NowMicro()
+						}
+					})
+					n.persist()
+				}
 				return
 			}
 			if txid == "" {
@@ -1101,6 +1120,17 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 			xlog.Info("refund broadcast", "order", orderID, "txid", txid)
 			if s := n.sessions[orderID]; s != nil {
 				s.refundDone = true
+			}
+			// C++ redeemOrderDeposit success sets trRollback (:3911): a deposit
+			// redeemed via the refund is rolled back, whether the prior attempt
+			// wrote "rollback failed" or the order was still mid-swap.
+			if n.rollbackGate(orderID) {
+				n.store.Update(orderID, func(o *Order) {
+					if !isOrderTerminal(o.Status) && o.Status != "rolled back" {
+						o.Status = "rolled back"
+						o.Updated = NowMicro()
+					}
+				})
 			}
 			n.persist()
 			// A refunded order is terminal: drop the session so it stops being
@@ -1121,6 +1151,24 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 		xlog.Warn("refund task dropped, engine busy", "order", orderID)
 		return false
 	}
+}
+
+// rollbackGate reports whether C++ redeemOrderDeposit's state gate
+// (state >= trCreated, xbridgesession.cpp:3852-3854) holds for orderID. The
+// session state is authoritative — csCreatedA is the deposit-broadcast state,
+// and scanRefunds only sweeps sessions past it (swap.go:1205); the store order
+// is the fallback for the stored-order escape hatch, where no live session
+// exists, keyed on RefundTx (set exactly when the deposit was built, C++
+// trCreated — covering the taker too, whose stored status stays "accepting").
+// Engine-owned (reads n.sessions); call from the engine or inline tests.
+func (n *Node) rollbackGate(orderID string) bool {
+	if s := n.sessions[orderID]; s != nil {
+		return s.state >= csCreatedA
+	}
+	if o := n.store.Get(orderID); o != nil {
+		return o.RefundTx != ""
+	}
+	return false
 }
 
 // postSwapTask posts a two-phase handshake task (deposit build / claim) to the

@@ -113,6 +113,10 @@ type fakeConnector struct {
 	mu         sync.Mutex
 	broadcasts []string
 	rawTx      map[string]string // display txid -> hex
+
+	// sendErr, when non-nil, makes SendRawTransaction fail with it — the
+	// refund/deposit broadcast-failure path tests.
+	sendErr error
 }
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
@@ -173,6 +177,9 @@ func (f *fakeConnector) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx
 func (f *fakeConnector) SendRawTransaction(txHex string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return "", f.sendErr
+	}
 	txid, err := txIDFromHex(txHex)
 	if err != nil {
 		return "", err
