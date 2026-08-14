@@ -257,10 +257,12 @@ No channel can block forever. C++ has no equivalent unbounded waits (the
   Tests read via `readOnEngine` (`concurrency_test.go:128-136`). **No race.**
 - `n.config`: every read goes through `cfg()` RLock (`node.go:274-278`); reload
   swaps under `cfgMu.Lock` (`node.go:329-331`). **No race.**
-- `n.block`/`blockAt`: `blockMu` RW (`node.go:507-527`); writers are
-  `blockLoop` and the stale-refresh inside `currentBlockHash`, called from
-  handler goroutines (`node.go:515-528`). **No race.**
-- `n.tickCount`, `n.pendingRefunds`: engine-only. **No race.**
+- `n.block`/`blockHeight`/`blockAt`: `blockMu` RW (`node.go:667`); writers are
+  `refreshBlock` from `blockLoop` and the stale-refresh inside
+  `currentBlockHash`/`currentBlockHeight`, called from handler goroutines
+  (`node.go:651,698`); the engine reads via the non-refreshing
+  `cachedBlockHeight` (`node.go:719-728`). **No race.**
+- `n.pendingRefunds`: engine-only. **No race.**
 - `n.snReg`: Registry `mu` RW (`p2p/servicenode/servicenode.go:546`); written by
   reader/peer readLoops, read by engine + handlers. **No race.**
 - `Store`: all access via mutex methods; `Copy()` deep-copies slices

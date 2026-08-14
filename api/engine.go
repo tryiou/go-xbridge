@@ -161,6 +161,8 @@ func (n *Node) engineLoop() {
 	defer close(n.tasks) // hygiene; workers also exit on n.stop
 	t := time.NewTicker(refundCheckInterval)
 	defer t.Stop()
+	te := time.NewTicker(expirySweepInterval)
+	defer te.Stop()
 	for {
 		select {
 		case cmd := <-n.cmds:
@@ -173,7 +175,6 @@ func (n *Node) engineLoop() {
 		case r := <-n.results:
 			n.safeRun(func() { r.task.apply(r.value, r.err) })
 		case <-t.C:
-			n.tickCount++
 			// Fund-safety sweep: auto-broadcast any pre-signed refund whose
 			// deposit lockTime has passed. Engine-owned: workers do the wallet
 			// I/O; the engine applies the results.
@@ -182,10 +183,13 @@ func (n *Node) engineLoop() {
 			// whose refund has been broadcast) so the live set stays bounded.
 			n.safeRun(func() { n.pruneSessions() })
 			// Mirror C++ saveOrders cadence: flush local swap state to disk
-			// periodically so a crash loses at most a few minutes of progress.
-			if n.tickCount%4 == 0 {
-				n.safeRun(func() { n.persist() })
-			}
+			// every 60 s so a crash loses at most a minute of progress
+			// (xbridgeapp.cpp:3744, every 4th 15 s timer tick).
+			n.safeRun(func() { n.persist() })
+		case <-te.C:
+			// Order-book expiry sweep (C++ checkAndEraseExpiredTransactions on
+			// the 15 s timer): prune open orders past their TTL/deadline.
+			n.safeRun(func() { n.pruneExpired() })
 		case <-n.stop:
 			return
 		}

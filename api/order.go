@@ -24,17 +24,27 @@ import (
 // the wire `created` field (C++ timeToInt → total_microseconds). Display via
 // iso8601 truncates to milliseconds.
 type Order struct {
-	ID             [32]byte
-	Type           OrderType
-	From           [20]byte
-	FromCurrency   string
-	FromAmount     uint64 // XBridge base units (COIN=1e6)
-	To             [20]byte
-	ToCurrency     string
-	ToAmount       uint64 // XBridge base units (COIN=1e6)
-	Created        uint64 // microseconds since epoch
-	Updated        uint64 // microseconds since epoch
-	BlockHash      [32]byte
+	ID           [32]byte
+	Type         OrderType
+	From         [20]byte
+	FromCurrency string
+	FromAmount   uint64 // XBridge base units (COIN=1e6)
+	To           [20]byte
+	ToCurrency   string
+	ToAmount     uint64 // XBridge base units (COIN=1e6)
+	Created      uint64 // microseconds since epoch
+	Updated      uint64 // microseconds since epoch
+	BlockHash    [32]byte
+	// BlockNumber is the BLOCK-chain height at which the order was first
+	// observed, stamped at ingest/make from the cached BLOCK-chain tip. It is
+	// the reference for the block-height expiry check
+	// (Transaction::isExpiredByBlockNumber, xbridgetransaction.cpp:288-311).
+	// Thin-client divergence: C++ derives the height at expiry time via
+	// LookupBlockIndex(m_blockHash) (:298-306); with no chain index the Go
+	// client approximates it with the tip height at first sighting. Zero means
+	// "unknown" (legacy persisted records predate the stamp); the expiry sweep
+	// then relies on the time-based TTLs only.
+	BlockNumber    uint32
 	PartialAllowed bool
 	MinFromAmount  uint64
 	OrigFromAmount uint64

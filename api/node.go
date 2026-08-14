@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -175,9 +176,6 @@ type Node struct {
 	// by the engine goroutine (and inline by tests, which never start it).
 	sessions map[string]*SwapSession
 
-	// tickCount counts engine-ticker ticks so we persist every Nth tick.
-	tickCount int
-
 	// engineRunning is true once start() has launched the engine goroutine.
 	// Node.submit runs commands inline on the caller when it is false (tests,
 	// or a node that never started) — the single-threaded behaviour the test
@@ -210,7 +208,10 @@ type Node struct {
 	// we mirror that by querying the BLOCK connector's getblockcount/getblockhash.
 	blockMu sync.RWMutex
 	block   [32]byte
-	blockAt time.Time
+	// blockHeight is the height of the cached anti-replay block (tip−1),
+	// stamped on orders at ingest and used as the expiry sweep's currentBlock.
+	blockHeight uint32
+	blockAt     time.Time
 
 	// cfgMu guards the live configuration. dxLoadXBridgeConf hot-reloads it
 	// (write lock) while handlers and the feed read it (read lock) via cfg().
@@ -645,7 +646,8 @@ func buildUtxoProofs(conn wallet.Connector, utxos []wallet.Utxo, c coins.Coin) (
 }
 
 // refreshBlock fetches the BLOCK best-block hash (tip-1, mirroring C++) and
-// caches it for stamping on outgoing orders. No-op without a BLOCK connector.
+// caches it — plus its height — for stamping on outgoing orders and the expiry
+// sweep. No-op without a BLOCK connector.
 func (n *Node) refreshBlock() {
 	conn := n.blockConnector()
 	if conn == nil {
@@ -659,8 +661,12 @@ func (n *Node) refreshBlock() {
 	if err != nil {
 		return
 	}
+	if count-1 > math.MaxUint32 {
+		return
+	}
 	n.blockMu.Lock()
 	n.block = h
+	n.blockHeight = uint32(count - 1)
 	n.blockAt = time.Now()
 	n.blockMu.Unlock()
 }
@@ -680,6 +686,77 @@ func (n *Node) currentBlockHash() [32]byte {
 	h = n.block
 	n.blockMu.RUnlock()
 	return h
+}
+
+// currentBlockHeight returns the cached BLOCK-chain tip height (the height of
+// the cached anti-replay block), refreshing it if stale. It is the currentBlock
+// reference for the block-height expiry check (C++ lastBlockHeight,
+// xbridgetransaction.cpp:307). When the BLOCK connector is absent or a refresh
+// fails, the previous cached height is returned (freshness falls back to the
+// blockLoop's 30 s cadence). Only call from handler/worker goroutines — the
+// refresh does wallet RPC.
+func (n *Node) currentBlockHeight() uint32 {
+	n.blockMu.RLock()
+	fresh := n.blockAt.After(time.Now().Add(-60*time.Second)) && n.block != [32]byte{}
+	height := n.blockHeight
+	n.blockMu.RUnlock()
+	if fresh {
+		return height
+	}
+	n.refreshBlock()
+	n.blockMu.RLock()
+	height = n.blockHeight
+	n.blockMu.RUnlock()
+	return height
+}
+
+// cachedBlockHeight returns the cached BLOCK-chain tip height WITHOUT forcing a
+// wallet refresh (non-blocking — safe for the engine goroutine). The blockLoop
+// keeps it fresh every 30 s. Returns 0 when the cache is stale (no successful
+// refresh within the last 60 s, or never populated), so the expiry sweep then
+// skips the block-height predicate for that pass (conservative — never a
+// wrongful prune, only a deferred one).
+func (n *Node) cachedBlockHeight() uint32 {
+	n.blockMu.RLock()
+	fresh := n.blockAt.After(time.Now().Add(-60*time.Second)) && n.block != [32]byte{}
+	h := n.blockHeight
+	n.blockMu.RUnlock()
+	if !fresh {
+		return 0
+	}
+	return h
+}
+
+// pruneExpired runs the order-book expiry sweep (C++
+// checkAndEraseExpiredTransactions, xbridgeapp.cpp:3573-3654) against the live
+// book. Engine-owned: it mutates n.store, so it always runs on the engine
+// goroutine (ticker + tests).
+func (n *Node) pruneExpired() {
+	// Protect orders whose handshake has started: the maker's store order stays
+	// "created" for the whole swap, so only the session state can tell an
+	// in-swap order from an unmatched one (C++ advances the descriptor to
+	// trHold, xbridgesession.cpp:1529; an unmatched maker order keeps its
+	// session at the initial state). Takers need no guard: their order is
+	// "accepting" for the whole swap (already excluded by status), and after a
+	// hub Reject the order is restored to "open" but the session stays past
+	// csTaker — guarding it here would leak the rejected order into the book
+	// forever (the session is never pruned), whereas C++ restores trPending and
+	// lets the app-side sweep erase it after an hour idle (xbridgeapp.cpp:3624).
+	inSwap := map[string]bool{}
+	for id, s := range n.sessions {
+		if s.isMaker && s.state > csMaker {
+			inSwap[id] = true
+		}
+	}
+	// Non-blocking height read: the blockLoop keeps the cache fresh; a stale
+	// cache just skips the block-height predicate for this pass.
+	removed := n.store.PruneExpired(time.Now(), n.cachedBlockHeight(), inSwap)
+	for _, id := range removed {
+		xlog.Info("order expired, pruned", "order", id)
+	}
+	if len(removed) > 0 {
+		xlog.Info("expiry sweep", "removed", len(removed))
+	}
 }
 
 // blockLoop keeps the cached block hash fresh.
@@ -771,6 +848,7 @@ func (n *Node) handlePacket(in inboundPacket) {
 // updateTimestamp (never replacing state).
 func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
 	o := normalizeFromPendingBody(b, snode)
+	o.BlockNumber = n.cachedBlockHeight()
 	// Touch handles the "known, non-canceled" case (C++ processPendingTransaction).
 	if n.store.Touch(hexEncode(o.ID[:])) {
 		return
@@ -1366,6 +1444,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	}
 
 	o := normalizeFromOrderBody(body, hexEncode(mPub[:]))
+	o.BlockNumber = n.currentBlockHeight()
 	o.MakerAddress = p.MakerAddress
 	o.TakerAddress = p.TakerAddress
 	// C++ renders block_id via uint256::GetHex (reversed display order).

@@ -39,6 +39,7 @@ type persistedSwap struct {
 	Created          uint64            `json:"created"`
 	Updated          uint64            `json:"updated"`
 	BlockHash        [32]byte          `json:"blockHash"`
+	BlockNumber      uint32            `json:"blockNumber"`
 	MakerPubkey      string            `json:"makerPubkey"`
 	MakerAddress     string            `json:"makerAddress"`
 	TakerAddress     string            `json:"takerAddress"`
@@ -241,6 +242,7 @@ func orderFields(o *Order) persistedSwap {
 		Created:          o.Created,
 		Updated:          o.Updated,
 		BlockHash:        o.BlockHash,
+		BlockNumber:      o.BlockNumber,
 		MakerPubkey:      o.MakerPubkey,
 		MakerAddress:     o.MakerAddress,
 		TakerAddress:     o.TakerAddress,
@@ -406,6 +408,7 @@ func buildOrder(ps persistedSwap) *Order {
 		Created:          ps.Created,
 		Updated:          ps.Updated,
 		BlockHash:        ps.BlockHash,
+		BlockNumber:      ps.BlockNumber,
 		MakerPubkey:      ps.MakerPubkey,
 		MakerAddress:     ps.MakerAddress,
 		TakerAddress:     ps.TakerAddress,

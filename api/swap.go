@@ -35,6 +35,12 @@ const (
 	// refundCheckInterval is how often the background watcher scans live sessions
 	// for refunds whose deposit lockTime has passed. Overridable in tests.
 	refundCheckInterval = 60 * time.Second
+
+	// expirySweepInterval mirrors C++ TIMER_INTERVAL (xbridgeapp.cpp:90): the
+	// order-book expiry sweep (checkAndEraseExpiredTransactions) runs every 15 s,
+	// and saveOrders fires every 4th tick (~60 s, xbridgeapp.cpp:3744). Overridable
+	// in tests.
+	expirySweepInterval = 15 * time.Second
 )
 
 // TxCancelReason values used by this branch's wire-Cancel paths. Only the B3

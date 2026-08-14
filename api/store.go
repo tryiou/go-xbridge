@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go-xbridge/proto"
+	"go-xbridge/swap"
 )
 
 // Store is the in-memory XBridge order book. It is populated by the P2P feed
@@ -328,6 +329,101 @@ func (s *Store) PruneUnconnected(kept map[string]bool) {
 			delete(s.orders, id)
 		}
 	}
+}
+
+// PruneExpired removes open-book orders that have exceeded their TTL, mirroring
+// C++ App::Impl::checkAndEraseExpiredTransactions (xbridgeapp.cpp:3573-3654) —
+// the periodic sweep driven by the 15 s timer. It applies the expiry predicates
+// to the OPEN book: status "created" (the store's unmatched local-order status,
+// written only by MakeOrder for a not-yet-taken order — NOT the trCreated
+// descriptor state) and status "open" (trPending). In-swap and terminal orders
+// are never swept here — they leave the book via their own lifecycle paths.
+//
+// inSwap is the set of order ids whose client-side handshake has STARTED (the
+// node's live sessions past their initial pre-swap state). The maker's store
+// order stays "created" until the swap finishes — the handshake never advances
+// its Status — so without this guard the sweep would prune an in-swap maker
+// order and release its deposit's utxo locks mid-swap (C++ protects it by
+// advancing the descriptor to trHold, xbridgesession.cpp:1529). Unmatched maker
+// orders (session still at its initial state) remain sweepable.
+//
+// Expired orders are REMOVED without a history entry, matching C++
+// eraseExpiredTransactions (xbridgeexchange.cpp:712-747, erases from
+// m_pendingTransactions without moveTransactionToHistory), and removal
+// auto-releases their locked-utxo contribution (lockedInfoLocked derives the
+// locked set from the live orders map). Pending partial orders waiting on their
+// prep-tx confirmation are never swept (C++ guards with !isOrderPending(),
+// xbridgeapp.cpp:3606-3607).
+//
+// Predicates (strict `>`; an order exactly at a TTL is not expired). The time
+// rules blend the C++ APP-side inactivity sweep that governs a trader's own
+// orders (xbridgeapp.cpp:3604-3634: erase once no activity for TTL (1 h)) with
+// the exchange-side block/deadline predicates (xbridgetransaction.cpp:268-311,
+// xbridgeexchange.cpp:712-747):
+//   - "created" (trNew): block-expired (tip − BlockNumber > BlocksTTL), or
+//     created-age > DeadlineTTL, or last-activity age > TTL.
+//   - "open" (trPending): last-activity age > TTL, or created-age > DeadlineTTL.
+//     Block-height expiry never applies past trNew (C++ :295-296 short-circuit).
+//
+// The created-age > DeadlineTTL for trNew is the exchange-side isExpired rule
+// (C++ app-side never applies the 7-day deadline to trNew directly); Go keeps
+// it because the port has no trNew→trOffline/trPending flip, so it is the only
+// bound on a "created" order whose relays keep its activity age fresh forever.
+//
+// now is the sweep time; currentBlock is the BLOCK-chain tip height (0 when
+// unknown — block-height expiry is skipped). A BlockNumber of 0 (unknown,
+// legacy persisted records) also skips block-height expiry. Returns the hex ids
+// removed, in ascending id order (callers log them deterministically).
+func (s *Store) PruneExpired(now time.Time, currentBlock uint32, inSwap map[string]bool) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nowUs := uint64(now.UnixMicro())
+	var pruned []string
+	for key, o := range s.orders {
+		if inSwap[key] {
+			continue
+		}
+		if o.Status != "created" && o.Status != "open" {
+			continue
+		}
+		// C++ isOrderPending: a partial order waiting on its prep-tx split is
+		// excluded from the expiry sweep (xbridgeapp.cpp:3606-3607).
+		if o.PrepTx != "" {
+			continue
+		}
+		// Age in whole seconds, flooring the µs difference (C++ total_seconds()
+		// truncates the duration toward zero).
+		created := ageSec(nowUs, o.Created)
+		updated := ageSec(nowUs, o.Updated)
+		expired := false
+		switch o.Status {
+		case "created": // C++ trNew
+			blockExpired := o.BlockNumber != 0 && currentBlock != 0 &&
+				currentBlock > o.BlockNumber && currentBlock-o.BlockNumber > swap.BlocksTTL
+			expired = blockExpired || created > swap.DeadlineTTL || updated > swap.TTL
+		case "open": // C++ trPending
+			expired = updated > swap.TTL || created > swap.DeadlineTTL
+		}
+		if expired {
+			delete(s.orders, key)
+			pruned = append(pruned, key)
+		}
+	}
+	sort.Strings(pruned)
+	return pruned
+}
+
+// ageSec returns the whole-second age of a microsecond timestamp relative to a
+// microsecond now: max(0, floor((now−ts)/1e6)). Flooring the DIFFERENCE matches
+// C++ boost::posix_time::time_duration::total_seconds() (xbridgeapp.cpp:3602),
+// and a timestamp ahead of now (clock skew) yields 0, never a negative age, so
+// it is never "expired" (C++ computes a negative duration, which also fails the
+// strict `>` check).
+func ageSec(nowUs, ts uint64) uint64 {
+	if ts >= nowUs {
+		return 0
+	}
+	return (nowUs - ts) / 1000000
 }
 
 // AddFill records a completed fill (used by dxGetOrderFills / dxGetOrderHistory).
