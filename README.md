@@ -74,9 +74,10 @@ The same INI format the original core wallet reads. Two section kinds:
 | `CashAddrPrefix` | string | BCH CashAddr HRP (e.g. `bitcoincash`); empty for non-BCH coins. |
 | `AddressPrefix` / `ScriptPrefix` / `SecretPrefix` | int | base58check version bytes (P2PKH / P2SH / WIF) as decimals. |
 | `COIN` | uint64 | Base-unit multiplier (e.g. `100000000`); decimals are derived from its trailing zeros. |
-| `MinimumAmount` | uint64 | Minimum trade amount (base units). |
+| `MinimumAmount` | uint64 | Dust / minimum amount source (base units) — C++ maps it onto the exchange wallets' `dustAmount` (xbridgeexchange.cpp:145); go-xbridge's conf dust fallback. |
 | `TxVersion` | int | Transaction version (default `1`). |
-| `DustAmount` / `MinTxFee` / `FeePerByte` | uint64 | Dust / fee rules (base units). |
+| `MinTxFee` / `FeePerByte` | uint64 | Fee rules (base units / sat-per-byte). |
+| `DustAmount` | uint64 | createConf-template key never read back by C++; parsed for fidelity only. |
 | `BlockTime` | int | Seconds per block (used for HTLC lock-time math). |
 | `Confirmations` | int | Required confirmations. |
 | `TxWithTimeField` | bool | Tx carries a time field. |

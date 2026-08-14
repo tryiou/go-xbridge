@@ -773,9 +773,10 @@ func TestTakeOrderBadAddressAfterFundsGate(t *testing.T) {
 // TestMakePartialDustNativeScale locks in RPC-F13: the partial minimum_size is
 // compared in the coin's NATIVE base units (partialMinimum * COIN < dustAmount,
 // xbridgewalletconnectorbtc.cpp:1900-1904), NOT in XBridge 1e6 base against a
-// native dust value. buildHubNode confs set no DustAmount, so effectiveDust =
-// 0.546 * relayFee * COIN; the stub wallet reports relayFee 0.0001, giving
-// 0.546 * 0.0001 * 1e8 = 5460 native (numerically equal to cppDustFallback).
+// native dust value. buildHubNode confs set no conf dust (MinimumAmount), so
+// effectiveDust = 0.546 * relayFee * COIN; the stub wallet reports relayFee
+// 0.0001, giving 0.546 * 0.0001 * 1e8 = 5460 native (numerically equal to
+// cppDustFallback).
 // Native = minFrom * 1e8/1e6 = minFrom * 100: 0.000055 -> 5500 native (NOT
 // dust), 0.000054 -> 5400 native (dust). The old 1e6-vs-native comparison
 // rejected everything below 5460 XBridge base (i.e. 0.00546 coins), wrongly

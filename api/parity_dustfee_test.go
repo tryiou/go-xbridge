@@ -8,11 +8,14 @@ import (
 
 func TestEffectiveDust(t *testing.T) {
 	// C++: dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460
-	// (xbridgewalletconnectorbtc.cpp:1526). Coin=1e8 (BTC-like) unless noted.
+	// (xbridgewalletconnectorbtc.cpp:1526). The conf-provided dust source is
+	// `MinimumAmount` (C++ maps it onto the exchange wallets' dustAmount,
+	// xbridgeexchange.cpp:145; it never reads a `DustAmount` key — CFG-F91).
+	// Coin=1e8 (BTC-like) unless noted.
 	const coin = uint64(100_000_000)
 	tests := []struct {
 		name     string
-		dust     uint64
+		min      uint64
 		relayFee float64
 		want     uint64
 	}{
@@ -20,15 +23,15 @@ func TestEffectiveDust(t *testing.T) {
 		{"relayFee set", 0, 0.0001, 5460},
 		// Relayfee differs from fallback (COIN=1e6) -> 0.546*0.0001*1e6 = 54.6 -> 54.
 		{"relayFee set small coin", 0, 0.0001, 54},
-		// No relayfee: conf DustAmount used directly when set.
-		{"dustAmount set", 100, 0, 100},
-		{"dustAmount set (large)", 546, 0, 546},
-		// No relayfee, no DustAmount: falls back to C++ constant 5460.
+		// No relayfee: conf MinimumAmount used directly when set.
+		{"minimumAmount set", 100, 0, 100},
+		{"minimumAmount set (large)", 546, 0, 546},
+		// No relayfee, no MinimumAmount: falls back to C++ constant 5460.
 		{"default 5460", 0, 0, cppDustFallback},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cc := &config.CoinConf{DustAmount: tc.dust, Coin: coin}
+			cc := &config.CoinConf{MinimumAmount: tc.min, Coin: coin}
 			if tc.name == "relayFee set small coin" {
 				cc.Coin = 1_000_000
 			}

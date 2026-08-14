@@ -515,7 +515,7 @@ func (n *Node) connector(t string) (wallet.Connector, error) {
 // relayFeeFor returns the live relay fee (BTC per kB) for a coin's wallet, used
 // by effectiveDust to compute C++'s dust threshold (xbridgewalletconnectorbtc.cpp:1526).
 // A missing/invalid connector yields 0, letting effectiveDust fall back to the
-// conf DustAmount or the C++ 5460 constant.
+// conf MinimumAmount or the C++ 5460 constant.
 func (n *Node) relayFeeFor(ticker string) (float64, error) {
 	conn, err := n.connector(ticker)
 	if err != nil {

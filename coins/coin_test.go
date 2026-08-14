@@ -93,6 +93,39 @@ func TestFromConfNoHardcoding(t *testing.T) {
 	}
 }
 
+// TestFromConfCashAddrPrefix locks CFG-F91: the conf `CashAddrPrefix` value
+// wins over the method-derived class constant, with C++'s fallbacks (bch.cpp:
+// 306-308, devault.cpp:278-280) when empty / "bitcoincash" on DEVAULT.
+func TestFromConfCashAddrPrefix(t *testing.T) {
+	bch := &config.CoinConf{Ticker: "BCH", CreateTxMethod: "BCH", Coin: 100000000, CashAddrPrefix: "mybch"}
+	c, err := FromConf(bch)
+	if err != nil {
+		t.Fatalf("FromConf: %v", err)
+	}
+	if c.CashAddrPrefix != "mybch" {
+		t.Errorf("CashAddrPrefix = %q, want conf value mybch (conf wins)", c.CashAddrPrefix)
+	}
+
+	// Empty conf value: the method-derived class constant kicks in.
+	bch.CashAddrPrefix = ""
+	c, _ = FromConf(bch)
+	if c.CashAddrPrefix != "bitcoincash" {
+		t.Errorf("CashAddrPrefix = %q, want bitcoincash fallback", c.CashAddrPrefix)
+	}
+
+	// DEVAULT with a "bitcoincash" conf value is overridden to "devault".
+	dv := &config.CoinConf{Ticker: "DVT", CreateTxMethod: "DEVAULT", Coin: 100000000, CashAddrPrefix: "bitcoincash"}
+	c, _ = FromConf(dv)
+	if c.CashAddrPrefix != "devault" {
+		t.Errorf("DEVAULT CashAddrPrefix = %q, want devault", c.CashAddrPrefix)
+	}
+	dv.CashAddrPrefix = "mydvt"
+	c, _ = FromConf(dv)
+	if c.CashAddrPrefix != "mydvt" {
+		t.Errorf("DEVAULT CashAddrPrefix = %q, want conf value mydvt", c.CashAddrPrefix)
+	}
+}
+
 // TestConcurrentInitFromConfGet proves the registry's atomic publication: a
 // hot-reload (InitFromConf) can run on one goroutine while readers call Get on
 // others, and no reader ever observes a torn or partial snapshot (the -race

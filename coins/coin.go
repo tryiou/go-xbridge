@@ -115,6 +115,17 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 	if c.Coin == 0 {
 		return Coin{}, fmt.Errorf("coins: %s: COIN not set in xbridge.conf", c.Ticker)
 	}
+	// CashAddrPrefix: the conf value wins; when empty it falls back to the
+	// per-connector class constant, mirroring the C++ BCH/DEVAULT connectors
+	// (bch.cpp:306-308 sets "bitcoincash" only if empty; devault.cpp:278-280
+	// overrides a "bitcoincash" value to "devault"). Pre-fix Go ignored the
+	// conf value entirely and always used the method-derived constant.
+	cashAddr := c.CashAddrPrefix
+	if cashAddr == "" {
+		cashAddr = cashAddrPrefixFromMethod(c.CreateTxMethod)
+	} else if c.CreateTxMethod == "DEVAULT" && cashAddr == "bitcoincash" {
+		cashAddr = "devault"
+	}
 	return Coin{
 		Ticker:          c.Ticker,
 		Name:            c.Title,
@@ -124,7 +135,7 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 		Bech32HRP:       bech32HRPFromMethod(c.CreateTxMethod),
 		SegWit:          segWitFromMethod(c.CreateTxMethod),
 		family:          familyFromMethod(c.CreateTxMethod),
-		CashAddrPrefix:  cashAddrPrefixFromMethod(c.CreateTxMethod),
+		CashAddrPrefix:  cashAddr,
 		signature:       signatureKindFromMethod(c.CreateTxMethod),
 		forkValue:       forkValueFromMethod(c.CreateTxMethod),
 		TxWithTimeField: c.TxWithTimeField,

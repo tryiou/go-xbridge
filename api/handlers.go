@@ -1797,20 +1797,24 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 // cppDustFallback is C++'s own dust fallback constant (xbridgewalletconnectorbtc.cpp:1526):
 // when no relay fee is available, C++ uses 5460 base units. go-xbridge gathers
 // the relay fee live from the wallet's getinfo.relayfee (C++ :74-76); when that
-// is unavailable it falls back to the conf `DustAmount` key, and finally to this
-// C++-defined constant.
+// is unavailable it falls back to the conf `MinimumAmount` key — C++ maps that
+// key onto the exchange wallets' dustAmount (xbridgeexchange.cpp:145) and never
+// reads a `DustAmount` key (a createConf-template key it does not read back) —
+// and finally to this C++-defined constant.
 const cppDustFallback = 5460
 
 // effectiveDust returns the minimum non-dust amount (base units) for a coin.
-// It mirrors C++ exactly (xbridgewalletconnectorbtc.cpp:1526):
-// dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460. The conf `DustAmount`
-// key is a secondary override and 5460 the final fallback, matching C++'s order.
+// C++ computes dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460
+// (xbridgewalletconnectorbtc.cpp:1526); go-xbridge has no live relay-fee feed,
+// so when it is unavailable the conf `MinimumAmount` key serves as the
+// thin-client conf fallback (C++ maps that key onto the exchange wallets'
+// dustAmount, xbridgeexchange.cpp:145) and 5460 is the final fallback.
 func effectiveDust(cc *config.CoinConf, relayFee float64) uint64 {
 	if relayFee > 0 {
 		return uint64(0.546 * relayFee * float64(cc.Coin))
 	}
-	if cc != nil && cc.DustAmount > 0 {
-		return cc.DustAmount
+	if cc != nil && cc.MinimumAmount > 0 {
+		return cc.MinimumAmount
 	}
 	return cppDustFallback
 }

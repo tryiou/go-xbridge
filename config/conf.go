@@ -9,9 +9,11 @@
 // `getmininginfo.relayfee` (xbridgewalletconnectorbtc.cpp:74-76) and is used
 // only for dust fallback (`dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460`,
 // xbridgewalletconnectorbtc.cpp:1526). go-xbridge has no live relay-fee feed
-// (thin client), so dust resolves from the conf `DustAmount` key, else the
-// C++-defined constant 5460. `GetNewKeySupported`/`ImportWithNoScanSupported`
-// are written by the createConf() template but are not read back by the reader.
+// (thin client), so dust resolves from the conf `MinimumAmount` key — C++ maps
+// that key onto the exchange wallets' dustAmount (xbridgeexchange.cpp:145) and
+// never reads a `DustAmount` key — else the C++-defined constant 5460.
+// `GetNewKeySupported`/`ImportWithNoScanSupported`/`DustAmount` are written by
+// the createConf() template but are not read back by the reader.
 package config
 
 import (
@@ -60,6 +62,10 @@ type CoinConf struct {
 	Coin          uint64
 	MinimumAmount uint64
 	TxVersion     int
+	// DustAmount is written by the createConf() template but never read back by
+	// the C++ reader (xbridgeexchange.cpp:145 maps `MinimumAmount` onto the
+	// exchange wallets' dustAmount instead). Parsed here for template fidelity;
+	// go-xbridge's dust resolves from MinimumAmount (see the package comment).
 	DustAmount    uint64
 	MinTxFee      uint64
 	BlockTime     int // seconds per block
