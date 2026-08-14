@@ -446,6 +446,23 @@ func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 			return nil, err
 		}
 	}
+	// C++ gates in this order: same-address, then amount <= 0, then dryrun
+	// (rpcxbridge.cpp:1146-1148 -> 1151-1161 -> 1164-1171). The same-address
+	// and amount checks must run here (before the dryrun check, which is
+	// handler-local) so the RPC precedence matches C++ even though TakeOrder
+	// re-checks them for direct callers.
+	if fromAddr == toAddr {
+		return nil, makeError(errInvalidParameters, "dxTakeOrder", "The from_address and to_address cannot be the same: "+fromAddr)
+	}
+	if amount != "" {
+		a, perr := parseXAmount(amount)
+		if perr != nil {
+			return nil, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
+		}
+		if a == 0 {
+			return nil, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+amount)
+		}
+	}
 	// dryrun is read as the literal string "dryrun" at index 4 only when there
 	// are exactly 5 params (C++: if params.size()==5). Any other value is an
 	// error, so a misspelled dryrun does not broadcast a take.

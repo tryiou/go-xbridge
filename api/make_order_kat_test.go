@@ -27,8 +27,8 @@ func runningHub(t *testing.T) (*servicenode.Registry, [33]byte) {
 // amounts, o.Created, and o.Utxos[0].Signature — never a rand.Read id.
 func TestMakeOrderDeterministicID(t *testing.T) {
 	n, cc := newHubNode(servicenode.NewRegistry())
-	fromID, _ := decodeAddr("BTC", btcAddr)
-	toID, _ := decodeAddr("SYS", btcAddr2)
+	fromID, _ := decodeAddr("dxMakeOrder", "BTC", btcAddr)
+	toID, _ := decodeAddr("dxMakeOrder", "SYS", btcAddr2)
 
 	o, rerr := n.MakeOrder(MakeOrderParams{
 		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
@@ -65,8 +65,8 @@ func TestMakeOrderDeterministicID(t *testing.T) {
 func TestMakeOrderAutoSplitPrepTx(t *testing.T) {
 	reg, _ := runningHub(t)
 	n, cc := newHubNode(reg)
-	fromID, _ := decodeAddr("BTC", btcAddr)
-	toID, _ := decodeAddr("SYS", btcAddr2)
+	fromID, _ := decodeAddr("dxMakeOrder", "BTC", btcAddr)
+	toID, _ := decodeAddr("dxMakeOrder", "SYS", btcAddr2)
 
 	o, rerr := n.MakeOrder(MakeOrderParams{
 		Type: "partial", AutoSplit: true,
@@ -137,8 +137,8 @@ func TestMakeOrderExactMatchPartial(t *testing.T) {
 		{TxID: strings.Repeat("bb", 32), Vout: 1, Amount: 100000900, Value: 1.000009, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 	}
 	n, cc := newHubNodeUtxos(reg, utxos)
-	fromID, _ := decodeAddr("BTC", btcAddr)
-	toID, _ := decodeAddr("SYS", btcAddr2)
+	fromID, _ := decodeAddr("dxMakeOrder", "BTC", btcAddr)
+	toID, _ := decodeAddr("dxMakeOrder", "SYS", btcAddr2)
 
 	o, rerr := n.MakeOrder(MakeOrderParams{
 		Type: "partial", AutoSplit: true,

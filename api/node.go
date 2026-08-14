@@ -848,20 +848,31 @@ type MakeOrderParams struct {
 	DryRun       bool
 }
 
-func decodeAddr(currency, addrStr string) ([20]byte, *rpcError) {
+func decodeAddr(method, currency, addrStr string) ([20]byte, *rpcError) {
 	c, ok := coins.Get(currency)
 	if !ok {
-		return [20]byte{}, makeError(errInvalidParameters, "dxMakeOrder", "unsupported currency: "+currency)
+		return [20]byte{}, makeError(errInvalidParameters, method, "unsupported currency: "+currency)
 	}
 	addr, err := c.DecodeAddress(addrStr)
 	if err != nil {
-		return [20]byte{}, makeError(errInvalidAddress, "dxMakeOrder", addrStr)
+		return [20]byte{}, makeError(errInvalidAddress, method, addrStr)
 	}
 	id, ok := addr.ID()
 	if !ok {
-		return [20]byte{}, makeError(errInvalidAddress, "dxMakeOrder", addrStr)
+		return [20]byte{}, makeError(errInvalidAddress, method, addrStr)
 	}
 	return id, nil
+}
+
+// takeBadAddressErr rebuilds decodeAddr's INVALID_ADDRESS error with the C++
+// dxTakeOrder message arg — ": <cur> address is bad. Are you using the correct
+// address?" (rpcxbridge.cpp:1221-1225). Non-address errors (e.g. an unsupported
+// currency) pass through untouched.
+func takeBadAddressErr(cur string, e *rpcError) *rpcError {
+	if e.Code == errInvalidAddress {
+		return makeError(errInvalidAddress, "dxTakeOrder", ": "+cur+" address is bad. Are you using the correct address?")
+	}
+	return e
 }
 
 func (n *Node) requireWrite(name string) *rpcError {
@@ -894,11 +905,11 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if err != nil {
 		return nil, makeError(errInvalidParameters, "dxMakeOrder", "invalid taker_size")
 	}
-	fromID, e := decodeAddr(p.Maker, p.MakerAddress)
+	fromID, e := decodeAddr("dxMakeOrder", p.Maker, p.MakerAddress)
 	if e != nil {
 		return nil, e
 	}
-	toID, e := decodeAddr(p.Taker, p.TakerAddress)
+	toID, e := decodeAddr("dxMakeOrder", p.Taker, p.TakerAddress)
 	if e != nil {
 		return nil, e
 	}
@@ -1376,11 +1387,29 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The from_address and to_address cannot be the same: "+p.FromAddress)
 	}
 	// C++ parses the id via uint256S (no format check here); an unparseable id
-	// yields a null id whose lookup misses, so report not-found.
+	// yields a null id whose lookup misses.
 	key := orderIDKey(p.ID)
+
+	// C++ parses and validates the amount BEFORE the transaction lookup
+	// (rpcxbridge.cpp:1151-1161): an explicit amount <= 0 errors 1025 with the
+	// RAW string even when the order id is unknown (RPC-F14).
+	var takeAmount uint64
+	if p.Amount != "" {
+		a, err := parseXAmount(p.Amount)
+		if err != nil {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
+		}
+		if a == 0 {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+p.Amount)
+		}
+		takeAmount = a
+	}
+
 	o := n.store.Get(key)
 	if o == nil {
-		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
+		// C++ renders makeError(TRANSACTION_NOT_FOUND, __FUNCTION__) with NO
+		// argument (rpcxbridge.cpp:1176-1179): "Transaction  not found".
+		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", "")
 	}
 
 	// C++ pre-swap orientation: fromSize = toAmount (taker sends), toSize =
@@ -1388,28 +1417,19 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	fromSize := o.ToAmount
 	toSize := o.FromAmount
 	if p.Amount != "" {
-		a, err := parseXAmount(p.Amount)
-		if err != nil {
-			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
+		a := takeAmount
+		if !o.PartialAllowed {
+			return orderListResult{}, makeError(errInvalidPartialOrder, "dxTakeOrder", "")
 		}
-		// C++ treats a take amount of 0 (and an omitted amount) as a FULL-ORDER
-		// take: fromSize/toSize stay at the full order size. Only a positive amount
-		// (on a partial order) engages the partial recompute via
-		// xBridgeSourceAmountFromPrice.
-		if a > 0 {
-			if !o.PartialAllowed {
-				return orderListResult{}, makeError(errInvalidPartialOrder, "dxTakeOrder", "")
-			}
-			if a < o.MinFromAmount {
-				return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The minimum amount for this order is: "+formatXAmount(o.MinFromAmount))
-			}
-			if a > o.FromAmount {
-				return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The maximum amount for this order is: "+formatXAmount(o.FromAmount))
-			}
-			if a < toSize {
-				toSize = a
-				fromSize = xBridgeSourceAmountFromPrice(toSize, o.ToAmount, o.FromAmount)
-			}
+		if a < o.MinFromAmount {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The minimum amount for this order is: "+formatXAmount(o.MinFromAmount))
+		}
+		if a > o.FromAmount {
+			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The maximum amount for this order is: "+formatXAmount(o.FromAmount))
+		}
+		if a < toSize {
+			toSize = a
+			fromSize = xBridgeSourceAmountFromPrice(toSize, o.ToAmount, o.FromAmount)
 		}
 	}
 
@@ -1443,14 +1463,17 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// C++ validates the taker/maker addresses only AFTER the amount,
 	// checkAcceptParams, self-trade and connector gates (rpcxbridge.cpp:
 	// 1219-1225 isValidAddress). An invalid address is INVALID_ADDRESS, but a
-	// prior gate failure wins.
-	fromID, e := decodeAddr(o.ToCurrency, p.FromAddress)
+	// prior gate failure wins. C++ checks the TO address (against the order's
+	// from-currency connector) FIRST, then the FROM address; both messages use
+	// the C++ arg ": <cur> address is bad. Are you using the correct address?"
+	// (RPC-F15).
+	toID, e := decodeAddr("dxTakeOrder", o.FromCurrency, p.ToAddress)
 	if e != nil {
-		return orderListResult{}, e
+		return orderListResult{}, takeBadAddressErr(o.FromCurrency, e)
 	}
-	toID, e := decodeAddr(o.FromCurrency, p.ToAddress)
+	fromID, e := decodeAddr("dxTakeOrder", o.ToCurrency, p.FromAddress)
 	if e != nil {
-		return orderListResult{}, e
+		return orderListResult{}, takeBadAddressErr(o.ToCurrency, e)
 	}
 
 	if p.DryRun {
@@ -1477,16 +1500,16 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	relayTo, _ := n.relayFeeFor(o.ToCurrency)
 	relayFrom, _ := n.relayFeeFor(o.FromCurrency)
 	if isDustNative(xBridgeValueFromAmount(fromSize), ccTo, relayTo, nativeTo) {
-		return orderListResult{}, makeError(errDust, "dxTakeOrder", "taker amount is dust")
+		return orderListResult{}, makeError(errDust, "dxTakeOrder", "")
 	}
 	if isDustNative(xBridgeValueFromAmount(toSize), ccFrom, relayFrom, nativeFrom) {
-		return orderListResult{}, makeError(errDust, "dxTakeOrder", "maker amount is dust")
+		return orderListResult{}, makeError(errDust, "dxTakeOrder", "")
 	}
 
 	if funds, ferr := n.availableBalance(); ferr != nil {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", ferr.Error())
 	} else if funds < xBridgeIntFromReal(serviceNodeFeeReal) {
-		return orderListResult{}, makeError(errInsufficientFundsDX, "dxTakeOrder", "not accepting order, insufficient funds")
+		return orderListResult{}, makeError(errInsufficientFundsDX, "dxTakeOrder", "")
 	}
 
 	// C++ acceptXBridgeTransaction (xbridgeapp.cpp:2165-2204): the order is
@@ -1500,11 +1523,11 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// hubAddress.
 	hubKey := decodePub33(o.SNodePubkey)
 	if !n.hubRegistered(hubKey[:]) {
-		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
+		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", "")
 	}
 	feeDest, ok := n.snReg.PaymentAddress(hubKey)
 	if !ok {
-		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", p.ID)
+		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", "")
 	}
 
 	// BLOCK service-node fee prep (C++ :2236-2267). Only 25-byte p2pkh UTXOs at
@@ -1519,7 +1542,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	blkConf := n.cfg().Confs["BLOCK"]
 	feeUtxoAvail, err := blk.ListUnspent(1)
 	if err != nil {
-		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
+		// C++ surfaces every fee-prep failure via makeError(statusCode,
+		// __FUNCTION__) with no argument (bare texts, xbridgeapp.cpp:2240-2264).
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "")
 	}
 	// C++ fee-prep excludes getAllLockedUtxos(connFrom->currency) (toCurrency)
 	// from the BLOCK fee outputs (:2247); in practice only the global fee set
@@ -1538,10 +1563,11 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	info, ierr := feeOrderInfo(o.ID, o.ToCurrency, fromSize, o.FromCurrency, toSize)
 	if ierr != nil {
+		// C++ surfaces these as bare makeError(statusCode, __FUNCTION__).
 		if errors.Is(ierr, errOrderInfoOverflow) {
-			return orderListResult{}, makeError(errInvalidOnchainHist, "dxTakeOrder", ierr.Error())
+			return orderListResult{}, makeError(errInvalidOnchainHist, "dxTakeOrder", "")
 		}
-		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", ierr.Error())
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "")
 	}
 	rawFeeHex, feeInputs, rerr := buildServiceNodeFeeTx(blk, blkCoin, blkConf, feeDest, info, feeUtxos)
 	if rerr != nil {

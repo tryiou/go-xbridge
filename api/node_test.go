@@ -225,7 +225,7 @@ func TestDecodeAddr(t *testing.T) {
 	})
 
 	// Valid P2PKH for version 0x00 — must decode to a non-zero 20-byte id.
-	id, e := decodeAddr("BTC", btcAddr)
+	id, e := decodeAddr("dxMakeOrder", "BTC", btcAddr)
 	if e != nil {
 		t.Fatalf("P2PKH decode: %v", e)
 	}
@@ -235,7 +235,7 @@ func TestDecodeAddr(t *testing.T) {
 
 	// Valid P2WPKH (BIP173 test vector BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4);
 	// its id equals the 20-byte witness program 751e76e8199196d454941c45d1b3a323f1433bd6.
-	id2, e := decodeAddr("BTC", "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4")
+	id2, e := decodeAddr("dxMakeOrder", "BTC", "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4")
 	if e != nil {
 		t.Fatalf("P2WPKH decode: %v", e)
 	}
@@ -248,11 +248,11 @@ func TestDecodeAddr(t *testing.T) {
 	}
 
 	// Malformed address -> rpcError.
-	if _, e := decodeAddr("BTC", "not-an-address"); e == nil {
+	if _, e := decodeAddr("dxMakeOrder", "BTC", "not-an-address"); e == nil {
 		t.Fatal("expected rpcError for malformed address")
 	}
 	// Unknown coin -> rpcError.
-	if _, e := decodeAddr("NOPE", btcAddr); e == nil {
+	if _, e := decodeAddr("dxMakeOrder", "NOPE", btcAddr); e == nil {
 		t.Fatal("expected rpcError for unknown coin")
 	}
 }

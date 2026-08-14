@@ -797,3 +797,68 @@ func TestMakePartialDustNativeScale(t *testing.T) {
 		t.Errorf("MakeOrder(min 0.000054) = %v, want 1025 dust error (native 5400 < 5460)", rerr)
 	}
 }
+
+// TestTakeOrderBadAddressMessage locks in RPC-F15's address errors: C++ checks
+// the TO address first (against the order's from-currency connector) and each
+// message uses the arg ": <cur> address is bad. Are you using the correct
+// address?" with name dxTakeOrder (rpcxbridge.cpp:1219-1225) — not the
+// "dxMakeOrder"-leaked generic form. Distinct BTC/SYS legs prove the currency
+// mapping (to -> order's from, from -> order's to).
+func TestTakeOrderBadAddressMessage(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x69)
+	n, _ := newHubNode(reg)
+	// Fund SYS so checkAcceptParams (the taker's sending currency) passes and
+	// the later address gate is reached.
+	n.config.Connectors["SYS"] = &stubConn{ticker: "SYS", addr: btcAddr, utxos: []wallet.Utxo{{
+		TxID: "0000000000000000000000000000000000000000000000000000000000000009", Vout: 0,
+		Amount: 100000000, Value: 1.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr,
+	}}}
+	id := [32]byte{0x79}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "SYS", ToAmount: 300000, Status: "open", Mine: false,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	// TO address (taker's receiving leg = order's BTC) is checked first; the
+	// message carries the order's FROM currency.
+	if _, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: "not-an-address"}); rerr == nil || rerr.Code != errInvalidAddress {
+		t.Fatalf("TakeOrder(bad to address) = %v, want INVALID_ADDRESS", rerr)
+	} else if rerr.Name != "dxTakeOrder" || rerr.Error != "Bad address : BTC address is bad. Are you using the correct address?" {
+		t.Errorf("TakeOrder(bad to address) = %+v, want name dxTakeOrder + BTC message", rerr)
+	}
+	// FROM address (taker's sending leg = order's SYS) -> order's TO currency.
+	if _, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: "not-an-address", ToAddress: btcAddr}); rerr == nil || rerr.Code != errInvalidAddress || rerr.Error != "Bad address : SYS address is bad. Are you using the correct address?" {
+		t.Errorf("TakeOrder(bad from address) = %v, want SYS message", rerr)
+	}
+}
+
+// TestTakeOrderOwnOrder locks in C++ isLocal() -> 1025 "Unable to accept your
+// own order." (rpcxbridge.cpp:1210-1212, RPC-F15): Mine is the Go isLocal
+// proxy, so a local maker order cannot be taken.
+func TestTakeOrderOwnOrder(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x6a)
+	n, _ := newHubNode(reg)
+	id := [32]byte{0x7a}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "open", Mine: true,
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errInvalidParameters || rerr.Error != "Invalid parameters: Unable to accept your own order." {
+		t.Fatalf("TakeOrder(own order) = %v, want 1025 'Unable to accept your own order.'", rerr)
+	}
+}
+
+// TestTakeOrderNotFoundBare locks in C++ dxTakeOrder's not-found message:
+// makeError(TRANSACTION_NOT_FOUND, __FUNCTION__) with NO argument — the
+// double-space "Transaction  not found" (rpcxbridge.cpp:1176-1179, RPC-F15).
+func TestTakeOrderNotFoundBare(t *testing.T) {
+	n, _ := newHubNode(nil)
+	var id [32]byte
+	id[0] = 0x7b
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errTxNotFound || rerr.Error != "Transaction  not found" {
+		t.Fatalf("TakeOrder(unknown) = %v, want 1021 double-space message", rerr)
+	}
+}

@@ -176,15 +176,28 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 			r.MakerSize, r.TakerSize, formatXAmount(o.ToAmount), formatXAmount(o.FromAmount))
 	}
 
-	// Amount "0" -> also a full take.
-	res, err = ctx.dxTakeOrder([]json.RawMessage{jstr(id), jstr(btcAddr), jstr(btcAddr2), jstr("0")})
-	if err != nil {
-		t.Fatalf("dxTakeOrder (amount 0): %v", err)
+	// Amount "0" is NOT a full take: C++ rejects an explicit amount <= 0 with
+	// 1025 carrying the raw string (rpcxbridge.cpp:1151-1161, RPC-F14).
+	if _, err := ctx.dxTakeOrder([]json.RawMessage{jstr(id), jstr(btcAddr), jstr(btcAddr2), jstr("0")}); err == nil {
+		t.Fatal("dxTakeOrder (amount 0) should error")
+	} else if err.Code != errInvalidParameters || err.Error != "Invalid parameters: The amount cannot be less than or equal to 0: 0" {
+		t.Errorf("dxTakeOrder (amount 0) = %+v, want 1025 with raw amount", err)
 	}
-	r = res.(orderListResult)
-	if r.MakerSize != formatXAmount(o.ToAmount) || r.TakerSize != formatXAmount(o.FromAmount) {
-		t.Errorf("full take (amount 0) = %s/%s, want %s/%s",
-			r.MakerSize, r.TakerSize, formatXAmount(o.ToAmount), formatXAmount(o.FromAmount))
+	// The amount <= 0 check runs BEFORE the order lookup: "0" on an unknown id
+	// still errors 1025 (rpcxbridge.cpp:1151-1161 precedes :1175-1179).
+	var missing [32]byte
+	missing[0] = 0x77
+	if _, err := ctx.dxTakeOrder([]json.RawMessage{jstr(dispID(missing)), jstr(btcAddr), jstr(btcAddr2), jstr("0")}); err == nil {
+		t.Fatal("dxTakeOrder (unknown id, amount 0) should error")
+	} else if err.Code != errInvalidParameters || !strings.Contains(err.Error, "cannot be less than or equal to 0") {
+		t.Errorf("dxTakeOrder (unknown id, amount 0) = %+v, want the amount error (precedence)", err)
+	}
+	// The same-address gate precedes the amount gate: identical addresses win
+	// over an amount of "0" (rpcxbridge.cpp:1146-1148 before :1151-1161).
+	if _, err := ctx.dxTakeOrder([]json.RawMessage{jstr(id), jstr(btcAddr), jstr(btcAddr), jstr("0")}); err == nil {
+		t.Fatal("dxTakeOrder (same address, amount 0) should error")
+	} else if !strings.Contains(err.Error, "cannot be the same") {
+		t.Errorf("dxTakeOrder (same address, amount 0) = %+v, want the same-address error (precedence)", err)
 	}
 }
 
