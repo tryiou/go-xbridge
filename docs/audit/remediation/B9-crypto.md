@@ -1,7 +1,7 @@
 # B9 — Crypto-connector parity (CRYPTO-F77, F82, F83, F88, F89, F91, F92)
 
 Branch: `fix/crypto-connectors` (off `main` @ B7 merge `dedbb1e`).
-Status: MERGED into `main` @ `<merge-commit-hash>`.
+Status: MERGED into `main` @ `2d076a3` (fast-forward).
 C++ reference: Blocknet Core @ `e9ddbc2bd` (v4.4.1 era).
 Go subject: `coins/tx.go`, `coins/coin.go`, `coins/coins_test.go`,
 `crypto/signer.go`, `api/swap.go`, `swap/deposit.go`, `wallet/rpc.go` (7 OPEN
