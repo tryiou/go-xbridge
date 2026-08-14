@@ -114,11 +114,20 @@ func (h *HandlerCtx) dxGetOrderFills(params []json.RawMessage) (interface{}, *rp
 func (h *HandlerCtx) dxGetOrders(params []json.RawMessage) (interface{}, *rpcError) {
 	// arity (==0) is enforced by checkArity (dispatch.go).
 	now := NowMicro()
-	out := []orderListResult{}
+	orders := []*Order{}
 	for _, o := range h.Store.List() {
 		switch statusString(o.Status) {
 		case "canceled", "finished", "expired":
-			if now-o.Updated > 60*1e6 {
+			// C++ filters with (currentTime - tr->txtime).total_seconds() > 60
+			// (rpcxbridge.cpp:439): currentTime is second_clock (whole seconds)
+			// while txtime is microsecond-resolution (a last-update time, mutated
+			// by updateTimestamp, xbridgetransactiondescr.h:630-634; Go's Store
+			// tracks Updated as the last mutation). total_seconds() truncates the
+			// DIFFERENCE toward zero, so the drop boundary is
+			// floor(now) - txtime >= 61e6 — not a difference of floors. The
+			// whole-second floor of now also keeps the comparison underflow-free
+			// when Updated is ahead of now (C++ then keeps the order).
+			if now/1e6*1e6 >= o.Updated+61_000_000 {
 				continue
 			}
 		}
@@ -134,6 +143,13 @@ func (h *HandlerCtx) dxGetOrders(params []json.RawMessage) (interface{}, *rpcErr
 				continue
 			}
 		}
+		orders = append(orders, o)
+	}
+	// C++ iterates m_transactions (a std::map<uint256>) in LSB-first byte order
+	// (uint256.h:45-49); Go Store.List() is map-ordered, so sort to match.
+	sort.Slice(orders, func(i, j int) bool { return orderIDLess(orders[i].ID, orders[j].ID) })
+	out := make([]orderListResult, 0, len(orders))
+	for _, o := range orders {
 		out = append(out, o.toListResult())
 	}
 	return out, nil
@@ -151,24 +167,19 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 	if !ok {
 		return nil, makeError(errInvalidParameters, "dxGetOrder", "(id)")
 	}
-	// C++ normalizes the id via uint256S (case-insensitive); Store keys are
-	// the raw lowercase-hex wire bytes, so reverse the display order first.
-	id = strings.ToLower(id)
-	key, err := orderIDKey(id)
-	if err != nil {
-		// uint256S(sid) yields a null id for an unparseable param; the null
-		// lookup misses, so C++ reports not-found (rpcxbridge.cpp:778-784).
-		return nil, makeError(errTxNotFound, "dxGetOrder", id)
-	}
-	o := h.Store.Get(key)
+	// C++ parses the id via uint256S (tolerant: a malformed id yields a null id
+	// whose lookup misses) and renders the not-found message with the parsed
+	// id's GetHex — a zero-padded 64-hex string (rpcxbridge.cpp:785).
+	raw := parseOrderIDS(id)
+	o := h.Store.Get(orderIDKey(id))
 	if o == nil {
 		// C++ App::transaction falls back to m_historicTransactions when the
 		// live map misses (xbridgeapp.cpp:1273-1292): finished/cancelled local
 		// orders are still resolvable after they left the live book.
-		o = h.Store.HistoryOrder(key)
+		o = h.Store.HistoryOrder(orderIDKey(id))
 	}
 	if o == nil {
-		return nil, makeError(errTxNotFound, "dxGetOrder", id)
+		return nil, makeError(errTxNotFound, "dxGetOrder", orderIDString(raw))
 	}
 	// C++ requires a wallet session for both order currencies.
 	if _, e := h.connector(o.FromCurrency, "dxGetOrder"); e != nil {
@@ -456,11 +467,13 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	if perr != nil {
 		return nil, perr
 	}
-	// C++ validates the id format up front (uint256S(sid).IsNull()).
-	key, err := orderIDKey(id)
-	if err != nil {
+	// C++ validates the id up front (uint256S(sid).IsNull()) and rejects a null
+	// id with the raw param string (rpcxbridge.cpp:1345-1353).
+	raw := parseOrderIDS(id)
+	if idIsNull(raw) {
 		return nil, makeError(errInvalidParameters, "dxCancelOrder", "Invalid order id ["+id+"]")
 	}
+	key := orderIDKey(id)
 	o := h.Store.Get(key)
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxCancelOrder", id)
@@ -932,11 +945,11 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 	// C++ getPartialOrderChain resolves both ancestors and descendants; reuse the
 	// shared chain walker so this matches dxPartialOrderChainDetails.
 	// C++ validates the id up front (uint256S(order_id).IsNull() -> "bad order id").
-	key, err := orderIDKey(id)
-	if err != nil {
+	raw := parseOrderIDS(id)
+	if idIsNull(raw) {
 		return nil, makeError(errInvalidParameters, "dxGetMyPartialOrderChain", "bad order id")
 	}
-	chain := h.partialOrderChain(key)
+	chain := h.partialOrderChain(orderIDKey(id))
 	if len(chain) == 0 {
 		return []interface{}{}, nil
 	}
@@ -1026,11 +1039,11 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		return nil, perr
 	}
 	// C++ validates the order id up front (uint256S(sid).IsNull()).
-	key, err := orderIDKey(id)
-	if err != nil {
+	raw := parseOrderIDS(id)
+	if idIsNull(raw) {
 		return nil, makeError(errInvalidParameters, "dxPartialOrderChainDetails", "Invalid order id ["+id+"]")
 	}
-	chain := h.partialOrderChain(key)
+	chain := h.partialOrderChain(orderIDKey(id))
 	// C++ returns an empty object `{}` for an unknown / empty chain (not an error).
 	if len(chain) == 0 {
 		return map[string]interface{}{}, nil
@@ -1118,7 +1131,10 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 			return nil, perr
 		}
 	}
-	if id == "" {
+	// C++ treats a null id (empty, whitespace, "0x", or otherwise unparseable)
+	// as "all": Exchange::getUtxoItems returns every locked entry for a null
+	// txid (xbridgeexchange.cpp:278-283; rpcxbridge.cpp:2648-2652).
+	if id == "" || idIsNull(parseOrderIDS(id)) {
 		// No id -> all locked utxos across the configured exchange wallets,
 		// rendered as C++ Exchange::getUtxoItems "txid:vout:amount:address" strings
 		// in fixed-6 XBridge scale.
@@ -1147,11 +1163,7 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		}
 		return map[string]interface{}{"all_locked_utxo": all}, nil
 	}
-	orderKey, err := orderIDKey(id)
-	if err != nil {
-		return nil, makeError(errInvalidParameters, "dxGetLockedUtxos", "Invalid order id ["+id+"]")
-	}
-	o := h.Store.Get(orderKey)
+	o := h.Store.Get(orderIDKey(id))
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", id)
 	}

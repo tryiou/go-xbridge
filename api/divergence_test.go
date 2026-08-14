@@ -70,8 +70,9 @@ func TestStateOrdinal(t *testing.T) {
 // `{}` (not an error) for an unknown / empty chain. T1.2.
 func TestDxPartialOrderChainDetailsEmptyChain(t *testing.T) {
 	ctx := newWalletTestCtx()
-	// Valid 64-hex id that matches no order.
-	id := "00" + strings.Repeat("0", 62)
+	// Valid non-null 64-hex id that matches no order (all-zeros would be the
+	// uint256S null id, which C++ rejects with 1025 "bad order id").
+	id := "0f" + strings.Repeat("0", 62)
 	res, err := ctx.dxPartialOrderChainDetails([]json.RawMessage{jstr(id)})
 	if err != nil {
 		t.Fatalf("empty chain should be {} not error: %v", err)

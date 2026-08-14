@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -510,32 +511,86 @@ func orderIDString(id [32]byte) string {
 	return hexEncode(r[:])
 }
 
-// parseOrderID converts a display-hex order id (uint256::GetHex order, as
-// returned by the dx* RPCs) back into the 32-byte internal representation used
-// as the Store key. Malformed ids (wrong length or non-hex) error, mirroring
-// the C++ uint256S validation in dxCancelOrder/dxPartialOrderChainDetails.
-func parseOrderID(s string) ([32]byte, error) {
+// parseOrderIDS converts a display-hex order id (uint256::GetHex order) back
+// into the 32-byte internal representation used as the Store key, mirroring
+// the tolerant C++ uint256S/SetHex parsing (uint256.cpp:27-53): leading
+// whitespace and an optional "0x"/"0X" prefix are skipped, a contiguous hex
+// run is consumed, and the nibbles are filled from the run's end into id[0]
+// (the least-significant byte) upward. Fewer than 64 hex chars left-pad with
+// zeros; more truncate the leading chars. It never errors on content — an
+// empty/whitespace/non-hex input yields the zero id. Callers apply the
+// per-method IsNull policy (only dxCancelOrder and the partial-chain methods
+// reject a null id; dxGetOrder/dxTakeOrder let a null id miss, and
+// dxGetLockedUtxos treats it as "all").
+func parseOrderIDS(s string) [32]byte {
 	var id [32]byte
-	if len(s) != 64 {
-		return id, errors.New("api: order id must be 64 hex chars")
+	i := 0
+	// skip leading whitespace (C++ IsSpace)
+	for i < len(s) && isSpace(s[i]) {
+		i++
 	}
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return id, errors.New("api: invalid order id hex")
+	// skip optional 0x
+	if i+1 < len(s) && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X') {
+		i += 2
 	}
-	for i, v := range b {
-		id[31-i] = v
+	// consume the contiguous hex run (HexDigit)
+	start := i
+	for i < len(s) && hexDigit(s[i]) >= 0 {
+		i++
 	}
-	return id, nil
+	// fill nibbles from the run's end into id[0] (LSB) upward, low nibble first
+	n := 0
+	for j := i - 1; j >= start && n < 64; j-- {
+		if n&1 == 0 {
+			id[n>>1] = byte(hexDigit(s[j]))
+		} else {
+			id[n>>1] |= byte(hexDigit(s[j])) << 4
+		}
+		n++
+	}
+	return id
+}
+
+// hexDigit mirrors C++ HexDigit (strencodings.h): the digit value for
+// [0-9a-fA-F], -1 otherwise. Bytes >= 0x80 are never hex.
+func hexDigit(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+// isSpace reports whether c is ASCII whitespace (C++ IsSpace: space, \t, \n,
+// \v, \f, \r).
+func isSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// idIsNull reports whether a parsed id is the C++ uint256 null value.
+func idIsNull(id [32]byte) bool { return id == [32]byte{} }
+
+// orderIDLess orders 32-byte ids the way C++ std::map<uint256> does: memcmp
+// from data[0] (the least-significant byte), NOT display-hex ascending
+// (uint256.h:45-49). Go internal ids already store LSB-first, so a plain
+// bytes.Compare on the raw bytes matches the C++ map iteration order.
+func orderIDLess(a, b [32]byte) bool {
+	return bytes.Compare(a[:], b[:]) < 0
 }
 
 // orderIDKey converts a display-hex order id param into the raw lowercase-hex
-// Store key. Callers wrap the returned error with their own rpcError name and
-// message. (Distinct from store.orderKey, which renders a raw [32]byte id.)
-func orderIDKey(id string) (string, error) {
-	raw, err := parseOrderID(id)
-	if err != nil {
-		return "", err
-	}
-	return hexEncode(raw[:]), nil
+// Store key using the tolerant uint256S parser (parseOrderIDS). Callers apply
+// the per-method IsNull policy themselves. (Distinct from store.orderKey,
+// which renders a raw [32]byte id.)
+func orderIDKey(id string) string {
+	raw := parseOrderIDS(id)
+	return hexEncode(raw[:])
 }

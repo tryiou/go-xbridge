@@ -1367,10 +1367,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 	// C++ parses the id via uint256S (no format check here); an unparseable id
 	// yields a null id whose lookup misses, so report not-found.
-	key, kerr := orderIDKey(p.ID)
-	if kerr != nil {
-		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
-	}
+	key := orderIDKey(p.ID)
 	o := n.store.Get(key)
 	if o == nil {
 		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)

@@ -709,8 +709,9 @@ func TestDxPartialChainRead(t *testing.T) {
 	}
 
 	// Missing id -> empty array (C++ returns [] for a valid but unknown order;
-	// a malformed id is a uint256S null whose lookup also misses).
-	unknown := strings.Repeat("0", 64)
+	// the all-zeros id is a uint256S null and is rejected with 1025 "bad order
+	// id" up front, so use a non-null id that simply matches nothing).
+	unknown := strings.Repeat("0", 63) + "f"
 	if res, err := ctx.dxGetMyPartialOrderChain([]json.RawMessage{jstr(unknown)}); err != nil {
 		t.Errorf("dxGetMyPartialOrderChain(missing) should return empty array, got error: %v", err)
 	} else if arr, ok := res.([]interface{}); !ok || len(arr) != 0 {
@@ -976,5 +977,156 @@ func TestDxLoadConfHotReloadMissingPath(t *testing.T) {
 	ctx := &HandlerCtx{Store: NewStore(), Node: node}
 	if res, rerr := ctx.dxLoadXBridgeConf(nil); rerr == nil {
 		t.Fatalf("expected error for empty ConfPath, got res=%v", res)
+	}
+}
+
+// TestDxGetOrdersSortedById locks in RPC-F03: C++ iterates m_transactions
+// (std::map<uint256>) in LSB-first byte order (uint256.h:45-49), so Go's
+// map-ordered Store.List() must be sorted by orderIDLess — NOT display-hex
+// ascending. Three open BTC/BTC orders; the LSB order is B < A < C while
+// display-hex ascending would give A < C < B.
+func TestDxGetOrdersSortedById(t *testing.T) {
+	ctx := newWalletTestCtx()
+	add := func(bs ...byte) string {
+		var id [32]byte
+		copy(id[:], bs)
+		ctx.Store.Add(&Order{
+			ID: id, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1000000,
+			ToCurrency: "BTC", ToAmount: 200000, Created: 1, Updated: 1, Status: "open", Mine: true,
+		})
+		return dispID(id)
+	}
+	a := add(0x01)       // display "..0001"
+	b := add(0x00, 0x01) // display "..000100"
+	c := add(0xff)       // display "..00ff"
+	if strings.Compare(a, b) >= 0 {
+		t.Fatalf("test setup: display-hex a<b expected, got %s vs %s", a, b)
+	}
+
+	res, err := ctx.dxGetOrders(nil)
+	if err != nil {
+		t.Fatalf("dxGetOrders: %v", err)
+	}
+	arr, ok := res.([]orderListResult)
+	if !ok || len(arr) != 3 {
+		t.Fatalf("dxGetOrders = %v (%T), want 3 orders", res, res)
+	}
+	want := []string{b, a, c} // LSB-first: [0x00,0x01] < [0x01] < [0xff]
+	for i, id := range want {
+		if arr[i].ID != id {
+			t.Errorf("dxGetOrders[%d].id = %s, want %s (LSB order)", i, arr[i].ID, id)
+		}
+	}
+}
+
+// TestDxGetOrdersSixtySecondBoundary locks in RPC-F04: the 60 s filter on
+// canceled/finished/expired orders drops exactly when
+// floor(now) - txtime >= 61e6, mirroring C++
+// (second_clock - txtime).total_seconds() > 60 (rpcxbridge.cpp:439).
+// total_seconds() truncates the DIFFERENCE toward zero, so a txtime with a
+// sub-second fraction keeps the order one whole second longer than a
+// whole-second-aligned txtime (61.9 s old is still "60 s").
+func TestDxGetOrdersSixtySecondBoundary(t *testing.T) {
+	ctx := newWalletTestCtx()
+	orig := NowMicro
+	defer func() { NowMicro = orig }()
+
+	seed := func(updated uint64) {
+		ctx.Store.Add(&Order{
+			ID: [32]byte{0x02}, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1000000,
+			ToCurrency: "BTC", ToAmount: 200000, Created: updated, Updated: updated, Status: "canceled", Mine: true,
+		})
+	}
+	count := func() int {
+		res, err := ctx.dxGetOrders(nil)
+		if err != nil {
+			t.Fatalf("dxGetOrders: %v", err)
+		}
+		return len(res.([]orderListResult))
+	}
+	cases := []struct {
+		name    string
+		updated uint64
+		now     uint64
+		want    int
+	}{
+		// Whole-second txtime: drops exactly at floor(now) - T >= 61e6.
+		{"aligned 60.9s kept", 0, 60_900_000, 1},
+		{"aligned 61.0s dropped", 0, 61_000_000, 0},
+		{"aligned 600s dropped", 0, 600_000_000, 0},
+		// Sub-second txtime fraction: total_seconds() truncates the difference,
+		// so an order 61.9 s old is still "60 s" and is kept; it drops at 62 s.
+		{"fractional 61.9s kept", 1_000, 61_900_000, 1},
+		{"fractional 62.0s dropped", 1_000, 62_000_000, 0},
+	}
+	for _, c := range cases {
+		seed(c.updated)
+		NowMicro = func() uint64 { return c.now }
+		if n := count(); n != c.want {
+			t.Errorf("%s: got %d orders, want %d", c.name, n, c.want)
+		}
+	}
+	// An open order is never filtered regardless of age.
+	seed(0)
+	NowMicro = func() uint64 { return 600_000_000 }
+	ctx.Store.Update(orderKey([32]byte{0x02}), func(o *Order) { o.Status = "open" })
+	if n := count(); n != 1 {
+		t.Errorf("open order 600s old: got %d orders, want 1", n)
+	}
+}
+
+// TestDxGetOrderNotFoundPadded locks in RPC-F06: dxGetOrder renders the
+// not-found message with the PARSED id's GetHex (rpcxbridge.cpp:785), so a
+// short/malformed id is zero-padded to 64 hex chars, not echoed raw.
+func TestDxGetOrderNotFoundPadded(t *testing.T) {
+	ctx := newWalletTestCtx()
+	if _, err := ctx.dxGetOrder([]json.RawMessage{jstr("deadbeef")}); err == nil {
+		t.Fatal("dxGetOrder(short) should error")
+	} else if err.Code != errTxNotFound {
+		t.Fatalf("dxGetOrder(short) code = %d, want 1021", err.Code)
+	} else if err.Error != "Transaction "+strings.Repeat("0", 56)+"deadbeef not found" {
+		t.Errorf("dxGetOrder(short) message = %q, want zero-padded 64-hex id", err.Error)
+	}
+	// An all-zeros id (uint256S null) has no null gate here: it just misses.
+	if _, err := ctx.dxGetOrder([]json.RawMessage{jstr(strings.Repeat("0", 64))}); err == nil {
+		t.Fatal("dxGetOrder(null id) should error")
+	} else if err.Code != errTxNotFound {
+		t.Fatalf("dxGetOrder(null id) code = %d, want 1021", err.Code)
+	}
+}
+
+// TestDxCancelOrderShortId locks in RPC-F05: dxCancelOrder rejects a NULL
+// uint256S id with 1025 "Invalid order id [<raw param>]" (rpcxbridge.cpp:
+// 1345-1353). A short-but-valid hex id ("abc") is NOT null — it is left-padded
+// to 64 hex and misses the store -> 1021; only genuinely unparseable input
+// ("zz", "0x", empty) parses to the null id and hits the 1025 gate.
+func TestDxCancelOrderShortId(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx)
+	// Unparseable -> null id -> 1025 with the raw param string.
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr("zz")}); err == nil {
+		t.Fatal("dxCancelOrder(non-hex) should error")
+	} else if err.Code != errInvalidParameters || err.Error != "Invalid parameters: Invalid order id [zz]" {
+		t.Errorf("dxCancelOrder(non-hex) = %+v, want 1025 with raw id", err)
+	}
+	// "0x" and empty also parse to null -> 1025, and the order survives.
+	for _, id := range []string{"0x", ""} {
+		if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(id)}); err == nil || err.Code != errInvalidParameters {
+			t.Errorf("dxCancelOrder(%q) = %+v, want 1025", id, err)
+		}
+	}
+	if o.Status != "open" {
+		t.Errorf("order status = %q, want open (null id must not cancel)", o.Status)
+	}
+	// The all-zeros id is null too -> 1025.
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(strings.Repeat("0", 64))}); err == nil || err.Code != errInvalidParameters {
+		t.Errorf("dxCancelOrder(null id) = %+v, want 1025", err)
+	}
+	// A short-but-valid hex id is left-padded, not rejected: it misses the
+	// store -> 1021 not-found (uint256S("abc") is non-null, rpcxbridge.cpp:1362).
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr("abc")}); err == nil {
+		t.Fatal("dxCancelOrder(abc) should error")
+	} else if err.Code != errTxNotFound {
+		t.Errorf("dxCancelOrder(abc) = %+v, want 1021 not-found (short id is valid)", err)
 	}
 }

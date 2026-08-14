@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -198,5 +199,78 @@ func TestMakeErrorShape(t *testing.T) {
 	u := makeError(errUnknown, "dx", "anything")
 	if u.Error != "Internal Server Error" {
 		t.Errorf("unknown error must ignore arg, got %q", u.Error)
+	}
+}
+
+// TestParseOrderIDS verifies the tolerant uint256S/SetHex port (uint256.cpp:
+// 27-53): leading spaces and an optional 0x/0X prefix are skipped, a contiguous
+// hex run is consumed, nibbles are filled from the run's end into the LSB
+// upward (<64 hex chars left-pad with zeros, >=64 truncate the leading chars),
+// and unparseable input yields the null id — never an error.
+func TestParseOrderIDS(t *testing.T) {
+	keyOf := func(id [32]byte) string { return hexEncode(id[:]) }
+	key := func(s string) string { return keyOf(parseOrderIDS(s)) }
+	// keyForDisplay builds the expected internal key from a display string.
+	displayKey := func(s string) string { return orderIDKey(s) }
+
+	zero := keyOf([32]byte{})
+	if key("") != zero || key("   ") != zero || key("Z12") != zero || key("0x") != zero || key("0X") != zero {
+		t.Errorf("null-parse inputs must yield the zero id")
+	}
+	cases := []struct{ in, want string }{
+		{"1234", "3412" + strings.Repeat("00", 30)},               // last char -> id[0] low nibble
+		{"  0x1234", "3412" + strings.Repeat("00", 30)},           // spaces + 0x skipped
+		{"0X12", "12" + strings.Repeat("00", 31)},                 // uppercase 0X
+		{"1234Z", "3412" + strings.Repeat("00", 30)},              // trailing non-hex ignored
+		{"12 34", "12" + strings.Repeat("00", 31)},                // interior whitespace ends the run
+		{"abc", "bc0a" + strings.Repeat("00", 30)},                // odd length: leading nibble zero
+		{"ABcd", "cdab" + strings.Repeat("00", 30)},               // mixed case
+		{"80", "80" + strings.Repeat("00", 31)},                   // high nibble at a nonzero byte
+		{"1", "01" + strings.Repeat("00", 31)},                    // single char -> id[0] low
+		{"0", zero},                                               // single "0" is the null id in C++ too
+		{"0x0", zero},                                             // "0x0" also parses to null
+		{strings.Repeat("a", 64), strings.Repeat("aa", 32)},       // exact 64
+		{"b" + strings.Repeat("a", 64), strings.Repeat("aa", 32)}, // 65: leading char truncated
+	}
+	for _, c := range cases {
+		if got := key(c.in); got != c.want {
+			t.Errorf("parseOrderIDS(%q) key = %s, want %s", c.in, got, c.want)
+		}
+	}
+	// Display round-trip: parse(orderIDString(id)) == id.
+	for _, raw := range [][32]byte{{0x01}, {0x00, 0x01}, {0xff}, {0xde, 0xad, 0xbe, 0xef}, {0x80}} {
+		var id [32]byte
+		copy(id[:], raw[:])
+		if displayKey(orderIDString(id)) != keyOf(id) {
+			t.Errorf("display round-trip failed for %x", id)
+		}
+	}
+}
+
+// TestOrderIDLess verifies the comparator matches C++ std::map<uint256> order:
+// memcmp from data[0] (LSB-first), which is the REVERSE of display-hex
+// ascending (uint256.h:45-49).
+func TestOrderIDLess(t *testing.T) {
+	ids := func(bs ...byte) [32]byte {
+		var id [32]byte
+		copy(id[:], bs)
+		return id
+	}
+	a := ids(0x01)          // display "..0001"
+	b := ids(0x00, 0x01)    // display "..000100"
+	if !orderIDLess(b, a) { // byte0 0x00 < 0x01
+		t.Errorf("orderIDLess(%x, %x) = false, want true (LSB)", b, a)
+	}
+	if orderIDLess(a, b) {
+		t.Errorf("orderIDLess(%x, %x) = true, want false (LSB)", a, b)
+	}
+	if strings.Compare(orderIDString(a), orderIDString(b)) >= 0 {
+		t.Errorf("display-hex order should be the reverse (a < b), got %s vs %s", orderIDString(a), orderIDString(b))
+	}
+	if !orderIDLess(ids(0x01), ids(0xff)) {
+		t.Errorf("orderIDLess(0x01, 0xff) should be true")
+	}
+	if orderIDLess(ids(0xff), ids(0xff)) {
+		t.Errorf("orderIDLess must be strict (equal ids)")
 	}
 }
