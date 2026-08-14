@@ -102,7 +102,7 @@ func main() {
 	confPath := flag.String("conf", defaultConfPath(), "path to xbridge.conf (read-only; never created)")
 	magicHex := flag.String("magic", "", "network magic (hex, 4 bytes); derived from -network if empty")
 	walletVersion := flag.Int("walletversion", 4040100, "Blocknet CLIENT_VERSION advertised in getnetworkinfo (default Blocknet 4.4.1)")
-	walletVersionStr := flag.String("walletversionstr", "/blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
+	walletVersionStr := flag.String("walletversionstr", "/Blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")

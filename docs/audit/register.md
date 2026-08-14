@@ -80,9 +80,9 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F41 | S2 | `dxSplit` fee formula differs (520·fpb per output + claw-back) | FIXED | B7 `fix/rpc-surface` (`feesPerUtxo = minTxFee1(1,3)+minTxFee2(1,1)` in XBridge units; real tx fee deducted from change, dust claw-back incl. C++ `outputCount -= 1` quirk — `TestDxSplitFeesPerUtxo`; parity oracle `main.cpp` + `TestValueMatchesCppSplit`) |
 | RPC-F42 | S2 | `dxSplit` change destination differs (requested address vs fresh address) | FIXED | B7 `fix/rpc-surface` (change output uses the requested address script — `TestDxSplitChangeToRequestedAddress`) |
 | RPC-F43 | S3 | `dxSplit` submit-failure code and error names | FIXED | B7 `fix/rpc-surface` (1004 BAD_REQUEST named after the actual method — `TestDxSplitSubmitFailure`) |
-| RPC-F44 | S2 | `dxGetUtxos` amounts trimmed vs C++ fixed-8 | OPEN | B7 |
-| RPC-F45 | S3 | `dxGetUtxos` listunspent failure code/text (1004 vs 1002) | OPEN | B7 |
-| RPC-F46 | S2 | `getnetworkinfo` shim diverges from real blocknetd (protocolversion, fees, subversion, fields) | RE-DECIDE | B7 (prior: Go-only extension) |
+| RPC-F44 | S2 | `dxGetUtxos` amounts trimmed vs C++ fixed-8 | FIXED | B7 `fix/rpc-surface` (`coins.FormatAmountFixed` — fixed `c.Decimals` places, no trimming, matching C++ `xBridgeStringValueFromPrice(amount, conn->COIN)` (xutil.cpp:216-221) — `TestFormatAmountFixed`, `TestDxGetUtxos`) |
+| RPC-F45 | S3 | `dxGetUtxos` listunspent failure code/text (1004 vs 1002) | FIXED | B7 `fix/rpc-surface` (1004 BAD_REQUEST named `dxGetUtxos` with C++ text `"failed to get unspent transaction outputs"` — `TestDxGetUtxosListUnspentError`) |
+| RPC-F46 | S2 | `getnetworkinfo` shim diverges from real blocknetd (protocolversion, fees, subversion, fields) | FIXED | B7 `fix/rpc-surface` (protocolversion 70713, xbridgeprotocolversion 55, xrouterprotocolversion 50, subversion `/Blocknet:4.4.1/`, relayfee/incrementalfee 8-decimal strings `"0.00010000"`/`"0.00001000"`, networks `proxy_randomize_credentials:false` — `TestGetNetworkInfo`) |
 | RPC-F47 | S2 | JSON-RPC HTTP status for parse/method-not-found (C++ 500/404 vs Go 200) | FIXED | B4 `fix/http-hardening` (status routing −32600→400, −32601→404, else 500; `TestServerEnvelopeStatusCodes`, `TestServerParseErrorStatus500`) |
 | RPC-F48 | S3 | method-not-found message appends the method name | FIXED | B4 `fix/http-hardening` (bare `"Method not found"`; `TestServerInvalidRequest`, `TestServerEnvelopeStatusCodes`) |
 | RPC-F49 | S3 | request body limit 4 MiB vs C++ 32 MiB | FIXED | B4 `fix/http-hardening` (32 MiB `rpcMaxBodyBytes`, non-envelope 413; `TestServerMaxBodyBytes`) |
@@ -249,7 +249,7 @@ namespace is the Current register above.
 | S2-I | CRYPTO-F77 | BCH forkid sighash — OPEN (B9) |
 | S2-J | CRYPTO-F89 | coin-family misclassification — OPEN |
 | S3-A | RPC-F11 | partial fields `"0"` literal — OPEN (B7) |
-| S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — OPEN (B7) |
+| S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — FIXED (B7) |
 | S3-C | RPC-F31 | locked-utxos amount format — OPEN (B7) |
 | S3-D | RPC-F28 | `p2sh_deposits` alignment — OPEN (B7) |
 | S3-E | RPC-F55 | new-token-address `[]` vs error — OPEN (B7) |

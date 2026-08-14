@@ -35,6 +35,9 @@ type stubConn struct {
 	// sendErr, when set, makes SendRawTransaction fail (dxSplit submit-failure
 	// tests, RPC-F43).
 	sendErr error
+	// listUnspentErr, when set, makes ListUnspent fail (dxGetUtxos
+	// listunspent-failure case, RPC-F45).
+	listUnspentErr error
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -45,6 +48,9 @@ func (s *stubConn) GetNewAddress() (string, error) {
 	return s.addr, nil
 }
 func (s *stubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
+	if s.listUnspentErr != nil {
+		return nil, s.listUnspentErr
+	}
 	return s.utxos, nil
 }
 func (s *stubConn) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
@@ -174,8 +180,11 @@ func TestDxGetUtxos(t *testing.T) {
 	if !ok || len(arr) != 1 {
 		t.Fatalf("result = %v (%T)", res, res)
 	}
-	if arr[0]["amount"] != "1" {
-		t.Errorf("amount = %v", arr[0]["amount"])
+	// C++ renders the amount fixed to the coin's decimal places
+	// (xBridgeStringValueFromPrice(amount, conn->COIN), rpcxbridge.cpp:3483):
+	// 1 BTC -> "1.00000000" (RPC-F44).
+	if arr[0]["amount"] != "1.00000000" {
+		t.Errorf("amount = %v, want 1.00000000", arr[0]["amount"])
 	}
 	if arr[0]["txid"] == "" || arr[0]["scriptPubKey"] == "" {
 		t.Errorf("missing utxo fields: %v", arr[0])
@@ -187,6 +196,27 @@ func TestDxGetUtxos(t *testing.T) {
 	// Too many params -> error (arity gate moved to checkArity, dispatch.go).
 	if rerr := checkArity("dxGetUtxos", 3); rerr == nil || !rerr.envelope || rerr.Code != -1 {
 		t.Errorf("checkArity(dxGetUtxos, 3) = %v, want envelope -1 (throw method)", rerr)
+	}
+}
+
+// TestDxGetUtxosListUnspentError locks the C++ listunspent-failure contract
+// (rpcxbridge.cpp:3476): 1004 BAD_REQUEST named after __FUNCTION__ with the
+// fixed text "failed to get unspent transaction outputs" (RPC-F45).
+func TestDxGetUtxosListUnspentError(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Node.cfg().Connectors["BTC"].(*stubConn).listUnspentErr = stubErr("wallet rpc down")
+	_, err := ctx.dxGetUtxos([]json.RawMessage{json.RawMessage(`"BTC"`)})
+	if err == nil {
+		t.Fatal("dxGetUtxos should fail when ListUnspent fails")
+	}
+	if err.Code != errBadRequest {
+		t.Errorf("code = %d, want 1004 (BAD_REQUEST)", err.Code)
+	}
+	if err.Name != "dxGetUtxos" {
+		t.Errorf("name = %q, want dxGetUtxos (C++ __FUNCTION__)", err.Name)
+	}
+	if err.Error != "Bad Request failed to get unspent transaction outputs" {
+		t.Errorf("text = %q, want C++ text", err.Error)
 	}
 }
 

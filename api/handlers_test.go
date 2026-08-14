@@ -1129,8 +1129,48 @@ func TestGetNetworkInfo(t *testing.T) {
 	if m["version"] != 4040100 {
 		t.Errorf("version = %v, want 4040100", m["version"])
 	}
-	if m["subversion"] != "/blocknet:4.4.1/" {
-		t.Errorf("subversion = %v, want /blocknet:4.4.1/", m["subversion"])
+	if m["subversion"] != "/Blocknet:4.4.1/" {
+		t.Errorf("subversion = %v, want /Blocknet:4.4.1/", m["subversion"])
+	}
+	// F46 alignment with real blocknetd (rpc/net.cpp:495-527, version.h).
+	if m["protocolversion"] != 70713 {
+		t.Errorf("protocolversion = %v, want 70713", m["protocolversion"])
+	}
+	if m["xbridgeprotocolversion"] != 55 {
+		t.Errorf("xbridgeprotocolversion = %v, want 55", m["xbridgeprotocolversion"])
+	}
+	if m["xrouterprotocolversion"] != 50 {
+		t.Errorf("xrouterprotocolversion = %v, want 50", m["xrouterprotocolversion"])
+	}
+	if m["relayfee"] != "0.00010000" {
+		t.Errorf("relayfee = %v, want \"0.00010000\"", m["relayfee"])
+	}
+	if m["incrementalfee"] != "0.00001000" {
+		t.Errorf("incrementalfee = %v, want \"0.00001000\"", m["incrementalfee"])
+	}
+	nets, ok := m["networks"].([]map[string]interface{})
+	if !ok || len(nets) != 3 {
+		t.Fatalf("networks = %v (%T), want 3 entries", m["networks"], m["networks"])
+	}
+	for _, n := range nets {
+		if n["proxy_randomize_credentials"] != false {
+			t.Errorf("networks[].proxy_randomize_credentials = %v, want false", n["proxy_randomize_credentials"])
+		}
+	}
+	// Key set must be the 15 C++ getnetworkinfo fields (order is sorted-map).
+	wantKeys := []string{
+		"version", "subversion", "protocolversion", "xbridgeprotocolversion",
+		"xrouterprotocolversion", "localservices", "localrelay", "timeoffset",
+		"networkactive", "connections", "networks", "relayfee", "incrementalfee",
+		"localaddresses", "warnings",
+	}
+	if len(m) != len(wantKeys) {
+		t.Errorf("field count = %d, want %d", len(m), len(wantKeys))
+	}
+	for _, k := range wantKeys {
+		if _, ok := m[k]; !ok {
+			t.Errorf("missing getnetworkinfo field %q", k)
+		}
 	}
 	if m["connections"] != 0 {
 		t.Errorf("connections = %v, want 0 (no live conn)", m["connections"])

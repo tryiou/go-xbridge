@@ -355,8 +355,9 @@ defaulted or trailing parameter.
 **`getnetworkinfo`**
 - `params`: none.
 - `result`: a bitcoind-shaped object: `version`, `subversion`, `protocolversion`,
-  `localservices`, `localrelay`, `timeoffset`, `networkactive`, `connections`,
-  `networks`, `relayfee`, `incrementalfee`, `localaddresses`, `warnings`.
+  `xbridgeprotocolversion`, `xrouterprotocolversion`, `localservices`,
+  `localrelay`, `timeoffset`, `networkactive`, `connections`, `networks`,
+  `relayfee`, `incrementalfee`, `localaddresses`, `warnings`.
 - `errors`: 1025 (any params).
 
 ## Tier 3 — thin-client limits

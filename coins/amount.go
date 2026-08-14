@@ -79,3 +79,19 @@ func FormatAmount(c Coin, v uint64) string {
 	frac = strings.TrimRight(frac, "0")
 	return intStr + "." + frac
 }
+
+// FormatAmountFixed renders base units (e.g. satoshis) as a decimal string for
+// coin c with exactly c.Decimals fractional digits (no trailing-zero trimming),
+// mirroring C++ xBridgeStringValueFromPrice(amount, COIN), which prints
+// std::fixed << setprecision(xBridgeSignificantDigits(COIN)) (xutil.cpp:216-221).
+func FormatAmountFixed(c Coin, v uint64) string {
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.Decimals)), nil)
+	q := new(big.Int)
+	r := new(big.Int)
+	q.QuoRem(new(big.Int).SetUint64(v), scale, r)
+	frac := r.String()
+	for len(frac) < c.Decimals {
+		frac = "0" + frac
+	}
+	return q.String() + "." + frac
+}

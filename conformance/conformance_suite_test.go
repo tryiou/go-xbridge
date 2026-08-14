@@ -428,14 +428,15 @@ func TestRPCResponseShape(t *testing.T) {
 		{method: "dxSplitInputs", mode: "exact", refKeys: []string{
 			"token", "include_fees", "split_amount_requested", "split_amount_with_fees",
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
-		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). CAND
-		// map -> sorted (handlers.go:1698-1706). DIVERGENT (Group-5 finding
-		// dxGetUtxos/key-order).
+		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). F44/F45
+		// fixed (amount fixed-8, 1004 listunspent error); the remaining divergence
+		// is CAND map -> sorted key order (handlers.go:2016-2075). DIVERGENT
+		// (finding dxGetUtxos/key-order).
 		{method: "dxGetUtxos", mode: "set", div: true, id: "dxGetUtxos/key-order", refKeys: []string{
 			"txid", "vout", "amount", "address", "scriptPubKey", "confirmations", "orderid"}},
-		// getnetworkinfo: 15 C++ fields (net.cpp:495-527). CAND emits 13 (missing
-		// xbridgeprotocolversion/xrouterprotocolversion) as a sorted map
-		// (handlers.go:1743-1761). DIVERGENT (Group-5 finding getnetworkinfo/fields).
+		// getnetworkinfo: 15 C++ fields (net.cpp:495-527). F46 fixed (all 15 now
+		// emitted); the remaining divergence is CAND map -> sorted key order
+		// (handlers.go:2082-2128). DIVERGENT (finding getnetworkinfo/fields).
 		{method: "getnetworkinfo", mode: "set", div: true, id: "getnetworkinfo/fields", refKeys: []string{
 			"version", "subversion", "protocolversion", "xbridgeprotocolversion",
 			"xrouterprotocolversion", "localservices", "localrelay", "timeoffset",

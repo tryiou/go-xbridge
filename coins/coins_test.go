@@ -229,3 +229,33 @@ func TestCoinRegistry(t *testing.T) {
 		t.Error("unknown coin should not be found")
 	}
 }
+
+// TestFormatAmountFixed locks the C++ xBridgeStringValueFromPrice(amount, COIN)
+// contract (xutil.cpp:216-221): base units rendered with exactly the coin's
+// Decimals fractional digits, no trailing-zero trimming.
+func TestFormatAmountFixed(t *testing.T) {
+	btc := Coin{Decimals: 8}
+	six := Coin{Decimals: 6}
+	cases := []struct {
+		c    Coin
+		v    uint64
+		want string
+	}{
+		{btc, 100000000, "1.00000000"},
+		{btc, 150000000, "1.50000000"},
+		{btc, 1, "0.00000001"},
+		{btc, 0, "0.00000000"},
+		{six, 100000000, "100.000000"},
+		{six, 1000000, "1.000000"},
+		{six, 0, "0.000000"},
+	}
+	for _, c := range cases {
+		if got := FormatAmountFixed(c.c, c.v); got != c.want {
+			t.Errorf("FormatAmountFixed(%v) = %q, want %q", c.v, got, c.want)
+		}
+	}
+	// The trimmed formatter must be unaffected.
+	if got := FormatAmount(btc, 100000000); got != "1" {
+		t.Errorf("FormatAmount(1 BTC) = %q, want \"1\"", got)
+	}
+}

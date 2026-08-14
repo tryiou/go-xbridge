@@ -2038,7 +2038,7 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 	}
 	utxos, err := conn.ListUnspent(minConf)
 	if err != nil {
-		return nil, makeError(errUnknown, "dxGetUtxos", err.Error())
+		return nil, makeError(errBadRequest, "dxGetUtxos", "failed to get unspent transaction outputs")
 	}
 	c, _ := coins.Get(ticker)
 	keys, byOrder := h.Store.LockedUtxoInfo()
@@ -2057,10 +2057,13 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 			orderid = byOrder[k]
 		}
 		out = append(out, map[string]interface{}{
-			"txid":          u.TxID,
-			"vout":          u.Vout,
-			"address":       u.Address,
-			"amount":        coins.FormatAmount(c, u.Amount),
+			"txid":    u.TxID,
+			"vout":    u.Vout,
+			"address": u.Address,
+			// C++ renders the amount fixed to the coin's decimal places via
+			// xBridgeStringValueFromPrice(utxo.amount, conn->COIN)
+			// (rpcxbridge.cpp:3483), e.g. "1.00000000" for BTC.
+			"amount":        coins.FormatAmountFixed(c, u.Amount),
 			"scriptPubKey":  u.ScriptPubKey,
 			"confirmations": u.Confirmations,
 			"orderid":       orderid,
@@ -2074,9 +2077,9 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 // (via its getinfo() wrapper) for its wallet-version gate before it will talk
 // to the wallet. We advertise a Blocknet version/subversion (configurable via
 // -walletversion/-walletversionstr, defaulting to 4.4.1) and the live peer
-// count so the dapp reports the wallet as connected. Only the fields BLOCK-DX
-// actually reads (version, subversion, connections) are meaningful; the rest
-// mirror bitcoind's shape for compatibility.
+// count so the dapp reports the wallet as connected. The remaining fields
+// mirror real blocknetd's getnetworkinfo (net.cpp:495-527) for compatibility
+// (RPC-F46).
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpcError) {
@@ -2089,7 +2092,7 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 	}
 	sub := h.Config().WalletVersionStr
 	if sub == "" {
-		sub = "/blocknet:4.4.1/"
+		sub = "/Blocknet:4.4.1/"
 	}
 	conns := 0
 	if h.Node != nil && h.Node.conn != nil {
@@ -2102,21 +2105,27 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 		}
 	}
 	return map[string]interface{}{
-		"version":         ver,
-		"subversion":      sub,
-		"protocolversion": 70015,
-		"localservices":   "000000000000000d",
-		"localrelay":      true,
-		"timeoffset":      0,
-		"networkactive":   true,
-		"connections":     conns,
+		"version":    ver,
+		"subversion": sub,
+		// F46 alignment with real blocknetd (rpc/net.cpp:495-527): protocol
+		// version 70713 (version.h), XBridge 55 / XRouter 50 (xbridge,xrouter
+		// version.h), 8-decimal ValueFromAmount fee strings, networks entries
+		// carrying proxy_randomize_credentials.
+		"protocolversion":        70713,
+		"xbridgeprotocolversion": 55,
+		"xrouterprotocolversion": 50,
+		"localservices":          "000000000000000d",
+		"localrelay":             true,
+		"timeoffset":             0,
+		"networkactive":          true,
+		"connections":            conns,
 		"networks": []map[string]interface{}{
-			{"name": "ipv4", "limited": false, "reachable": true, "proxy": ""},
-			{"name": "ipv6", "limited": false, "reachable": true, "proxy": ""},
-			{"name": "onion", "limited": true, "reachable": false, "proxy": ""},
+			{"name": "ipv4", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
+			{"name": "ipv6", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
+			{"name": "onion", "limited": true, "reachable": false, "proxy": "", "proxy_randomize_credentials": false},
 		},
-		"relayfee":       0.00001,
-		"incrementalfee": 0.00000001,
+		"relayfee":       "0.00010000",
+		"incrementalfee": "0.00001000",
 		"localaddresses": []interface{}{},
 		"warnings":       "",
 	}, nil
