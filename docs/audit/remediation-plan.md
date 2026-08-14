@@ -53,7 +53,7 @@ here can lag the code.
 | B7 | `fix/rpc-surface` | **RPC-F03–F59** (+ re-decide F37) | `api/handlers.go`, `api/response.go`, `api/order.go`, `api/utxo_select.go`, `api/store.go`, `coins/amount.go`, `api/node.go` | B3, B4 |
 | B8 | `fix/state-machinery` | **STATE-F72–F75** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `swap/transaction.go` | B3 |
 | B9 | `fix/crypto-connectors` | **CRYPTO-F77 (S1), F82, F83, F88, F89, F91, F92** (F98/F99 DOCUMENTED residual: PART/BCD non-portable) | `coins/tx.go`, `coins/coin.go`, `coins/cashaddr.go`, `coins/base58check.go`, `crypto/signer.go`, `api/swap.go`, `api/handlers.go`, `api/utxo_select.go`, `wallet/rpc.go`, `swap/deposit.go` | B3 |
-| B10 | `fix/config-parity` | **CFG-F84–F91** | `config/conf.go`, `cmd/main.go`, `coins/coin.go`, `wallet/conf.go`, `api/node.go`, `api/handlers.go` | B4 |
+| B10 | `fix/config-parity` | **CFG-F84–F91** (F86 DOCUMENTED; F80 folded) | `config/conf.go`, `config/admit.go`, `cmd/xbridged/main.go`, `coins/coin.go`, `wallet/conf.go`, `wallet/activate.go`, `api/node.go`, `api/store.go`, `api/handlers.go`, `api/utxo_select.go`, `api/engine.go` | B4 |
 | B11 | `fix/concurrency` | **CONC-F92–F94** | `api/node.go`, `api/engine.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/persist.go` | B5 |
 
 \* SEC-F03 (taker-trust) has no standalone code — the HTLC composition is sound
@@ -63,10 +63,11 @@ theft. B3 carries the end-to-end refusal test and corrects the attacker model
 in the register.
 
 **Deliberate/documented (no branch):** RPC-F19/F39 (Tier-3 data source),
-WIRE-F65/F66 (hardening/doc), STATE-F76, CONC-F95/F96, CRYPTO-F79/F80/F81
-(thin-client deliberate), INV-F97–F100, STATE-F77/F78, CONC-F97–F102,
-SEC-F01, RPC-F59, CRYPTO-F84/F93–F96 (fixed; regression-covered). Each is
-marked `FIXED`/`DOCUMENTED` in `register.md`.
+WIRE-F65/F66 (hardening/doc), STATE-F76, CONC-F95/F96, CRYPTO-F79 (fee
+fallback; CRYPTO-F80 FIXED on B10), CRYPTO-F81 (address hardening),
+INV-F97–F100, STATE-F77/F78, CONC-F97–F102, SEC-F01, RPC-F59,
+CRYPTO-F84/F93–F96 (fixed; regression-covered), CFG-F86 (never-creates). Each
+is marked `FIXED`/`DOCUMENTED` in `register.md`.
 
 **Status (2026-08-13):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
@@ -83,7 +84,11 @@ split fee model, utxos fixed-8, tokens/conf, getnetworkinfo, gettradingdata
 documented). **B9 merged** (crypto-connectors: CRYPTO-F77 S1 forkid sighash —
 BCH 0xffdead/BTG 79/DEVAULT 0 — F82 RNG, F83 block-hash byte order, F88 BIP143
 live, F89 BTG/DEVAULT classification; F91/F92 RPC payloads; F98/F99 PART/BCD
-documented non-portable). B8, B10, B11 pending.
+documented non-portable). **B10 merged** (config-parity: CFG-F84–F91 — `[Rpc]`
+whitelist, admission gates `config.Admit`, `ExchangeWallets` parsing, exact-case
+keys, CLI flags, `MinimumAmount`/`CashAddrPrefix`/`CreateTxMethod` alignment,
+ExchangeWallets-keyed activation + reachability probe + 30 s sweep + order
+clearing; CFG-F86 documented never-creates). B8, B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -269,14 +274,23 @@ PART/BCD tx formats are non-portable → `CRYPTO-F98`/`CRYPTO-F99` DOCUMENTED
 (deferred); DCR is not in the live manifest (dropped). Branch doc:
 `B9-crypto.md`.
 
-### B10 — `fix/config-parity` — CFG-F84–F91
+### B10 — `fix/config-parity` — CFG-F84–F91 — **DONE, merged to `main`**
 
-Whitelist `[Main]`/`[Rpc]` sections (startup kill); wallet-admission gates
-(locktime/confirmation drift); missing-conf template; hot-reload semantics
-(`ExchangeWallets` keying, gates, non-local order clearing); `ExchangeWallets`
-separator set + validation; case sensitivity; CLI flags (`-enableexchange`,
-`-dxnowallets`, version case); conf-key set alignment (`MinimumAmount`,
-`CashAddrPrefix`, `CreateTxMethod`).
+Conf-parity pass: `[Rpc]`/`[Main]` whitelisted in `config.Load` (F84, a stock
+conf no longer aborts startup); exact-case key/section lookups (F89, boost
+property_tree semantics); `ExchangeWallets` split on `,;:` with
+`ccy::Symbol::validate` (F88); wallet admission gates ported to `config.Admit`
+and applied at startup/reload/sweep via `config.Admitted` (F85); `Title`
+defaults to `""`, `MinimumAmount` is the dust source, the `CashAddrPrefix` conf
+value wins over the method table, ETH/unknown `CreateTxMethod` rejected (F91);
+`-dxnowallets`/`-enableexchange` flags + startup honors `Main.ShowAllOrders`
+(F90, version-case sub-item already fixed on B7). `wallet.Activator` connects
+exactly `[Main].ExchangeWallets` ∩ gates ∩ a live reachability probe (C++
+`updateActiveWallets`, 300 s bad-wallet retry), reload preserves the daemon
+flags + `PersistSecrets`, clears non-local orders unless ShowAllOrders, and a
+30 s sweep re-probes in-memory settings (F87). CFG-F86 is DOCUMENTED — the
+never-creates hard rule stands; the daemon requires an existing conf. Branch
+doc: `B10-config.md`.
 
 ### B11 — `fix/concurrency` — CONC-F92–F94
 

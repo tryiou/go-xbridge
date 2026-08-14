@@ -138,7 +138,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | CRYPTO-F77 | S1 | BCH forkid `0x41` sighash missing in Go local signing | FIXED | B9 `fix/crypto-connectors`: parameterized BIP143 digest + forkid signing (fork value 0xffdead for live BCH mainnet replay protection, bch.cpp:203-209/497-499; DEVAULT 0, BTG 79) wired into `buildRefundTx`/`redeemCounterparty`/`DepositSpec.SignInput` via `SignTxInputForCoin`; DER byte 0x41; `TestBCHRefundForkidSigned`, `TestHashForSigningForkID`, `TestSignTxInputForCoinDispatch`, `TestForkidSignatureHashMatchesCpp` (parity oracle transcription of bch.cpp:191-256/btg.cpp:118-207) |
 | CRYPTO-F78 | S2 | Deposit tx fee formula `minTxFee1(nIn,3)` vs Go `estimateFee(nIn,2)` | FIXED | B3 `fix/deposit-path`: `estimateFee(cc, nIn, 3)` at `api/swap.go` (`(192nIn+102)·FeePerByte`, C++ `xbridgesession.cpp:1994/:2526`); `TestEstimateFeeMatchesCppVsize` |
 | CRYPTO-F79 | S3 | Fee fallback: C++ 0 vs Go 2 sat/vB when FeePerByte unset | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
-| CRYPTO-F80 | S3 | Go honors `DustAmount` conf key C++ never reads | DOCUMENTED | deliberate thin-client (`api.md` Tier-3) |
+| CRYPTO-F80 | S3 | Go honors `DustAmount` conf key C++ never reads | FIXED | B10: the dust source moved to `MinimumAmount` (C++ maps it onto the exchange wallets' `dustAmount`, xbridgeexchange.cpp:145); `DustAmount` is now parsed-but-unread, matching C++ (createConf-template key); `TestEffectiveDust` |
 | CRYPTO-F81 | S3 | Address decoding strictness differs (base58check version byte, cashaddr) | DOCUMENTED | deliberate hardening (`api.md` Tier-3) |
 | CRYPTO-F82 | S4 | RNG top-bit bias in Go private-key generation | FIXED | B9: `crypto.NewPrivateKey` full-range 256-bit with retry into [1, N-1] (C++ `makeNewKey`, xbridgecryptoproviderbtc.cpp:204-210); `TestNewPrivateKeyFullRange` |
 | CRYPTO-F83 | S3 | Block-hash byte order assumption unverified end-to-end | FIXED | B9: `wallet.revHashHex` pinned against a captured real block hash (Bitcoin genesis) = C++ `base_blob<256>::SetHex` internal bytes (uint256.cpp:27-53); `TestRevHashHexCapturedBlockHash` + parity `TestBlockHashByteOrderMatchesCpp` (oracle transcription) |
@@ -163,14 +163,14 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| CFG-F84 | S2 | `[Rpc]` section in xbridge.conf aborts xbridged at startup | OPEN | B10 |
-| CFG-F85 | S2 | Wallet admission validation gates absent (locktime/confirmation drift) | OPEN | B10 |
-| CFG-F86 | S2 | Missing conf: C++ creates template and runs; Go exits(1) | OPEN | B10 |
-| CFG-F87 | S2 | Hot-reload semantics differ (ExchangeWallets keying, gates, order clearing) | OPEN | B10 |
-| CFG-F88 | S3 | ExchangeWallets parsing differs (`,` `;` `:` + validation) | OPEN | B10 |
-| CFG-F89 | S3 | Case-insensitive keys in Go vs case-sensitive C++ | OPEN | B10 |
-| CFG-F90 | S3 | Missing CLI flags / flag differences (-enableexchange, -dxnowallets, version case) | OPEN | B10 |
-| CFG-F91 | S3 | Go-only conf keys and ignored C++ keys (MinimumAmount, CashAddrPrefix, CreateTxMethod) | OPEN | B10 |
+| CFG-F84 | S2 | `[Rpc]` section in xbridge.conf aborts xbridged at startup | FIXED | B10 `fix/config-parity`: `[Rpc]`/`[Main]` whitelisted in `config.Load` (exact-case; dead section per util/settings.h:49-65); `TestLoadSkipsRpcSection` |
+| CFG-F85 | S2 | Wallet admission validation gates absent (locktime/confirmation drift) | FIXED | B10: `config.Admit` ports xbridgeapp.cpp:1002-1090 (connect check, maker/taker locktime targets incl. slow chains, confirmation drift `max(900/blockTime,4)`, `CreateTxMethod` dispatch); applied via `config.Admitted` at startup/reload/sweep; `TestAdmitGates`, `TestAdmitCreateTxMethod`, `TestAdmittedFilters` |
+| CFG-F86 | S2 | Missing conf: C++ creates template and runs; Go exits(1) | DOCUMENTED | deliberate: go-xbridge never creates the conf (hard rule) — the library AND daemon require an existing xbridge.conf; C++ `createConf` template at xbridgeapp.cpp:306-358; `B10-config.md` |
+| CFG-F87 | S2 | Hot-reload semantics differ (ExchangeWallets keying, gates, order clearing) | FIXED | B10: `wallet.Activator` connects exactly `[Main].ExchangeWallets` ∩ gates ∩ reachability probe (C++ `updateActiveWallets`, xbridgeapp.cpp:917-1214, with the 300 s bad-wallet retry); reload preserves `ForceShowAllOrders`/`CheckReachability`/`PersistSecrets` and clears non-local orders unless ShowAllOrders (`clearNonLocalOrders`, rpcxbridge.cpp:229-233); 30 s sweep (:3674-3677); `TestActivateExchangeWalletsOnly`, `TestActivateProbe`, `TestActivateBadWalletRetry`, `TestReloadAppliesEWKeying`, `TestReloadPrunesUnconnectedOrders`, `TestSweepConnectors`, `TestPruneUnconnected` |
+| CFG-F88 | S3 | ExchangeWallets parsing differs (`,` `;` `:` + validation) | FIXED | B10: split on `,;:` + `ccy::Symbol::validate` (uppercase, len 1..8, no trim, util/settings.cpp:143-166 / currency.h:29-47); `TestExchangeWalletsCppSemantics` |
+| CFG-F89 | S3 | Case-insensitive keys in Go vs case-sensitive C++ | FIXED | B10: exact-case key and `[Main]` lookups (boost property_tree is case-sensitive); `TestCaseSensitiveKeys` |
+| CFG-F90 | S3 | Missing CLI flags / flag differences (-enableexchange, -dxnowallets, version case) | FIXED | B10: `-dxnowallets` (ShowAllOrders override, kept across reload as `ForceShowAllOrders`) + `-enableexchange` (inert compat no-op); daemon now honors `Main.ShowAllOrders` at startup (pre-fix only after a reload); `-walletversionstr` case already fixed in `a0fee1e` (B7) |
+| CFG-F91 | S3 | Go-only conf keys and ignored C++ keys (MinimumAmount, CashAddrPrefix, CreateTxMethod) | FIXED | B10: `Title` default `""` (Settings::get `_T()`, settings.h:75-84 — the findings card had the direction inverted); `MinimumAmount` is the dust source (xbridgeexchange.cpp:145), `DustAmount` template-only; `CashAddrPrefix` conf value wins with C++ fallbacks (bch.cpp:306-308 / devault.cpp:278-280); ETH/unknown `CreateTxMethod` rejected (xbridgeapp.cpp:1043-1090); `TestTitleDefaultsEmpty`, `TestEffectiveDust`, `TestFromConfCashAddrPrefix`, `TestAdmitCreateTxMethod` |
 
 ### CONCURRENCY axis (`CONC-F92`–`CONC-F102`) — evidence: `evidence/concurrency.md`
 
@@ -250,16 +250,24 @@ namespace is the Current register above.
 | S2-H | CRYPTO-F81 | base58check strictness — DOCUMENTED |
 | S2-I | CRYPTO-F77 | BCH forkid sighash — FIXED (B9, fork value 0xffdead) |
 | S2-J | CRYPTO-F89 | coin-family misclassification — FIXED (B9: BTG/DEVAULT; PART/BCD deferred to CRYPTO-F98/F99) |
+| S2-K | CFG-F84 | `[Rpc]` aborts startup — FIXED (B10) |
+| S2-L | CFG-F85 | admission gates absent — FIXED (B10: `config.Admit`) |
+| S2-M | CFG-F86 | missing-conf template — DOCUMENTED (B10: never-creates stance) |
+| S2-N | CFG-F87 | hot-reload semantics — FIXED (B10: EW keying + gates + probe + 30 s sweep + order clearing) |
 | S3-A | RPC-F11 | partial fields `"0"` literal — FIXED (B7) |
 | S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — FIXED (B7) |
 | S3-C | RPC-F31 | locked-utxos amount format — FIXED (B7) |
 | S3-D | RPC-F28 | `p2sh_deposits` alignment — FIXED (B7) |
 | S3-E | RPC-F55 | new-token-address `[]` vs error — FIXED (B7) |
-| S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
+| S3-F | CRYPTO-F79 | fee fallback 0 vs 2 sat/vB — DOCUMENTED; CRYPTO-F80 dust key — FIXED (B10: `MinimumAmount`) |
 | S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — FIXED (B9) |
 | S3-I | CRYPTO-F92 | secret-from-payTx input scan — FIXED (B9) |
 | S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B8) |
+| S3-K | CFG-F88 | `ExchangeWallets` parsing — FIXED (B10) |
+| S3-L | CFG-F89 | case-insensitive keys — FIXED (B10: exact-case) |
+| S3-M | CFG-F90 | CLI flags — FIXED (B10: `-dxnowallets`/`-enableexchange`; version case done B7) |
+| S3-N | CFG-F91 | conf-key set alignment — FIXED (B10: Title, MinimumAmount, CashAddrPrefix, CreateTxMethod) |
 | S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 
 ---

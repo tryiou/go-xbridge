@@ -517,7 +517,7 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: C++ dust comes only from `0.546·relayFee·COIN` or `MinimumAmount`.
 - CAND: `api/handlers.go:1453` reads a `DustAmount` key.
 - IMPACT: a conf with DustAmount produces different dust thresholds between the two daemons.
-- FIX: remove the Go-only key or implement the C++ dust formula.
+- FIX (B10): the Go dust source moved to `MinimumAmount` (C++ maps it onto the exchange wallets' `dustAmount`, xbridgeexchange.cpp:145); `DustAmount` is parsed-but-unread (createConf-template key), matching C++; `TestEffectiveDust`.
 
 ### CRYPTO-F81 · S3 · CRYPTO · Address decoding strictness differences
 - REF: C++ is lenient — `toXAddr` erases the cashaddr prefix unconditionally and accepts hash lengths up to 64 bytes; base58check prefix mismatches tolerated.
@@ -544,49 +544,49 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: `util/settings.h:49-65` — `Rpc.*` keys defined but never read (dead section).
 - CAND: `config/conf.go:111-118` — every non-Main section is parsed as a coin; a stock config with `[Rpc]` → `"COIN not set"` fatal (`coins/coin.go:87-89`, `cmd/xbridged/main.go:163-165`).
 - IMPACT: a config C++ runs fine with kills go-xbridge at startup.
-- FIX: whitelist `[Main]`/`[Rpc]` sections in Go config parsing.
+- FIX (B10): whitelist `[Main]`/`[Rpc]` in `config.Load` (exact-case); `TestLoadSkipsRpcSection`.
 
 ### CFG-F85 · S2 · CONFIG · Wallet admission validation gates absent in Go
 - REF: `xbridgeapp.cpp:1002-1040` — drops wallets failing maker/taker locktime targets, confirmation drift, reachability; BlockTime==0 gate at `:1002-1006`.
 - CAND: `wallet/conf.go:15-17`, `coins/coin.go:87-89` — only Ip/Port/COIN presence.
 - IMPACT: coins C++ refuses to load trade in Go (potentially unsafe locktimes).
-- FIX: port the admission gates.
+- FIX (B10): new `config.Admit` (connect check, maker/taker targets incl. slow chains, confirmation drift `max(900/blockTime,4)`, `CreateTxMethod` dispatch) + `config.Admitted`, applied at startup/reload/sweep; constants single-sourced in `config` (`xbridgewallet.h:96-102`); `TestAdmitGates`, `TestAdmitCreateTxMethod`, `TestAdmittedFilters`.
 
 ### CFG-F86 · S2 · CONFIG · Missing conf: C++ creates template and runs; Go exits(1)
 - REF: `init.cpp:1920`, `settings.cpp:75-79` — creates the default xbridge.conf and continues.
 - CAND: `config/conf.go:98-103`, `cmd/xbridged/main.go:159-162` — exits(1).
 - IMPACT: first-run behavior differs; a dApp's unattended Go daemon fails to start.
-- FIX: create the template or start with defaults.
+- FIX (B10): **DOCUMENTED** — the never-creates hard rule stands (library AND daemon require an existing conf); C++ `createConf` template at `xbridgeapp.cpp:306-358` is not ported (`B10-config.md`).
 
 ### CFG-F87 · S2 · CONFIG · Hot-reload semantics differ
 - REF: reload re-applies admission gates, drops wallets leaving ExchangeWallets, clears non-local orders, keeps prior state on failure (`rpcxbridge.cpp:229-233`; `xbridgeapp.cpp:931-948,3811-3826`).
 - CAND: `api/node.go:287-334` — atomic last-good on failure; keys connectors off ALL `[TICKER]` sections (never ExchangeWallets); no gates; never clears non-local orders.
 - IMPACT: post-reload state differs (wallet set, gates, stale orders).
-- FIX: port gates, ExchangeWallets-based keying, and non-local order clearing.
+- FIX (B10): `wallet.Activator` connects exactly `[Main].ExchangeWallets` ∩ gates ∩ reachability probe (`updateActiveWallets` `xbridgeapp.cpp:917-1214`, 300 s bad-wallet retry); reload preserves `ForceShowAllOrders`/`CheckReachability`/`PersistSecrets` and clears non-local orders via `Store.PruneUnconnected` unless ShowAllOrders (`clearNonLocalOrders`, `rpcxbridge.cpp:229-233`); 30 s sweep re-probes in-memory settings (`:3674-3677`), guarded against clobbering a reload; `TestActivateExchangeWalletsOnly`, `TestActivateProbe`, `TestActivateBadWalletRetry`, `TestReloadAppliesEWKeying`, `TestReloadPrunesUnconnectedOrders`, `TestSweepConnectors`, `TestPruneUnconnected`.
 
 ### CFG-F88 · S3 · CONFIG · ExchangeWallets parsing differs
 - REF: `util/settings.cpp:143-166` — splits on `,` `;` `:` with symbol validation/uppercase.
 - CAND: `config/conf.go:232-249` — splits on `,` only, no validation.
 - IMPACT: wallets list parsed differently for `;`-separated configs.
-- FIX: port the separator set + validation.
+- FIX (B10): split on `,;:` + `ccy::Symbol::validate` (uppercase, len 1..8, no trim, `currency.h:29-47`); `TestExchangeWalletsCppSemantics`.
 
 ### CFG-F89 · S3 · CONFIG · Case-insensitive keys in Go vs case-sensitive C++
 - REF: boost property_tree is case-sensitive (`COIN` ≠ `coin`).
 - CAND: `config/conf.go:112,169` — case-insensitive lookups.
 - IMPACT: configs with wrong-cased keys are silently accepted by Go.
-- FIX: match C++ case sensitivity.
+- FIX (B10): exact-case key + `[Main]` lookups; `TestCaseSensitiveKeys`.
 
 ### CFG-F90 · S3 · CONFIG · Missing CLI flags / flag differences
 - REF: `-enableexchange`, `-dxnowallets` (`init.cpp:572`; `xbridgeapp.cpp:372`).
 - CAND: no equivalents; ShowAllOrders only via programmatic `api.Config` (`api/node.go:78-81`); `-walletversionstr` default lowercase `"/blocknet:4.4.1/"` vs C++ `"/Blocknet:4.4.1/"`.
 - IMPACT: operator can't toggle exchange mode / show-all via CLI; version string differs.
-- FIX: add the CLI flags; fix the version-string case.
+- FIX (B10): `-dxnowallets` (ShowAllOrders override, kept across reload as `Config.ForceShowAllOrders`) + `-enableexchange` (inert compat no-op); daemon honors `Main.ShowAllOrders` at startup (pre-fix only after a reload). The `-walletversionstr` case sub-item was already fixed in `a0fee1e` (B7).
 
 ### CFG-F91 · S3 · CONFIG · Go-only conf keys and ignored C++ keys
-- REF: C++ never reads `DustAmount`, `GetNewKeySupported`, `ImportWithNoScanSupported`, `OmitJSONVersion`; C++ reads `MinimumAmount` (`xbridgeexchange.cpp:124,145`) and `CashAddrPrefix`; C++ `AddressPrefix` is a string (`xbridgewalletconnectorbtc.cpp:1516-1518`) vs Go int; C++ `Title` defaults to section name vs Go `""`; C++ rejects ETH/unknown `CreateTxMethod` (`xbridgeapp.cpp:1043-1090`) while Go silently maps to BTC (`coins/coin.go:107-113`); Go ignores the `CashAddrPrefix` conf value (`coins/coin.go:99,119-126`).
+- REF: C++ never reads `DustAmount`, `GetNewKeySupported`, `ImportWithNoScanSupported`, `OmitJSONVersion`; C++ reads `MinimumAmount` (`xbridgeexchange.cpp:124,145`) and `CashAddrPrefix`; C++ `AddressPrefix` is a string (`xbridgewalletconnectorbtc.cpp:1516-1518`) vs Go int; C++ `Title` defaults to `""` on a missing key (`Settings::get` `_T()`, `settings.h:75-84`) — NOT the section name (this card previously had the direction inverted); C++ rejects ETH/unknown `CreateTxMethod` (`xbridgeapp.cpp:1043-1090`) while Go silently maps to BTC (`coins/coin.go:107-113`); Go ignores the `CashAddrPrefix` conf value (`coins/coin.go:99,119-126`).
 - CAND: Go reads `DustAmount` + `OmitJSONVersion` (used), `GetNewKeySupported`/`ImportWithNoScanSupported` (inert); ignores `MinimumAmount` and the `CashAddrPrefix` value.
 - IMPACT: config surface accepts keys the reference never reads and drops keys the reference uses; behavior on ETH/unknown method diverges.
-- FIX: align the accepted-key set and defaults with C++; honor `MinimumAmount` and `CashAddrPrefix`; reject ETH/unknown CreateTxMethod.
+- FIX (B10): `Title` default `""`; `effectiveDust`/`isDustNative` use `MinimumAmount` (folded `CRYPTO-F80`; `DustAmount` parsed-but-unread, template-only); `coins.FromConf` honors the `CashAddrPrefix` conf value with C++'s fallbacks (`bch.cpp:306-308`/`devault.cpp:278-280`); `config.Admit` rejects ETH/unknown `CreateTxMethod`; `TestTitleDefaultsEmpty`, `TestEffectiveDust`, `TestFromConfCashAddrPrefix`, `TestAdmitCreateTxMethod`.
 
 ---
 
