@@ -108,6 +108,15 @@ func main() {
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
 	persistSecrets := flag.Bool("persistsecrets", true, "persist per-trade M keypair/secret/pre-signed refund in the swap-state file (default true; C++ orders.dat parity); false keeps the file secret-free, but a restarted mid-flight swap cannot auto-refund or re-sign cancels")
 	rpcServerTimeout := flag.Int("rpcservertimeout", 30, "timeout in seconds for HTTP RPC requests (C++ DEFAULT_HTTP_SERVER_TIMEOUT parity)")
+	// -dxnowallets mirrors C++ gArgs.GetBoolArg("-dxnowallets",
+	// settings().showAllOrders()) (xbridgeapp.cpp:372): show all orders across
+	// the network regardless of local wallets, overriding Main.ShowAllOrders.
+	dxnowallets := flag.Bool("dxnowallets", false, "show all orders across the network for non-local wallets (C++ -dxnowallets; overrides Main.ShowAllOrders)")
+	// -enableexchange mirrors C++'s flag of the same name (init.cpp:569). It
+	// gates Exchange::isEnabled on a service node (settings.cpp:45); xbridged
+	// is not a service node and exchange mode is inherent to it, so the flag is
+	// accepted for blocknetd CLI parity and is a no-op.
+	enableExchange := flag.Bool("enableexchange", false, "accepted for blocknetd CLI parity; exchange mode is inherent for xbridged (no-op)")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -209,6 +218,14 @@ func main() {
 		DataDir:          dataDir,
 		ConfPath:         *confPath,
 		PersistSecrets:   *persistSecrets,
+		// ShowAllOrders follows the conf unless -dxnowallets overrides it
+		// (C++ showAllOrders() / -dxnowallets, xbridgeapp.cpp:372). Pre-fix
+		// the daemon ignored Main.ShowAllOrders entirely until a reload.
+		ShowAllOrders:      conf.Main.ShowAllOrders || *dxnowallets,
+		ForceShowAllOrders: *dxnowallets,
+		// Reachability probe on (faithful updateActiveWallets); disabled in
+		// tests only.
+		CheckReachability: true,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {
@@ -244,10 +261,12 @@ func main() {
 
 	if *nodeAddr != "" {
 		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "explicit",
-			"node", *nodeAddr, "network", *network, "conf", *confPath, "coins", len(conf.Coins))
+			"node", *nodeAddr, "network", *network, "conf", *confPath, "coins", len(conf.Coins),
+			"showallorders", cfg.ShowAllOrders, "enableexchange", *enableExchange)
 	} else {
 		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "discovery",
-			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
+			"network", *network, "conf", *confPath, "coins", len(conf.Coins),
+			"showallorders", cfg.ShowAllOrders, "enableexchange", *enableExchange)
 	}
 	// httpSrv is kept by name so shutdown can drain in-flight RPC handlers
 	// (srv.Shutdown) instead of exiting under them. Timeouts (RPC-F58): the

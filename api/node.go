@@ -79,6 +79,19 @@ type Config struct {
 	// when true, dxGetOrders shows every order regardless of whether a wallet
 	// connector exists for its currencies (rpcxbridge.cpp:432-446).
 	ShowAllOrders bool
+	// ForceShowAllOrders is the -dxnowallets command-line override (C++
+	// gArgs.GetBoolArg("-dxnowallets", ...), xbridgeapp.cpp:372). It is kept
+	// separate from ShowAllOrders so a dxLoadXBridgeConf hot-reload can
+	// recompute ShowAllOrders from the reloaded conf while preserving the
+	// daemon-level flag, which C++ also keeps across reloads.
+	ForceShowAllOrders bool
+	// CheckReachability probes each activated wallet connector (C++
+	// conn->init() ≈ a wallet RPC round-trip) at startup and on reload and the
+	// periodic sweep, dropping connectors whose wallet is unreachable. The
+	// daemon enables it; tests keep it off so hermetic fixtures need no live
+	// wallet. Mirrors updateActiveWallets' valid/bad connection split
+	// (xbridgeapp.cpp:1104-1200).
+	CheckReachability bool
 	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
 	// Network is the Blocknet network to discover on: "mainnet" (default),
