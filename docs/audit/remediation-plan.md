@@ -77,7 +77,10 @@ F67–F70 — caps, magic/version/checksum gates, canonical varint, snl echo,
 regtest rename, cmd2/50 removal). **B4 merged** (http hardening: RPC-F01/F02,
 F47–F52/F58 — transport status routing, bare method-not-found, 32 MiB cap,
 always-auth + rpcauth, batch/named, strict params + NO_SESSION name, arity
-gates). B7–B11 pending.
+gates). **B7 merged** (RPC response-surface: RPC-F03–F57, F59 — order/filter,
+cancel codes, make/take shape, order-history OHLCV, order-book bump/nesting,
+split fee model, utxos fixed-8, tokens/conf, getnetworkinfo, gettradingdata
+documented). B8–B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -227,7 +230,7 @@ RPC bodies from debug logs (`api/swap.go:383,485,545,650`,
 `wallet/rpc.go:129,138`). See `remediation/B6-secrets.md`. Tests:
 `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`.
 
-### B7 — `fix/rpc-surface` — RPC-F03–F59 (RPC S2/S3 set)
+### B7 — `fix/rpc-surface` — RPC-F03–F59 (RPC S2/S3 set) — **DONE, merged to `main`**
 
 The RPC semantic pass: ordering (RPC-F03), boundary (RPC-F04), `uint256S`
 parser (RPC-F05/RPC-F06), cancel ordering/codes (RPC-F07/RPC-F08), make-order

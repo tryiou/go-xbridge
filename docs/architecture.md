@@ -411,8 +411,9 @@ against the C++ `dx*` contract — run it after touching the port or C++ XBridge
 - **Fidelity over shortcuts.** Byte-for-byte 1:1 with the C++ wire contract;
   validate against live captured packets and the C++ writers, not header
   comments.
-- Amounts are base units of `COIN = 1_000_000`; `dx*` amounts display as
-  **6-decimal** fixed strings (matches C++ `setprecision(6)`).
+- Amounts are base units of the coin's `COIN` (XBridge scale 1e6; BTC 1e8);
+  `dx*` amounts display with `xBridgeSignificantDigits(COIN)` fractional digits
+  (8 for COIN=1e8, 6 for COIN=1e6).
 - Run `gofmt` before committing; keep logic / style / refactor in separate
   commits.
 

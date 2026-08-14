@@ -1,6 +1,7 @@
 # B7 — RPC response-surface parity (RPC-F03..F57, F59)
 
 Branch: `fix/rpc-surface` (off `main` @ B4 merge `d7394ee`).
+Status: MERGED into `main` @ `<merge-commit-hash>`.
 C++ reference: Blocknet Core @ `ac930b7f8` (v4.4.1 era).
 Go subject: `api/response.go`, `api/handlers.go`, `api/order.go`,
 `api/store.go`, `api/node.go`, `coins/amount.go` (45 OPEN findings — F19,
@@ -106,9 +107,13 @@ confirmed conforming at HEAD and are pinned by tests only.
   50 (`src/xrouter/version.h`); `relayfee`/`incrementalfee` are **strings**
   (`ValueFromAmount`, 8-decimal fixed: `"0.00010000"` / `"0.00001000"`);
   `networks[]` entries carry `proxy_randomize_credentials` (false here).
-- **F17 — history time is end-based.** Row = `ArrayIL{ iso8601(x.timeEnd -
-  offset), low, high, open, close, volume }` where offset = granularity only for
-  `at_start` (default `at_end`, offset 0). Volume = **from/maker side**.
+- **F17 — history row time is the bucket START.** C++ emits
+  `ArrayIL{ iso8601(x.timeEnd - offset), low, high, open, close, volume }`
+  (rpcxbridge.cpp:681-682) where offset = granularity for `at_start` (the
+  DEFAULT `interval_timestamp`) and 0 for `at_end`; so with the default the
+  row timestamp is `x.timeEnd - granularity` = the bucket start. Go emits
+  `iso8601(bucketStart * 1e6)` (handlers.go:742-748), matching. Volume =
+  **from/maker side**.
 - **F04/F26 — txtime source.** Go `Order` has no `Txtime` field; the store
   tracks `Created`/`Updated` only. C++ `txtime` is the **last-update** time
   (mutated by `updateTimestamp`, xbridgetransactiondescr.h:630-634), so for
@@ -134,13 +139,14 @@ confirmed conforming at HEAD and are pinned by tests only.
 - **DOCUMENTED divergences (no code change)** — F23/F24 (no synthesized
   `"Wallet"` key; C++ ticker order is race-dependent), F37 (gettradingdata
   alias deliberately absent), F38/F39 (trading-data needs a 43200-block/30-day
-  on-chain scan the thin client cannot do). Each gets a register row +
+  on-chain scan the thin client cannot do). Each has a register row +
   rationale.
-- **Scope** — STATE-F79 and CRYPTO-F89 are tagged Owner B7 in the register but
-  belong to B8 / B9; G15 reassigns their owners instead of expanding scope.
-- **Doc correction** — CLAUDE.md + AGENTS.md "6-decimal fixed" rule is stale
-  for `COIN=1e8` coins; display precision is `xBridgeSignificantDigits(COIN)`
-  (digit-count of COIN). Fixed at G15.
+- **Scope** — STATE-F79 and CRYPTO-F89 were tagged Owner B7 in the register but
+  belong to B8 / B9; G15 reassigned them (STATE-F79 → B8, CRYPTO-F89 → B9,
+  SEC-F02 → B8) instead of expanding scope.
+- **Doc correction (done at G15)** — CLAUDE.md + AGENTS.md + `docs/architecture.md`
+  + `docs/api.md` "6-decimal fixed" rule was stale for `COIN=1e8` coins; display
+  precision is `xBridgeSignificantDigits(COIN)` (digit-count of COIN).
 
 ## Tests
 

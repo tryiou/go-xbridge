@@ -76,10 +76,11 @@ The HTTP transport matches the C++ `httprpc.cpp` conventions (audit branch B4
 
 ## Response conventions
 
-- **Amounts** are fixed **6-decimal strings** (base units of `COIN = 1_000_000`),
-  truncating: `"1.500000"`. (Exceptions: `dxGetUtxos`/`dxGetLockedUtxos` amounts
-  are native-decimal with trailing zeros trimmed, and `dxGetTokenBalances`
-  rounds — see [audit/register.md](audit/register.md) RPC-F44/RPC-F31.)
+- **Amounts** are fixed **6-decimal strings** (XBridge scale `TransactionDescr::COIN` = 1e6),
+  truncating: `"1.500000"`. (Exceptions: `dxGetUtxos` amounts are fixed to the
+  coin's `COIN` decimals — `"1.00000000"` for BTC (RPC-F44); `dxGetLockedUtxos`
+  uses C++ default-double rendering (RPC-F31); `dxGetTokenBalances` renders
+  fixed-6 — see [audit/register.md](audit/register.md).)
 - **Timestamps** are ISO-8601 strings with millisecond precision:
   `"2026-08-07T12:00:00.000Z"`.
 - **Order ids** are 64-hex strings in display order.

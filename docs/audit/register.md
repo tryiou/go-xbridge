@@ -39,26 +39,26 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 |---|---|---|---|---|
 | RPC-F01 | S2 | Error-channel policy: C++ *throws* envelope errors for param/type errors; Go returns business results | FIXED | B4 `fix/http-hardening` (strict parsers, envelope −1/−3, read-order, `limit` param; `TestStrictParamEnvelopeErrors`, `TestRpcTypeCheckErrors`) — no string coercion |
 | RPC-F02 | S2 | `NO_SESSION` error `name` hardcoded `"dx"` instead of the method name | FIXED | B4 `fix/http-hardening` (`TestNoSessionNameIsMethodName`) |
-| RPC-F03 | S2 | `dxGetOrders` array order random (Go map) vs id-ascending (C++ std::map) | OPEN | B7 |
-| RPC-F04 | S3 | `dxGetOrders` 60 s filter boundary (µs-exact vs second-truncated) | OPEN | B7 |
-| RPC-F05 | S2 | Exactly-64-hex id gate vs C++ `uint256S` left-pad/truncate tolerance | OPEN | B7 |
-| RPC-F06 | S3 | `dxGetOrder` not-found message renders id raw vs zero-padded | OPEN | B7 |
-| RPC-F07 | S3 | `dxCancelOrder` cancels *before* validating connectors (side-effect order) | OPEN | B7 |
-| RPC-F08 | S3 | `dxCancelOrder` cancel-failure error codes/text set differs (incl. isLocal→1021) | OPEN | B7 |
-| RPC-F09 | S2 | `dxMakeOrder` response field ORDER differs (updated/created swapped; addresses/block_id last) | OPEN | B7 |
-| RPC-F10 | S2 | `dxMakeOrder`/`dxMakePartialOrder` dryrun returns real id + extra fields vs C++ zero id | OPEN | B7 |
-| RPC-F11 | S2 | `dxMakeOrder` non-partial `partial_*` values: literal `"0"` vs `"0.000000"` | OPEN | B7 |
-| RPC-F12 | S3 | `dxMakeOrder` `NO_SERVICE_NODE` message includes the pair; C++ bare | OPEN | B7 |
-| RPC-F13 | S2 | `dxMakePartialOrder` dust gate: 1e6-scale minFrom vs native 1e8-scale dust | OPEN | B7 |
-| RPC-F14 | S2 | `dxTakeOrder` explicit amount `"0"` is a full take in Go, error 1025 in C++ | OPEN | B7 |
-| RPC-F15 | S3 | `dxTakeOrder` error texts/names leak (`INVALID_ADDRESS` text, `name` "dxMakeOrder") | OPEN | B7 |
-| RPC-F16 | S2 | `dxGetOrderHistory` sums the WRONG asset volume (taker vs from/maker) | OPEN | B7 |
-| RPC-F17 | S2 | `dxGetOrderHistory` encoding: shortest-roundtrip floats vs C++ fixed-8; raw ratio vs 1e-6-quantized price | OPEN | B7 |
-| RPC-F18 | S2 | `dxGetOrderHistory` validation missing (granularity whitelist, end≤start, limit) | OPEN | B7 |
+| RPC-F03 | S2 | `dxGetOrders` array order random (Go map) vs id-ascending (C++ std::map) | FIXED | B7 `fix/rpc-surface` (`orderIDLess` LSB-first byte sort, C++ `std::map<uint256>` order — `TestDxGetOrdersSortedById`, `TestOrderIDLess`) |
+| RPC-F04 | S3 | `dxGetOrders` 60 s filter boundary (µs-exact vs second-truncated) | FIXED | B7 `fix/rpc-surface` (second-truncated on creation time — `TestDxGetOrdersSixtySecondBoundary`) |
+| RPC-F05 | S2 | Exactly-64-hex id gate vs C++ `uint256S` left-pad/truncate tolerance | FIXED | B7 `fix/rpc-surface` (tolerant `parseOrderIDS` — `TestParseOrderIDS`, `TestDxCancelOrderShortId`) |
+| RPC-F06 | S3 | `dxGetOrder` not-found message renders id raw vs zero-padded | FIXED | B7 `fix/rpc-surface` (zero-padded 64-hex not-found id — `TestDxGetOrderNotFoundPadded`) |
+| RPC-F07 | S3 | `dxCancelOrder` cancels *before* validating connectors (side-effect order) | FIXED | B7 `fix/rpc-surface` (connectors validated before cancel side effects — `TestDxCancelOrderSideEffectBeforeValidation`) |
+| RPC-F08 | S3 | `dxCancelOrder` cancel-failure error codes/text set differs (incl. isLocal→1021) | FIXED | B7 `fix/rpc-surface` (C++ codes/texts incl. isLocal→1021 — `TestDxCancelOrderFromConnectorGate`, `TestDxCancelOrderNonLocal`, `TestDxCancelOrderNotFoundPadded`) |
+| RPC-F09 | S2 | `dxMakeOrder` response field ORDER differs (updated/created swapped; addresses/block_id last) | FIXED | B7 `fix/rpc-surface` (flat Layout B make-order struct, C++ insertion order — `TestMakeOrderResponseLayoutB`) |
+| RPC-F10 | S2 | `dxMakeOrder`/`dxMakePartialOrder` dryrun returns real id + extra fields vs C++ zero id | FIXED | B7 `fix/rpc-surface` (dryrun zero-id 14-field — `TestMakeDryrunResponse`) |
+| RPC-F11 | S2 | `dxMakeOrder` non-partial `partial_*` values: literal `"0"` vs `"0.000000"` | FIXED | B7 `fix/rpc-surface` (Layout B `"0.000000"` literals — `TestMakeOrderResponseLayoutB`) |
+| RPC-F12 | S3 | `dxMakeOrder` `NO_SERVICE_NODE` message includes the pair; C++ bare | FIXED | B7 `fix/rpc-surface` (bare `NO_SERVICE_NODE` — `TestMakeOrderResponseLayoutB`) |
+| RPC-F13 | S2 | `dxMakePartialOrder` dust gate: 1e6-scale minFrom vs native 1e8-scale dust | FIXED | B7 `fix/rpc-surface` (native-scale dust gate — `TestMakePartialDustNativeScale`) |
+| RPC-F14 | S2 | `dxTakeOrder` explicit amount `"0"` is a full take in Go, error 1025 in C++ | FIXED | B7 `fix/rpc-surface` (explicit 0 → 1025 — `TestDxTakeOrderFullTake`) |
+| RPC-F15 | S3 | `dxTakeOrder` error texts/names leak (`INVALID_ADDRESS` text, `name` "dxMakeOrder") | FIXED | B7 `fix/rpc-surface` (C++ address text + `name` `"dxTakeOrder"` — `TestTakeOrderBadAddressMessage`, `TestTakeOrderNotFoundBare`) |
+| RPC-F16 | S2 | `dxGetOrderHistory` sums the WRONG asset volume (taker vs from/maker) | FIXED | B7 `fix/rpc-surface` (from/maker volume side — `TestDxGetOrderHistoryInverse`) |
+| RPC-F17 | S2 | `dxGetOrderHistory` encoding: shortest-roundtrip floats vs C++ fixed-8; raw ratio vs 1e-6-quantized price | FIXED | B7 `fix/rpc-surface` (fixed-8 OHLCV + 1e-6-quantized price; row time = bucket START per default `interval_timestamp=at_start` — `TestQuantizePrice`, `TestXFloat`, `TestDxGetOrderHistory*`) |
+| RPC-F18 | S2 | `dxGetOrderHistory` validation missing (granularity whitelist, end≤start, limit) | FIXED | B7 `fix/rpc-surface` (granularity whitelist, end≤start, limit — `TestDxGetOrderHistoryValidations`, `TestDxGetOrderHistoryLimitTail`) |
 | RPC-F19 | S2 | `dxGetOrderHistory` data source: fills store never written → always empty | DOCUMENTED | Tier-3 (session-local fills, `api.md`) |
-| RPC-F20 | S3 | `dxGetOrderBook` price formula omits C++ +1/COIN bump | OPEN | B7 |
-| RPC-F21 | S3 | `dxGetOrderBook` equal-best-price tie-break nondeterministic | OPEN | B7 |
-| RPC-F22 | S3 | `dxGetOrderBook` int-width (Go `int` vs C++ int64_t) | OPEN | B7 |
+| RPC-F20 | S3 | `dxGetOrderBook` price formula omits C++ +1/COIN bump | FIXED | B7 `fix/rpc-surface` (+1/COIN price bump — `TestDxGetOrderBookPriceBump`) |
+| RPC-F21 | S3 | `dxGetOrderBook` equal-best-price tie-break nondeterministic | FIXED | B7 `fix/rpc-surface` (deterministic `orderIDLess` tie-break — `TestDxGetOrderBookTieBreak`) |
+| RPC-F22 | S3 | `dxGetOrderBook` int-width (Go `int` vs C++ int64_t) | FIXED | B7 `fix/rpc-surface` (int64 width, `TestDxGetOrderBook*`) |
 | RPC-F23 | S2 | `dxGetTokenBalances` `"Wallet"` key derivation/presence differ | DOCUMENTED | no synthesized `Wallet` key — thin client exposes the BLOCK connector balance under its ticker (deliberate, `B7-rpc.md`) |
 | RPC-F24 | S3 | `dxGetTokenBalances` key order (Go map-sorted, Wallet last) | DOCUMENTED | C++ ticker order is race-dependent thread-completion order (non-conformable; same decision as F23) |
 | RPC-F25 | S3 | `dxGetTokenBalances` precision (C++ per-UTXO double sum vs Go exact integer) | FIXED | B7 `fix/rpc-surface` (golden `TestDxGetTokenBalancesSum`; agreement to the 6th decimal) |
@@ -93,7 +93,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F54 | S3 | `dxGetNetworkTokens` membership: Go unions config; C++ pure SN service union | FIXED | B7 `fix/rpc-surface` (pure SN service union via `Registry.WalletServices()`; config `NetworkTokens`/`ExchangeWallets` no longer contribute — `TestDxTokenListsFromConf`, `TestDxGetNetworkTokensLive`) |
 | RPC-F55 | S3 | `dxGetNewTokenAddress` error path returns `[]` in C++, business 1002 in Go | FIXED | B7 `fix/rpc-surface` (GetNewAddress failure -> empty array, C++ `getNewTokenAddress()` empty-string (rpcxbridge.cpp:186-190) — `TestDxGetNewTokenAddressGetNewAddrError`) |
 | RPC-F56 | S3 | `dxLoadXBridgeConf` reload failure shape and side effects differ | FIXED | B7 `fix/rpc-surface` (reload failure returns `false` result, not a business error — C++ `uret(success)` (rpcxbridge.cpp:229-234) — `TestDxLoadConfFailureFalse`, `TestDxLoadConfHotReloadMissingPath`); coin/connector rebuild side effects in `Node.reloadConf`; non-local-order clearing (`clearNonLocalOrders`, :232-233) tracked under B10 `fix/config-parity` |
-| RPC-F57 | S2 | `dxGetOrderBook` detail-4 nesting `[[…]]` vs flat | OPEN | B7 |
+| RPC-F57 | S2 | `dxGetOrderBook` detail-4 nesting `[[…]]` vs flat | FIXED | B7 `fix/rpc-surface` (detail-4 `[[…]]` nesting — `TestDxGetOrderBookDetail`) |
 | RPC-F58 | S2 | HTTP auth/timeout hardening missing | FIXED | B4 `fix/http-hardening` (`-rpcservertimeout` + `http.Server` read/write/header/idle timeouts) |
 | RPC-F59 | S3 | `dxGetMyPartialOrderChain` unknown/malformed id handling | FIXED | B7 (bad-order-id) |
 
@@ -129,7 +129,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | STATE-F76 | S4 | Live handshake uses separate `clientState`, not ported `swap.State` | DOCUMENTED | internal choice (`findings.md`) |
 | STATE-F77 | S2 | Post-completion handshake retransmit re-broadcasts deposit/claim | FIXED | state guards (`swap_guard_test.go`) |
 | STATE-F78 | S2 | Handshake inbound packets re-verified against pinned hub key, no TOFU | FIXED | hub-key pinning (`swap.go`) |
-| STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | OPEN | B7 |
+| STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | OPEN | B8 |
 
 ### CRYPTO axis (`CRYPTO-F77`–`CRYPTO-F97`) — evidence: `evidence/crypto.md`
 
@@ -147,7 +147,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | CRYPTO-F86 | S2 | `buildDeposit` broadcasts before building the refund | FIXED | B3 `fix/deposit-path`: sign → local txid → refund → broadcast; `TestDepositNotBroadcastWhenRefundFails` |
 | CRYPTO-F87 | S2 | Deposit re-runs `ListUnspent` instead of `xtx->usedCoins` | FIXED | B3 `fix/deposit-path`: `Order.UsedCoins` recorded at make/take, `swapCtx.funding` snapshot consumed by `buildDeposit`; `TestDepositSpendsUsedCoins` |
 | CRYPTO-F88 | S3 | Segwit/BIP143 signing dead code; bech32 re-encoded legacy | OPEN | B9 |
-| CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | OPEN | B7 |
+| CRYPTO-F89 | S3 | Coin-family misclassification / missing connectors (DEVAULT, DCR, PART, BTG) | OPEN | B9 |
 | CRYPTO-F90 | S3 | Refund/payment payout model (fee2 margin, oOverpayment) | FIXED | B3 `fix/deposit-path`: claim spends the validated deposit (exact `P2SHNative` at `DepositVout`), refund pays full nominal (fee2 implicit); `OBinTxVout/OBinTxP2SHAmount/OOverpayment` persisted; `TestRedeemCounterpartyPayout` |
 | CRYPTO-F91 | S3 | `signrawtransaction` param payload ("ALL" in privkeys slot) | OPEN | B9 |
 | CRYPTO-F92 | S3 | `secretFromScriptSig` requires 33-byte push | OPEN | B9 |
@@ -200,7 +200,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
 | SEC-F01 | S2 | RPC binds to loopback by default (auth only when both creds set) | FIXED | loopback bind |
-| SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B7 |
+| SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B8 |
 | SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | FIXED | B3 `fix/deposit-path` (composite): validated-deposit refusal kills the theft end-to-end — `TestSecF03CompositeRefusal` (taker refuses a bad A-deposit → Cancel + no B deposit; maker refuses a bad B-deposit at ConfirmA → Cancel + refund rollback). Attacker model corrected: the hostile outcome is **theft**, not recoverable lockup. |
 | SEC-F04 | S2 | Plaintext secrets + debug-log leakage | FIXED | B6 `fix/secrets-hygiene`: `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`. |
 
@@ -240,24 +240,24 @@ namespace is the Current register above.
 | S1-B | CRYPTO-F94 | deposit `SEQUENCE_FINAL` — FIXED |
 | S1-C | CRYPTO-F95 | deposit locks `Amount + fee2` — FIXED |
 | S1-D | CRYPTO-F96 | `nTime` sighash on time-field coins — FIXED |
-| S2-A | RPC-F57 | order-book detail-4 nesting — OPEN (B7) |
+| S2-A | RPC-F57 | order-book detail-4 nesting — FIXED (B7) |
 | S2-B | RPC-F59 | partial-chain unknown/malformed id — FIXED |
-| S2-C | RPC-F40 | `dxSplitInputs` utxo schema — OPEN (B7) |
+| S2-C | RPC-F40 | `dxSplitInputs` utxo schema — FIXED (B7) |
 | S2-D | STATE-F72 | expiry sweep unwired — OPEN (B8) |
 | S2-E | STATE-F78 | hub-key pinning, no TOFU — FIXED |
 | S2-H | CRYPTO-F81 | base58check strictness — DOCUMENTED |
 | S2-I | CRYPTO-F77 | BCH forkid sighash — OPEN (B9) |
-| S2-J | CRYPTO-F89 | coin-family misclassification — OPEN |
-| S3-A | RPC-F11 | partial fields `"0"` literal — OPEN (B7) |
+| S2-J | CRYPTO-F89 | coin-family misclassification — OPEN (B9) |
+| S3-A | RPC-F11 | partial fields `"0"` literal — FIXED (B7) |
 | S3-B | RPC-F44 | `dxGetUtxos` amounts trimmed — FIXED (B7) |
-| S3-C | RPC-F31 | locked-utxos amount format — OPEN (B7) |
-| S3-D | RPC-F28 | `p2sh_deposits` alignment — OPEN (B7) |
+| S3-C | RPC-F31 | locked-utxos amount format — FIXED (B7) |
+| S3-D | RPC-F28 | `p2sh_deposits` alignment — FIXED (B7) |
 | S3-E | RPC-F55 | new-token-address `[]` vs error — FIXED (B7) |
 | S3-F | CRYPTO-F79/F80 | fee/dust thin-client substitutions — DOCUMENTED |
 | S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |
 | S3-I | CRYPTO-F92 | `secretFromScriptSig` 33-byte push — OPEN (B9) |
-| S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B7) |
+| S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B8) |
 | S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 
 ---

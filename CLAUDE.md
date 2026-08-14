@@ -45,8 +45,11 @@ Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
   XBridge.
 - **Separate concerns in commits** — logic / style (gofmt) / refactor kept apart.
 - Run `gofmt` before committing.
-- Amounts are base units of `COIN = 1_000_000`; `dx*` amounts display as
-  **6-decimal** fixed strings (matches C++ `setprecision(6)`).
+- Amounts are base units of the coin's `COIN` (XBridge scale is 1e6; BTC is
+  1e8). `dx*` amounts display with `xBridgeSignificantDigits(COIN)` fractional
+  digits — the digit-count of the coin's COIN (8 for COIN=1e8, 6 for COIN=1e6).
+  XBridge-scale values (`TransactionDescr::COIN` = 1e6) render fixed-6; per-coin
+  amounts render at the coin's COIN precision.
 
 ## Git policy
 

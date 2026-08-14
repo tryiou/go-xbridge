@@ -36,10 +36,10 @@ Every finding was double-checked by a verification subagent that re-traced the f
 ### RPC-F03 · S2 · RPC · dxGetOrders array order is random (Go map) vs id-ascending (C++ std::map)
 - REF: `rpcxbridge.cpp:42` (`std::map<uint256, …>` typedef), `rpcxbridge.cpp:430,434` iterate ascending-by-id.
 - CAND: `api/store.go:154-162` iterates a Go map; `api/handlers.go:108` appends in map order (unsorted).
-- OBSERVED_REF: `[id1,id2,id3…]` lexicographically ascending by 64-hex id.
+- OBSERVED_REF: `[id1,id2,id3…]` ascending by `uint256 operator<` — memcmp from `data[0]`, i.e. **LSB-first** byte order (`uint256.h:45-49`), which is NOT display-hex ascending.
 - OBSERVED_CAND: nondeterministic order across calls.
 - IMPACT: dApps that assume ordering or render a stable list see nondeterministic output.
-- FIX: sort the returned slice by display-hex id ascending.
+- FIX: sort the returned slice by the internal `[32]byte` id via `orderIDLess` (LSB-first), matching `std::map<uint256>` — resolved at B7 (`TestDxGetOrdersSortedById`, `TestOrderIDLess`).
 
 ### RPC-F04 · S3 · RPC · dxGetOrders 60-second filter boundary differs (µs-exact vs second-truncated)
 - REF: `rpcxbridge.cpp:431,439` — `total_seconds() > 60` (second granularity), includes the (60s, 61s) window.
@@ -297,7 +297,7 @@ Every finding was double-checked by a verification subagent that re-traced the f
 
 ### RPC-F46 · S2 · RPC · getnetworkinfo shim diverges from the real blocknetd RPC
 - REF (real daemon): `blocknet_core/src/version.h:12` protocolversion `70713`; getnetworkinfo relayfee `0.00010000`, incrementalfee `0.00001000`; fields `xbridgeprotocolversion`(55) and `xrouterprotocolversion`(50); `subversion "/Blocknet:4.4.1/"` (`clientversion.cpp`); networks entries with `proxy_randomize_credentials`.
-- CAND: `api/handlers.go:1721-1761` — protocolversion `70015`; relayfee `0.00001`; incrementalfee `0.00000001`; missing xbridge/xrouter protocol fields; `"/blocknet:4.4.1/"` lowercase; networks entries missing proxy_randomize_credentials.
+- CAND (pre-fix): `api/handlers.go` — protocolversion `70015`; relayfee `0.00001`; incrementalfee `0.00000001`; missing xbridge/xrouter protocol fields; `"/blocknet:4.4.1/"` lowercase; networks entries missing proxy_randomize_credentials. Resolved at B7: the shim now emits all 15 daemon fields/values (sorted-map key order remains the only divergence).
 - IMPACT: dApps feature-detecting via getnetworkinfo get wrong capabilities.
 - FIX: mirror the real daemon's getnetworkinfo fields and values.
 
