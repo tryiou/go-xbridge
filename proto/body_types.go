@@ -906,55 +906,6 @@ func (b *FinishedBody) Unmarshal(data []byte) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// xbcXChatMessage (2) — relays a serialized Bitcoin p2p message.
-// ---------------------------------------------------------------------------
-
-type XChatMessageBody struct {
-	Raw []byte
-}
-
-func (b *XChatMessageBody) Marshal() []byte {
-	w := NewBodyWriter()
-	w.Bytes(b.Raw)
-	return w.Payload()
-}
-
-func (b *XChatMessageBody) Unmarshal(data []byte) error {
-	b.Raw = make([]byte, len(data))
-	copy(b.Raw, data)
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// xbcServicesPing (50) — array of supported-service name strings.
-// ---------------------------------------------------------------------------
-
-type ServicesPingBody struct {
-	Services []string
-}
-
-func (b *ServicesPingBody) Marshal() []byte {
-	w := NewBodyWriter()
-	for _, s := range b.Services {
-		w.String(s)
-	}
-	return w.Payload()
-}
-
-func (b *ServicesPingBody) Unmarshal(data []byte) error {
-	r := NewBodyReader(data)
-	b.Services = nil
-	for r.remaining() > 0 {
-		s, err := r.String()
-		if err != nil {
-			return err
-		}
-		b.Services = append(b.Services, s)
-	}
-	return nil
-}
-
 // DecodeBody parses the body of a packet for the given command into the
 // appropriate typed struct. It returns the struct value (as interface{}) so the
 // caller can type-assert; nil for commands without a typed body.
@@ -1014,16 +965,12 @@ func DecodeBody(cmd XBridgeCommand, body []byte) (interface{}, error) {
 	case XbcTransactionReject:
 		var b RejectBody
 		return &b, b.Unmarshal(body)
-	case XbcXChatMessage:
-		var b XChatMessageBody
-		return &b, b.Unmarshal(body)
 	default:
-		// XbcServicesPing (50) is intentionally not decoded here: a core
-		// XBridge wallet learns the network token set from the servicenode
-		// P2P messages (SNREGISTER/SNPING/SNLISTPING), which go-xbridge parses
-		// in p2p/servicenode rather than through this XBridge-path codec. The
-		// ServicesPingBody type exists for the standalone servicenode wire
-		// format, not for DecodeBody.
+		// XbcXChatMessage (2) and XbcServicesPing (50) have no C++ writer on
+		// either side (xbridgesession.cpp:373-375, servicenodemgr.h:113-117)
+		// and are never sent on the live wire, so their former speculative
+		// body types were removed (WIRE-F67/F68). A received packet of either
+		// command is an explicit unsupported-command error here.
 		return nil, errors.New("xbridge: no typed body for command " + cmd.String())
 	}
 }

@@ -505,6 +505,26 @@ func TestAddPingIgnoresStalePing(t *testing.T) {
 	}
 }
 
+// TestAddPingReturnsAccepted asserts AddPing reports whether it actually stored
+// the ping (the strict-newer gate), so the SNLIST response set can mirror it.
+func TestAddPingReturnsAccepted(t *testing.T) {
+	reg := NewRegistry()
+	key := pickPubkey(t, 0x64)
+	base := uint32(time.Now().Unix()) - 200
+	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base}) {
+		t.Fatal("first valid ping must be accepted")
+	}
+	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base}) {
+		t.Fatal("equal pingTime must be rejected (strict-newer gate)")
+	}
+	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base - 10}) {
+		t.Fatal("stale ping must be rejected")
+	}
+	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"LTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base + 100}) {
+		t.Fatal("newer ping must be accepted")
+	}
+}
+
 // TestAddRegistrationClearsNode verifies a registration arriving AFTER a ping
 // resets the node: SNREGISTER carries no config on the wire (servicenode.h:355-
 // 384), so addSn stores version 0/empty services — the Go registry must never

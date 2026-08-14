@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -22,8 +23,9 @@ var dialDedup = xlog.NewDedupe(60*time.Second, func(addr string, total int, elap
 })
 
 // handshakeTimeout bounds the version/verack exchange so a misbehaving peer
-// cannot hang Dial indefinitely.
-const handshakeTimeout = 30 * time.Second
+// cannot hang Dial indefinitely. It mirrors C++ DEFAULT_PEER_CONNECT_TIMEOUT =
+// 60 s (net.h:83), the deadline C++ gives a peer to send its first message.
+const handshakeTimeout = 60 * time.Second
 
 // Conn is a thin XBridge peer connection over the Bitcoin P2P transport.
 // It performs the version/verack handshake and streams decoded XBridge packets.
@@ -99,10 +101,22 @@ func (c *Conn) handshake() error {
 		}
 		switch msg.Command {
 		case "version":
-			seenVersion = true
-			if v, err := UnmarshalVersion(msg.Payload); err == nil {
-				c.peerVersion = v
+			if seenVersion {
+				// C++ disconnects on a duplicate version message
+				// (net_processing.cpp:1574-1582).
+				return errors.New("p2p: duplicate version message")
 			}
+			seenVersion = true
+			v, err := UnmarshalVersion(msg.Payload)
+			if err != nil {
+				return err
+			}
+			if v.Version < MinPeerProtoVersion {
+				// C++ disconnects peers below MIN_PEER_PROTO_VERSION
+				// (net_processing.cpp:1617-1626).
+				return fmt.Errorf("p2p: peer version %d below minimum %d", v.Version, MinPeerProtoVersion)
+			}
+			c.peerVersion = v
 			if err := c.writeVerack(); err != nil {
 				return err
 			}
@@ -191,19 +205,39 @@ func (c *Conn) WritePacket(p *proto.Packet, dest [20]byte) error {
 }
 
 func (c *Conn) readMessage() (*Message, error) {
-	hdr := make([]byte, 4+cmdSize+8)
-	if _, err := io.ReadFull(c.reader, hdr); err != nil {
-		return nil, err
+	for {
+		hdr := make([]byte, 4+cmdSize+8)
+		if _, err := io.ReadFull(c.reader, hdr); err != nil {
+			return nil, err
+		}
+		length := binary.LittleEndian.Uint32(hdr[4+cmdSize : 4+cmdSize+4])
+		if length > MaxPayloadSize {
+			// C++ disconnects a peer declaring more than
+			// MAX_PROTOCOL_MESSAGE_LENGTH (net.cpp:583-585).
+			return nil, errors.New("p2p: implausible message length")
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(c.reader, payload); err != nil {
+			return nil, err
+		}
+		msg, err := UnmarshalMessage(append(hdr, payload...))
+		if err != nil {
+			if errors.Is(err, ErrChecksum) {
+				// C++ logs and drops a bad-checksum frame without disconnecting
+				// (net_processing.cpp:3138-3145); keep the connection and read
+				// the next frame.
+				xlog.Debug("p2p: dropping frame with bad checksum")
+				continue
+			}
+			return nil, err
+		}
+		if msg.Magic != c.magic {
+			// C++ disconnects on an invalid message start
+			// (net_processing.cpp:3117-3121).
+			return nil, errors.New("p2p: unexpected network magic")
+		}
+		return msg, nil
 	}
-	length := binary.LittleEndian.Uint32(hdr[4+cmdSize : 4+cmdSize+4])
-	if length > 64*1024*1024 {
-		return nil, errors.New("p2p: implausible message length")
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.reader, payload); err != nil {
-		return nil, err
-	}
-	return UnmarshalMessage(append(hdr, payload...))
 }
 
 // PeerVersion returns the peer's advertised version message, captured during

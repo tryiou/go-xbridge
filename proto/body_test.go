@@ -290,9 +290,17 @@ func TestSwapBodiesRoundTrip(t *testing.T) {
 	roundTrip(t, "FinishedBody",
 		func() []byte { return (&FinishedBody{ID: [32]byte{2}}).Marshal() },
 		func(d []byte) error { var b FinishedBody; return b.Unmarshal(d) })
-	roundTrip(t, "ServicesPingBody",
-		func() []byte { return (&ServicesPingBody{Services: []string{"dx", "blocknet"}}).Marshal() },
-		func(d []byte) error { var b ServicesPingBody; return b.Unmarshal(d) })
+}
+
+// TestDecodeBodyRejectsUnwriterCommands asserts commands with no C++ writer on
+// either side (xbcXChatMessage 2, xbcServicesPing 50) are rejected by DecodeBody
+// rather than mis-decoded by a speculative body type (WIRE-F67/F68).
+func TestDecodeBodyRejectsUnwriterCommands(t *testing.T) {
+	for _, cmd := range []XBridgeCommand{XbcXChatMessage, XbcServicesPing} {
+		if v, err := DecodeBody(cmd, []byte{0x01}); err == nil {
+			t.Fatalf("DecodeBody(%s) = %v, nil; want unsupported-command error", cmd, v)
+		}
+	}
 }
 
 // liveOrderPacket is the same real xbridge P2P payload captured from a live

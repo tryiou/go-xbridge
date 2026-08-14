@@ -48,7 +48,7 @@ func defaultPort(network string) int {
 	switch network {
 	case "testnet":
 		return 41474
-	case "staging":
+	case "regtest":
 		return 41489
 	default:
 		return 41412 // mainnet
@@ -56,13 +56,13 @@ func defaultPort(network string) int {
 }
 
 // SeedList returns the DNS seed hostnames and the fixed ip:port seeds for a
-// network. "mainnet" is the default; "testnet" and "staging" are also known.
+// network. "mainnet" is the default; "testnet" and "regtest" are also known.
 // Unknown networks fall back to mainnet.
 func SeedList(network string) (dns []string, fixed []string) {
 	switch network {
 	case "testnet":
 		return testnetDNSSeeds, testnetFixedSeeds
-	case "staging":
+	case "regtest":
 		return nil, nil // no public seeds configured
 	default:
 		return mainnetDNSSeeds, mainnetFixedSeeds

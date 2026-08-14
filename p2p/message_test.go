@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -31,5 +32,23 @@ func TestUnmarshalMessagePayloadShort(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf[16:20], 100) // claims 100-byte payload, only 5 follow
 	if _, err := UnmarshalMessage(buf); err == nil {
 		t.Fatal("expected error when payload shorter than declared")
+	}
+}
+
+// TestUnmarshalMessageChecksumSentinel asserts a bad checksum surfaces the
+// exported ErrChecksum sentinel (the connection layer drops it non-fatally,
+// mirroring C++ net_processing.cpp:3138-3145).
+func TestUnmarshalMessageChecksumSentinel(t *testing.T) {
+	m := &Message{
+		Magic:    MainnetMagic,
+		Command:  "ping",
+		Payload:  []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+		Checksum: Checksum([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}),
+	}
+	buf := m.Marshal()
+	buf[len(buf)-1] ^= 0xff // corrupt the payload so the checksum no longer matches
+	_, err := UnmarshalMessage(buf)
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("err = %v, want errors.Is(ErrChecksum)", err)
 	}
 }

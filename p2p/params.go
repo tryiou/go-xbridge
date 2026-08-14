@@ -4,7 +4,12 @@ package p2p
 var (
 	MainnetMagic = [4]byte{0xa1, 0xa0, 0xa2, 0xa3} // port 41412
 	TestnetMagic = [4]byte{0x45, 0x76, 0x65, 0xbb} // port 41474
-	StagingMagic = [4]byte{0xa1, 0xcf, 0x7e, 0xac} // port 41489
+
+	// RegtestMagic is C++ REGTEST (chainparams.cpp:417-421): the third
+	// chainparams network is named "regtest" (strNetworkID, :373-376), which
+	// go-xbridge previously mislabeled "staging". There is no real Blocknet
+	// staging network.
+	RegtestMagic = [4]byte{0xa1, 0xcf, 0x7e, 0xac} // port 41489
 )
 
 // XBridgeNetCommand is the Bitcoin P2P message command under which XBridge

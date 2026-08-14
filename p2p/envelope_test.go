@@ -127,6 +127,50 @@ func TestEnvelopeLengthMismatch(t *testing.T) {
 	}
 }
 
+// TestReadVarIntCanonical asserts non-canonical CompactSize encodings are
+// rejected exactly like C++ ReadCompactSize (serialize.h:289-303): an extended
+// form whose value fits in fewer bytes is an error, and a value above MAX_SIZE
+// is an error.
+func TestReadVarIntCanonical(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		ok   bool
+		want int
+	}{
+		{"single byte", []byte{0xfd - 1}, true, 0xfc},
+		{"fd canonical (253)", []byte{0xfd, 0xfd, 0x00}, true, 253},
+		{"fd non-canonical (<253)", []byte{0xfd, 0x05, 0x00}, false, 0},
+		{"fe canonical", []byte{0xfe, 0x00, 0x00, 0x01, 0x00}, true, 0x10000},
+		{"fe non-canonical (<0x10000)", []byte{0xfe, 0xff, 0xff, 0x00, 0x00}, false, 0},
+		// 0xff is canonical only for values >= 2^32, which always exceed the
+		// 32 MiB MAX_SIZE bound, so every 0xff form is rejected.
+		{"ff always over MAX_SIZE", []byte{0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, false, 0},
+		{"over MAX_SIZE", []byte{0xfe, 0x01, 0x00, 0x00, 0x02}, false, 0}, // 0x02000001 > 32 MiB
+		{"truncated fd", []byte{0xfd, 0x05}, false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, _, err := readVarInt(c.in, 0)
+			if c.ok && (err != nil || n != c.want) {
+				t.Fatalf("readVarInt = %d, %v; want %d, nil", n, err, c.want)
+			}
+			if !c.ok && err == nil {
+				t.Fatalf("readVarInt = %d, nil; want error", n)
+			}
+		})
+	}
+	// The canonical encodings still round-trip through the writer.
+	for _, n := range []int{0xfc, 253, 0x10000, 0x100000000} {
+		if n > maxCompactSize {
+			continue
+		}
+		if got, _, err := readVarInt(writeVarInt(n), 0); err != nil || got != n {
+			t.Fatalf("round-trip %d = %d, %v", n, got, err)
+		}
+	}
+}
+
 func TestEnvelopeTimestampUnit(t *testing.T) {
 	// The 8-byte transport timestamp MUST be in MICROSECONDS to match C++
 	// (timeToInt = total_microseconds(), xutil.cpp:280) — it is part of the

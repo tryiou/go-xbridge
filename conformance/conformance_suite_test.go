@@ -788,11 +788,6 @@ func TestWireCommandBodies(t *testing.T) {
 		hexBody string
 		skip    string // non-empty => t.Skip with this reason
 	}{
-		{name: "xbcXChatMessage", cmd: proto.XbcXChatMessage, hexBody: "deadbeef",
-			// DIVERGENT/TBD: cmd-2 has NO C++ writer ("not implemented",
-			// xbridgesession.cpp:373-375); the raw-bytes body is unverifiable
-			// against any live writer. WIRE_CONFORMANCE.md finding cmd2-body.
-			skip: "cmd2-body: no C++ writer; body form TBD"},
 		{name: "xbcTransaction", cmd: proto.XbcTransaction, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
 			"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "6274630000000000" + "2100000000000000" +
 			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000" +
@@ -855,15 +850,11 @@ func TestWireCommandBodies(t *testing.T) {
 		{name: "xbcTransactionCancel", cmd: proto.XbcTransactionCancel, hexBody: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20" + "efbeedfe"},
 		{name: "xbcTransactionFinished", cmd: proto.XbcTransactionFinished, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
 		{name: "xbcTransactionReject", cmd: proto.XbcTransactionReject, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" + "dec0ad0b"},
-		{name: "xbcServicesPing", cmd: proto.XbcServicesPing, hexBody: "424c4f434b00" + "42544300" + "4c544300",
-			// DIVERGENT/TBD: cmd-50 has NO C++ writer (servicenodemgr.h:113-117
-			// TODO) and DecodeBody intentionally refuses it (body_types.go:1020-1028).
-			// WIRE_CONFORMANCE.md finding cmd50-body.
-			skip: "cmd50-body: no C++ writer; Go typed body unverifiable"},
 	}
 	for _, c := range cases {
-		// Each command is a subtest so a skip (cmd 2 / cmd 50) does not abort
-		// the remaining 18 body vectors.
+		// Each command is a subtest so a skip does not abort the remaining
+		// body vectors. (cmd 2 xbcXChatMessage and cmd 50 xbcServicesPing have
+		// no C++ writer and their body types were removed on B5, WIRE-F67/F68.)
 		t.Run(c.name, func(t *testing.T) {
 			if c.skip != "" {
 				t.Skipf("%s: %s", c.name, c.skip)
@@ -976,10 +967,6 @@ func checkBodyFields(t *testing.T, name string, cmd proto.XBridgeCommand, v inte
 	case *proto.FinishedBody:
 		if !hashEq(txid, b.ID[:]) {
 			t.Errorf("%s: FinishedBody fields mismatch: %+v", name, b)
-		}
-	case *proto.XChatMessageBody:
-		if !bytes.Equal(b.Raw, hx("deadbeef")) {
-			t.Errorf("%s: XChatMessageBody fields mismatch: %+v", name, b)
 		}
 	default:
 		t.Errorf("%s: unhandled body type %T", name, v)
