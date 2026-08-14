@@ -1,10 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"strconv"
-	"strings"
 )
 
 // HandlerCtx carries the dependencies each dx* handler needs.
@@ -68,114 +67,303 @@ func Lookup(method string) Handler {
 }
 
 // ---------------------------------------------------------------------------
-// Positional parameter parsing. Blocknet RPC uses positional params (a JSON
-// array), so handlers index params[0], params[1], ... directly.
+// Arity gates (RPC-F52).
+//
+// C++ enforces each dx* method's param count up front. The old-style methods
+// return a business 1025 result error with the exact param-list string
+// (uret(makeError(INVALID_PARAMETERS, __FUNCTION__, <msg>))); the throw
+// methods throw the full RPCHelpMan help text as an envelope error code -1
+// (rpc/server.cpp:584-586). checkArity runs before the handler so the gates are
+// centralized and match C++ per method (see remediation/B4-http.md).
 // ---------------------------------------------------------------------------
 
-func strParam(params []json.RawMessage, i int) (string, bool) {
-	if i >= len(params) {
-		return "", false
-	}
-	var s string
-	if err := json.Unmarshal(params[i], &s); err != nil {
-		return "", false
-	}
-	return s, true
+type arityKind int
+
+const (
+	arityBusiness arityKind = iota // 1025 result-error
+	arityThrow                     // envelope -1 with the RPCHelpMan help text
+)
+
+// maxArity marks an unbounded upper param count (C++ ignores extras past the
+// last read index for dxMakeOrder / dxMakePartialOrder).
+const maxArity = -1
+
+type aritySpec struct {
+	min, max int
+	kind     arityKind
+	msg      string
 }
 
-func optStrParam(params []json.RawMessage, i int, def string) string {
-	if i >= len(params) {
-		return def
-	}
-	var s string
-	if err := json.Unmarshal(params[i], &s); err != nil {
-		return def
-	}
-	return s
+var arity = map[string]aritySpec{
+	// Business 1025 gates (exact C++ makeError arg).
+	"dxGetNewTokenAddress":   {1, 1, arityBusiness, "(ticker)"},
+	"dxLoadXBridgeConf":      {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetLocalTokens":       {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetNetworkTokens":     {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrders":            {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrderFills":        {2, 3, arityBusiness, "(maker) (taker) (combined, default=true)[optional]"},
+	"dxGetOrderHistory":      {5, 8, arityBusiness, "(maker) (taker) (start time) (end time) (granularity) (order_ids, default=false)[optional] (with_inverse, default=false)[optional] (limit, default=2147483647)[optional]"},
+	"dxGetOrder":             {1, 1, arityBusiness, "(id)"},
+	"dxCancelOrder":          {1, 1, arityBusiness, "(id)"},
+	"dxGetOrderBook":         {3, 4, arityBusiness, "(detail, 1-4) (maker) (taker) (max_orders, default=50)[optional]"},
+	"dxGetTokenBalances":     {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetLockedUtxos":       {0, 1, arityBusiness, "Too many parameters."},
+	"dxFlushCancelledOrders": {0, 1, arityBusiness, "ageMillis must be an integer >= 0"},
+	"dxGetMyOrders":          {0, 0, arityBusiness, "This function does not accept any parameters."},
+
+	// Throw methods (envelope -1 with the byte-for-byte RPCHelpMan help text).
+	"dxMakeOrder":                {7, maxArity, arityThrow, helpDxMakeOrder},
+	"dxMakePartialOrder":         {6, maxArity, arityThrow, helpDxMakePartialOrder},
+	"dxTakeOrder":                {3, 5, arityThrow, helpDxTakeOrder},
+	"dxGetMyPartialOrderChain":   {1, 1, arityThrow, helpDxGetMyPartialOrderChain},
+	"dxPartialOrderChainDetails": {1, 1, arityThrow, helpDxPartialOrderChainDetails},
+	"dxSplitAddress":             {3, 6, arityThrow, helpDxSplitAddress},
+	"dxSplitInputs":              {3, 7, arityThrow, helpDxSplitInputs},
+	"dxGetUtxos":                 {1, 2, arityThrow, helpDxGetUtxos},
+	"dxGetTradingData":           {0, 2, arityThrow, helpDxGetTradingData},
+	// getnetworkinfo is a Go shim with its own gate (B7/F46).
 }
 
-func boolParam(params []json.RawMessage, i int, def bool) (bool, bool) {
+// checkArity returns the C++ arity violation for method with n params, or nil
+// when the count is within bounds. Methods without a registry entry (and
+// unbounded maxima) are never gated.
+func checkArity(method string, n int) *rpcError {
+	spec, ok := arity[method]
+	if !ok {
+		return nil
+	}
+	if n >= spec.min && (spec.max == maxArity || n <= spec.max) {
+		return nil
+	}
+	if spec.kind == arityThrow {
+		return makeEnvelopeError(-1, spec.msg)
+	}
+	return makeError(errInvalidParameters, method, spec.msg)
+}
+
+// ---------------------------------------------------------------------------
+// Strict positional parameter parsing (RPC-F01).
+//
+// C++ reads dx* params either through json_spirit (Array params; a wrong/null
+// value type throws std::runtime_error) or directly through UniValue
+// (request.params[i].get_*(); a different message). Both surface as a JSON-RPC
+// envelope error code -1 via rpc/server.cpp:584-586. The helpers below
+// reproduce those throws as envelope rpcErrors with the exact C++ message.
+//
+// Absent params (i >= len(params)) are NOT an error here: C++ guards every
+// optional read by params.size() and the arity registry (checkArity) enforces
+// required counts before the handler runs.
+// ---------------------------------------------------------------------------
+
+// jsonTypeOf classifies a raw JSON value using json_spirit's value names
+// (json_spirit_value.h:586-604): Object, Array, string, boolean, integer,
+// real, null.
+func jsonTypeOf(raw json.RawMessage) string {
+	s := bytes.TrimSpace(raw)
+	if len(s) == 0 {
+		return "null"
+	}
+	switch s[0] {
+	case '{':
+		return "Object"
+	case '[':
+		return "Array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "boolean"
+	case 'n':
+		return "null"
+	}
+	// Number: integer unless it carries a fraction or exponent (int_type vs
+	// real_type in json_spirit).
+	for _, c := range s {
+		switch c {
+		case '.', 'e', 'E':
+			return "real"
+		}
+	}
+	return "integer"
+}
+
+func spErr(msg string) *rpcError { return makeEnvelopeError(-1, msg) }
+
+// spStr is the json_spirit get_str() equivalent: a present non-string (incl.
+// null) is a thrown envelope -1 "get_value< string > called on <T> Value".
+func spStr(params []json.RawMessage, i int) (string, bool, *rpcError) {
 	if i >= len(params) {
-		return def, true
+		return "", false, nil
+	}
+	if t := jsonTypeOf(params[i]); t != "string" {
+		return "", true, spErr(fmt.Sprintf("get_value< string > called on %s Value", t))
+	}
+	var s string
+	_ = json.Unmarshal(params[i], &s)
+	return s, true, nil
+}
+
+// spBool is the json_spirit get_bool() equivalent.
+func spBool(params []json.RawMessage, i int) (bool, bool, *rpcError) {
+	if i >= len(params) {
+		return false, false, nil
+	}
+	if t := jsonTypeOf(params[i]); t != "boolean" {
+		return false, true, spErr(fmt.Sprintf("get_value< boolean > called on %s Value", t))
 	}
 	var b bool
-	if err := json.Unmarshal(params[i], &b); err != nil {
-		// tolerate "true"/"false" string forms
-		var s string
-		if json.Unmarshal(params[i], &s) == nil {
-			s = strings.ToLower(strings.TrimSpace(s))
-			return s == "true", true
-		}
-		return def, false
-	}
-	return b, true
+	_ = json.Unmarshal(params[i], &b)
+	return b, true, nil
 }
 
-func intParam(params []json.RawMessage, i int, def int) (int, bool) {
+// spInt is the json_spirit get_int() equivalent (message uses the int_type
+// name, "integer").
+func spInt(params []json.RawMessage, i int) (int, bool, *rpcError) {
 	if i >= len(params) {
-		return def, true
+		return 0, false, nil
+	}
+	if t := jsonTypeOf(params[i]); t != "integer" {
+		return 0, true, spErr(fmt.Sprintf("get_value< integer > called on %s Value", t))
 	}
 	var n int
-	if err := json.Unmarshal(params[i], &n); err != nil {
-		// tolerate numeric strings
-		var s string
-		if json.Unmarshal(params[i], &s) == nil {
-			if v, e := strconv.Atoi(strings.TrimSpace(s)); e == nil {
-				return v, true
-			}
-		}
-		return def, false
+	if json.Unmarshal(params[i], &n) != nil {
+		return 0, true, spErr(fmt.Sprintf("get_value< integer > called on %s Value", jsonTypeOf(params[i])))
 	}
-	return n, true
+	return n, true, nil
 }
 
-// int64Param extracts an int64 from a param that may be a JSON number or a
-// decimal string (dapps send unix timestamps/seconds either way).
-func int64Param(params []json.RawMessage, i int) (int64, bool) {
+// spInt64 is the json_spirit get_int64() equivalent.
+func spInt64(params []json.RawMessage, i int) (int64, bool, *rpcError) {
 	if i >= len(params) {
-		return 0, false
+		return 0, false, nil
+	}
+	if t := jsonTypeOf(params[i]); t != "integer" {
+		return 0, true, spErr(fmt.Sprintf("get_value< integer > called on %s Value", t))
 	}
 	var n int64
-	if err := json.Unmarshal(params[i], &n); err == nil {
-		return n, true
+	if json.Unmarshal(params[i], &n) != nil {
+		return 0, true, spErr(fmt.Sprintf("get_value< integer > called on %s Value", jsonTypeOf(params[i])))
+	}
+	return n, true, nil
+}
+
+// uvStr is the UniValue get_str() equivalent ("JSON value is not a string as
+// expected"). A missing index in C++ yields NullUniValue, so absent and null
+// throw exactly like a wrong type.
+func uvStr(params []json.RawMessage, i int) (string, *rpcError) {
+	if i >= len(params) || jsonTypeOf(params[i]) != "string" {
+		return "", spErr("JSON value is not a string as expected")
 	}
 	var s string
-	if err := json.Unmarshal(params[i], &s); err == nil {
-		if v, e := strconv.ParseInt(strings.TrimSpace(s), 10, 64); e == nil {
-			return v, true
-		}
-	}
-	return 0, false
+	_ = json.Unmarshal(params[i], &s)
+	return s, nil
 }
 
-// mustBool is boolParam with error propagation: a present-but-unparseable
-// param is a caller error (errInvalidParameters), not a silent default. A
-// missing param still yields def (ok=true).
-func mustBool(params []json.RawMessage, i int, def bool, method string) (bool, *rpcError) {
-	v, ok := boolParam(params, i, def)
-	if !ok {
-		return def, makeError(errInvalidParameters, method, fmt.Sprintf("param %d is not a boolean", i))
+// uvBool is the UniValue get_bool() equivalent ("JSON value is not a boolean
+// as expected"); used for unconditional reads (dxSplitInputs params[3..5]).
+func uvBool(params []json.RawMessage, i int) (bool, *rpcError) {
+	if i >= len(params) || jsonTypeOf(params[i]) != "boolean" {
+		return false, spErr("JSON value is not a boolean as expected")
 	}
-	return v, nil
+	var b bool
+	_ = json.Unmarshal(params[i], &b)
+	return b, nil
 }
 
-// mustInt is intParam with error propagation: a present-but-unparseable param
-// is a caller error, not a silent default. A missing param still yields def.
-func mustInt(params []json.RawMessage, i, def int, method string) (int, *rpcError) {
-	v, ok := intParam(params, i, def)
-	if !ok {
-		return def, makeError(errInvalidParameters, method, fmt.Sprintf("param %d is not an integer", i))
+// uvBoolOpt is an isNull()-guarded UniValue bool read (dxSplitAddress
+// params[3..5], dxGetUtxos include_used): absent or null keeps the default; a
+// present non-boolean throws.
+func uvBoolOpt(params []json.RawMessage, i int, def bool) (bool, *rpcError) {
+	if i >= len(params) || jsonTypeOf(params[i]) == "null" {
+		return def, nil
 	}
-	return v, nil
+	if jsonTypeOf(params[i]) != "boolean" {
+		return false, spErr("JSON value is not a boolean as expected")
+	}
+	var b bool
+	_ = json.Unmarshal(params[i], &b)
+	return b, nil
 }
 
-func strArrayParam(params []json.RawMessage, i int) ([]string, bool) {
+// uvArr is the UniValue get_array() equivalent (dxSplitInputs utxos).
+func uvArr(params []json.RawMessage, i int) ([]json.RawMessage, *rpcError) {
+	if i >= len(params) || jsonTypeOf(params[i]) != "Array" {
+		return nil, spErr("JSON value is not an array as expected")
+	}
+	var arr []json.RawMessage
+	if json.Unmarshal(params[i], &arr) != nil {
+		return nil, spErr("JSON value is not an array as expected")
+	}
+	return arr, nil
+}
+
+// uvTypeNameOf classifies a raw JSON value using UniValue's type names
+// (univalue.cpp:219-232): null, bool, object, array, string, number. Unlike
+// json_spirit, UniValue treats integer and real alike ("number").
+func uvTypeNameOf(raw json.RawMessage) string {
+	t := jsonTypeOf(raw)
+	switch t {
+	case "integer", "real":
+		return "number"
+	case "boolean":
+		return "bool"
+	case "Object":
+		return "object"
+	case "Array":
+		return "array"
+	case "null":
+		return "null"
+	}
+	return "string"
+}
+
+// rtcStr/rtcNum/rtcBool are the RPCTypeCheck equivalents (rpc/server.cpp:81-103,
+// RPCTypeCheckArgument). Several dx* handlers call RPCTypeCheck before reading
+// the value, which throws envelope code -3 (RPC_TYPE_ERROR) with
+// "Expected type <t>, got <name>" — distinct from the get_*() throws (-1).
+// Present null is a mismatch (fAllowNull defaults to false).
+func rtcErr(want, got string) *rpcError {
+	return makeEnvelopeError(-3, fmt.Sprintf("Expected type %s, got %s", want, got))
+}
+
+func rtcStr(params []json.RawMessage, i int) (string, *rpcError) {
 	if i >= len(params) {
-		return nil, true
+		return "", nil
 	}
-	var arr []string
-	if err := json.Unmarshal(params[i], &arr); err != nil {
-		return nil, false
+	if t := uvTypeNameOf(params[i]); t != "string" {
+		return "", rtcErr("string", t)
 	}
-	return arr, true
+	var s string
+	_ = json.Unmarshal(params[i], &s)
+	return s, nil
+}
+
+func rtcNum(params []json.RawMessage, i int) (int, *rpcError) {
+	if i >= len(params) {
+		return 0, nil
+	}
+	if t := uvTypeNameOf(params[i]); t != "number" {
+		return 0, rtcErr("number", t)
+	}
+	// C++ follows RPCTypeCheck with a json_spirit get_int() read
+	// (rpcxbridge.cpp:2853), which throws -1 on a real value.
+	if t := jsonTypeOf(params[i]); t == "real" {
+		return 0, spErr("get_value< integer > called on real Value")
+	}
+	var n int
+	if json.Unmarshal(params[i], &n) != nil {
+		return 0, spErr(fmt.Sprintf("get_value< integer > called on %s Value", jsonTypeOf(params[i])))
+	}
+	return n, nil
+}
+
+func rtcBool(params []json.RawMessage, i int) (bool, *rpcError) {
+	if i >= len(params) {
+		return false, nil
+	}
+	if t := uvTypeNameOf(params[i]); t != "bool" {
+		return false, rtcErr("bool", t)
+	}
+	var b bool
+	_ = json.Unmarshal(params[i], &b)
+	return b, nil
 }

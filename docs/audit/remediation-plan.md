@@ -74,7 +74,10 @@ log-site removals, corrupt-file severity parity). **B3 merged** (deposit path:
 CRYPTO-F85/F86/F87/F78/F90/F97, STATE-F71, SEC-F03 — validated-deposit gate,
 native-unit scale, wire-Cancel). **B5 merged** (wire hardening: WIRE-F57–F64,
 F67–F70 — caps, magic/version/checksum gates, canonical varint, snl echo,
-regtest rename, cmd2/50 removal). B4, B7–B11 pending.
+regtest rename, cmd2/50 removal). **B4 merged** (http hardening: RPC-F01/F02,
+F47–F52/F58 — transport status routing, bare method-not-found, 32 MiB cap,
+always-auth + rpcauth, batch/named, strict params + NO_SESSION name, arity
+gates). B7–B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -150,20 +153,43 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   attacker model corrected in the register (theft, not lockup).
 - **Verify:** as B1; `make parity` + `make canary`. Commits: one per ID + docs.
 
-### B4 — `fix/http-hardening` — RPC-F58, RPC-F01/F02/F47–F52
+### B4 — `fix/http-hardening` — RPC-F58, RPC-F01/F02/F47–F52 — MERGED
 
-- `authorized` returns true with no user configured (`api/server.go:78-80`);
-  `SetAuth` silently disables on partial creds (`:62-68`); no
-  method/content-type/host checks; `http.Server` has no timeouts
-  (`cmd/main.go:236`). C++ is POST-only + always-authenticated
+- Original gap: `authorized` returned true with no user configured; `SetAuth`
+  silently disabled on partial creds; no method/content-type/host checks;
+  `http.Server` had no timeouts. C++ is POST-only + always-authenticated
   (`src/xbridge/httprpc.cpp:148-234`).
-- **RPC-F58:** add `http.Server` read/write/idle timeouts + hardening.
-- **RPC-F01:** error-channel policy — param-count/type errors as envelope error
-  (code −1) on the throw methods; strict parsers (`api/dispatch.go`).
-- **RPC-F02:** `NO_SESSION` `name` = the handler's `__FUNCTION__`, not `"dx"`
-  (`api/handlers.go:200,204`).
-- **RPC-F47–F52:** HTTP status 500/404 vs 200; method-not-found text; 32 MiB
-  body; always-auth model; batch/named params + `-32600`; arity gates → 1025.
+- **RPC-F58 (delivered):** `http.Server` read/write/header/idle timeouts +
+  `-rpcservertimeout` (default 30 s, C++ `DEFAULT_HTTP_SERVER_TIMEOUT`).
+- **RPC-F47 (delivered):** `httpStatusForCode` — 400 for −32600, 404 for
+  −32601, 500 otherwise (was HTTP 200 everywhere).
+- **RPC-F48 (delivered):** bare `"Method not found"` (no method-name suffix);
+  id parsed before dispatch and echoed on pre-dispatch errors.
+- **RPC-F49 (delivered):** 32 MiB `rpcMaxBodyBytes` via `MaxBytesReader`,
+  non-envelope 413 (was 4 MiB + JSON −32700).
+- **RPC-F50 (delivered):** always-auth when ANY credential configured
+  (`-rpcuser/-rpcpassword` or multi-user `-rpcauth` HMAC-SHA256), 401 empty
+  body + `WWW-Authenticate`, 250 ms failure delay. Residual (documented):
+  no auto-cookie file; loopback-open when zero credentials configured.
+- **RPC-F51 (delivered):** batch (`execOne` per element, always HTTP 200);
+  named params rejected with −8 `"Unknown named parameter <key>"`; −32600
+  emitted for request-shape errors.
+- **RPC-F01 (delivered):** error-channel policy — strict parsers
+  (`spStr/spBool/spInt/spInt64`, `uvStr/uvBool/uvBoolOpt/uvArr`,
+  `rtcStr/rtcNum/rtcBool`); param/type errors as envelope −1 (json_spirit
+  family) or −3 (RPCTypeCheck family); C++ read-order + `limit` validation.
+- **RPC-F02 (delivered):** `NO_SESSION` `name` = the handler method name
+  (not `"dx"`).
+- **RPC-F52 (delivered):** central arity registry (`api/dispatch.go`) with
+  byte-for-byte C++ help-text errors (business methods → 1025; throw methods →
+  envelope −1 with the `RPCHelpMan` text); per-handler gates removed.
+- **Delivered (B4):** commits `859b7aa` (brief), `4a0e422` (transport),
+  `e5995d2` (auth), `6304ea9` (strict params/NO_SESSION), `e1bc23f` (arity),
+  `7c0157c` (conformance promote). Diff brief: `remediation/B4-http.md`.
+  Contract corrections verified against C++: json_spirit `get_value< T >`
+  messages, UniValue `JSON value is not a X as expected`, `RPCTypeCheck`
+  `-3 "Expected type t, got n"`, business 1025 vs throw-envelope split.
+- **Verify:** full suite + race green; `make parity` + `make canary` green.
 
 ### B5 — `fix/wire-hardening` — WIRE-F57–F64, WIRE-F67–F70 — MERGED
 

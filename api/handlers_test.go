@@ -22,6 +22,13 @@ func jstr(s string) json.RawMessage {
 	return json.RawMessage([]byte(`"` + s + `"`))
 }
 
+// jnum wraps a Go int64 as a JSON-RawMessage number param. C++ reads int params
+// via get_int()/get_int64(), which throw on a JSON string, so tests must pass
+// real JSON numbers (strict parsing, RPC-F01).
+func jnum(n int64) json.RawMessage {
+	return json.RawMessage([]byte(strconv.FormatInt(n, 10)))
+}
+
 // dispID renders a raw order id the way the dx* RPCs display it (C++
 // uint256::GetHex order). Tests use it for RPC inputs and to assert echoed ids.
 func dispID(id [32]byte) string { return orderIDString(id) }
@@ -67,9 +74,9 @@ func TestDxGetOrdersRead(t *testing.T) {
 		t.Errorf("dxGetOrders entry = %+v", arr[0])
 	}
 
-	// dxGetOrders rejects params.
-	if _, err := ctx.dxGetOrders([]json.RawMessage{jstr("x")}); err == nil {
-		t.Error("dxGetOrders should reject params")
+	// dxGetOrders rejects params (arity gate moved to checkArity, dispatch.go).
+	if rerr := checkArity("dxGetOrders", 1); rerr == nil || rerr.Code != errInvalidParameters {
+		t.Errorf("checkArity(dxGetOrders, 1) = %v, want business 1025", rerr)
 	}
 }
 
@@ -148,7 +155,7 @@ func TestDxGetOrderBookEmptyPairEmitsArrays(t *testing.T) {
 	// objects for an empty book (rpcxbridge.cpp:1568-1576).
 	ctx := newWalletTestCtx()
 	res, err := ctx.dxGetOrderBook([]json.RawMessage{
-		jstr("1"), jstr("BTC"), jstr("LTC"),
+		jnum(1), jstr("BTC"), jstr("LTC"),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderBook: %v", err)
@@ -178,7 +185,7 @@ func TestDxGetOrderBookRead(t *testing.T) {
 	// detail=1, maker=BTC, taker=BTC -> the BTC/BTC order (From=BTC,To=BTC)
 	// matches both the ask and bid filters, so it lands in both sides.
 	res, err := ctx.dxGetOrderBook([]json.RawMessage{
-		jstr("1"), jstr("BTC"), jstr("BTC"),
+		jnum(1), jstr("BTC"), jstr("BTC"),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderBook: %v", err)
@@ -223,10 +230,10 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 	ctx := newWalletTestCtx()
 
 	// detail out of range -> errInvalidDetailLevel.
-	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("0"), jstr("BTC"), jstr("BTC")}); err == nil {
+	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jnum(0), jstr("BTC"), jstr("BTC")}); err == nil {
 		t.Error("detail=0 should error")
 	}
-	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jstr("5"), jstr("BTC"), jstr("BTC")}); err == nil {
+	if _, err := ctx.dxGetOrderBook([]json.RawMessage{jnum(5), jstr("BTC"), jstr("BTC")}); err == nil {
 		t.Error("detail=5 should error")
 	}
 
@@ -256,7 +263,7 @@ func TestDxGetOrderBookDetailLevels(t *testing.T) {
 
 	for lvl := 1; lvl <= 4; lvl++ {
 		res, err := ctx.dxGetOrderBook([]json.RawMessage{
-			jstr(strconv.Itoa(lvl)), jstr("BTC"), jstr("LTC"),
+			jnum(int64(lvl)), jstr("BTC"), jstr("LTC"),
 		})
 		if err != nil {
 			t.Fatalf("detail %d: %v", lvl, err)
@@ -379,7 +386,7 @@ func TestDxGetOrderBookD2WindowAndMerge(t *testing.T) {
 	seed("LTC", "BTC", 300_000, 30_000_000) // 0.01
 
 	res, err := ctx.dxGetOrderBook([]json.RawMessage{
-		jstr("2"), jstr("BTC"), jstr("LTC"), json.RawMessage("4"),
+		jnum(2), jstr("BTC"), jstr("LTC"), jnum(4),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderBook detail 2: %v", err)
@@ -537,7 +544,7 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 	// start must be >= XSeries earliest (2018-02-25 00:00:00 UTC = 1519516800) per C++ fidelity.
 	const xEarly = int64(1519516800)
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jstr(strconv.FormatInt(xEarly, 10)), jstr(strconv.FormatInt(xEarly+180, 10)), jstr("60"),
+		jstr("BTC"), jstr("LTC"), jnum(xEarly), jnum(xEarly + 180), jnum(60),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderHistory: %v", err)
@@ -559,7 +566,7 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 	}
 	// end <= start -> no buckets -> [].
 	endStart, e2 := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jstr("100"), jstr("0"), jstr("60"),
+		jstr("BTC"), jstr("LTC"), jnum(100), jnum(0), jnum(60),
 	})
 	if e2 == nil {
 		if arr, ok := endStart.([]interface{}); !ok || len(arr) != 0 {
@@ -608,8 +615,8 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	// bucket2 (xEarly+1080..xEarly+1140): ccc (price=1.0)
 	// bucket3 (xEarly+1140..xEarly+1200): empty
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jstr(strconv.FormatInt(xEarly+1000, 10)), jstr(strconv.FormatInt(xEarly+1180, 10)), jstr("60"),
-		json.RawMessage("true"), jstr("false"),
+		jstr("BTC"), jstr("LTC"), jnum(xEarly + 1000), jnum(xEarly + 1180), jnum(60),
+		json.RawMessage("true"), json.RawMessage("false"),
 	})
 	if err != nil {
 		t.Fatalf("dxGetOrderHistory: %v", err)
@@ -842,11 +849,13 @@ func TestDxCancelOrderNoLiveSession(t *testing.T) {
 }
 
 // TestDxSplitInputsBadBoolParam verifies a malformed (non-boolean) flag errors
-// out via errInvalidParameters instead of silently defaulting to true (Module F).
+// out as the C++-thrown envelope error (code -1, "JSON value is not a boolean
+// as expected") instead of silently defaulting (Module F; RPC-F01).
 func TestDxSplitInputsBadBoolParam(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// C++ requires exactly 7 params: ticker, splitamount, address, include_fees,
-	// show_rawtx, submit, utxos. include_fees=123 is not a boolean -> must error.
+	// show_rawtx, submit, utxos. include_fees=123 is not a boolean -> the
+	// UniValue get_bool() throw becomes an envelope error (code -1).
 	params := []json.RawMessage{
 		jstr("BTC"), jstr("1000000"), jstr(btcAddr),
 		json.RawMessage("123"), // not a boolean -> must error
@@ -856,10 +865,16 @@ func TestDxSplitInputsBadBoolParam(t *testing.T) {
 	}
 	res, err := ctx.dxSplitInputs(params)
 	if err == nil {
-		t.Fatalf("expected errInvalidParameters for non-boolean include_fees, got res=%v", res)
+		t.Fatalf("expected envelope error for non-boolean include_fees, got res=%v", res)
 	}
-	if err.Code != errInvalidParameters {
-		t.Errorf("err.Code = %d, want %d", err.Code, errInvalidParameters)
+	if err.Code != -1 {
+		t.Errorf("err.Code = %d, want -1 (envelope misc error)", err.Code)
+	}
+	if !err.envelope {
+		t.Errorf("err must be an envelope error (C++ get_bool() throw), got business error %+v", err)
+	}
+	if err.Error != "JSON value is not a boolean as expected" {
+		t.Errorf("err.Error = %q, want UniValue message", err.Error)
 	}
 }
 

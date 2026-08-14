@@ -285,7 +285,7 @@ func TestRPCMethodNameField(t *testing.T) {
 		case "gettradingdata":
 			// DIVERGENT: the lowercase command is a separate C++ registration
 			// (rpcxbridge.cpp:3520); CAND has no dispatch entry -> envelope
-			// -32601 "Method not found: gettradingdata", no business-error name.
+			// -32601 "Method not found" (bare), no business-error name.
 			// (RPC_CONFORMANCE.md Group-4 verdict; dispatch.go:38-63.)
 			if strings.HasPrefix(got, "dxGetTradingData") {
 				div, id = true, "gettradingdata-missing"
@@ -1571,10 +1571,12 @@ func TestStateExpirySemantics(t *testing.T) {
 
 // TestEnvelopeTransport encodes the JSON-RPC 1.0 envelope conventions:
 // result/error/id field order, compact no-space JSON + trailing newline,
-// business-errors-in-result, and the envelope codes the CAND server emits
-// (-32700/-32601/-32603/-401). The fixture renders the go-xbridge server's
-// actual response bytes (FIXME). The RPC_CONFORMANCE.md ENVELOPE & TRANSPORT
-// section verified the byte conventions on BOTH sides.
+// business-errors-in-result, and the envelope codes the server emits
+// (-32700/-32600/-32601/-32603). HTTP status follows C++ routing: 400 for
+// -32600, 404 for -32601, 500 otherwise (api/httpStatusForCode). The fixture
+// renders the go-xbridge server's actual response bytes (FIXME). The
+// RPC_CONFORMANCE.md ENVELOPE & TRANSPORT section verified the byte
+// conventions on BOTH sides; the transport rows below are now strict.
 func TestEnvelopeTransport(t *testing.T) {
 	// Reference byte strings (compact, no spaces, trailing \n; envelope key
 	// order result,error,id; envelope error object {code,message}). These are
@@ -1596,8 +1598,8 @@ func TestEnvelopeTransport(t *testing.T) {
 	if want := `{"result":true,"error":null,"id":1}`; string(out) != want {
 		t.Errorf("success envelope = %s, want %s", out, want)
 	}
-	out, _ = json.Marshal(envelope{Result: nil, Error: &envelopeErr{Code: -32601, Message: "Method not found: foo"}, ID: nil})
-	if want := `{"result":null,"error":{"code":-32601,"message":"Method not found: foo"},"id":null}`; string(out) != want {
+	out, _ = json.Marshal(envelope{Result: nil, Error: &envelopeErr{Code: -32601, Message: "Method not found"}, ID: nil})
+	if want := `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":null}`; string(out) != want {
 		t.Errorf("error envelope = %s, want %s", out, want)
 	}
 	// Compact no-space + trailing newline: encoding/json emits no structural
@@ -1606,7 +1608,9 @@ func TestEnvelopeTransport(t *testing.T) {
 	// scan is not used because string values legitimately contain spaces.
 
 	// Reference transport rows. `ref` is the C++ behavior; `cand` is the
-	// documented CAND behavior. Divergent rows are expected-fail.
+	// go-xbridge behavior. Rows with cand set assert cand == ref (strict); the
+	// remaining rows are reference-only (no cand yet) and just log the C++
+	// contract. The transport behaviors are asserted live in api/server_test.go.
 	rows := []struct {
 		name      string
 		div       bool
@@ -1623,45 +1627,53 @@ func TestEnvelopeTransport(t *testing.T) {
 			ref: "result,error,id (both sides)"},
 		{name: "compact no-space + trailing newline",
 			ref: "no spaces after ':'/','; '\\n' appended (both sides)"},
-		// DIVERGENT: C++ method-not-found is -32601 "Method not found", HTTP 404;
-		// CAND appends the method name and returns HTTP 200.
-		// (RPC_CONFORMANCE.md ENVELOPE & TRANSPORT; server.go:169-176.)
-		{name: "method-not-found message/status", div: true, id: "envelope/method-not-found",
+		// CONFORMANT (B4): C++ method-not-found is -32601 "Method not found"
+		// (bare message), HTTP 404. The Go server emits the same bare message
+		// (api/server.go dispatchOne) and routes -32601 -> 404 (httpStatusForCode).
+		// (RPC-F48; api/server_test.go TestServerEnvelopeStatusCodes.)
+		{name: "method-not-found message/status",
 			ref:  `-32601 "Method not found" HTTP 404`,
-			cand: `-32601 "Method not found: <m>" HTTP 200`},
-		// DIVERGENT: C++ emits -32600 for request-shape errors; CAND never
-		// emits -32600 (missing-method/params-shape map to -32700/-32601).
-		// (RPC_CONFORMANCE.md: "CAND never emits RPC_INVALID_REQUEST".)
-		{name: "RPC_INVALID_REQUEST -32600", div: true, id: "envelope/-32600-never-emitted",
-			ref:  `-32600 "Missing method"/"Method must be a string" HTTP 400`,
-			cand: `-32700 / -32601, HTTP 200`},
-		// DIVERGENT: auth model — C++ always authenticates (cookie default) with
-		// an empty 401 body; CAND is default-open, and on failure returns a JSON
-		// body with custom code -401 (C++ never emits -401).
-		// (RPC_CONFORMANCE.md ENVELOPE & TRANSPORT; server.go:62-125.)
-		{name: "auth model / -401", div: true, id: "envelope/auth--401",
-			ref:  "always-auth (cookie default); 401 with empty body; no -401 code",
-			cand: "default-open; 401 + JSON {error:{code:-401,...}}; no cookie/rpcauth"},
-		// DIVERGENT: oversized-request handling — C++ libevent cap 32 MiB with a
-		// non-envelope HTTP error; CAND caps at 4 MiB and replies 413 with a JSON
-		// envelope -32700 "Parse error: request body too large".
-		// (RPC_CONFORMANCE.md ENVELOPE & TRANSPORT; server.go:111-139.)
-		{name: "oversized request cap", div: true, id: "envelope/body-cap",
+			cand: `-32601 "Method not found" HTTP 404`},
+		// CONFORMANT (B4): C++ emits -32600 for request-shape errors; the Go
+		// server now does too (api/server.go parseRequest; all three messages).
+		// (RPC-F48; api/server_test.go TestServerInvalidRequest.)
+		{name: "RPC_INVALID_REQUEST -32600",
+			ref:  `-32600 "Missing method"/"Method must be a string"/"Params must be an array or object" HTTP 400`,
+			cand: `-32600 "Missing method"/"Method must be a string"/"Params must be an array or object" HTTP 400`},
+		// CONFORMANT (B4): auth model — C++ always authenticates (auto-cookie
+		// default) with an empty 401 body and never emits -401; the Go server is
+		// always-auth whenever ANY credential is configured (-rpcuser/-rpcpassword
+		// or -rpcauth), returns an empty 401 body + WWW-Authenticate, and drops
+		// the old custom -401 code. Residual documented divergence (RPC-F50): Go
+		// does not auto-create a cookie file and is default-open on loopback when
+		// NO credentials are configured (C++ is always authenticated).
+		// (RPC-F50; api/server_test.go TestServerRPCAuth/RpcAuthMultiUser/RpcAuthDelay.)
+		{name: "auth model / -401",
+			ref:  "always-auth; 401 with empty body; no -401 code",
+			cand: "always-auth; 401 with empty body; no -401 code"},
+		// CONFORMANT (B4): oversized-request handling — C++ libevent cap 32 MiB
+		// with a non-envelope HTTP error; the Go server now caps at 32 MiB
+		// (api/server.go rpcMaxBodyBytes) and replies 413 without a JSON envelope.
+		// (RPC-F49; api/server_test.go TestServerMaxBodyBytes.)
+		{name: "oversized request cap",
 			ref:  "32 MiB, non-envelope HTTP error",
-			cand: "4 MiB, 413 + {error:{code:-32700,message:\"Parse error: request body too large\"}}"},
-		// DIVERGENT: batch requests and named params are unsupported in CAND
-		// (a top-level array body fails Unmarshal -> -32700; an object params
-		// also -> -32700). C++ JSONRPCExecBatch + transformNamedArguments.
-		// (RPC_CONFORMANCE.md ENVELOPE & TRANSPORT; server.go:157-164.)
-		{name: "batch / named params", div: true, id: "envelope/batch-named-unsupported",
-			ref:  "batch (JSONRPCExecBatch) + named params (transformNamedArguments) supported",
-			cand: "batch -> -32700; named params -> -32700"},
-		// DIVERGENT: id echo on malformed body — C++ parses id first and echoes
-		// it; CAND loses the id on whole-body Unmarshal failure (id:null).
-		// (RPC_CONFORMANCE.md ENVELOPE & TRANSPORT; server.go:157-163.)
-		{name: "id echo on malformed body", div: true, id: "envelope/id-echo",
+			cand: "32 MiB, non-envelope HTTP error"},
+		// CONFORMANT (B4): batch requests are supported (C++ JSONRPCExecBatch;
+		// Go api/server.go execOne per element, always HTTP 200) and named
+		// params are rejected with -8 "Unknown named parameter <key>" — C++ dx*
+		// methods have empty argNames so transformNamedArguments rejects the
+		// first named key; the Go server mirrors that for the first key.
+		// (RPC-F51; api/server_test.go TestServerBatch/TestServerNamedParamsRejected.)
+		{name: "batch / named params",
+			ref:  "batch (JSONRPCExecBatch) supported; named params rejected with -8 (dx* empty argNames)",
+			cand: "batch (JSONRPCExecBatch) supported; named params rejected with -8 (dx* empty argNames)"},
+		// CONFORMANT (B4): id echo on malformed body — C++ parses id first and
+		// echoes it; the Go server parses id in parseRequest before dispatch and
+		// echoes it on pre-dispatch errors.
+		// (RPC-F48; api/server_test.go TestServerInvalidRequest.)
+		{name: "id echo on malformed body",
 			ref:  "id parsed before dispatch; echoed on pre-dispatch errors",
-			cand: "id lost on whole-body Unmarshal failure -> null"},
+			cand: "id parsed before dispatch; echoed on pre-dispatch errors"},
 	}
 	for _, r := range rows {
 		if r.cand == "" {

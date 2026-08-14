@@ -97,6 +97,19 @@ type rpcError struct {
 	Error string `json:"error"`
 	Code  int    `json:"code"`
 	Name  string `json:"name"`
+	// envelope marks a JSON-RPC envelope error (result:null,
+	// error:{code,message}, HTTP status per httpStatusForCode) as opposed to the
+	// Blocknet business-error-in-result convention (HTTP 200). C++ surfaces
+	// param-type/arity/help violations as thrown RPC errors (envelope), while
+	// business gates stay in the result — see remediation/B4-http.md.
+	envelope bool
+}
+
+// makeEnvelopeError builds a transport-level rpcError that the server
+// serializes as the JSON-RPC envelope error object and routes to the C++
+// HTTP status for the code.
+func makeEnvelopeError(code int, msg string) *rpcError {
+	return &rpcError{Code: code, Error: msg, envelope: true}
 }
 
 // xbridgeErrorText mirrors util/xbridgeerror.cpp::xbridgeErrorText(code, arg):

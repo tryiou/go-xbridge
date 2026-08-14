@@ -37,8 +37,8 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| RPC-F01 | S2 | Error-channel policy: C++ *throws* envelope errors for param/type errors; Go returns business results | OPEN | B4 |
-| RPC-F02 | S2 | `NO_SESSION` error `name` hardcoded `"dx"` instead of the method name | OPEN | B4 |
+| RPC-F01 | S2 | Error-channel policy: C++ *throws* envelope errors for param/type errors; Go returns business results | FIXED | B4 `fix/http-hardening` (strict parsers, envelope −1/−3, read-order, `limit` param; `TestStrictParamEnvelopeErrors`, `TestRpcTypeCheckErrors`) — no string coercion |
+| RPC-F02 | S2 | `NO_SESSION` error `name` hardcoded `"dx"` instead of the method name | FIXED | B4 `fix/http-hardening` (`TestNoSessionNameIsMethodName`) |
 | RPC-F03 | S2 | `dxGetOrders` array order random (Go map) vs id-ascending (C++ std::map) | OPEN | B7 |
 | RPC-F04 | S3 | `dxGetOrders` 60 s filter boundary (µs-exact vs second-truncated) | OPEN | B7 |
 | RPC-F05 | S2 | Exactly-64-hex id gate vs C++ `uint256S` left-pad/truncate tolerance | OPEN | B7 |
@@ -83,18 +83,18 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F44 | S2 | `dxGetUtxos` amounts trimmed vs C++ fixed-8 | OPEN | B7 |
 | RPC-F45 | S3 | `dxGetUtxos` listunspent failure code/text (1004 vs 1002) | OPEN | B7 |
 | RPC-F46 | S2 | `getnetworkinfo` shim diverges from real blocknetd (protocolversion, fees, subversion, fields) | RE-DECIDE | B7 (prior: Go-only extension) |
-| RPC-F47 | S2 | JSON-RPC HTTP status for parse/method-not-found (C++ 500/404 vs Go 200) | OPEN | B4 |
-| RPC-F48 | S3 | method-not-found message appends the method name | OPEN | B4 |
-| RPC-F49 | S3 | request body limit 4 MiB vs C++ 32 MiB | OPEN | B4 |
-| RPC-F50 | S2 | auth model: Go open-by-default vs C++ always-auth | OPEN | B4 |
-| RPC-F51 | S3 | batch / named params / -32600 unsupported | OPEN | B4 |
-| RPC-F52 | S3 | extra positional params accepted where C++ errors (business 1025) | OPEN | B4 |
+| RPC-F47 | S2 | JSON-RPC HTTP status for parse/method-not-found (C++ 500/404 vs Go 200) | FIXED | B4 `fix/http-hardening` (status routing −32600→400, −32601→404, else 500; `TestServerEnvelopeStatusCodes`, `TestServerParseErrorStatus500`) |
+| RPC-F48 | S3 | method-not-found message appends the method name | FIXED | B4 `fix/http-hardening` (bare `"Method not found"`; `TestServerInvalidRequest`, `TestServerEnvelopeStatusCodes`) |
+| RPC-F49 | S3 | request body limit 4 MiB vs C++ 32 MiB | FIXED | B4 `fix/http-hardening` (32 MiB `rpcMaxBodyBytes`, non-envelope 413; `TestServerMaxBodyBytes`) |
+| RPC-F50 | S2 | auth model: Go open-by-default vs C++ always-auth | FIXED | B4 `fix/http-hardening` (always-auth when creds configured, 401 empty body, 250 ms delay; `TestServerRPCAuth`, `TestServerRpcAuthMultiUser`, `TestServerRpcAuthDelay`) — residual: no auto-cookie file, loopback-open when unconfigured (documented) |
+| RPC-F51 | S3 | batch / named params / -32600 unsupported | FIXED | B4 `fix/http-hardening` (batch supported, named → −8; `TestServerBatch`, `TestServerNamedParamsRejected`) |
+| RPC-F52 | S3 | extra positional params accepted where C++ errors (business 1025) | FIXED | B4 `fix/http-hardening` (arity registry + C++ help-text 1025; `TestArityBusinessMethods`, `TestArityThrowMethods`) |
 | RPC-F53 | S3 | `dxGetLocalTokens` returns unconnected/duplicate tickers | OPEN | B7 |
 | RPC-F54 | S3 | `dxGetNetworkTokens` membership: Go unions config; C++ pure SN service union | OPEN | B7 |
 | RPC-F55 | S3 | `dxGetNewTokenAddress` error path returns `[]` in C++, business 1002 in Go | OPEN | B7 |
 | RPC-F56 | S3 | `dxLoadXBridgeConf` reload failure shape and side effects differ | OPEN | B7 |
 | RPC-F57 | S2 | `dxGetOrderBook` detail-4 nesting `[[…]]` vs flat | OPEN | B7 |
-| RPC-F58 | S2 | HTTP auth/timeout hardening missing | OPEN | B4 |
+| RPC-F58 | S2 | HTTP auth/timeout hardening missing | FIXED | B4 `fix/http-hardening` (`-rpcservertimeout` + `http.Server` read/write/header/idle timeouts) |
 | RPC-F59 | S3 | `dxGetMyPartialOrderChain` unknown/malformed id handling | FIXED | B7 (bad-order-id) |
 
 ### WIRE axis (`WIRE-F57`–`WIRE-F71`) — evidence: `evidence/wire.md`, `evidence/wire_p1.md`, `evidence/wire_p2.md`
@@ -221,7 +221,7 @@ namespace is the Current register above.
 | F6 | CONC-F100 | no wallet I/O under lock — FIXED |
 | F7 | SEC-F02 | inbound UTXO proofs unverified — OPEN |
 | F8 | CRYPTO-F88 | segwit dead code — OPEN |
-| F10 | RPC-F49 | 4 MiB body cap — RE-DECIDE |
+| F10 | RPC-F49 | 4 MiB body cap — FIXED (B4 `fix/http-hardening`: 32 MiB `rpcMaxBodyBytes`, non-envelope 413) |
 | F11–F14 | INV-F100 | vestigial helpers — FIXED |
 | F15 | CONC-F101 | live `*Order` race — FIXED |
 | F16 | STATE-F77 | post-completion retransmit — FIXED |
@@ -232,7 +232,7 @@ namespace is the Current register above.
 | F21 | CRYPTO-F85 | `checkDepositTransaction` absent — FIXED (B3 `fix/deposit-path`) |
 | F22 | SEC-F03 | taker-trust composite — FIXED (B3 `fix/deposit-path`) |
 | F23 | CRYPTO-F86 | `buildDeposit` broadcast order — FIXED (B3 `fix/deposit-path`) |
-| F24 | RPC-F58 | HTTP auth/timeout hardening — OPEN (B4) |
+| F24 | RPC-F58 | HTTP auth/timeout hardening — FIXED (B4 `fix/http-hardening`) |
 | F25 | WIRE-F57/F63 | P2P addr/varint DoS — FIXED (B5 `fix/wire-hardening`) |
 | F26 | SEC-F04 | plaintext secrets — FIXED (B6 `fix/secrets-hygiene`) |
 | F27 | CRYPTO-F87 | `usedCoins` vs `ListUnspent` — FIXED (B3 `fix/deposit-path`) |
@@ -258,7 +258,7 @@ namespace is the Current register above.
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — OPEN (B9) |
 | S3-I | CRYPTO-F92 | `secretFromScriptSig` 33-byte push — OPEN (B9) |
 | S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B7) |
-| S4 | RPC-F24/F30/F36, RPC-F52, WIRE-F57 | key order, +1/COIN, help text, leniency, 64 MiB cap — DOCUMENTED |
+| S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 
 ---
 

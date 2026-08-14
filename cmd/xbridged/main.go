@@ -89,11 +89,13 @@ func main() {
 	// httpserver.cpp:308 loopback default. An explicit -rpcbind (host:port) is
 	// required to expose the JSON-RPC surface beyond localhost.
 	rpcBind := flag.String("rpcbind", "127.0.0.1:41414", "JSON-RPC listen address (host:port); defaults to loopback, set explicitly to bind elsewhere")
-	// RPC auth (SEC-F01): enforced only when BOTH -rpcuser and -rpcpassword are set
-	// (no cookie fallback). Unauthenticated RPC is safe only because the
-	// default bind is loopback; a non-loopback bind with no auth logs a warning.
+	// RPC auth (SEC-F01 / RPC-F50): enforced whenever ANY credential is set —
+	// -rpcuser/-rpcpassword (both required) or -rpcauth user:salt$hash entries
+	// (comma-separated, HMAC-SHA256 parity with blocknetd). No cookie auth is
+	// generated (documented divergence from C++; see docs/audit/register.md).
 	rpcUser := flag.String("rpcuser", "", "RPC Basic auth username (requires -rpcpassword)")
 	rpcPass := flag.String("rpcpassword", "", "RPC Basic auth password (requires -rpcuser)")
+	rpcAuth := flag.String("rpcauth", "", "RPC multi-user auth entries, comma-separated, format user:salt$hash")
 	network := flag.String("network", "mainnet", "Blocknet network to discover on and select the P2P magic from: mainnet|testnet|regtest (-magic overrides the magic)")
 	nodeAddr := flag.String("node", "", "explicit Blocknet service-node P2P address (host:port); empty enables network discovery")
 	addNode := flag.String("addnode", "", "comma-separated explicit peer addresses (host:port) to add to discovered peers")
@@ -105,6 +107,7 @@ func main() {
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
 	persistSecrets := flag.Bool("persistsecrets", true, "persist per-trade M keypair/secret/pre-signed refund in the swap-state file (default true; C++ orders.dat parity); false keeps the file secret-free, but a restarted mid-flight swap cannot auto-refund or re-sign cancels")
+	rpcServerTimeout := flag.Int("rpcservertimeout", 30, "timeout in seconds for HTTP RPC requests (C++ DEFAULT_HTTP_SERVER_TIMEOUT parity)")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -215,15 +218,28 @@ func main() {
 
 	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
-	// SEC-F01: RPC auth is enforced only when both -rpcuser and -rpcpassword are
-	// provided (no cookie fallback). Either alone is ignored.
-	if *rpcUser != "" && *rpcPass != "" {
-		srv.SetAuth(*rpcUser, *rpcPass)
+	// SEC-F01 / RPC-F50: auth is enforced whenever ANY credential is configured
+	// (-rpcuser+-rpcpassword or -rpcauth). With none, the loopback-default bind
+	// is open (no cookie; documented divergence).
+	var rpcauthList []string
+	for _, e := range strings.Split(*rpcAuth, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			rpcauthList = append(rpcauthList, e)
+		}
+	}
+	authConfigured := (*rpcUser != "" && *rpcPass != "") || len(rpcauthList) > 0
+	if authConfigured {
+		if *rpcUser != "" && *rpcPass != "" {
+			srv.SetAuth(*rpcUser, *rpcPass)
+		}
+		if len(rpcauthList) > 0 {
+			srv.SetRpcAuth(rpcauthList)
+		}
 	} else if !isLoopbackAddr(*rpcBind) {
 		// Unauthenticated RPC bound beyond loopback is not safe to expose
 		// (mirrors blocknetd's warning for RPC without auth).
 		xlog.Warn("RPC without authentication is not safe to expose",
-			"rpcbind", *rpcBind, "hint", "set -rpcuser and -rpcpassword")
+			"rpcbind", *rpcBind, "hint", "set -rpcuser/-rpcpassword or -rpcauth")
 	}
 
 	if *nodeAddr != "" {
@@ -234,8 +250,19 @@ func main() {
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
 	// httpSrv is kept by name so shutdown can drain in-flight RPC handlers
-	// (srv.Shutdown) instead of exiting under them.
-	httpSrv := &http.Server{Addr: *rpcBind, Handler: srv}
+	// (srv.Shutdown) instead of exiting under them. Timeouts (RPC-F58): the
+	// read/write timeout mirrors C++ -rpcservertimeout (evhttp_set_timeout,
+	// httpserver.cpp:393, DEFAULT_HTTP_SERVER_TIMEOUT=30); the header and idle
+	// timeouts are Go-side hardening (no C++ counterpart).
+	rpcTimeout := time.Duration(*rpcServerTimeout) * time.Second
+	httpSrv := &http.Server{
+		Addr:              *rpcBind,
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       rpcTimeout,
+		WriteTimeout:      rpcTimeout,
+		IdleTimeout:       60 * time.Second,
+	}
 	// Finalization on SIGINT/SIGTERM. os.Exit skips defers, so shutdown steps
 	// must run explicitly here: stop the P2P node (peer conns / read-loops),
 	// flush pending dedup summaries, then close the log file.
