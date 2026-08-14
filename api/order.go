@@ -256,38 +256,98 @@ func (o *Order) toDetailResult() orderDetailResult {
 	}
 }
 
-// makeOrderResponse renders the dxMakeOrder result. Mirrors rpcxbridge.cpp
-// dxMakeOrder SUCCESS branch: the partial_* fields are "0.000000" (formatXAmount
-// of zero), order_type is "exact", and status is "created".
+// makeOrderResponse renders the dxMakeOrder SUCCESS result (Layout B,
+// rpcxbridge.cpp:1047-1067). C++ emits created_at BEFORE updated_at (updated
+// is a now() estimate), the addresses at 2/5, block_id 10th, the partial_*
+// fields as literal "0", order_type "exact", and status "created".
 func (o *Order) makeOrderResponse() makeOrderResult {
-	base := o.toOrderBase()
-	base.PartialMinimum = formatXAmount(0)
-	base.PartialOrigMakerSize = formatXAmount(0)
-	base.PartialOrigTakerSize = formatXAmount(0)
-	base.OrderType = "exact"
-	base.Status = "created"
 	return makeOrderResult{
-		orderBase:    base,
-		MakerAddress: o.MakerAddress,
-		TakerAddress: o.TakerAddress,
-		BlockID:      o.BlockID,
+		ID:                   orderIDString(o.ID),
+		MakerAddress:         o.MakerAddress,
+		Maker:                o.FromCurrency,
+		MakerSize:            formatXAmount(o.FromAmount),
+		TakerAddress:         o.TakerAddress,
+		Taker:                o.ToCurrency,
+		TakerSize:            formatXAmount(o.ToAmount),
+		CreatedAt:            iso8601(o.Created),
+		UpdatedAt:            iso8601(NowMicro()),
+		BlockID:              o.BlockID,
+		OrderType:            "exact",
+		PartialMinimum:       "0",
+		PartialOrigMakerSize: "0",
+		PartialOrigTakerSize: "0",
+		PartialRepost:        false,
+		PartialParentID:      parentIDString([32]byte{}),
+		Status:               "created",
 	}
 }
 
-// makePartialOrderResponse renders the dxMakePartialOrder result. Mirrors
-// rpcxbridge.cpp dxMakePartialOrder SUCCESS branch: order_type is "partial",
-// the partial_* fields carry the real values (toOrderBase already does this
-// when PartialAllowed is true), order_type stays "partial", partial_repost is
-// the caller-supplied repost flag, and status is "created".
+// dryrunMakeOrderResponse renders the dxMakeOrder DRYRUN (rpcxbridge.cpp:
+// 1004-1021): zero id, no created_at/updated_at/block_id, the addresses after
+// maker_size/taker_size, partial_* literal "0".
+func (o *Order) dryrunMakeOrderResponse() dryrunMakeOrderResult {
+	return dryrunMakeOrderResult{
+		ID:                   orderIDString([32]byte{}),
+		Maker:                o.FromCurrency,
+		MakerSize:            formatXAmount(o.FromAmount),
+		MakerAddress:         o.MakerAddress,
+		Taker:                o.ToCurrency,
+		TakerSize:            formatXAmount(o.ToAmount),
+		TakerAddress:         o.TakerAddress,
+		OrderType:            "exact",
+		PartialMinimum:       "0",
+		PartialOrigMakerSize: "0",
+		PartialOrigTakerSize: "0",
+		PartialRepost:        false,
+		PartialParentID:      parentIDString([32]byte{}),
+		Status:               "created",
+	}
+}
+
+// makePartialOrderResponse renders the dxMakePartialOrder SUCCESS result
+// (Layout B, rpcxbridge.cpp:3070-3090): order_type "partial", the real
+// partial_* values, partial_repost from the caller, status "created".
 func (o *Order) makePartialOrderResponse(repost bool) makeOrderResult {
-	base := o.toOrderBase()
-	base.PartialRepost = repost
-	base.Status = "created"
 	return makeOrderResult{
-		orderBase:    base,
-		MakerAddress: o.MakerAddress,
-		TakerAddress: o.TakerAddress,
-		BlockID:      o.BlockID,
+		ID:                   orderIDString(o.ID),
+		MakerAddress:         o.MakerAddress,
+		Maker:                o.FromCurrency,
+		MakerSize:            formatXAmount(o.FromAmount),
+		TakerAddress:         o.TakerAddress,
+		Taker:                o.ToCurrency,
+		TakerSize:            formatXAmount(o.ToAmount),
+		CreatedAt:            iso8601(o.Created),
+		UpdatedAt:            iso8601(NowMicro()),
+		BlockID:              o.BlockID,
+		OrderType:            "partial",
+		PartialMinimum:       formatXAmount(o.MinFromAmount),
+		PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
+		PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
+		PartialRepost:        repost,
+		PartialParentID:      parentIDString(o.ParentID),
+		Status:               "created",
+	}
+}
+
+// dryrunMakePartialOrderResponse renders the dxMakePartialOrder DRYRUN
+// (rpcxbridge.cpp:3106-3122): zero id, no timestamps/block_id, real partial
+// values.
+func (o *Order) dryrunMakePartialOrderResponse(repost bool) dryrunMakeOrderResult {
+	return dryrunMakeOrderResult{
+		ID:                   orderIDString([32]byte{}),
+		Maker:                o.FromCurrency,
+		MakerSize:            formatXAmount(o.FromAmount),
+		MakerAddress:         o.MakerAddress,
+		Taker:                o.ToCurrency,
+		TakerSize:            formatXAmount(o.ToAmount),
+		TakerAddress:         o.TakerAddress,
+		OrderType:            "partial",
+		PartialMinimum:       formatXAmount(o.MinFromAmount),
+		PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
+		PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
+		PartialRepost:        repost,
+		PartialParentID:      parentIDString([32]byte{}),
+		Status:               "created",
 	}
 }
 

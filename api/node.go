@@ -864,9 +864,9 @@ func decodeAddr(currency, addrStr string) ([20]byte, *rpcError) {
 	return id, nil
 }
 
-func (n *Node) requireWrite() *rpcError {
+func (n *Node) requireWrite(name string) *rpcError {
 	if n.conn == nil {
-		return makeError(errNoServiceNode, "dx", "")
+		return makeError(errNoServiceNode, name, "")
 	}
 	return nil
 }
@@ -874,7 +874,7 @@ func (n *Node) requireWrite() *rpcError {
 // MakeOrder builds, signs and (unless dry-run) broadcasts an xbcTransaction
 // packet, returning the order in dxMakeOrder's response shape.
 func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
-	if e := n.requireWrite(); e != nil {
+	if e := n.requireWrite("dxMakeOrder"); e != nil {
 		return nil, e
 	}
 	// Reject amounts that are more precise than Blocknet allows (C++
@@ -921,24 +921,27 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	// getSn re-check at :1518). The chosen hub is pinned for this order: its
 	// pubkey/address travel in the SEND envelope and on the Order record.
 	//
-	// Skipped in dry-run: Go's dxMakeOrder dry-run is a validation/preview
-	// extension (C++ has none) that broadcasts nothing and creates no session,
-	// so there is no hub to select or protect.
+	// Skipped in dry-run: C++ short-circuits to the dryrun result before
+	// makeTransaction (rpcxbridge.cpp:990-1021), so there is no hub to select;
+	// the dryrun response carries the zero id and no timestamps/block_id.
 	var hubKey [33]byte
 	var hubAddr [20]byte
 	if !p.DryRun {
 		reg := n.snReg
 		if reg == nil {
 			// No registry at all: the operator must connect to a service node
-			// (or run one) before any make can succeed (C++ :1515).
+			// (or run one) before any make can succeed (C++ :1515). C++ emits
+			// makeError(statusCode, __FUNCTION__) with NO argument — the bare
+			// "Could not find a service node with required services: " text
+			// (rpcxbridge.cpp:1036-1037, RPC-F12).
 			xlog.Warn("dxMakeOrder refused: no service-node registry (empty snReg)", "maker", p.Maker, "taker", p.Taker)
-			return nil, makeError(errNoServiceNode, "dxMakeOrder", p.Maker+"/"+p.Taker)
+			return nil, makeError(errNoServiceNode, "dxMakeOrder", "")
 		}
 		var ok bool
 		hubKey, ok = reg.Pick([]string{p.Maker, p.Taker})
 		if !ok {
 			xlog.Warn("dxMakeOrder refused: no running hub advertising both currencies", "maker", p.Maker, "taker", p.Taker)
-			return nil, makeError(errNoServiceNode, "dxMakeOrder", p.Maker+"/"+p.Taker)
+			return nil, makeError(errNoServiceNode, "dxMakeOrder", "")
 		}
 		hubAddr = coins.KeyID(hubKey[:])
 	}
@@ -950,7 +953,6 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if _, e := n.connector(p.Taker); e != nil {
 		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
 	}
-
 	partial := false
 	minFrom := fromAmt
 	cc := n.cfg().Confs[p.Maker]
@@ -975,9 +977,17 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		if minFrom > fromAmt {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
-		// C++ connFrom->isDustAmount(partialMinimum): base units < configured dust.
+		// C++ connFrom->isDustAmount(partialMinimum): the minimum is compared in
+		// the coin's NATIVE base units (partialMinimum * COIN) against the
+		// native dust threshold (xbridgewalletconnectorbtc.cpp:1900-1904).
+		// minFrom is XBridge 1e6 base, so scale it up with the same double
+		// arithmetic C++ uses before comparing (RPC-F13). minimum_size is not
+		// precision-validated (unlike maker/taker sizes), so parseXAmount
+		// truncates to 6 decimals; a sub-6-decimal min like "0.0000546" (native
+		// 5460, NOT dust in C++) truncates to 0.000054 (native 5400, dust here)
+		// — a pre-existing truncation narrow-band divergence, accepted.
 		relayFee, _ = n.relayFeeFor(p.Maker)
-		if cc != nil && minFrom < effectiveDust(cc, relayFee) {
+		if cc != nil && float64(minFrom)/float64(coinScale)*float64(nativeCoin) < float64(effectiveDust(cc, relayFee)) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
@@ -1358,7 +1368,7 @@ func (n *Node) checkAcceptParams(currency string, fromSize uint64, fromAddress s
 // the dryrun result, and recomputes the swap sizes for partial takes via
 // xBridgeSourceAmountFromPrice.
 func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
-	if e := n.requireWrite(); e != nil {
+	if e := n.requireWrite("dxTakeOrder"); e != nil {
 		return orderListResult{}, e
 	}
 	// C++ dxTakeOrder: from_address and to_address must differ.
@@ -1737,7 +1747,7 @@ type CancelOrderParams struct {
 // CancelOrder broadcasts an xbcTransactionCancel packet for the given order and
 // returns the dxCancelOrder response shape.
 func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
-	if e := n.requireWrite(); e != nil {
+	if e := n.requireWrite("dxCancelOrder"); e != nil {
 		return nil, e
 	}
 	o := n.store.Get(p.ID)

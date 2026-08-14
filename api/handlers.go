@@ -339,6 +339,11 @@ func (h *HandlerCtx) dxMakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 	if e != nil {
 		return nil, e
 	}
+	// C++ renders a distinct dryrun object: zero id, no timestamps/block_id
+	// (rpcxbridge.cpp:1004-1021).
+	if dryRun {
+		return o.dryrunMakeOrderResponse(), nil
+	}
 	return o.makeOrderResponse(), nil
 }
 
@@ -409,6 +414,11 @@ func (h *HandlerCtx) dxMakePartialOrder(params []json.RawMessage) (interface{}, 
 	})
 	if e != nil {
 		return nil, e
+	}
+	// C++ renders a distinct dryrun object: zero id, no timestamps/block_id
+	// (rpcxbridge.cpp:3106-3122).
+	if dryRun {
+		return o.dryrunMakePartialOrderResponse(repost), nil
 	}
 	return o.makePartialOrderResponse(repost), nil
 }

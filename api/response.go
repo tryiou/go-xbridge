@@ -54,12 +54,48 @@ type orderDetailResult struct {
 	TakerAddress string `json:"taker_address"`
 }
 
-// makeOrderResult is used by dxMakeOrder (adds addresses + block_id).
+// makeOrderResult is the dxMakeOrder / dxMakePartialOrder SUCCESS response
+// (Layout B, rpcxbridge.cpp:1047-1067 / :3070-3090): created_at BEFORE
+// updated_at, maker_address 2nd, taker_address 5th, block_id 10th.
 type makeOrderResult struct {
-	orderBase
-	MakerAddress string `json:"maker_address"`
-	TakerAddress string `json:"taker_address"`
-	BlockID      string `json:"block_id"`
+	ID                   string `json:"id"`
+	MakerAddress         string `json:"maker_address"`
+	Maker                string `json:"maker"`
+	MakerSize            string `json:"maker_size"`
+	TakerAddress         string `json:"taker_address"`
+	Taker                string `json:"taker"`
+	TakerSize            string `json:"taker_size"`
+	CreatedAt            string `json:"created_at"`
+	UpdatedAt            string `json:"updated_at"`
+	BlockID              string `json:"block_id"`
+	OrderType            string `json:"order_type"`
+	PartialMinimum       string `json:"partial_minimum"`
+	PartialOrigMakerSize string `json:"partial_orig_maker_size"`
+	PartialOrigTakerSize string `json:"partial_orig_taker_size"`
+	PartialRepost        bool   `json:"partial_repost"`
+	PartialParentID      string `json:"partial_parent_id"`
+	Status               string `json:"status"`
+}
+
+// dryrunMakeOrderResult is the dxMakeOrder / dxMakePartialOrder DRYRUN response
+// (rpcxbridge.cpp:1004-1021 / :3106-3122): zero id, NO created_at /
+// updated_at / block_id, and the maker/taker addresses AFTER maker_size /
+// taker_size.
+type dryrunMakeOrderResult struct {
+	ID                   string `json:"id"`
+	Maker                string `json:"maker"`
+	MakerSize            string `json:"maker_size"`
+	MakerAddress         string `json:"maker_address"`
+	Taker                string `json:"taker"`
+	TakerSize            string `json:"taker_size"`
+	TakerAddress         string `json:"taker_address"`
+	OrderType            string `json:"order_type"`
+	PartialMinimum       string `json:"partial_minimum"`
+	PartialOrigMakerSize string `json:"partial_orig_maker_size"`
+	PartialOrigTakerSize string `json:"partial_orig_taker_size"`
+	PartialRepost        bool   `json:"partial_repost"`
+	PartialParentID      string `json:"partial_parent_id"`
+	Status               string `json:"status"`
 }
 
 // cancelOrderResult is the dxCancelOrder response. Note: unlike dxGetMyOrders /

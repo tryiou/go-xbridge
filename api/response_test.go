@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -160,8 +161,8 @@ func TestStatusString(t *testing.T) {
 }
 
 func TestMakeOrderResponseShapes(t *testing.T) {
-	// dxMakeOrder must report partial_* = "0.000000" (formatXAmount of zero) and
-	// status = "created".
+	// dxMakeOrder (exact) must report partial_* = literal "0" (C++
+	// rpcxbridge.cpp:1060-1062) and status = "created".
 	o := &Order{
 		ID:             [32]byte{0x01},
 		FromCurrency:   "SYS",
@@ -177,8 +178,8 @@ func TestMakeOrderResponseShapes(t *testing.T) {
 		BlockID:        "blockhash",
 	}
 	r := o.makeOrderResponse()
-	if r.PartialMinimum != "0.000000" || r.PartialOrigMakerSize != "0.000000" || r.PartialOrigTakerSize != "0.000000" {
-		t.Errorf("dxMakeOrder partial fields must be \"0.000000\", got %q/%q/%q",
+	if r.PartialMinimum != "0" || r.PartialOrigMakerSize != "0" || r.PartialOrigTakerSize != "0" {
+		t.Errorf("dxMakeOrder partial fields must be \"0\", got %q/%q/%q",
 			r.PartialMinimum, r.PartialOrigMakerSize, r.PartialOrigTakerSize)
 	}
 	if r.Status != "created" || r.OrderType != "exact" {
@@ -272,5 +273,89 @@ func TestOrderIDLess(t *testing.T) {
 	}
 	if orderIDLess(ids(0xff), ids(0xff)) {
 		t.Errorf("orderIDLess must be strict (equal ids)")
+	}
+}
+
+// TestMakeOrderResponseLayoutB locks in RPC-F09's field ORDER: the dxMakeOrder
+// SUCCESS object is Layout B — created_at BEFORE updated_at, maker_address
+// 2nd, taker_address 5th, block_id 10th (rpcxbridge.cpp:1047-1067). A struct
+// field reorder (or embedding the old Layout A base) breaks this golden.
+func TestMakeOrderResponseLayoutB(t *testing.T) {
+	o := &Order{
+		ID:           [32]byte{0xab},
+		FromCurrency: "SYS",
+		FromAmount:   1500000,
+		ToCurrency:   "LTC",
+		ToAmount:     150000,
+		Created:      uint64(time.Date(2018, 1, 15, 18, 15, 30, 123456000, time.UTC).UnixMicro()),
+		MakerAddress: "maddr",
+		TakerAddress: "taddr",
+		BlockID:      "blockhash",
+	}
+	orig := NowMicro
+	NowMicro = func() uint64 { return uint64(time.Date(2018, 1, 15, 18, 25, 5, 654321000, time.UTC).UnixMicro()) }
+	defer func() { NowMicro = orig }()
+
+	b, err := json.Marshal(o.makeOrderResponse())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"id":"` + strings.Repeat("0", 62) + `ab","maker_address":"maddr","maker":"SYS","maker_size":"1.500000","taker_address":"taddr","taker":"LTC","taker_size":"0.150000","created_at":"2018-01-15T18:15:30.123Z","updated_at":"2018-01-15T18:25:05.654Z","block_id":"blockhash","order_type":"exact","partial_minimum":"0","partial_orig_maker_size":"0","partial_orig_taker_size":"0","partial_repost":false,"partial_parent_id":"","status":"created"}`
+	if string(b) != want {
+		t.Errorf("Layout B JSON:\n got %s\nwant %s", string(b), want)
+	}
+}
+
+// TestMakeDryrunResponse locks in RPC-F10: the dxMakeOrder / dxMakePartialOrder
+// dryrun objects carry the ZERO id, no created_at/updated_at/block_id, and the
+// maker/taker addresses AFTER maker_size/taker_size (rpcxbridge.cpp:1004-1021,
+// 3106-3122).
+func TestMakeDryrunResponse(t *testing.T) {
+	zero := strings.Repeat("0", 64)
+	o := &Order{
+		ID:             [32]byte{0xab},
+		FromCurrency:   "SYS",
+		FromAmount:     1500000,
+		ToCurrency:     "LTC",
+		ToAmount:       150000,
+		PartialAllowed: true,
+		MinFromAmount:  500000,
+		OrigFromAmount: 1500000,
+		OrigToAmount:   150000,
+		MakerAddress:   "maddr",
+		TakerAddress:   "taddr",
+	}
+
+	exact := o.dryrunMakeOrderResponse()
+	if exact.ID != zero {
+		t.Errorf("exact dryrun id = %q, want zero id", exact.ID)
+	}
+	// Full JSON golden pins the 14-field dryrun byte ORDER (rpcxbridge.cpp:
+	// 1005-1020): id, maker, maker_size, maker_address, taker, taker_size,
+	// taker_address, order_type, ... — addresses AFTER the sizes, no timestamps.
+	b, err := json.Marshal(exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	want := `{"id":"` + zero + `","maker":"SYS","maker_size":"1.500000","maker_address":"maddr","taker":"LTC","taker_size":"0.150000","taker_address":"taddr","order_type":"exact","partial_minimum":"0","partial_orig_maker_size":"0","partial_orig_taker_size":"0","partial_repost":false,"partial_parent_id":"","status":"created"}`
+	if s != want {
+		t.Errorf("exact dryrun JSON:\n got %s\nwant %s", s, want)
+	}
+	for _, absent := range []string{"created_at", "updated_at", "block_id"} {
+		if strings.Contains(s, absent) {
+			t.Errorf("exact dryrun JSON contains %q (must be 14 fields): %s", absent, s)
+		}
+	}
+	if exact.OrderType != "exact" || exact.PartialMinimum != "0" || exact.MakerAddress != "maddr" {
+		t.Errorf("exact dryrun shape wrong: %+v", exact)
+	}
+
+	part := o.dryrunMakePartialOrderResponse(true)
+	if part.ID != zero {
+		t.Errorf("partial dryrun id = %q, want zero id", part.ID)
+	}
+	if part.OrderType != "partial" || part.PartialMinimum != "0.500000" || part.PartialRepost != true {
+		t.Errorf("partial dryrun shape wrong: %+v", part)
 	}
 }

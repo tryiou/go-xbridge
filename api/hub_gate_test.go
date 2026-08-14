@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"go-xbridge/coins"
@@ -114,7 +115,10 @@ func hubKey(t *testing.T, seed byte) ([32]byte, [33]byte, string, [20]byte) {
 }
 
 // TestMakeOrderNoRegistry verifies dxMakeOrder fails with NO_SERVICE_NODE (1032)
-// when no service-node registry is configured (C++ makeTransaction:1515).
+// when no service-node registry is configured (C++ makeTransaction:1515). RPC-F12:
+// C++ emits makeError(statusCode, __FUNCTION__) with NO argument, so the message
+// is the bare "Could not find a service node with required services: " (the
+// maker/taker pair is NOT appended).
 func TestMakeOrderNoRegistry(t *testing.T) {
 	n, _ := newHubNode(nil)
 	o, rerr := n.MakeOrder(MakeOrderParams{
@@ -123,6 +127,9 @@ func TestMakeOrderNoRegistry(t *testing.T) {
 	})
 	if rerr == nil || rerr.Code != errNoServiceNode {
 		t.Fatalf("MakeOrder(nil registry) = %v, want errNoServiceNode", rerr)
+	}
+	if rerr.Error != "Could not find a service node with required services: " {
+		t.Errorf("MakeOrder(nil registry) message = %q, want bare text with trailing space", rerr.Error)
 	}
 	if o != nil {
 		t.Fatalf("expected nil order, got %+v", o)
@@ -760,5 +767,33 @@ func TestTakeOrderBadAddressAfterFundsGate(t *testing.T) {
 	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: "not-an-address-1", ToAddress: "not-an-address-2"})
 	if rerr == nil || rerr.Code != errInsufficientFunds {
 		t.Fatalf("TakeOrder(bad address, under-funded) = %v, want errInsufficientFunds (address gate must run later)", rerr)
+	}
+}
+
+// TestMakePartialDustNativeScale locks in RPC-F13: the partial minimum_size is
+// compared in the coin's NATIVE base units (partialMinimum * COIN < dustAmount,
+// xbridgewalletconnectorbtc.cpp:1900-1904), NOT in XBridge 1e6 base against a
+// native dust value. buildHubNode confs set no DustAmount, so effectiveDust =
+// 0.546 * relayFee * COIN; the stub wallet reports relayFee 0.0001, giving
+// 0.546 * 0.0001 * 1e8 = 5460 native (numerically equal to cppDustFallback).
+// Native = minFrom * 1e8/1e6 = minFrom * 100: 0.000055 -> 5500 native (NOT
+// dust), 0.000054 -> 5400 native (dust). The old 1e6-vs-native comparison
+// rejected everything below 5460 XBridge base (i.e. 0.00546 coins), wrongly
+// rejecting 0.000055.
+func TestMakePartialDustNativeScale(t *testing.T) {
+	n, _ := newHubNode(nil) // dryrun skips the hub gate, so no registry needed
+	mk := func(min string) *rpcError {
+		_, rerr := n.MakeOrder(MakeOrderParams{
+			Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+			Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+			Type: "partial", MinSize: min, DryRun: true,
+		})
+		return rerr
+	}
+	if rerr := mk("0.000055"); rerr != nil {
+		t.Errorf("MakeOrder(min 0.000055) = %v, want NO dust error (native 5500 >= 5460)", rerr)
+	}
+	if rerr := mk("0.000054"); rerr == nil || rerr.Code != errInvalidParameters || !strings.Contains(rerr.Error, "dust") {
+		t.Errorf("MakeOrder(min 0.000054) = %v, want 1025 dust error (native 5400 < 5460)", rerr)
 	}
 }
