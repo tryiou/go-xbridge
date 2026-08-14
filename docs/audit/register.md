@@ -71,8 +71,8 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F32 | S2 | `dxGetLockedUtxos` 1021 trigger too narrow in Go | FIXED | B7 `fix/rpc-surface` (1021 on no-reserved-utxos `getUtxoItems` miss + expired-state validity — `TestDxGetLockedUtxosNoReserved`) |
 | RPC-F33 | S3 | `dxGetLockedUtxos` per-order key selection (status ordinal vs map membership) | FIXED | B7 `fix/rpc-surface` (pending/accepted map membership: `o.Mine || st >= accepting` → maker_and_taker — `TestDxGetLockedUtxosKeyByState`) |
 | RPC-F34 | S3 | `dxGetLockedUtxos` id echo un-normalized | FIXED | B7 `fix/rpc-surface` (echo `orderIDString(parseOrderIDS(id))` — `TestDxGetLockedUtxosIdEchoNormalized`) |
-| RPC-F35 | S2 | `dxFlushCancelledOrders` flushes only the cancelled ledger, not book/history | OPEN | B7 |
-| RPC-F36 | S3 | `dxFlushCancelledOrders` use_count/ordering/key order | OPEN | B7 |
+| RPC-F35 | S2 | `dxFlushCancelledOrders` flushes only the cancelled ledger, not book/history | FIXED | B7 `fix/rpc-surface` (scans + erases cancelled from live book AND history, `xbridgeapp.cpp:1331-1354` — `TestFlushCancelledPrunesBookAndHistory`, `TestDxGetLockedAndFlush`). Residual: Go sets `Updated`=now at cancel (restarts the age clock), C++ leaves txtime at the last pre-cancel update — identical under age 0 |
+| RPC-F36 | S3 | `dxFlushCancelledOrders` use_count/ordering/key order | FIXED | B7 `fix/rpc-surface` (per-map uint256 id ordering, ordered struct keys `ageMillis/now/durationMicrosec/flushedOrders` — `TestFlushCancelledPrunesBookAndHistory`; use_count = owning-map ref 1, Go has no shared_ptr — debug-only residual) |
 | RPC-F37 | S2 | `gettradingdata` (lowercase) missing from Go dispatch | RE-DECIDE | B7 (prior: deliberate removal) |
 | RPC-F38 | S2 | `dxGetTradingData` `fee_txid`/`nodepubkey` always `""` | OPEN | B7 |
 | RPC-F39 | S2 | `dxGetTradingData` data source: local fills vs on-chain scan | DOCUMENTED | Tier-3 (`api.md`) |

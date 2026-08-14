@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math"
 	"strings"
 	"testing"
 
@@ -442,18 +443,32 @@ func TestDxGetLockedUtxosTerminalOrder(t *testing.T) {
 }
 
 // TestFlushCancelledUnderflow verifies a huge ageMillis does not underflow uint64
-// (it prunes everything) and age 0 prunes all remaining entries. T1.4.
+// (keepTime stays large so every old entry is pruned) and age 0 prunes all
+// remaining entries. It drives the C++-faithful path: cancelled orders are
+// pruned from the LIVE BOOK and history (xbridgeapp.cpp:1331-1354, RPC-F35).
+// T1.4.
 func TestFlushCancelledUnderflow(t *testing.T) {
 	s := NewStore()
-	s.RecordCancelled("a", 100)
-	s.RecordCancelled("b", 200)
-	// A huge age far exceeds any utxo txtime, so every entry is pruned. The
-	// uint64 subtraction must be clamped, not wrap around.
+	addCancelled := func(seed byte, updated uint64) {
+		o := &Order{ID: [32]byte{seed}, FromCurrency: "BTC", FromAmount: 1,
+			ToCurrency: "BTC", ToAmount: 1, Status: "canceled", Mine: true, Updated: updated}
+		s.Add(o)
+	}
+	addCancelled(0xa, 100)
+	addCancelled(0xb, 200)
+	// A huge age makes keepTime large (no uint64 wrap), so every old entry is
+	// pruned.
 	if got := s.FlushCancelled(1 << 40); len(got) != 2 {
 		t.Errorf("huge age should prune all 2 entries, got %d", len(got))
 	}
-	s.RecordCancelled("c", 300)
+	addCancelled(0xc, 300)
 	if got := s.FlushCancelled(0); len(got) != 1 {
 		t.Errorf("age 0 should prune the remaining entry, got %d", len(got))
+	}
+	// An absurd age whose µs conversion would overflow uint64 clamps keepTime
+	// to the epoch: nothing is pruned (C++ now - absurd age is far in the past).
+	addCancelled(0xd, 1)
+	if got := s.FlushCancelled(math.MaxInt64); len(got) != 0 {
+		t.Errorf("overflowing age should prune nothing, got %d", len(got))
 	}
 }

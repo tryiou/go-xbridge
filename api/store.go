@@ -1,6 +1,9 @@
 package api
 
 import (
+	"encoding/hex"
+	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -19,15 +22,18 @@ import (
 // *Order pointer ever escapes for out-of-lock mutation — a reader can never
 // observe a torn order or race the writer.
 //
-// The append-only histories (fills/history/cancelled) are bounded: each is
-// trimmed to its cap on write so the store cannot grow without bound.
+// The append-only histories (fills/history) are bounded: each is trimmed to its
+// cap on write so the store cannot grow without bound. Cancelled orders are NOT
+// tracked in a separate ledger — they stay in the live book (status "canceled")
+// and history until dxFlushCancelledOrders prunes them, mirroring C++ which
+// erases trCancelled entries from m_transactions and m_historicTransactions
+// (xbridgeapp.cpp:1331-1354, RPC-F35).
 type Store struct {
-	mu        sync.RWMutex
-	orders    map[string]*Order
-	fills     []fillEntry // recent completed fills (session-scoped, like C++)
-	locked    map[string]*Order
-	cancelled []cancelledEntry
-	history   []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
+	mu      sync.RWMutex
+	orders  map[string]*Order
+	fills   []fillEntry // recent completed fills (session-scoped, like C++)
+	locked  map[string]*Order
+	history []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
 	// reserved holds the "txid:vout" keys (display order) committed atomically
 	// by a take before its Accepting packet leaves (C++ lockCoins/lockFeeUtxos
 	// under m_utxosOrderLock, xbridgeapp.cpp:2236-2267). The reservation is
@@ -52,7 +58,6 @@ type reservedKeys struct {
 const (
 	maxStoreFills   = 1000 // bound on s.fills (CONC-F99: bounded history)
 	maxStoreHistory = 1000 // bound on s.history (CONC-F99: bounded history)
-	maxCancelled    = 1000 // bound on s.cancelled (in addition to the age prune)
 )
 
 // trimOldest returns s with at most max elements, dropping the oldest entries
@@ -94,8 +99,13 @@ type fillEntry struct {
 	PartialRepost        bool
 }
 
-type cancelledEntry struct {
-	ID       string
+// flushedOrder is one cancelled order removed by FlushCancelled (C++
+// App::FlushedOrder, xbridgeapp.cpp:1331). ID is the raw [32]byte so the
+// C++ std::map id ordering (orderIDLess) can be reproduced; the handler renders
+// the display hex. UseCount mirrors ptr.use_count() (the owning map reference);
+// Go has no shared_ptr, so the debug-only refcount is reported as 1.
+type flushedOrder struct {
+	ID       [32]byte
 	Txtime   uint64
 	UseCount int
 }
@@ -557,41 +567,71 @@ func (s *Store) ReleaseReserve(key string) {
 	delete(s.reserved, key)
 }
 
-// RecordCancelled records a flushed cancelled order (dxFlushCancelledOrders).
-func (s *Store) RecordCancelled(id string, txtime uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cancelled = append(s.cancelled, cancelledEntry{ID: id, Txtime: txtime, UseCount: 1})
-	s.cancelled = trimOldest(s.cancelled, maxCancelled)
-}
-
 // FlushCancelled prunes cancelled orders whose txtime is older than
-// minAgeMillis, mirroring C++ dxFlushCancelledOrders. keepTime = now -
-// minAgeMillis(ms); entries with Txtime < keepTime are removed and returned in
-// the flushed subset (the rest are kept). A minAgeMillis of 0 prunes everything
-// regardless of age.
-func (s *Store) FlushCancelled(minAgeMillis uint64) []cancelledEntry {
+// minAgeMillis from BOTH the live book and history, mirroring C++
+// App::flushCancelledOrders (xbridgeapp.cpp:1331-1354) which erases
+// trCancelled transactions from m_transactions AND m_historicTransactions
+// (RPC-F35). keepTime = now - minAgeMillis(ms); orders with txtime < keepTime
+// are removed and returned (the rest are kept). A minAgeMillis of 0 prunes
+// everything regardless of age. The returned list is ordered the way C++
+// iterates its std::maps — the live book first, then history, each in
+// uint256-ascending (id) order (RPC-F36).
+func (s *Store) FlushCancelled(minAgeMillis uint64) []flushedOrder {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// keepTime = now - minAgeMillis(ms). A very large age would make the
-	// subtrahend overflow uint64 and wrap; clamp so every entry is pruned.
+	// keepTime = now - minAgeMillis(ms). A huge age whose µs conversion would
+	// overflow uint64 is skipped entirely, leaving keepTime at 0 (the epoch):
+	// `Updated < 0` matches nothing, so nothing is pruned — matching C++ where
+	// now - an absurd age is far in the past (bpt::ptime cannot be negative).
 	now := NowMicro()
-	sub := uint64(minAgeMillis) * 1000
 	keepTime := uint64(0)
-	if sub <= now {
-		keepTime = now - sub
-	}
-	flushed := make([]cancelledEntry, 0)
-	kept := make([]cancelledEntry, 0, len(s.cancelled))
-	for _, c := range s.cancelled {
-		if c.Txtime < keepTime {
-			flushed = append(flushed, c)
-		} else {
-			kept = append(kept, c)
+	if minAgeMillis <= math.MaxInt64/1000 {
+		sub := uint64(minAgeMillis) * 1000
+		if sub <= now {
+			keepTime = now - sub
 		}
 	}
-	s.cancelled = kept
-	return flushed
+	var liveFlushed, histFlushed []flushedOrder
+	for key, o := range s.orders {
+		if statusString(o.Status) == "canceled" && o.Updated < keepTime {
+			liveFlushed = append(liveFlushed, flushedOrder{ID: o.ID, Txtime: o.Updated, UseCount: 1})
+			delete(s.orders, key)
+		}
+	}
+	kept := s.history[:0]
+	for _, e := range s.history {
+		if statusString(e.Status) == "canceled" && e.Updated < keepTime {
+			histFlushed = append(histFlushed, flushedOrder{ID: historyOrderID(e), Txtime: e.Updated, UseCount: 1})
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	s.history = kept
+	// C++ iterates each std::map in uint256 ascending (id order), live first
+	// then history (xbridgeapp.cpp:1336,1340); reproduce that per-block order.
+	sort.SliceStable(liveFlushed, func(i, j int) bool {
+		return orderIDLess(liveFlushed[i].ID, liveFlushed[j].ID)
+	})
+	sort.SliceStable(histFlushed, func(i, j int) bool {
+		return orderIDLess(histFlushed[i].ID, histFlushed[j].ID)
+	})
+	return append(liveFlushed, histFlushed...)
+}
+
+// historyOrderID returns the raw [32]byte id of a history record (from the
+// order snapshot when present, else decoded from the store-key hex), so a
+// flushed history entry can be rendered/ordered like the C++ descriptor id.
+func historyOrderID(e historyEntry) [32]byte {
+	if e.Order != nil {
+		return e.Order.ID
+	}
+	raw, err := hex.DecodeString(e.ID)
+	if err != nil || len(raw) != 32 {
+		return [32]byte{}
+	}
+	var b [32]byte
+	copy(b[:], raw)
+	return b
 }
 
 // NowMicro returns the current time in microseconds since epoch (mirrors C++

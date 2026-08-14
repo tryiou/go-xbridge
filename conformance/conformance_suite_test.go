@@ -405,9 +405,8 @@ func TestRPCResponseShape(t *testing.T) {
 		{method: "dxGetLockedUtxos", mode: "set", div: true, id: "dxGetLockedUtxos/key-order", refKeys: []string{
 			"id", "<currency_key>"}},
 		// dxFlushCancelledOrders: ageMillis, now, durationMicrosec, flushedOrders
-		// (rpcxbridge.cpp:1474-1489). CAND map -> alphabetical. DIVERGENT
-		// (Group-4 finding dxFlushCancelledOrders/key-order).
-		{method: "dxFlushCancelledOrders", mode: "set", div: true, id: "dxFlushCancelledOrders/key-order", refKeys: []string{
+		// (rpcxbridge.cpp:1474-1489). CONFORMANT (RPC-F36 fixed: ordered struct).
+		{method: "dxFlushCancelledOrders", mode: "exact", refKeys: []string{
 			"ageMillis", "now", "durationMicrosec", "flushedOrders"}},
 		// dxGetTradingData record: timestamp, fee_txid, nodepubkey, id, taker,
 		// taker_size, maker, maker_size (rpcxbridge.cpp:2889-2898). CAND map ->

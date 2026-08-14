@@ -100,6 +100,24 @@ type partialChainDetailsResult struct {
 	P2SHDepositsCounterparty []string `json:"p2sh_deposits_counterparty"`
 }
 
+// flushCancelledResult is the dxFlushCancelledOrders success object. Field ORDER
+// matches the C++ writer (rpcxbridge.cpp:1474-1489): ageMillis, now,
+// durationMicrosec, flushedOrders (RPC-F36).
+type flushCancelledResult struct {
+	AgeMillis        int64             `json:"ageMillis"`
+	Now              string            `json:"now"`
+	DurationMicrosec int64             `json:"durationMicrosec"`
+	FlushedOrders    []flushedOrderOut `json:"flushedOrders"`
+}
+
+// flushedOrderOut is one flushed cancelled order (rpcxbridge.cpp:1482-1486):
+// id in display hex, txtime as µs ISO8601, use_count (debug-only).
+type flushedOrderOut struct {
+	ID       string `json:"id"`
+	Txtime   string `json:"txtime"`
+	UseCount int    `json:"use_count"`
+}
+
 // makeOrderResult is the dxMakeOrder / dxMakePartialOrder SUCCESS response
 // (Layout B, rpcxbridge.cpp:1047-1067 / :3070-3090): created_at BEFORE
 // updated_at, maker_address 2nd, taker_address 5th, block_id 10th.

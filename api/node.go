@@ -1837,9 +1837,10 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 		})
 		o.Status = "canceled"
 		o.Updated = now
-		// C++ dxFlushCancelledOrders renders the flushed "id" as it.id.GetHex()
-		// (rpcxbridge.cpp:1483), i.e. display order, so record the display id.
-		n.store.RecordCancelled(orderIDString(o.ID), o.Created)
+		// The cancelled order stays in the live book (status "canceled"); C++
+		// dxFlushCancelledOrders scans m_transactions + m_historicTransactions
+		// for trCancelled entries and erases them (xbridgeapp.cpp:1331-1354),
+		// so no separate cancelled ledger is needed (RPC-F35).
 		// Best-effort fund recovery: if a deposit was already broadcast, return
 		// it via the pre-signed CLTV refund rather than leaving it locked at
 		// the hub. Fire-and-forget; outcomes are logged by the refund apply.

@@ -1414,19 +1414,20 @@ func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface
 	now := NowMicro()
 	flushed := h.Store.FlushCancelled(uint64(ageMillis))
 	dur := NowMicro() - now
-	orders := make([]map[string]interface{}, 0, len(flushed))
-	for _, c := range flushed {
-		orders = append(orders, map[string]interface{}{
-			"id":        c.ID,
-			"txtime":    iso8601(c.Txtime),
-			"use_count": c.UseCount,
+	orders := make([]flushedOrderOut, 0, len(flushed))
+	for _, f := range flushed {
+		orders = append(orders, flushedOrderOut{
+			ID:       orderIDString(f.ID),
+			Txtime:   iso8601(f.Txtime),
+			UseCount: f.UseCount,
 		})
 	}
-	return map[string]interface{}{
-		"ageMillis":        ageMillis,
-		"now":              iso8601(now),
-		"durationMicrosec": int64(dur),
-		"flushedOrders":    orders,
+	// RPC-F36: keys emitted in C++ pushKV order (rpcxbridge.cpp:1474-1489).
+	return flushCancelledResult{
+		AgeMillis:        int64(ageMillis),
+		Now:              iso8601(now),
+		DurationMicrosec: int64(dur),
+		FlushedOrders:    orders,
 	}, nil
 }
 

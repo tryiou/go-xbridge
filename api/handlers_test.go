@@ -624,20 +624,77 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 		t.Errorf("dxGetLockedUtxos missing BTC_and_BTC key: %v", m)
 	}
 
-	// Flush (empty, then with a recorded cancel).
+	// Flush (empty: the open made order is not cancelled).
 	res, err = ctx.dxFlushCancelledOrders(nil)
 	if err != nil {
 		t.Fatalf("dxFlushCancelledOrders: %v", err)
 	}
-	m, ok = res.(map[string]interface{})
-	if !ok || len(m["flushedOrders"].([]map[string]interface{})) != 0 {
+	m = mustJSONMap(t, res)
+	if fo, _ := m["flushedOrders"].([]interface{}); len(fo) != 0 {
 		t.Fatalf("dxFlushCancelledOrders (empty) = %v", res)
 	}
-	ctx.Store.RecordCancelled(dispID(o.ID), 5)
+	// RPC-F35: a cancelled order is pruned from the live book on the next
+	// flush (C++ erases trCancelled from m_transactions, xbridgeapp.cpp:1336).
+	ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
+		ord.Status = "canceled"
+		ord.Updated = 1 // ancient -> flushed by age 0
+	})
 	res, _ = ctx.dxFlushCancelledOrders(nil)
-	m, _ = res.(map[string]interface{})
-	if len(m["flushedOrders"].([]map[string]interface{})) != 1 {
-		t.Fatalf("dxFlushCancelledOrders (recorded) = %v", res)
+	m = mustJSONMap(t, res)
+	if fo, _ := m["flushedOrders"].([]interface{}); len(fo) != 1 {
+		t.Fatalf("dxFlushCancelledOrders (cancelled) = %v", res)
+	}
+}
+
+// TestFlushCancelledPrunesBookAndHistory locks in RPC-F35 (C++ erases
+// trCancelled orders from BOTH m_transactions and m_historicTransactions,
+// xbridgeapp.cpp:1331-1354) and RPC-F36 ordering/key-order: the flushed list is
+// the live-book block (uint256 id order) followed by the history block, and the
+// result object emits ageMillis, now, durationMicrosec, flushedOrders.
+func TestFlushCancelledPrunesBookAndHistory(t *testing.T) {
+	ctx := newWalletTestCtx()
+	// Live id GREATER than the history id: C++ emits the live std::map block
+	// first (id-ascending) then the history block (xbridgeapp.cpp:1336), so a
+	// global id sort would give [aa, bb] but the port must give [bb, aa].
+	live := &Order{ID: [32]byte{0xbb}, FromCurrency: "BTC", FromAmount: 1,
+		ToCurrency: "BTC", ToAmount: 1, Status: "canceled", Mine: true, Updated: 1}
+	ctx.Store.Add(live)
+	hist := &Order{ID: [32]byte{0xaa}, FromCurrency: "BTC", FromAmount: 1,
+		ToCurrency: "BTC", ToAmount: 1, Status: "canceled", Mine: true, Updated: 1}
+	ctx.Store.AddToHistory(hist, "canceled", 0, 1)
+
+	res, err := ctx.dxFlushCancelledOrders(nil) // age 0 -> flush everything
+	if err != nil {
+		t.Fatalf("dxFlushCancelledOrders: %v", err)
+	}
+	m := mustJSONMap(t, res)
+	fo, _ := m["flushedOrders"].([]interface{})
+	if len(fo) != 2 {
+		t.Fatalf("flushedOrders = %v, want live + history entries", m["flushedOrders"])
+	}
+	// Live block (bb) before history block (aa) — NOT a global id sort.
+	if fo[0].(map[string]interface{})["id"] != dispID(live.ID) ||
+		fo[1].(map[string]interface{})["id"] != dispID(hist.ID) {
+		t.Fatalf("flushed order order = %v, want live(%s) then history(%s)", fo, dispID(live.ID), dispID(hist.ID))
+	}
+	// Both sources are actually pruned.
+	if ctx.Store.Get(hexEncode(live.ID[:])) != nil {
+		t.Error("live cancelled order still in the book after flush")
+	}
+	if h := ctx.Store.History(); len(h) != 0 {
+		t.Errorf("cancelled history entry still present after flush: %v", h)
+	}
+	// RPC-F36 key order (rpcxbridge.cpp:1474-1489).
+	b, _ := json.Marshal(res)
+	s := string(b)
+	want := []string{"ageMillis", "now", "durationMicrosec", "flushedOrders"}
+	last := -1
+	for _, k := range want {
+		p := strings.Index(s, `"`+k+`"`)
+		if p < 0 || p < last {
+			t.Fatalf("key %q out of C++ order in %s", k, s)
+		}
+		last = p
 	}
 }
 
