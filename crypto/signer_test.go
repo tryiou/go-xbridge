@@ -1,11 +1,41 @@
 package crypto
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"go-xbridge/proto"
 )
+
+// TestNewPrivateKeyFullRange (CRYPTO-F82) pins the full-range generation: every
+// key is a valid secp256k1 scalar in [1, N-1], and across enough draws the top
+// bit is set at least once — proving the generator no longer clears it (the
+// pre-fix code forced b[0]&=0x7f, discarding a bit of entropy).
+func TestNewPrivateKeyFullRange(t *testing.T) {
+	order := secp256k1.Params().N
+	topBitSet := false
+	for i := 0; i < 256; i++ {
+		k, err := NewPrivateKey()
+		if err != nil {
+			t.Fatalf("NewPrivateKey: %v", err)
+		}
+		if len(k) != 32 {
+			t.Fatalf("key length = %d, want 32", len(k))
+		}
+		v := new(big.Int).SetBytes(k)
+		if v.Sign() == 0 || v.Cmp(order) >= 0 {
+			t.Fatalf("key %x out of [1, N-1]", k)
+		}
+		if k[0]&0x80 != 0 {
+			topBitSet = true
+		}
+	}
+	if !topBitSet {
+		t.Error("no generated key had the top bit set; generation still biased (CRYPTO-F82)")
+	}
+}
 
 func TestSignVerifyRoundTrip(t *testing.T) {
 	signer := NewBtcSigner()

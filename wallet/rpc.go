@@ -300,7 +300,15 @@ func (c *RPCConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (strin
 			Amount:       amt,
 		})
 	}
-	args := []interface{}{txHex, prev, "ALL"}
+	// CRYPTO-F91: the signrawtransaction payload matches C++ exactly
+	// (xbridgewalletconnectorbtc.cpp:1055-1089): [rawtx, prevtxs|null, keys|null].
+	// Position 3 is the privkeys ARRAY (null here — the wallet owns the keys),
+	// not a sighash type: the pre-fix code sent "ALL" there, which landed in the
+	// privkeys slot and diverged from C++. prevtxs is JSON null when empty.
+	args := []interface{}{txHex, nil, nil}
+	if len(prev) > 0 {
+		args[1] = prev
+	}
 	var res rpcSignResult
 	// Legacy primary (old wallets); fall back to the modern RPC on error.
 	if err := c.cli.Call("signrawtransaction", args, &res); err != nil {

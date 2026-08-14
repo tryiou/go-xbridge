@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -134,16 +135,29 @@ func (BtcSigner) VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error) 
 
 // NewPrivateKey returns a fresh 32-byte secp256k1 scalar. XBridge uses
 // this for the per-order HTLC secret keypair (xPubKey/xPrivKey), generated
-// at order-creation time (C++ xbridgeapp.cpp:2001).
+// at order-creation time (C++ xbridgeapp.cpp:2001). It uses the full 256-bit
+// range with retry until the scalar is in [1, N-1] (N = curve group order),
+// mirroring C++ m_cp.makeNewKey (CRYPTO-F82): the pre-fix code cleared the top
+// bit, discarding one bit of entropy. Keys are local (no interop impact), but
+// the generated space should match C++.
 func NewPrivateKey() ([]byte, error) {
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return nil, err
+	order := secp256k1.Params().N
+	for i := 0; i < 64; i++ {
+		var b [32]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
+		}
+		// N < 2^256, so only a scalar >= N or 0 needs a redraw (probability
+		// ~2^-128 per draw; the loop effectively never iterates).
+		if new(big.Int).SetBytes(b[:]).Cmp(order) >= 0 {
+			continue
+		}
+		if b == [32]byte{} {
+			continue
+		}
+		return b[:], nil
 	}
-	// Clear the high bits so the scalar is a valid secp256k1 private key
-	// (< curve order); btcec rejects out-of-range scalars.
-	b[0] &= 0x7f
-	return b[:], nil
+	return nil, errors.New("crypto: failed to generate a valid private key")
 }
 
 // FullyValidPubKey reports whether pk is a 33-byte compressed secp256k1

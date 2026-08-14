@@ -1660,8 +1660,11 @@ func (c *swapCtx) minConf(cc *config.CoinConf) int {
 
 // secretFromPayTx extracts the 33-byte HTLC secret preimage from a serialized
 // payTx, verifying it against the expected secretHash hx (the deposit's
-// HashedSecret). C++ does the same in getSecretFromPaymentTransaction, which only
-// adopts a push whose getKeyId(push) equals hx.
+// HashedSecret). C++ does the same in getSecretFromPaymentTransaction
+// (xbridgewalletconnectorbtc.cpp:2241-2276), which scans every vin's scriptSig
+// and only adopts a push whose getKeyId(push) equals hx. CRYPTO-F92: scan ALL
+// inputs, not just input 0 — the deposit-spending input is not guaranteed to be
+// the first, and the hash check makes a wrong-input match impossible.
 func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) {
 	raw, err := hex.DecodeString(payHex)
 	if err != nil {
@@ -1673,9 +1676,13 @@ func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) 
 		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
 		return [33]byte{}, false
 	}
-	secret, ok := secretFromScriptSig(tx.Inputs[0].ScriptSig, hx)
-	xlog.Debug("secretFromPayTx", "ok", ok)
-	return secret, ok
+	for _, in := range tx.Inputs {
+		if secret, ok := secretFromScriptSig(in.ScriptSig, hx); ok {
+			return secret, true
+		}
+	}
+	xlog.Debug("secretFromPayTx", "ok", false)
+	return [33]byte{}, false
 }
 
 // secretFromScriptSig parses a payment scriptSig (<secret 33> <sig> <myPubKey>

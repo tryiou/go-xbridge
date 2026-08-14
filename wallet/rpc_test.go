@@ -194,6 +194,39 @@ func TestRPCConnector(t *testing.T) {
 	})
 }
 
+// TestRevHashHexCapturedBlockHash (CRYPTO-F83) pins the block-hash byte order
+// against a real captured block hash (the Bitcoin genesis block, display
+// order). getblockhash returns display order; the XBridge wire carries the
+// internal (little-endian) bytes, which the C++ base_blob<256>::SetHex
+// (uint256.cpp:27-53) stores as the display bytes REVERSED (last hex pair in
+// data[0]). revHashHex must produce exactly those bytes.
+func TestRevHashHexCapturedBlockHash(t *testing.T) {
+	display := "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+	got, err := revHashHex(display)
+	if err != nil {
+		t.Fatalf("revHashHex: %v", err)
+	}
+	wantHex := "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"
+	var want [32]byte
+	b, err := hex.DecodeString(wantHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(want[:], b)
+	if got != want {
+		t.Fatalf("revHashHex(%s)\n got %x\nwant %x", display, got, want)
+	}
+	// The reversal is an involution: reversing the internal bytes yields the
+	// display hash again (the wire reader round-trips).
+	var back [32]byte
+	for i := range got {
+		back[i] = got[31-i]
+	}
+	if h := hex.EncodeToString(back[:]); h != display {
+		t.Errorf("round-trip = %s, want %s", h, display)
+	}
+}
+
 func TestRPCConnectorUnauthorized(t *testing.T) {
 	srv := mockRPC(t)
 	defer srv.Close()
@@ -310,6 +343,84 @@ func TestSignRawTransactionLegacyPrimary(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0] != "signrawtransaction" {
 		t.Fatalf("call order = %v, want [signrawtransaction] only", calls)
+	}
+}
+
+// TestSignRawTransactionPayloadMatchesCpp (CRYPTO-F91) pins the signrawtransaction
+// request payload to the C++ form (xbridgewalletconnectorbtc.cpp:1055-1089):
+// [rawtx, prevtxs|null, keys|null]. The old port sent "ALL" in the privkeys
+// slot (position 3) — a sighash type string where C++ sends JSON null — and
+// always sent an empty array instead of null for empty prevtxs.
+func TestSignRawTransactionPayloadMatchesCpp(t *testing.T) {
+	var got [][]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		got = append(got, req.Params)
+		enc := json.NewEncoder(w)
+		switch req.Method {
+		case "signrawtransaction":
+			enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
+		case "signrawtransactionwithwallet":
+			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
+		default:
+			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+		}
+	}))
+	defer srv.Close()
+
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+
+	// Empty prevTxs -> [rawtx, null, null]; both RPCs must carry it.
+	if _, _, err := c.SignRawTransaction("abcd", nil); err != nil {
+		t.Fatalf("SignRawTransaction(empty prev): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d RPC calls, want 2", len(got))
+	}
+	for i, p := range got {
+		if len(p) != 3 {
+			t.Fatalf("call %d: params = %v, want 3 elements [rawtx, prevtxs|null, keys|null]", i, p)
+		}
+		if p[0] != "abcd" {
+			t.Errorf("call %d: rawtx = %v, want abcd", i, p[0])
+		}
+		if p[1] != nil {
+			t.Errorf("call %d: prevtxs = %v, want null for empty prevTxs", i, p[1])
+		}
+		if p[2] != nil {
+			t.Errorf("call %d: keys = %v, want null (C++ sends no privkeys)", i, p[2])
+		}
+	}
+
+	// Non-empty prevTxs -> [rawtx, [prev], null].
+	got = nil
+	if _, _, err := c.SignRawTransaction("beef", []PrevTx{{
+		TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Vout: 0,
+		ScriptPubKey: "76a914deadbeef88ac", Amount: 150000000,
+	}}); err != nil {
+		t.Fatalf("SignRawTransaction(prev): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d RPC calls, want 2", len(got))
+	}
+	p := got[0]
+	if len(p) != 3 || p[2] != nil {
+		t.Fatalf("params = %v, want [beef, [prev], null]", p)
+	}
+	prevArr, ok := p[1].([]interface{})
+	if !ok || len(prevArr) != 1 {
+		t.Fatalf("prevtxs = %T %v, want a 1-element array", p[1], p[1])
+	}
+	po, ok := prevArr[0].(map[string]interface{})
+	if !ok || po["txid"] != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || po["scriptPubKey"] != "76a914deadbeef88ac" {
+		t.Fatalf("prevtx entry = %v, want the mapped PrevTx fields", prevArr[0])
+	}
+	if vout, ok := po["vout"].(float64); !ok || vout != 0 {
+		t.Fatalf("prevtx vout = %v, want 0", po["vout"])
+	}
+	if amt, ok := po["amount"].(float64); !ok || amt != 1.5 {
+		t.Fatalf("prevtx amount = %v, want 1.5 (whole coins, like C++)", po["amount"])
 	}
 }
 

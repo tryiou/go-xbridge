@@ -1421,6 +1421,47 @@ func TestSecretFromScriptSig(t *testing.T) {
 	}
 }
 
+// TestSecretFromPayTxScansAllInputs (CRYPTO-F92) proves secretFromPayTx scans
+// every input's scriptSig, matching C++ getSecretFromPaymentTransaction which
+// iterates all vins (xbridgewalletconnectorbtc.cpp:2241-2276). The
+// secret-bearing input is at index 1 — the pre-fix code read only Inputs[0]
+// and would have failed to recover the preimage.
+func TestSecretFromPayTxScansAllInputs(t *testing.T) {
+	realSecret := make([]byte, 33)
+	for i := range realSecret {
+		realSecret[i] = byte(i + 1)
+	}
+	myPubKey := make([]byte, 33)
+	for i := range myPubKey {
+		myPubKey[i] = byte(200 - i)
+	}
+	sig := make([]byte, 71)
+	inner := []byte{0x51, 0x20}
+	realHash := coins.KeyID(realSecret)
+
+	paySig := coins.BuildPaymentScriptSig(realSecret, sig, myPubKey, inner)
+	decoySig := coins.BuildPaymentScriptSig(myPubKey, sig, myPubKey, inner)
+
+	payTx := &coins.Tx{
+		Version: 2,
+		Inputs: []coins.TxIn{
+			{PrevOut: coins.OutPoint{Index: 1}, ScriptSig: decoySig, Sequence: 0xffffffff},
+			{PrevOut: coins.OutPoint{Index: 0}, ScriptSig: paySig, Sequence: 0xffffffff},
+		},
+		Outputs:  []coins.TxOut{{Value: 1000, ScriptPubKey: []byte{0x51}}},
+		LockTime: 0,
+	}
+	payHex := hex.EncodeToString(payTx.Serialize())
+
+	got, ok := secretFromPayTx(payHex, realHash, false)
+	if !ok || got != to33(realSecret) {
+		t.Fatalf("secretFromPayTx (secret at input 1): ok=%v got=%x want=%x", ok, got, realSecret)
+	}
+	if _, ok := secretFromPayTx(payHex, coins.KeyID([]byte("unrelated-preimage-material-that-matches-nothing")), false); ok {
+		t.Error("secretFromPayTx adopted a push for an unrelated hash")
+	}
+}
+
 func mustHex(s string) []byte {
 	b, err := hex.DecodeString(s)
 	if err != nil {
