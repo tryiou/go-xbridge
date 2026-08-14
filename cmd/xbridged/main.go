@@ -105,6 +105,7 @@ func main() {
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
 	persistSecrets := flag.Bool("persistsecrets", true, "persist per-trade M keypair/secret/pre-signed refund in the swap-state file (default true; C++ orders.dat parity); false keeps the file secret-free, but a restarted mid-flight swap cannot auto-refund or re-sign cancels")
+	rpcServerTimeout := flag.Int("rpcservertimeout", 30, "timeout in seconds for HTTP RPC requests (C++ DEFAULT_HTTP_SERVER_TIMEOUT parity)")
 	flag.Parse()
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
@@ -234,8 +235,19 @@ func main() {
 			"network", *network, "conf", *confPath, "coins", len(conf.Coins))
 	}
 	// httpSrv is kept by name so shutdown can drain in-flight RPC handlers
-	// (srv.Shutdown) instead of exiting under them.
-	httpSrv := &http.Server{Addr: *rpcBind, Handler: srv}
+	// (srv.Shutdown) instead of exiting under them. Timeouts (RPC-F58): the
+	// read/write timeout mirrors C++ -rpcservertimeout (evhttp_set_timeout,
+	// httpserver.cpp:393, DEFAULT_HTTP_SERVER_TIMEOUT=30); the header and idle
+	// timeouts are Go-side hardening (no C++ counterpart).
+	rpcTimeout := time.Duration(*rpcServerTimeout) * time.Second
+	httpSrv := &http.Server{
+		Addr:              *rpcBind,
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       rpcTimeout,
+		WriteTimeout:      rpcTimeout,
+		IdleTimeout:       60 * time.Second,
+	}
 	// Finalization on SIGINT/SIGTERM. os.Exit skips defers, so shutdown steps
 	// must run explicitly here: stop the P2P node (peer conns / read-loops),
 	// flush pending dedup summaries, then close the log file.

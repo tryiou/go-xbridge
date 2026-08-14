@@ -13,12 +13,13 @@ import (
 	xlog "go-xbridge/log"
 )
 
-// rpcRequest is the bitcoind-style JSON-RPC 1.0 request envelope used by
-// Blocknet. Params are positional (a JSON array), not named.
-type rpcRequest struct {
-	Method string            `json:"method"`
-	Params []json.RawMessage `json:"params"`
-	ID     json.RawMessage   `json:"id"`
+// rawRequest preserves the id across field-by-field validation. The whole
+// envelope is decoded into raw pieces first (mirroring C++ JSONRPCRequest::parse,
+// which parses id before anything else, so pre-dispatch errors echo it).
+type rawRequest struct {
+	Method json.RawMessage
+	Params json.RawMessage
+	ID     json.RawMessage
 }
 
 // rpcResponse is the JSON-RPC 1.0 envelope, matching blocknetd's dx* surface
@@ -32,10 +33,26 @@ type rpcResponse struct {
 }
 
 // envelopeError is used only for transport-level failures (parse error, unknown
-// method) — distinct from business errors, which live in the result object.
+// method, invalid request) — distinct from business errors, which live in the
+// result object. The shape mirrors C++ (code, message) only.
 type envelopeError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// httpStatusForCode maps an envelope error code to the HTTP status the daemon
+// replies with, mirroring JSONErrorReply (httprpc.cpp:70-85): RPC_INVALID_REQUEST
+// (-32600) -> 400, RPC_METHOD_NOT_FOUND (-32601) -> 404, everything else
+// (parse, misc -1, type -8, internal -32603, ...) -> 500.
+func httpStatusForCode(code int) int {
+	switch code {
+	case -32600:
+		return http.StatusBadRequest
+	case -32601:
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // Server is the JSON-RPC 1.0 HTTP server exposing the dx* surface.
@@ -43,10 +60,7 @@ type Server struct {
 	ctx    *HandlerCtx
 	verify bool // when true, signatures are verified before storing orders
 
-	// user/pass are the HTTP Basic credentials RPC callers must present. When
-	// both are empty (the daemon's default) no authentication is enforced —
-	// SEC-F01 (RPC auth) binds to loopback by default and defers to the operator to
-	// enable auth explicitly via -rpcuser/-rpcpassword.
+	// user/pass are the HTTP Basic credentials RPC callers must present.
 	user, pass string
 }
 
@@ -105,86 +119,204 @@ func parseBasicAuth(h string) (user, pass string, ok bool) {
 	return string(b[:i]), string(b[i+1:]), true
 }
 
-// rpcMaxBodyBytes caps the JSON-RPC request body (RPC-F49): a body larger than
-// this is rejected instead of being buffered in whole, closing the
-// unbounded-decode surface in ServeHTTP.
-const rpcMaxBodyBytes = 4 << 20
+// rpcMaxBodyBytes caps the JSON-RPC request body (RPC-F49): C++ sets
+// evhttp_set_max_body_size to MAX_SIZE = 0x02000000 (32 MiB) — serialize.h:27,
+// httpserver.cpp:395. A body larger than this is rejected with a non-envelope
+// HTTP 413 (libevent behavior) instead of being buffered in whole.
+const rpcMaxBodyBytes = 32 << 20
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	// JSONRPC handles only POST (httprpc.cpp:151-154).
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte("JSONRPC server handles only POST requests"))
+		return
+	}
 	// RPC auth gate (SEC-F01): reject without a 401 + challenge when credentials
 	// are configured, before any handler runs.
 	if !s.authorized(r) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+basicRealm+`"`)
 		w.WriteHeader(http.StatusUnauthorized)
-		writeJSON(w, rpcResponse{
-			Result: nil,
-			Error:  &envelopeError{Code: -401, Message: "Authentication failed"},
-			ID:     nil,
-		})
 		return
 	}
 	// Bound the request body (RPC-F49): read it fully through MaxBytesReader so
-	// an oversized body is rejected instead of buffered unbounded.
+	// an oversized body is rejected (non-envelope 413, matching libevent)
+	// instead of buffered unbounded.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rpcMaxBodyBytes))
 	if err != nil {
 		xlog.Warn("rpc transport error", "code", -32700, "msg", "Request body too large")
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		writeJSON(w, rpcResponse{
-			Result: nil,
-			Error:  &envelopeError{Code: -32700, Message: "Parse error: request body too large"},
-			ID:     nil,
-		})
 		return
 	}
 	// Never return an empty body: a panic in a handler must still produce a
 	// valid JSON-RPC envelope (mirrors blocknetd, which never emits an empty
-	// HTTP response). Without this, a transient handler panic would surface as
-	// an empty body to the caller.
+	// HTTP response).
 	var reqID json.RawMessage
 	defer func() {
 		if rec := recover(); rec != nil {
 			xlog.Error("server: recovered panic in handler", "panic", rec)
-			writeJSON(w, rpcResponse{
-				Result: nil,
-				Error:  &envelopeError{Code: -32603, Message: fmt.Sprintf("Internal error: %v", rec)},
-				ID:     reqID,
-			})
+			s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32603, fmt.Sprintf("Internal error: %v", rec)), reqID))
 		}
 	}()
 
-	req := rpcRequest{}
-	if err := json.Unmarshal(body, &req); err != nil {
-		xlog.Warn("rpc transport error", "code", -32700, "msg", "Parse error")
-		writeJSON(w, rpcResponse{
-			Result: nil,
-			Error:  &envelopeError{Code: -32700, Message: "Parse error"},
-			ID:     req.ID,
-		})
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Top-level object parse error"), nil))
 		return
 	}
-	reqID = req.ID
+	switch trimmed[0] {
+	case '{':
+		raw := rawRequest{}
+		if err := json.Unmarshal(body, &raw); err != nil {
+			s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Parse error"), nil))
+			return
+		}
+		reqID = raw.ID
+		s.writeResponse(w, s.dispatchOne(raw))
+	case '[':
+		// Batch request (JSONRPCExecBatch, server.cpp:497-504): process each
+		// element independently; the batch itself always replies HTTP 200.
+		var arr []json.RawMessage
+		if err := json.Unmarshal(body, &arr); err != nil {
+			s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Parse error"), nil))
+			return
+		}
+		results := make([]rpcResponse, 0, len(arr))
+		for _, el := range arr {
+			results = append(results, s.execOne(el))
+		}
+		writeJSON(w, results)
+	default:
+		// Not an object or array (server.cpp:201).
+		s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Top-level object parse error"), nil))
+	}
+}
 
-	handler := Lookup(req.Method)
+// execOne processes a single element of a batch. Non-object elements are an
+// invalid request ("Invalid Request object", server.cpp:437-438).
+func (s *Server) execOne(el json.RawMessage) rpcResponse {
+	trimmed := bytes.TrimSpace(el)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return envelopeResponse(makeEnvelopeError(-32600, "Invalid Request object"), nil)
+	}
+	raw := rawRequest{}
+	if err := json.Unmarshal(el, &raw); err != nil {
+		return envelopeResponse(makeEnvelopeError(-32700, "Parse error"), nil)
+	}
+	return s.dispatchOne(raw)
+}
+
+// dispatchOne validates the request envelope, finds the handler, and runs it.
+func (s *Server) dispatchOne(raw rawRequest) rpcResponse {
+	method, params, id, perr := parseRequest(raw)
+	if perr != nil {
+		return envelopeResponse(perr, id)
+	}
+	handler := Lookup(method)
 	if handler == nil {
-		xlog.Warn("rpc transport error", "code", -32601, "method", req.Method, "msg", "Method not found")
-		writeJSON(w, rpcResponse{
-			Result: nil,
-			Error:  &envelopeError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)},
-			ID:     req.ID,
-		})
-		return
+		xlog.Warn("rpc transport error", "code", -32601, "method", method)
+		return envelopeResponse(makeEnvelopeError(-32601, "Method not found"), id)
+	}
+	xlog.Debug("rpc request", "method", method)
+	result, rpcErr := s.call(handler, params, id)
+	if rpcErr != nil {
+		if rpcErr.envelope {
+			return envelopeResponse(rpcErr, id)
+		}
+		// Business error: Blocknet returns it as the *result* object.
+		xlog.Warn("rpc error", "method", method, "code", rpcErr.Code, "msg", rpcErr.Error)
+		return businessResponse(rpcErr, id)
+	}
+	return rpcResponse{Result: result, Error: nil, ID: id}
+}
+
+// call runs a handler with panic containment so a handler panic surfaces as an
+// envelope -32603 in the current request (or batch element).
+func (s *Server) call(handler Handler, params []json.RawMessage, id json.RawMessage) (result interface{}, rpcErr *rpcError) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			xlog.Error("server: recovered panic in handler", "panic", rec)
+			rpcErr = makeEnvelopeError(-32603, fmt.Sprintf("Internal error: %v", rec))
+		}
+	}()
+	return handler(s.ctx, params)
+}
+
+// parseRequest validates one request object per JSONRPCRequest::parse
+// (server.cpp:434-465) and returns positional params. Named-parameter objects
+// are rejected: every dx* command registers no arg names (rpcxbridge.cpp:
+// 3498-3526), so transformNamedArguments throws on the first key
+// (server.cpp:549-551, 578-582).
+func parseRequest(raw rawRequest) (method string, params []json.RawMessage, id json.RawMessage, err *rpcError) {
+	id = raw.ID
+
+	// Method.
+	if len(raw.Method) == 0 || bytes.Equal(bytes.TrimSpace(raw.Method), []byte("null")) {
+		return "", nil, id, makeEnvelopeError(-32600, "Missing method")
+	}
+	var m string
+	if json.Unmarshal(raw.Method, &m) != nil {
+		return "", nil, id, makeEnvelopeError(-32600, "Method must be a string")
 	}
 
-	xlog.Debug("rpc request", "method", req.Method)
-	result, rpcErr := handler(s.ctx, req.Params)
-	if rpcErr != nil {
-		// Business error: Blocknet returns it as the *result* object.
-		xlog.Warn("rpc error", "method", req.Method, "code", rpcErr.Code, "msg", rpcErr.Error)
-		writeJSON(w, rpcResponse{Result: rpcErr, Error: nil, ID: req.ID})
-		return
+	// Params: absent/null -> empty array; array -> positional; object -> named.
+	if len(raw.Params) == 0 || bytes.Equal(bytes.TrimSpace(raw.Params), []byte("null")) {
+		return m, nil, id, nil
 	}
-	writeJSON(w, rpcResponse{Result: result, Error: nil, ID: req.ID})
+	trimmed := bytes.TrimSpace(raw.Params)
+	if trimmed[0] == '[' {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return "", nil, id, makeEnvelopeError(-32600, "Params must be an array or object")
+		}
+		return m, arr, id, nil
+	}
+	if trimmed[0] == '{' {
+		if key := firstObjectKey(trimmed); key != "" {
+			return "", nil, id, makeEnvelopeError(-8, "Unknown named parameter "+key)
+		}
+		// Empty object {}: transformNamedArguments leaves params empty.
+		return m, nil, id, nil
+	}
+	return "", nil, id, makeEnvelopeError(-32600, "Params must be an array or object")
+}
+
+// firstObjectKey returns the first key of a JSON object (in document order).
+func firstObjectKey(raw []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	t, err := dec.Token()
+	if err != nil || t != json.Delim('{') {
+		return ""
+	}
+	t, err = dec.Token()
+	if err != nil {
+		return ""
+	}
+	s, _ := t.(string)
+	return s
+}
+
+func (s *Server) writeResponse(w http.ResponseWriter, resp rpcResponse) {
+	if env, ok := resp.Error.(*envelopeError); ok {
+		w.WriteHeader(httpStatusForCode(env.Code))
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	writeJSON(w, resp)
+}
+
+func envelopeResponse(err *rpcError, id json.RawMessage) rpcResponse {
+	return rpcResponse{
+		Result: nil,
+		Error:  &envelopeError{Code: err.Code, Message: err.Error},
+		ID:     id,
+	}
+}
+
+func businessResponse(err *rpcError, id json.RawMessage) rpcResponse {
+	return rpcResponse{Result: err, Error: nil, ID: id}
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
