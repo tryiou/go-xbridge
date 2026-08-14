@@ -1,6 +1,7 @@
 package coins
 
 import (
+	"bytes"
 	"encoding/hex"
 	"os"
 	"strings"
@@ -314,5 +315,90 @@ func TestCoinSignatureDescriptor(t *testing.T) {
 		if coin.SegWit != c.segwit {
 			t.Errorf("%s: segwit = %v, want %v", c.method, coin.SegWit, c.segwit)
 		}
+	}
+}
+
+// twenty returns a fixed 20-byte identifier.
+func twenty() []byte {
+	return []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
+}
+
+// TestBTGAddressRoundTrip (CRYPTO-F89) verifies the BTG connector is a forkid
+// coin with native segwit (bech32 HRP "btg"): base58check P2PKH/P2SH (version
+// bytes 38/23, as in the manifest bitcoingold conf) and bech32 segwit
+// addresses all round-trip through encode/decode.
+func TestBTGAddressRoundTrip(t *testing.T) {
+	btg, err := FromConf(&config.CoinConf{
+		Ticker: "BTG", Title: "BitcoinGold", CreateTxMethod: "BTG",
+		AddressPrefix: 38, ScriptPrefix: 23, Coin: 100000000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if btg.SignatureKind() != SigForkID || btg.ForkValue() != 79 {
+		t.Fatalf("BTG signing descriptor = kind %v fork %d, want SigForkID/79", btg.SignatureKind(), btg.ForkValue())
+	}
+	if !btg.SegWit || btg.Bech32HRP != "btg" {
+		t.Fatalf("BTG segwit = %v HRP %q, want true/btg", btg.SegWit, btg.Bech32HRP)
+	}
+
+	p2pkh := Address{Coin: btg, Kind: P2PKH, Prefix: 38, Hash: twenty()}.String()
+	a, err := btg.DecodeAddress(p2pkh)
+	if err != nil || a.Kind != P2PKH || !bytes.Equal(a.Hash, twenty()) {
+		t.Fatalf("BTG P2PKH round-trip failed: err=%v kind=%v addr=%q", err, a.Kind, p2pkh)
+	}
+
+	p2sh := Address{Coin: btg, Kind: P2SH, Prefix: 23, Hash: twenty()}.String()
+	a, err = btg.DecodeAddress(p2sh)
+	if err != nil || a.Kind != P2SH || !bytes.Equal(a.Hash, twenty()) {
+		t.Fatalf("BTG P2SH round-trip failed: err=%v kind=%v addr=%q", err, a.Kind, p2sh)
+	}
+
+	// The version-byte literals above deliberately mirror the manifest
+	// bitcoingold conf (AddressPrefix=38, ScriptPrefix=23); keep them literal so
+	// a P2PKH<->P2SH swap in FromConf cannot be masked by derived literals.
+	wit := Address{Coin: btg, Kind: P2WPKH, Hash: twenty(), WitnessVersion: 0}.String()
+	if !strings.HasPrefix(wit, "btg1") {
+		t.Fatalf("BTG segwit address %q not bech32 with btg HRP", wit)
+	}
+	a, err = btg.DecodeAddress(wit)
+	if err != nil || a.Kind != P2WPKH || !bytes.Equal(a.Hash, twenty()) {
+		t.Fatalf("BTG bech32 round-trip failed: err=%v kind=%v addr=%q", err, a.Kind, wit)
+	}
+}
+
+// TestDevaultAddressCashaddr (CRYPTO-F89) verifies the DEVAULT connector is
+// classified as the BCH family with cashaddr HRP "devault" (devault.cpp:274-280)
+// and fork value 0 (replay protection disabled, devault.cpp:171): a cashaddr
+// address round-trips and legacy base58check input is rejected (the documented
+// F81 hardening — the BCH-family decoder is cashaddr-only).
+func TestDevaultAddressCashaddr(t *testing.T) {
+	dev, err := FromConf(&config.CoinConf{
+		Ticker: "DVT", Title: "DeVault", CreateTxMethod: "DEVAULT",
+		AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dev.Family() != FamilyUTXOBCH {
+		t.Fatalf("DEVAULT family = %q, want %q", dev.Family(), FamilyUTXOBCH)
+	}
+	if dev.SignatureKind() != SigForkID || dev.ForkValue() != 0 {
+		t.Fatalf("DEVAULT signing descriptor = kind %v fork %d, want SigForkID/0", dev.SignatureKind(), dev.ForkValue())
+	}
+
+	addr := Address{Coin: dev, Kind: P2PKH, Hash: twenty()}.String()
+	if !strings.HasPrefix(addr, "devault:") {
+		t.Fatalf("DEVAULT address %q not cashaddr with devault HRP", addr)
+	}
+	a, err := dev.DecodeAddress(addr)
+	if err != nil || a.Kind != P2PKH || !bytes.Equal(a.Hash, twenty()) {
+		t.Fatalf("DEVAULT cashaddr round-trip failed: err=%v kind=%v addr=%q", err, a.Kind, addr)
+	}
+	// Legacy base58check input is rejected — the BCH-family decoder is
+	// cashaddr-only (documented F81 hardening).
+	if _, err := dev.DecodeAddress(base58CheckEncode(0, twenty())); err == nil {
+		t.Error("DEVAULT accepted a legacy base58check address (F81 hardening)")
 	}
 }
