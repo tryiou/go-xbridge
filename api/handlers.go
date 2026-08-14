@@ -476,22 +476,36 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	key := orderIDKey(id)
 	o := h.Store.Get(key)
 	if o == nil {
-		return nil, makeError(errTxNotFound, "dxCancelOrder", id)
+		// C++ App::transaction falls back to the history map, so a finished /
+		// cancelled order still resolves here (and then fails the state gate).
+		o = h.Store.HistoryOrder(key)
+	}
+	if o == nil {
+		// C++ renders the miss with id.ToString() — a zero-padded 64-hex id
+		// (rpcxbridge.cpp:1362).
+		return nil, makeError(errTxNotFound, "dxCancelOrder", orderIDString(raw))
 	}
 	// C++ refuses to cancel once the swap has progressed to trCreated or beyond
 	// (the order is already committed / in process).
 	if stateOrdinal(o.Status) >= 6 {
 		return nil, makeError(errInvalidState, "dxCancelOrder", "The order is already "+statusString(o.Status))
 	}
-	// C++ requires a wallet session for both currencies to build the result.
+	// C++ cancels FIRST (cancelXBridgeTransaction, xbridgeapp.cpp:2468-2501)
+	// and only then resolves the wallet connectors to build the result
+	// (rpcxbridge.cpp:1364-1385). The from-currency connector is gated INSIDE
+	// CancelOrder (missing from -> NO_SESSION, no cancel); a missing TO
+	// connector only fails the result build here — the cancel side effect
+	// already happened (RPC-F07).
+	res, e := h.Node.CancelOrder(CancelOrderParams{ID: key})
+	if e != nil {
+		return nil, e
+	}
+	// C++ requires a wallet session for both currencies to build the result
+	// (NO_SESSION carries the currency).
 	if _, e := h.connector(o.FromCurrency, "dxCancelOrder"); e != nil {
 		return nil, e
 	}
 	if _, e := h.connector(o.ToCurrency, "dxCancelOrder"); e != nil {
-		return nil, e
-	}
-	res, e := h.Node.CancelOrder(CancelOrderParams{ID: key})
-	if e != nil {
 		return nil, e
 	}
 	return res.toCancelResult(), nil

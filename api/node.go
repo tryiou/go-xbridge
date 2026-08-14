@@ -1742,7 +1742,27 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	}
 	o := n.store.Get(p.ID)
 	if o == nil {
-		return nil, makeError(errTxNotFound, "dxCancelOrder", p.ID)
+		return nil, makeError(errTxNotFound, "dxCancelOrder", "")
+	}
+	// C++ cancelXBridgeTransaction refuses to cancel an order this node does
+	// not own: !ptr->isLocal() -> TRANSACTION_NOT_FOUND, surfaced via
+	// makeError(res, __FUNCTION__) with an EMPTY argument — the double-space
+	// "Transaction  not found" (xbridgeapp.cpp:2473-2479; rpcxbridge.cpp:1370).
+	// Mine is the Go isLocal proxy (the partial chain filters locals the same
+	// way): only orders this node created hold the per-trade key the cancel
+	// packet is signed with.
+	if !o.Mine {
+		return nil, makeError(errTxNotFound, "dxCancelOrder", "")
+	}
+	// C++ cancelXBridgeTransaction requires the from-currency wallet connector
+	// BEFORE broadcasting the cancel (xbridgeapp.cpp:2489-2495): a missing
+	// from-currency session prevents the cancel side effect entirely, surfaced
+	// as NO_SESSION with an EMPTY argument — "No session for currency "
+	// (trailing space). (A missing TO connector does NOT block the cancel; it
+	// only fails the result build afterwards, rpcxbridge.cpp:1382-1384.)
+	cfg := n.cfg()
+	if cfg == nil || cfg.Connectors[o.FromCurrency] == nil {
+		return nil, makeError(errNoSession, "dxCancelOrder", "")
 	}
 	var reason uint32 = 0
 	var rerr *rpcError
@@ -1751,8 +1771,18 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	n.submit(func() {
 		// Authoritative re-check on the engine: the order may have been
 		// cancelled/removed since the HTTP snapshot.
-		if n.store.Get(p.ID) == nil {
-			rerr = makeError(errTxNotFound, "dxCancelOrder", p.ID)
+		cur := n.store.Get(p.ID)
+		if cur == nil {
+			rerr = makeError(errTxNotFound, "dxCancelOrder", "")
+			return
+		}
+		// C++ cancelXBridgeTransaction also rejects states strictly past
+		// trCreated (xbridgeapp.cpp:2481-2486) — a race guard for orders that
+		// advanced between the RPC gate and the engine re-check. Surfaced like
+		// every cancelXBridgeTransaction failure: makeError(res, __FUNCTION__)
+		// with an empty argument ("invalid transaction state ").
+		if stateOrdinal(cur.Status) > 6 {
+			rerr = makeError(errInvalidState, "dxCancelOrder", "")
 			return
 		}
 		// Cancel is signed with the trade's per-trade M keypair (C++ session

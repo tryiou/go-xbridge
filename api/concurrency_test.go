@@ -573,23 +573,40 @@ func TestConcurrentCancelOrderSingleSession(t *testing.T) {
 	copy(oid[:], []byte("concurrent-cancel-order-00000000"))
 	o := &Order{
 		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
-		Status: "open",
+		Status: "open", Mine: true, // a local maker order is cancellable (C++ isLocal)
 	}
 	n.store.Add(o)
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: addrFor(0, "maker-c"), TakerAddress: addrFor(0, "taker-c")}, arr32(mPriv), toArr33(mPub))
 
 	const cancels = 8
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok, dup := 0, 0
 	for i := 0; i < cancels; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, rerr := n.CancelOrder(CancelOrderParams{ID: hexEncode(oid[:])}); rerr != nil {
-				t.Errorf("CancelOrder: %v", rerr)
+			_, rerr := n.CancelOrder(CancelOrderParams{ID: hexEncode(oid[:])})
+			mu.Lock()
+			defer mu.Unlock()
+			if rerr == nil {
+				ok++
+				return
 			}
+			// C++ cancelXBridgeTransaction rejects a re-cancel with
+			// INVALID_STATE (xbridgeapp.cpp:2481-2486): the engine serializes
+			// the cancels, so the losers see the order already canceled.
+			if rerr.Code == errInvalidState {
+				dup++
+				return
+			}
+			t.Errorf("CancelOrder: %v", rerr)
 		}()
 	}
 	wg.Wait()
+	if ok != 1 || dup != cancels-1 {
+		t.Fatalf("cancel outcomes: %d ok / %d already-canceled, want 1 / %d", ok, dup, cancels-1)
+	}
 
 	// Engine-serialized tails: exactly one session survives (no fork/leak).
 	if got := readOnEngine(t, n, func() int { return len(n.sessions) }); got != 1 {
@@ -598,10 +615,11 @@ func TestConcurrentCancelOrderSingleSession(t *testing.T) {
 	if got := n.store.Get(hexEncode(oid[:])); got == nil || got.Status != "canceled" {
 		t.Fatalf("order status = %v, want canceled", got)
 	}
-	// Each cancel tail sent its own cancel packet (signed with the session's
-	// per-trade M key) — none lost, none raced.
-	if got := len(cc.snapshot()); got != cancels {
-		t.Fatalf("cancel packets written = %d, want %d", got, cancels)
+	// The serialized engine writes exactly one cancel packet — the single
+	// cancel that passed the state gate (C++ sends one per successful
+	// cancelXBridgeTransaction).
+	if got := len(cc.snapshot()); got != 1 {
+		t.Fatalf("cancel packets written = %d, want 1", got)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"go-xbridge/coins"
 	"go-xbridge/crypto"
 	xlog "go-xbridge/log"
+	"go-xbridge/wallet"
 )
 
 // newPersistNode builds a minimal Node wired for persistence tests: a temp
@@ -155,9 +156,15 @@ func TestCancelAfterRestart(t *testing.T) {
 		n2.restoreSwap(p)
 	}
 
-	// CancelOrder needs a conn to write the packet; capture it.
+	// CancelOrder needs a conn to write the packet; capture it. The from-currency
+	// wallet connector must also be registered (C++ cancelXBridgeTransaction
+	// gates the cancel on it, xbridgeapp.cpp:2489-2495).
 	cc := &captureXConn{}
 	n2.conn = cc
+	n2.config.Connectors = map[string]wallet.Connector{
+		"BTC": &stubConn{ticker: "BTC", addr: btcAddr},
+		"LTC": &stubConn{ticker: "LTC", addr: btcAddr},
+	}
 
 	if _, rerr := n2.CancelOrder(CancelOrderParams{ID: hexEncode(id[:])}); rerr != nil {
 		t.Fatalf("CancelOrder after restart: %v", rerr)

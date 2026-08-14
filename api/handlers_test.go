@@ -1130,3 +1130,116 @@ func TestDxCancelOrderShortId(t *testing.T) {
 		t.Errorf("dxCancelOrder(abc) = %+v, want 1021 not-found (short id is valid)", err)
 	}
 }
+
+// TestDxCancelOrderSideEffectBeforeValidation locks in RPC-F07's to-connector
+// case: C++ cancels the order FIRST (cancelXBridgeTransaction,
+// xbridgeapp.cpp:2468-2501) and only then resolves the connectors to build the
+// result (rpcxbridge.cpp:1364-1385). A missing TO connector must NOT prevent
+// the cancel side effect — the order is cancelled, and only the result build
+// fails with NO_SESSION carrying the to currency.
+func TestDxCancelOrderSideEffectBeforeValidation(t *testing.T) {
+	ctx := newWalletTestCtx()
+	priv, pub := newKey(t)
+	o := &Order{
+		ID: [32]byte{0x07}, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "NOPE", ToAmount: 200000, Created: 1, Updated: 1, Status: "open", Mine: true,
+		MakerAddress: "mk", TakerAddress: "tk",
+	}
+	ctx.Store.Add(o)
+	ctx.Node.conn = fakeXConn{}
+	ctx.Node.sessions = map[string]*SwapSession{}
+	ctx.Node.newMakerSession(o, MakeOrderParams{MakerAddress: "mk", TakerAddress: "tk"}, arr32(priv), toArr33(pub))
+
+	res, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))})
+	// The cancel side effect happened despite the missing TO connector...
+	if got := ctx.Store.Get(hexEncode(o.ID[:])); got == nil || got.Status != "canceled" {
+		t.Errorf("order status = %v, want canceled (cancel must run before connector validation)", got)
+	}
+	// ...and the RPC then fails to build the result: NO_SESSION carrying the
+	// TO currency (the from connector was present, so the cancel went through).
+	if err == nil {
+		t.Fatalf("dxCancelOrder = %+v, want NO_SESSION error", res)
+	}
+	if err.Code != errNoSession || err.Error != "No session for currency NOPE" {
+		t.Errorf("dxCancelOrder code/msg = %d/%q, want 1018 'No session for currency NOPE'", err.Code, err.Error)
+	}
+}
+
+// TestDxCancelOrderFromConnectorGate locks in RPC-F08's from-connector gate:
+// C++ cancelXBridgeTransaction requires the FROM-currency wallet connector
+// BEFORE broadcasting the cancel (xbridgeapp.cpp:2489-2495). A missing
+// from-currency session prevents the cancel side effect entirely, surfaced as
+// NO_SESSION with an EMPTY argument — "No session for currency " (trailing
+// space).
+func TestDxCancelOrderFromConnectorGate(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := &Order{
+		ID: [32]byte{0x08}, Type: OrderTypeMaker, FromCurrency: "NOPE", FromAmount: 1000000,
+		ToCurrency: "NOPE", ToAmount: 200000, Created: 1, Updated: 1, Status: "open", Mine: true,
+		MakerAddress: "mk", TakerAddress: "tk",
+	}
+	ctx.Store.Add(o)
+	ctx.Node.conn = fakeXConn{}
+
+	res, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))})
+	if err == nil {
+		t.Fatalf("dxCancelOrder(missing from connector) = %+v, want NO_SESSION error", res)
+	}
+	if err.Code != errNoSession || err.Error != "No session for currency " {
+		t.Errorf("dxCancelOrder(missing from connector) = %d/%q, want 1018 empty-arg message", err.Code, err.Error)
+	}
+	// The missing from-connector gate fires BEFORE the cancel: no side effect.
+	if got := ctx.Store.Get(hexEncode(o.ID[:])); got == nil || got.Status != "open" {
+		t.Errorf("order status = %v, want open (from-connector gate must prevent the cancel)", got)
+	}
+}
+
+// TestDxCancelOrderNonLocal locks in RPC-F08's isLocal branch: C++
+// cancelXBridgeTransaction refuses to cancel an order this node does not own
+// with TRANSACTION_NOT_FOUND, surfaced via makeError(res, __FUNCTION__) with
+// an EMPTY argument — the double-space "Transaction  not found"
+// (xbridgeapp.cpp:2473-2479; rpcxbridge.cpp:1370).
+func TestDxCancelOrderNonLocal(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Node.conn = fakeXConn{} // satisfy requireWrite (runs before the Mine gate)
+	o := seedOrder(ctx)
+	o.Mine = false // observed, not created locally
+	res, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))})
+	if err == nil {
+		t.Fatalf("dxCancelOrder(non-local) = %+v, want error", res)
+	}
+	if err.Code != errTxNotFound || err.Error != "Transaction  not found" {
+		t.Errorf("dxCancelOrder(non-local) = %+v, want 1021 with double-space text", err)
+	}
+	if got := ctx.Store.Get(hexEncode(o.ID[:])); got == nil || got.Status != "open" {
+		t.Errorf("non-local order must not be cancelled, status = %v", got)
+	}
+}
+
+// TestDxCancelOrderHistoryStateGate verifies the C++ history fallback: an order
+// that only lives in the history map still resolves (App::transaction falls
+// back) and is then rejected by the state gate — 1028, not 1021
+// (rpcxbridge.cpp:1355-1363).
+func TestDxCancelOrderHistoryStateGate(t *testing.T) {
+	ctx := newWalletTestCtx()
+	o := seedOrder(ctx)
+	ctx.Store.MoveToHistory(hexEncode(o.ID[:]), "finished", 0, NowMicro())
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr(dispID(o.ID))}); err == nil {
+		t.Fatal("dxCancelOrder(finished-in-history) should error")
+	} else if err.Code != errInvalidState || err.Error != "invalid transaction state The order is already finished" {
+		t.Errorf("dxCancelOrder(finished-in-history) = %+v, want 1028 already finished", err)
+	}
+}
+
+// TestDxCancelOrderNotFoundPadded verifies the store-miss message renders the
+// PARSED id's GetHex (zero-padded 64-hex), matching rpcxbridge.cpp:1362.
+func TestDxCancelOrderNotFoundPadded(t *testing.T) {
+	ctx := newWalletTestCtx()
+	if _, err := ctx.dxCancelOrder([]json.RawMessage{jstr("abc")}); err == nil {
+		t.Fatal("dxCancelOrder(short) should error")
+	} else if err.Code != errTxNotFound {
+		t.Fatalf("dxCancelOrder(short) code = %d, want 1021", err.Code)
+	} else if err.Error != "Transaction "+strings.Repeat("0", 60)+"0abc not found" {
+		t.Errorf("dxCancelOrder(short) message = %q, want zero-padded 64-hex id", err.Error)
+	}
+}
