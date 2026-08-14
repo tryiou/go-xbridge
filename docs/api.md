@@ -6,6 +6,11 @@ API works as a drop-in replacement for blocknetd's XBridge RPC.
 
 All 24 methods are documented below: 23 `dx*` commands plus `getnetworkinfo`.
 The C++ `gettradingdata` command is not exposed — only `dxGetTradingData` is.
+This is a deliberate removal (RPC-F37): the lowercase command is a
+blocknetd-internal registration (`rpcxbridge.cpp:3520`) with a different schema
+and a duplicated `to` key; `xbridged` is a thin client and only surfaces the
+`dxGetTradingData` variant. Calling `gettradingdata` against `xbridged` returns
+the envelope error `-32601 Method not found`.
 
 ## Calling convention
 
@@ -344,7 +349,9 @@ defaulted or trailing parameter.
   `false`) [optional].
 - `result`: array of 8-field records `{timestamp, fee_txid, nodepubkey, id,
   taker, taker_size, maker, maker_size}`. Session-local fills only — see
-  Tier 3.
+  Tier 3. `fee_txid`/`nodepubkey` are always `""`: they come from the on-chain
+  BLOCK scan (RPC-F38/F39) that a thin client cannot replay. `blocks`/`errors`
+  are accepted for contract compatibility but cannot bound a BLOCK block scan.
 
 **`dxLoadXBridgeConf`**
 - `params`: none.
@@ -367,7 +374,9 @@ view, so three families of commands are bounded by what this node has observed:
 
 - **`dxGetOrderHistory` / `dxGetTradingData`** aggregate from **session-local
   fills** only (fills this node saw on its P2P feed); they cannot replay
-  historical chain data.
+  historical chain data. `dxGetTradingData` accordingly reports
+  `fee_txid`/`nodepubkey` as `""` (they require the on-chain BLOCK scan,
+  RPC-F38/F39).
 - **`dxGetNetworkTokens`** is bounded by the servicenodes this node is currently
   connected to (their advertised wallet services), not the whole network.
 - **Locked-UTXO accounting** (`dxGetUtxos`, `dxGetLockedUtxos`,

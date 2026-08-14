@@ -410,13 +410,15 @@ func TestRPCResponseShape(t *testing.T) {
 			"ageMillis", "now", "durationMicrosec", "flushedOrders"}},
 		// dxGetTradingData record: timestamp, fee_txid, nodepubkey, id, taker,
 		// taker_size, maker, maker_size (rpcxbridge.cpp:2889-2898). CAND map ->
-		// sorted. DIVERGENT (Group-4 finding dxGetTradingData/key-order).
+		// sorted; fee_txid/nodepubkey always "" (F38/F39, Tier-3 thin-client
+		// limit). DIVERGENT (Group-4 finding dxGetTradingData/key-order).
 		{method: "dxGetTradingData", mode: "set", div: true, id: "dxGetTradingData/key-order", refKeys: []string{
 			"timestamp", "fee_txid", "nodepubkey", "id", "taker", "taker_size",
 			"maker", "maker_size"}},
 		// gettradingdata: different schema with a DUPLICATE "to" key
-		// (rpcxbridge.cpp:2761-2770). CAND has no dispatch entry -> -32601.
-		// DIVERGENT (Group-4 finding gettradingdata-missing).
+		// (rpcxbridge.cpp:2761-2770). CAND has no dispatch entry -> -32601
+		// (F37: deliberate removal, documented). DIVERGENT (Group-4 finding
+		// gettradingdata-missing).
 		{method: "gettradingdata", mode: "set", div: true, id: "gettradingdata-missing", refKeys: []string{
 			"timestamp", "txid", "to", "xid", "from", "fromAmount", "toAmount"}},
 		// dxSplitAddress: 8 keys in C++ order (rpcxbridge.cpp:3280-3289).
