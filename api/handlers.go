@@ -1551,19 +1551,30 @@ func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcE
 	if len(utxos) == 0 {
 		return nil, makeError(errBadRequest, "dxSplitInputs", "No utxos were specified")
 	}
+	// C++ rejects a user-specified utxo that is locked by an order
+	// (rpcxbridge.cpp:3374-3379).
+	lockedKeys, _ := h.Store.LockedUtxoInfo()
+	for _, u := range utxos {
+		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+		if lockedKeys[k] {
+			return nil, makeError(errBadRequest, "dxSplitInputs", "Cannot split utxo already in use: "+k)
+		}
+	}
 	return h.splitTx(ticker, splitAmt, address, includeFees, showRawTx, submit, utxos, "dxSplitInputs")
 }
 
 // splitTx builds, signs and optionally submits a UTXO-split transaction for the
-// given coin, mirroring C++ dxSplitAddress/dxSplitInputs:
-//   - each split output sends `splitAmount` (and +fee when include_fees) to address;
-//   - change returns to a fresh address;
-//   - the result echoes C++'s 8-field object
-//     {token, include_fees, split_amount_requested, split_amount_with_fees,
-//     split_utxo_count, split_total, txid, rawtx}.
+// given coin, mirroring C++ dxSplitAddress/dxSplitInputs + splitUtxos
+// (xbridgewalletconnectorbtc.cpp:2628-2767):
+//   - each split output sends `splitAmount` (+feesPerUtxo when include_fees) to address;
+//   - the real tx fee is deducted from change, clawed back from the last split
+//     output when the change is dust;
+//   - change goes to the REQUESTED address (RPC-F42), not a fresh one;
+//   - the result echoes C++'s 8-field object in pushKV order.
 //
-// Amounts are rendered in XBridge 1e6 scale (formatXAmount); the tx itself is
-// built in the coin's native scale. txid is the double-SHA256 of the signed
+// Fee math is done in XBridge 1e6 units exactly as C++ (minTxFee1/minTxFee2
+// whole-coin + xBridgeIntFromReal, RPC-F41); raw tx values are converted to the
+// coin's native scale at build time. txid is the double-SHA256 of the signed
 // transaction, byte-reversed — always computed, even when submit=false.
 func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees, showRawTx, submit bool, utxos []wallet.Utxo, method string) (interface{}, *rpcError) {
 	conn, e := h.connector(ticker, method)
@@ -1572,81 +1583,148 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}
 	c, ok := coins.Get(ticker)
 	if !ok {
-		return nil, makeError(errInvalidParameters, "dxSplit", "unknown coin: "+ticker)
+		return nil, makeError(errInvalidParameters, method, "unknown coin: "+ticker)
 	}
-	// C++ parses splitamount via xBridgeAmountFromString (1e6 scale); the real tx
-	// output values are converted to the coin's native scale.
 	targetXB, err := parseXAmount(splitAmountStr)
 	if err != nil {
-		return nil, makeError(errInvalidParameters, "dxSplit", "invalid split amount")
+		return nil, makeError(errInvalidParameters, method, "invalid split amount")
 	}
-	target := fromXBridgeAmt(c, targetXB)
 	cc, _ := h.Node.cfg().Confs[ticker]
-
-	// C++ dust gate on the minimum split amount.
 	relayFee, _ := conn.GetRelayFee()
-	if cc != nil && targetXB < effectiveDust(cc, relayFee) {
-		return nil, makeError(errBadRequest, "dxSplit", "split amount is dust ["+formatXAmount(targetXB)+"]")
+	// C++ dust gate on the minimum split amount (xbridgewalletconnectorbtc.cpp:2635).
+	if isDustNative(xBridgeValueFromAmount(targetXB), cc, relayFee, coinNativeScale(c)) {
+		return nil, makeError(errBadRequest, method, "split amount is dust ["+formatXAmount(targetXB)+"]")
+	}
+	// C++ validates the address (and wallet membership) BEFORE listing utxos
+	// (xbridgewalletconnectorbtc.cpp:2639-2642): BAD_REQUEST named after the
+	// method (RPC-F43). Native-segwit destinations are also rejected here (the
+	// split builder only emits legacy scripts).
+	if a, derr := c.DecodeAddress(address); derr != nil || (a.Kind != coins.P2PKH && a.Kind != coins.P2SH) {
+		return nil, makeError(errBadRequest, method, "address is invalid or not in the wallet for token "+ticker)
 	}
 
-	if len(utxos) == 0 {
-		minConf := 0
-		if cc != nil {
-			minConf = cc.Confirmations
-		}
-		utxos, err = conn.ListUnspent(minConf)
-		if err != nil {
-			return nil, makeError(errUnknown, "dxSplit", err.Error())
-		}
-	}
-	if len(utxos) == 0 {
-		return nil, makeError(errInsufficientFunds, "dxSplit", "no UTXOs to split")
+	// C++ fee model in XBridge units (xbridgewalletconnectorbtc.cpp:2665-2734):
+	// feesPerUtxo = minTxFee1(1,3) + minTxFee2(1,1) per split output (added only
+	// when include_fees); the real tx fee minTxFee1(vins,vouts) is deducted from
+	// change, and a dust change claws it back from the last split output.
+	// Computed up front because the auto-path utxo filter drops entries whose
+	// camount already equals splitSize (:2670-2676).
+	fee1XB := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 3))
+	fee2XB := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 1))
+	feesPerUtxoXB := fee1XB + fee2XB
+	splitSizeXB := targetXB
+	if includeFees {
+		splitSizeXB += feesPerUtxoXB
 	}
 
+	minConf := 0
+	if cc != nil {
+		minConf = cc.Confirmations
+	}
+	walletUtxos, err := conn.ListUnspent(minConf)
+	if err != nil {
+		return nil, makeError(errBadRequest, method, err.Error())
+	}
+	lockedKeys, _ := h.Store.LockedUtxoInfo()
+	if len(utxos) == 0 {
+		// Auto path (dxSplitAddress): split the spendable (non-locked) utxos,
+		// mirroring splitUtxos getUnspent(..., excluded) plus its auto filters
+		// (xbridgewalletconnectorbtc.cpp:2670-2676): skip utxos that already
+		// match the split size, or that belong to another wallet address.
+		utxos = nil
+		for _, u := range walletUtxos {
+			k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+			if lockedKeys[k] {
+				continue
+			}
+			if camount(u) == splitSizeXB || u.Address != address {
+				continue
+			}
+			utxos = append(utxos, u)
+		}
+	} else {
+		// Explicit path (dxSplitInputs): C++ needs only txid+vout (COutPoint,
+		// rpcxbridge.cpp:3362-3367); resolve the entries against the wallet's
+		// unspent list and reject any that are not available (RPC-F40). The
+		// wallet's data wins, and the vins follow the WALLET's order (C++
+		// builds newUnspent by scanning getUnspent, :2648-2662).
+		want := map[string]bool{}
+		for _, u := range utxos {
+			want[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] = true
+		}
+		resolved := make([]wallet.Utxo, 0, len(utxos))
+		for _, w := range walletUtxos {
+			k := w.TxID + ":" + strconv.FormatUint(uint64(w.Vout), 10)
+			if want[k] {
+				resolved = append(resolved, w)
+				delete(want, k)
+			}
+		}
+		if len(want) > 0 {
+			var missing string
+			for k := range want {
+				missing = k
+				break
+			}
+			return nil, makeError(errBadRequest, method, "user specified utxo was not found or is not available: "+missing)
+		}
+		utxos = resolved
+	}
+	if len(utxos) == 0 {
+		return nil, makeError(errBadRequest, method, "failed to get unspent transaction outputs for token "+ticker)
+	}
+	// C++ caps the input count at 100 (xbridgewalletconnectorbtc.cpp:2683-2685).
+	if len(utxos) > 100 {
+		utxos = utxos[:100]
+	}
 	destScript, e := legacyOutputScript(c, address)
 	if e != nil {
 		return nil, e
 	}
-	changeAddr, err := conn.GetNewAddress()
-	if err != nil {
-		return nil, makeError(errUnknown, "dxSplit", err.Error())
-	}
-	changeScript, e := legacyOutputScript(c, changeAddr)
-	if e != nil {
-		return nil, e
-	}
 
-	var total uint64
-	var prevTxs []wallet.PrevTx
+	var vinsTotalXB uint64
 	for _, u := range utxos {
-		total += u.Amount
-		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
+		vinsTotalXB += camount(u)
 	}
-
-	// Fee estimate (fallback to conf FeePerByte when estimatesmartfee is absent).
-	fee := estimateFee(cc, len(utxos), 2)
-
-	// Per-output size matches C++: splitAmount, plus fee when include_fees.
-	splitSize := target
-	if includeFees {
-		splitSize += fee
-	}
-	nSplits := total / splitSize
+	nSplits := int(vinsTotalXB / splitSizeXB)
 	if nSplits > 100 {
 		nSplits = 100
 	}
 	if nSplits == 0 {
-		return nil, makeError(errInsufficientFunds, "dxSplit", "insufficient funds for split amount")
+		return nil, makeError(errBadRequest, method, "already split all unused utxos in address ["+address+"]")
 	}
+	remainderXB := vinsTotalXB - uint64(nSplits)*splitSizeXB
+	txFeesXB := xBridgeIntFromReal(minTxFeeWhole(cc, len(utxos), nSplits))
 
-	spent := nSplits * splitSize
-	change := uint64(0)
-	if total > spent {
-		change = total - spent
+	outs := make([]uint64, 0, nSplits+1)
+	for i := 0; i < nSplits; i++ {
+		outs = append(outs, splitSizeXB)
 	}
-	// Dust change is dropped (C++ claws it back into fees); keeps the tx relayable.
-	if cc != nil && change < effectiveDust(cc, relayFee) {
-		change = 0
+	// Change (or claw-back) — C++ xbridgewalletconnectorbtc.cpp:2707-2734.
+	change := int64(remainderXB) - int64(txFeesXB)
+	if change > 0 && !isDustNative(xBridgeValueFromAmount(uint64(change)), cc, relayFee, coinNativeScale(c)) {
+		// Change goes to the REQUESTED address (RPC-F42).
+		outs = append(outs, uint64(change))
+	} else {
+		feesLeft := txFeesXB
+		for feesLeft > 0 && len(outs) > 0 {
+			last := outs[len(outs)-1]
+			if last <= feesLeft {
+				outs = outs[:len(outs)-1]
+				nSplits--
+				feesLeft -= last
+			} else {
+				outs[len(outs)-1] = last - feesLeft
+				if isDustNative(xBridgeValueFromAmount(outs[len(outs)-1]), cc, relayFee, coinNativeScale(c)) {
+					outs = outs[:len(outs)-1]
+				}
+				nSplits-- // C++ outputCount -= 1 even when the vout is kept (:2730)
+				feesLeft = 0
+			}
+		}
+	}
+	if len(outs) == 0 {
+		return nil, makeError(errBadRequest, method, "unable to split further, already split all unused utxos in address ["+address+"]")
 	}
 
 	tx := &coins.Tx{Version: 1}
@@ -1656,53 +1734,53 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	for _, u := range utxos {
 		hash, err := reverseTxidHex(u.TxID)
 		if err != nil {
-			return nil, makeError(errInvalidParameters, "dxSplit", "bad utxo txid: "+u.TxID)
+			return nil, makeError(errBadRequest, method, "bad utxo txid: "+u.TxID)
 		}
 		tx.Inputs = append(tx.Inputs, coins.TxIn{
 			PrevOut:  coins.OutPoint{Hash: hash, Index: u.Vout},
 			Sequence: 0xffffffff,
 		})
 	}
-	for i := uint64(0); i < nSplits; i++ {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: splitSize, ScriptPubKey: destScript})
-	}
-	if change > 0 {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: change, ScriptPubKey: changeScript})
+	for _, v := range outs {
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: fromXBridgeAmt(c, v), ScriptPubKey: destScript})
 	}
 
 	unsigned := hex.EncodeToString(tx.Serialize())
+	prevTxs := make([]wallet.PrevTx, 0, len(utxos))
+	for _, u := range utxos {
+		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
+	}
 	signedHex, complete, err := conn.SignRawTransaction(unsigned, prevTxs)
 	if err != nil {
-		return nil, makeError(errUnknown, "dxSplit", err.Error())
+		return nil, makeError(errBadRequest, method, err.Error())
 	}
 	if !complete {
-		return nil, makeError(errUnknown, "dxSplit", "signing incomplete (wallet missing keys?)")
+		return nil, makeError(errBadRequest, method, "failed to sign the split transaction "+ticker)
 	}
-
 	txid, e := txidOfRawTx(signedHex)
 	if e != nil {
 		return nil, e
 	}
-
 	rawtx := ""
 	if showRawTx {
 		rawtx = signedHex
 	}
 	if submit {
 		if _, err := conn.SendRawTransaction(signedHex); err != nil {
-			return nil, makeError(errUnknown, "dxSplit", err.Error())
+			// RPC-F43: submit failure is 1004 BAD_REQUEST, named after the
+			// actual method (rpcxbridge.cpp:3278/3392).
+			return nil, makeError(errBadRequest, method, err.Error())
 		}
 	}
-
-	return map[string]interface{}{
-		"token":                  ticker,
-		"include_fees":           includeFees,
-		"split_amount_requested": formatXAmount(targetXB),
-		"split_amount_with_fees": formatXAmount(toXBridgeAmt(c, splitSize)),
-		"split_utxo_count":       int(nSplits),
-		"split_total":            formatXAmount(toXBridgeAmt(c, total)),
-		"txid":                   txid,
-		"rawtx":                  rawtx,
+	return splitTxResult{
+		Token:                ticker,
+		IncludeFees:          includeFees,
+		SplitAmountRequested: formatXAmount(targetXB),
+		SplitAmountWithFees:  formatXAmount(splitSizeXB),
+		SplitUtxoCount:       nSplits,
+		SplitTotal:           formatXAmount(vinsTotalXB),
+		TxID:                 txid,
+		RawTx:                rawtx,
 	}, nil
 }
 
@@ -1881,6 +1959,16 @@ func toXBridgeAmt(c coins.Coin, native uint64) uint64 {
 	return native * coinScale / nc
 }
 
+// coinNativeScale returns the native base-unit scale of coin c (10^Decimals,
+// e.g. 1e8 for BTC), used where C++ references the wallet's ::COIN.
+func coinNativeScale(c coins.Coin) uint64 {
+	nc := uint64(1)
+	for i := 0; i < c.Decimals; i++ {
+		nc *= 10
+	}
+	return nc
+}
+
 // fromXBridgeAmt converts an XBridge 1e6-scale amount into the coin's native
 // base units for use as a real on-chain output value.
 func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {
@@ -1895,6 +1983,9 @@ func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {
 }
 
 // parseUtxoParam parses the explicit-utxos array argument of dxSplitInputs.
+// C++ needs only txid+vout per entry (COutPoint, rpcxbridge.cpp:3362-3367);
+// amount/scriptPubKey/address are optional and, when absent, resolved from the
+// wallet's unspent list by splitTx (RPC-F40).
 func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError) {
 	var arr []struct {
 		TxID         string `json:"txid"`
@@ -1908,11 +1999,15 @@ func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError
 	}
 	out := make([]wallet.Utxo, 0, len(arr))
 	for _, x := range arr {
-		amt, err := coins.ParseAmount(c, x.Amount)
-		if err != nil {
-			return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxo amount")
+		u := wallet.Utxo{TxID: x.TxID, Vout: x.Vout, Address: x.Address, ScriptPubKey: x.ScriptPubKey}
+		if x.Amount != "" {
+			amt, err := coins.ParseAmount(c, x.Amount)
+			if err != nil {
+				return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxo amount")
+			}
+			u.Amount = amt
 		}
-		out = append(out, wallet.Utxo{TxID: x.TxID, Vout: x.Vout, Address: x.Address, Amount: amt, ScriptPubKey: x.ScriptPubKey})
+		out = append(out, u)
 	}
 	return out, nil
 }

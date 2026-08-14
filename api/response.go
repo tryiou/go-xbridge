@@ -118,6 +118,21 @@ type flushedOrderOut struct {
 	UseCount int    `json:"use_count"`
 }
 
+// splitTxResult is the dxSplitAddress / dxSplitInputs success object. Field
+// ORDER matches the C++ writer (rpcxbridge.cpp:3280-3289 / 3394-3403): token,
+// include_fees, split_amount_requested, split_amount_with_fees, split_utxo_count,
+// split_total, txid, rawtx (RPC-F36-style ordered emission).
+type splitTxResult struct {
+	Token                string `json:"token"`
+	IncludeFees          bool   `json:"include_fees"`
+	SplitAmountRequested string `json:"split_amount_requested"`
+	SplitAmountWithFees  string `json:"split_amount_with_fees"`
+	SplitUtxoCount       int    `json:"split_utxo_count"`
+	SplitTotal           string `json:"split_total"`
+	TxID                 string `json:"txid"`
+	RawTx                string `json:"rawtx"`
+}
+
 // makeOrderResult is the dxMakeOrder / dxMakePartialOrder SUCCESS response
 // (Layout B, rpcxbridge.cpp:1047-1067 / :3070-3090): created_at BEFORE
 // updated_at, maker_address 2nd, taker_address 5th, block_id 10th.

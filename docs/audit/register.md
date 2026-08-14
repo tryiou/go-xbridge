@@ -76,10 +76,10 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F37 | S2 | `gettradingdata` (lowercase) missing from Go dispatch | RE-DECIDE | B7 (prior: deliberate removal) |
 | RPC-F38 | S2 | `dxGetTradingData` `fee_txid`/`nodepubkey` always `""` | OPEN | B7 |
 | RPC-F39 | S2 | `dxGetTradingData` data source: local fills vs on-chain scan | DOCUMENTED | Tier-3 (`api.md`) |
-| RPC-F40 | S2 | `dxSplitInputs` requires amount/scriptPubKey; C++ needs only txid/vout | OPEN | B7 |
-| RPC-F41 | S2 | `dxSplit` fee formula differs (520·fpb per output + claw-back) | OPEN | B7 |
-| RPC-F42 | S2 | `dxSplit` change destination differs (requested address vs fresh address) | OPEN | B7 |
-| RPC-F43 | S3 | `dxSplit` submit-failure code and error names | OPEN | B7 |
+| RPC-F40 | S2 | `dxSplitInputs` requires amount/scriptPubKey; C++ needs only txid/vout | FIXED | B7 `fix/rpc-surface` (txid/vout-only entries resolved against the wallet's unspent by txid/vout; locked-utxo guard — `TestDxSplitInputsTxidVoutOnly`, `TestDxSplitInputsLockedUtxo`) |
+| RPC-F41 | S2 | `dxSplit` fee formula differs (520·fpb per output + claw-back) | FIXED | B7 `fix/rpc-surface` (`feesPerUtxo = minTxFee1(1,3)+minTxFee2(1,1)` in XBridge units; real tx fee deducted from change, dust claw-back incl. C++ `outputCount -= 1` quirk — `TestDxSplitFeesPerUtxo`; parity oracle `main.cpp` + `TestValueMatchesCppSplit`) |
+| RPC-F42 | S2 | `dxSplit` change destination differs (requested address vs fresh address) | FIXED | B7 `fix/rpc-surface` (change output uses the requested address script — `TestDxSplitChangeToRequestedAddress`) |
+| RPC-F43 | S3 | `dxSplit` submit-failure code and error names | FIXED | B7 `fix/rpc-surface` (1004 BAD_REQUEST named after the actual method — `TestDxSplitSubmitFailure`) |
 | RPC-F44 | S2 | `dxGetUtxos` amounts trimmed vs C++ fixed-8 | OPEN | B7 |
 | RPC-F45 | S3 | `dxGetUtxos` listunspent failure code/text (1004 vs 1002) | OPEN | B7 |
 | RPC-F46 | S2 | `getnetworkinfo` shim diverges from real blocknetd (protocolversion, fees, subversion, fields) | RE-DECIDE | B7 (prior: Go-only extension) |

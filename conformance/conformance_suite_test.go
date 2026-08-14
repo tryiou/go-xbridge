@@ -419,14 +419,13 @@ func TestRPCResponseShape(t *testing.T) {
 		// DIVERGENT (Group-4 finding gettradingdata-missing).
 		{method: "gettradingdata", mode: "set", div: true, id: "gettradingdata-missing", refKeys: []string{
 			"timestamp", "txid", "to", "xid", "from", "fromAmount", "toAmount"}},
-		// dxSplitAddress: 8 keys, C++ order (rpcxbridge.cpp:3280-3289). CAND map
-		// -> sorted (handlers.go:1426-1435). DIVERGENT (Group-5 finding
-		// dxSplitAddress/key-order).
-		{method: "dxSplitAddress", mode: "set", div: true, id: "dxSplitAddress/key-order", refKeys: []string{
+		// dxSplitAddress: 8 keys in C++ order (rpcxbridge.cpp:3280-3289).
+		// CONFORMANT (RPC-F41-era ordered struct).
+		{method: "dxSplitAddress", mode: "exact", refKeys: []string{
 			"token", "include_fees", "split_amount_requested", "split_amount_with_fees",
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
-		// dxSplitInputs: same 8 keys (rpcxbridge.cpp:3394-3403). DIVERGENT (Group-5).
-		{method: "dxSplitInputs", mode: "set", div: true, id: "dxSplitInputs/key-order", refKeys: []string{
+		// dxSplitInputs: same 8 keys (rpcxbridge.cpp:3394-3403). CONFORMANT.
+		{method: "dxSplitInputs", mode: "exact", refKeys: []string{
 			"token", "include_fees", "split_amount_requested", "split_amount_with_fees",
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
 		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). CAND

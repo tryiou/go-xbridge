@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -30,6 +32,9 @@ type stubConn struct {
 	// (default IsGood:true when neither is set).
 	depositCheck    *wallet.DepositCheck
 	depositCheckErr error
+	// sendErr, when set, makes SendRawTransaction fail (dxSplit submit-failure
+	// tests, RPC-F43).
+	sendErr error
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -46,6 +51,9 @@ func (s *stubConn) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (st
 	return txHex, true, nil
 }
 func (s *stubConn) SendRawTransaction(txHex string) (string, error) {
+	if s.sendErr != nil {
+		return "", s.sendErr
+	}
 	return "txid123", nil
 }
 func (s *stubConn) GetRelayFee() (float64, error) {
@@ -245,10 +253,7 @@ func TestDxSplitAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dxSplitAddress: %v", err)
 	}
-	m, ok := res.(map[string]interface{})
-	if !ok {
-		t.Fatalf("result = %v (%T)", res, res)
-	}
+	m := mustJSONMap(t, res)
 	// C++ derives txid from the signed tx (double-SHA256, byte-reversed); it is
 	// always present, even before submission.
 	txid, _ := m["txid"].(string)
@@ -276,6 +281,126 @@ func TestDxSplitAddressNoConnector(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected no-session error for unconfigured coin")
+	}
+}
+
+// TestDxSplitFeesPerUtxo locks in RPC-F41: split_amount_with_fees is the split
+// size plus feesPerUtxo = minTxFee1(1,3) + minTxFee2(1,1), added only when
+// include_fees. For BTC (FeePerByte=2): fee1 = (192+102)*2 = 588 -> 5 XB units,
+// fee2 = (192+34)*2 = 452 -> 4 XB units, feesPerUtxo = 9.
+func TestDxSplitFeesPerUtxo(t *testing.T) {
+	ctx := newWalletTestCtx()
+	withFees, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("true"), json.RawMessage("false"), json.RawMessage("false"),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitAddress(include_fees): %v", err)
+	}
+	if m := mustJSONMap(t, withFees); m["split_amount_with_fees"] != "0.500009" {
+		t.Errorf("split_amount_with_fees = %v, want 0.500009 (target + feesPerUtxo 9)", m["split_amount_with_fees"])
+	}
+	noFees, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("false"),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitAddress(no fees): %v", err)
+	}
+	if m := mustJSONMap(t, noFees); m["split_amount_with_fees"] != "0.500000" {
+		t.Errorf("split_amount_with_fees = %v, want 0.500000", m["split_amount_with_fees"])
+	}
+}
+
+// TestDxSplitInputsTxidVoutOnly locks in RPC-F40: dxSplitInputs entries need only
+// txid+vout (the documented example, rpcxbridge.cpp:3347); amount/script are
+// resolved from the wallet's unspent list.
+func TestDxSplitInputsTxidVoutOnly(t *testing.T) {
+	ctx := newWalletTestCtx()
+	utxo := ctx.Node.config.Connectors["BTC"].(*stubConn).utxos[0]
+	res, err := ctx.dxSplitInputs([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("true"), json.RawMessage("false"), json.RawMessage("false"),
+		json.RawMessage(`[{"txid":"` + utxo.TxID + `","vout":0}]`),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitInputs(txid/vout only): %v", err)
+	}
+	m := mustJSONMap(t, res)
+	if m["split_utxo_count"] != float64(1) {
+		t.Errorf("split_utxo_count = %v, want 1", m["split_utxo_count"])
+	}
+}
+
+// TestDxSplitInputsLockedUtxo locks in the C++ "Cannot split utxo already in
+// use" guard (rpcxbridge.cpp:3374-3379): a user-specified utxo reserved by an
+// order errors 1004.
+func TestDxSplitInputsLockedUtxo(t *testing.T) {
+	ctx := newWalletTestCtx()
+	seedOrderWithUtxo(ctx, [32]byte{}) // reserves the stub utxo
+	_, err := ctx.dxSplitInputs([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("true"), json.RawMessage("false"), json.RawMessage("false"),
+		json.RawMessage(`[{"txid":"0000000000000000000000000000000000000000000000000000000000000000","vout":0}]`),
+	})
+	if err == nil || err.Code != errBadRequest {
+		t.Fatalf("dxSplitInputs(locked utxo) = %v, want BAD_REQUEST", err)
+	}
+}
+
+// TestDxSplitChangeToRequestedAddress locks in RPC-F42: ALL outputs (split and
+// change) use the REQUESTED address's script. The stub signs without modifying
+// the tx, so the raw tx decodes to the actual outputs; a fresh change address
+// would produce a different script.
+func TestDxSplitChangeToRequestedAddress(t *testing.T) {
+	ctx := newWalletTestCtx()
+	c, ok := coins.Get("BTC")
+	if !ok {
+		t.Fatal("coins.Get BTC failed")
+	}
+	dest, e := legacyOutputScript(c, btcAddr)
+	if e != nil {
+		t.Fatalf("legacyOutputScript: %v", e)
+	}
+	res, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("true"), json.RawMessage("true"), json.RawMessage("false"),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitAddress(show_rawtx): %v", err)
+	}
+	m := mustJSONMap(t, res)
+	wire, derr2 := hex.DecodeString(m["rawtx"].(string))
+	if derr2 != nil {
+		t.Fatalf("decode rawtx: %v", derr2)
+	}
+	parsed, derr := coins.Deserialize(wire)
+	if derr != nil {
+		t.Fatalf("deserialize rawtx: %v", derr)
+	}
+	tx := parsed
+	// 1 split output + 1 change output (neither dust).
+	if len(tx.Outputs) != 2 {
+		t.Fatalf("tx outputs = %d, want 2 (split + change)", len(tx.Outputs))
+	}
+	for i, out := range tx.Outputs {
+		if !bytes.Equal(out.ScriptPubKey, dest) {
+			t.Errorf("output %d script = %x, want requested address script %x", i, out.ScriptPubKey, dest)
+		}
+	}
+}
+
+// TestDxSplitSubmitFailure locks in RPC-F43: a submit failure is 1004
+// BAD_REQUEST named after the actual method (rpcxbridge.cpp:3278/3392).
+func TestDxSplitSubmitFailure(t *testing.T) {
+	ctx := newWalletTestCtx()
+	ctx.Node.config.Connectors["BTC"].(*stubConn).sendErr = stubErr("rejected")
+	_, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("true"), json.RawMessage("false"), json.RawMessage("true"),
+	})
+	if err == nil || err.Code != errBadRequest || err.Name != "dxSplitAddress" {
+		t.Fatalf("dxSplitAddress(submit fail) = %v, want BAD_REQUEST named dxSplitAddress", err)
 	}
 }
 
