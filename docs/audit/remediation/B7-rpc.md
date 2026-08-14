@@ -1,7 +1,7 @@
 # B7 — RPC response-surface parity (RPC-F03..F57, F59)
 
 Branch: `fix/rpc-surface` (off `main` @ B4 merge `d7394ee`).
-Status: MERGED into `main` @ `<merge-commit-hash>`.
+Status: MERGED into `main` @ `7799943` (fast-forward).
 C++ reference: Blocknet Core @ `ac930b7f8` (v4.4.1 era).
 Go subject: `api/response.go`, `api/handlers.go`, `api/order.go`,
 `api/store.go`, `api/node.go`, `coins/amount.go` (45 OPEN findings — F19,
