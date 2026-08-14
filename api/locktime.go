@@ -1,5 +1,7 @@
 package api
 
+import "go-xbridge/config"
+
 // Locktime-drift validation for the accept/take path.
 //
 // This mirrors C++ BtcWalletConnector::acceptableLockTimeDrift
@@ -7,11 +9,12 @@ package api
 // site. C++ computes locktimes as BLOCK HEIGHTS (lockTime() == currentBlock +
 // target/blockTime), which is exactly what Go's swapCtx.computeLockTimeFor
 // does, so the arithmetic ports directly. The constants mirror
-// xbridgewallet.h / script.h.
+// xbridgewallet.h / script.h; the drift pair is aliased from the config
+// package (the single source of truth shared with the admission gates).
 const (
-	lockTimeThreshold       = 500_000_000 // LOCKTIME_THRESHOLD (script.h:39)
-	xLockTimeDriftSeconds   = 900         // XLOCKTIME_DRIFT_SECONDS = XTAKER_LOCKTIME_TARGET_SECONDS/2 (1800/2)
-	xMaxLockTimeDriftBlocks = 4           // XMAX_LOCKTIME_DRIFT_BLOCKS (xbridgewallet.h:97)
+	lockTimeThreshold       = 500_000_000                    // LOCKTIME_THRESHOLD (script.h:39)
+	xLockTimeDriftSeconds   = config.XLocktimeDriftSeconds   // XLOCKTIME_DRIFT_SECONDS
+	xMaxLockTimeDriftBlocks = config.XMaxLockTimeDriftBlocks // XMAX_LOCKTIME_DRIFT_BLOCKS (xbridgewallet.h:97)
 )
 
 // acceptableLockTimeDrift reports whether the counterparty's deposit lockTime

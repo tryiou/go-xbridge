@@ -21,14 +21,16 @@ import (
 // currentBlock + target/blockTime; we do the same via the connector's
 // getblockcount. XLOCKTIME_DRIFT (15m) is the tolerance applied to the taker's
 // CreateB locktime — checked but not strictly enforced here.
+//
+// The values are the config-package mirrors of the C++ constexprs
+// (xbridgewallet.h:96-102), the single source of truth shared with the
+// admission gates (config.Admit).
 const (
-	makerLockTimeSec = 7200
-	takerLockTimeSec = 1800
-
-	// C++ xbridgewallet.h constexprs (not conf-driven; faithfully mirrored):
-	xMinLockTimeBlocks    = 6    // XMIN_LOCKTIME_BLOCKS
-	xSlowTakerLockTimeSec = 3600 // XSLOW_TAKER_LOCKTIME_TARGET_SECONDS
-	xSlowBlockTimeSec     = 600  // XSLOW_BLOCKTIME_SECONDS
+	makerLockTimeSec      = config.XMakerLocktimeTargetSeconds
+	takerLockTimeSec      = config.XTakerLocktimeTargetSeconds
+	xMinLockTimeBlocks    = config.XMinLockTimeBlocks
+	xSlowTakerLockTimeSec = config.XSlowTakerLocktimeTargetSeconds
+	xSlowBlockTimeSec     = config.XSlowBlockTimeSeconds
 
 	// refundCheckInterval is how often the background watcher scans live sessions
 	// for refunds whose deposit lockTime has passed. Overridable in tests.
