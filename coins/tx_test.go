@@ -465,6 +465,193 @@ func testTx() *Tx {
 	}
 }
 
+// TestHashForSigningBIP143MatchesSegwit pins the parameterized BIP143 digest:
+// passing SigHashAll must reproduce the old HashForSigningSegwit output on the
+// canonical native-P2WPKH vector.
+func TestHashForSigningBIP143MatchesSegwit(t *testing.T) {
+	tx := &Tx{
+		Version: 1,
+		Inputs: []TxIn{
+			{PrevOut: OutPoint{Hash: hash32(t, "fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f"), Index: 0}, Sequence: 0xffffffee},
+			{PrevOut: OutPoint{Hash: hash32(t, "ef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57b90ec68a"), Index: 1}, Sequence: 0xffffffff},
+		},
+		Outputs: []TxOut{
+			{Value: 112340000, ScriptPubKey: mustDecode(t, "76a9148280b37df378db99f66f85c95a783a76ac7a6d5988ac")},
+			{Value: 223450000, ScriptPubKey: mustDecode(t, "76a9143bde42dbee7e4dbe6a21b2d50ce2f0167faa815988ac")},
+		},
+		LockTime: 17,
+	}
+	scriptCode := P2WPKHScriptCode(mustDecode(t, "1d0f172a0ecb48aee1be1f2687d2963ae33f71a1"))
+	const amount = 600000000
+
+	got, err := tx.HashForSigningBIP143(1, scriptCode, amount, SigHashAll)
+	if err != nil {
+		t.Fatalf("HashForSigningBIP143: %v", err)
+	}
+	old, err := tx.HashForSigningSegwit(1, scriptCode, amount)
+	if err != nil {
+		t.Fatalf("HashForSigningSegwit: %v", err)
+	}
+	if got != old {
+		t.Errorf("parameterized BIP143 (SigHashAll) != HashForSigningSegwit")
+	}
+	if h := hex.EncodeToString(got[:]); h != "c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670" {
+		t.Errorf("BIP143 native P2WPKH sigHash\n got %s", h)
+	}
+}
+
+// TestHashForSigningForkID pins the forkid digest: BCH/DEVAULT fork value 0
+// commits hashType 0x41, BTG fork value 79 commits 0x4F41, and both must differ
+// from the plain BIP143 SIGHASH_ALL digest (proving the fork value is committed).
+func TestHashForSigningForkID(t *testing.T) {
+	tx := &Tx{
+		Version: 2,
+		Inputs: []TxIn{{
+			PrevOut:  OutPoint{Hash: hash32(t, "8967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab"), Index: 0},
+			Sequence: 0xfffffffe,
+		}},
+		Outputs: []TxOut{{
+			Value:        1234567,
+			ScriptPubKey: BuildP2PKHScript(KeyID(genPub)),
+		}},
+		LockTime: 600,
+	}
+	// Arbitrary scriptCode bytes; content is irrelevant to digest construction.
+	inner := []byte{0xa9, 0x14}
+	inner = append(inner, make([]byte, 20)...)
+	inner = append(inner, 0x87)
+	const amount = 100000000
+
+	plain, err := tx.HashForSigningBIP143(0, inner, amount, SigHashAll)
+	if err != nil {
+		t.Fatalf("HashForSigningBIP143: %v", err)
+	}
+
+	for _, tc := range []struct {
+		forkValue uint32
+		hashType  uint32
+	}{
+		{forkValue: 0, hashType: SigHashForkID | SigHashAll},          // BCH/DEVAULT -> 0x41
+		{forkValue: 79, hashType: 79<<8 | SigHashForkID | SigHashAll}, // BTG -> 0x4F41
+	} {
+		got, err := tx.HashForSigningForkID(0, inner, amount, tc.forkValue)
+		if err != nil {
+			t.Fatalf("HashForSigningForkID(%d): %v", tc.forkValue, err)
+		}
+		direct, err := tx.HashForSigningBIP143(0, inner, amount, tc.hashType)
+		if err != nil {
+			t.Fatalf("HashForSigningBIP143(%#x): %v", tc.hashType, err)
+		}
+		if got != direct {
+			t.Errorf("forkid(%d) digest != BIP143 hashType %#x", tc.forkValue, tc.hashType)
+		}
+		if got == plain {
+			t.Errorf("forkid(%d) digest equals plain SIGHASH_ALL digest; fork value not committed", tc.forkValue)
+		}
+	}
+}
+
+// TestSignTxInputForkIDRoundTrip signs with the forkid digest and verifies: the
+// trailing sighash byte is 0x41, verification round-trips, and tampering the
+// committed amount breaks verification.
+func TestSignTxInputForkIDRoundTrip(t *testing.T) {
+	tx := &Tx{
+		Version: 2,
+		Inputs: []TxIn{{
+			PrevOut:  OutPoint{Hash: hash32(t, "8967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab"), Index: 0},
+			Sequence: 0xfffffffe,
+		}},
+		Outputs: []TxOut{{
+			Value:        1234567,
+			ScriptPubKey: BuildP2PKHScript(KeyID(genPub)),
+		}},
+		LockTime: 600,
+	}
+	inner := []byte{0xa9, 0x14}
+	inner = append(inner, make([]byte, 20)...)
+	inner = append(inner, 0x87)
+	const amount = 100000000
+
+	sig, err := SignTxInputForkID(tx, 0, inner, amount, 0, genPriv)
+	if err != nil {
+		t.Fatalf("SignTxInputForkID: %v", err)
+	}
+	if sig[len(sig)-1] != SigHashForkID|SigHashAll {
+		t.Errorf("forkid signature trailing byte = %#x, want 0x41", sig[len(sig)-1])
+	}
+	ok, err := VerifyTxInputForkID(tx, 0, inner, genPub, amount, 0, sig)
+	if err != nil || !ok {
+		t.Fatalf("VerifyTxInputForkID ok=%v err=%v", ok, err)
+	}
+	if ok, err := VerifyTxInputForkID(tx, 0, inner, genPub, amount+1, 0, sig); ok || err != nil {
+		t.Errorf("tampered amount: verification ok=%v err=%v, want false/nil", ok, err)
+	}
+	// The legacy verifier must reject the 0x41 sighash byte (wrong algorithm).
+	if _, err := VerifyTxInput(tx, 0, inner, genPub, sig); err == nil {
+		t.Error("legacy verifier accepted a forkid signature")
+	}
+}
+
+// TestSignTxInputForCoinDispatch checks the per-coin dispatcher selects the
+// forkid digest for forkid coins and the legacy digest otherwise.
+func TestSignTxInputForCoinDispatch(t *testing.T) {
+	tx := &Tx{
+		Version: 2,
+		Inputs: []TxIn{{
+			PrevOut:  OutPoint{Hash: hash32(t, "8967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab"), Index: 0},
+			Sequence: 0xfffffffe,
+		}},
+		Outputs: []TxOut{{
+			Value:        1234567,
+			ScriptPubKey: BuildP2PKHScript(KeyID(genPub)),
+		}},
+		LockTime: 600,
+	}
+	// Arbitrary scriptCode bytes; content is irrelevant to digest construction.
+	inner := []byte{0xa9, 0x14}
+	inner = append(inner, make([]byte, 20)...)
+	inner = append(inner, 0x87)
+	const amount = 100000000
+
+	bch := Coin{Ticker: "BCH", signature: SigForkID, forkValue: 0xffdead}
+	btg := Coin{Ticker: "BTG", signature: SigForkID, forkValue: 79}
+	btc := Coin{Ticker: "BTC", signature: SigLegacy}
+
+	sigBCH, err := SignTxInputForCoin(tx, 0, inner, amount, genPriv, bch)
+	if err != nil {
+		t.Fatalf("SignTxInputForCoin(BCH): %v", err)
+	}
+	if sigBCH[len(sigBCH)-1] != SigHashForkID|SigHashAll {
+		t.Errorf("BCH signature byte = %#x, want 0x41", sigBCH[len(sigBCH)-1])
+	}
+	if ok, _ := VerifyTxInputForkID(tx, 0, inner, genPub, amount, 0xffdead, sigBCH); !ok {
+		t.Error("BCH dispatch signature failed forkid-0xffdead verification")
+	}
+
+	sigBTG, err := SignTxInputForCoin(tx, 0, inner, amount, genPriv, btg)
+	if err != nil {
+		t.Fatalf("SignTxInputForCoin(BTG): %v", err)
+	}
+	if ok, _ := VerifyTxInputForkID(tx, 0, inner, genPub, amount, 79, sigBTG); !ok {
+		t.Error("BTG dispatch signature failed forkid-79 verification")
+	}
+	// The same key under a different fork value must not verify.
+	if ok, _ := VerifyTxInputForkID(tx, 0, inner, genPub, amount, 0, sigBTG); ok {
+		t.Error("BTG signature verified under fork value 0")
+	}
+
+	sigBTC, err := SignTxInputForCoin(tx, 0, inner, amount, genPriv, btc)
+	if err != nil {
+		t.Fatalf("SignTxInputForCoin(BTC): %v", err)
+	}
+	if sigBTC[len(sigBTC)-1] != SigHashAll {
+		t.Errorf("BTC signature byte = %#x, want 0x01", sigBTC[len(sigBTC)-1])
+	}
+	if ok, _ := VerifyTxInput(tx, 0, inner, genPub, sigBTC); !ok {
+		t.Error("BTC dispatch signature failed legacy verification")
+	}
+}
+
 // indexOf returns the first index of sub within s at or after from, or -1.
 func indexOf(s, sub []byte, from int) int {
 	if from < 0 || from > len(s) {

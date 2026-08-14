@@ -11,8 +11,15 @@ import (
 	xlog "go-xbridge/log"
 )
 
-// SigHashAll is the only sighash type XBridge uses for deposit/refund/payment.
+// SigHashAll is the SIGHASH_ALL base type (the only base type XBridge uses for
+// deposit/refund/payment).
 const SigHashAll = 0x01
+
+// SigHashForkID is the SIGHASH_FORKID flag (0x40). Forkid coins (BCH/DEVAULT,
+// BTG) commit (forkValue<<8)|SIGHASH_FORKID|SIGHASH_ALL in the BIP143 digest
+// and append SIGHASH_FORKID|SIGHASH_ALL (0x41) to the DER signature — the fork
+// value affects only the digest (bch.cpp:391-406, btg.cpp:262-269).
+const SigHashForkID = 0x40
 
 // maxTxIns / maxTxOuts cap the number of inputs/outputs a transaction may
 // declare. Peer- or wallet-supplied counts are untrusted; these (plus the
@@ -399,19 +406,24 @@ func (t *Tx) HashForSigning(idx int, prevScript []byte) [32]byte {
 	return d2
 }
 
-// HashForSigningSegwit computes the BIP143 SIGHASH_ALL digest for input idx.
-// scriptCode is the script being executed (for P2WPKH this is the implied
-// P2PKH script `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`; for a
-// P2WSH / nested-witness HTLC input it is the witness/redeem script). amount is
-// the value (base units) of the output being spent. Reference:
+// HashForSigningBIP143 computes the BIP143 digest for input idx, committing the
+// given hashType (the SIGHASH type, including any SIGHASH_FORKID flag and fork
+// value) as the trailing 4-byte field. scriptCode is the script being executed
+// (for P2WPKH this is the implied P2PKH script; for a P2WSH / nested-witness or
+// forkid HTLC input it is the witness/redeem script). amount is the value (base
+// units) of the output being spent. Reference:
 // https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki
 //
 //	hashPrevouts = dSHA256(all input outpoints)
 //	hashSequence = dSHA256(all input sequences)
 //	hashOutputs  = dSHA256(all outputs)
 //	preimage = version ‖ hashPrevouts ‖ hashSequence ‖ outpoint ‖
-//	           scriptCode ‖ amount ‖ nSequence ‖ hashOutputs ‖ locktime ‖ sighash
-func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) ([32]byte, error) {
+//	           scriptCode ‖ amount ‖ nSequence ‖ hashOutputs ‖ locktime ‖ hashType
+//
+// The forkid variants (BCH/BTG) use the same preimage with hashType carrying the
+// fork value; the XBridge serializeWithTimeField nTime is NOT committed here,
+// matching the C++ forkid SignatureHash (bch.cpp:192-270, btg.cpp:118-207).
+func (t *Tx) HashForSigningBIP143(idx int, scriptCode []byte, amount uint64, hashType uint32) ([32]byte, error) {
 	if idx < 0 || idx >= len(t.Inputs) {
 		return [32]byte{}, errors.New("coins: input index out of range")
 	}
@@ -471,10 +483,32 @@ func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) ([3
 	binary.LittleEndian.PutUint32(lt[:], t.LockTime)
 	buf.Write(lt[:])
 	var sh [4]byte
-	binary.LittleEndian.PutUint32(sh[:], SigHashAll)
+	binary.LittleEndian.PutUint32(sh[:], hashType)
 	buf.Write(sh[:])
 
 	return dsha(buf.Bytes()), nil
+}
+
+// HashForSigningForkID computes the BCH-style (BIP135) forkid digest for input
+// idx: the BIP143 preimage with the sighash type set to
+// (forkValue<<8)|SIGHASH_FORKID|SIGHASH_ALL. forkValue 0 yields hashType 0x41
+// (DEVAULT); 79 yields 0x4F41 (BTG); live BCH mainnet uses 0xffdead, committing
+// 0xffdead41 (see forkValueFromMethod). Matches the C++ forkid SignatureHash
+// (bch.cpp:192-270, btg.cpp:118-207), which always takes the BIP143 branch when
+// SIGHASH_FORKID is set.
+func (t *Tx) HashForSigningForkID(idx int, scriptCode []byte, amount uint64, forkValue uint32) ([32]byte, error) {
+	hashType := (forkValue << 8) | SigHashForkID | SigHashAll
+	return t.HashForSigningBIP143(idx, scriptCode, amount, hashType)
+}
+
+// HashForSigningSegwit computes the BIP143 SIGHASH_ALL digest for input idx.
+// scriptCode is the script being executed (for P2WPKH this is the implied
+// P2PKH script `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`; for a
+// P2WSH / nested-witness HTLC input it is the witness/redeem script). amount is
+// the value (base units) of the output being spent. Reference:
+// https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki
+func (t *Tx) HashForSigningSegwit(idx int, scriptCode []byte, amount uint64) ([32]byte, error) {
+	return t.HashForSigningBIP143(idx, scriptCode, amount, SigHashAll)
 }
 
 // P2WPKHScriptCode returns the BIP143 scriptCode for spending a P2WPKH output
@@ -514,12 +548,47 @@ func SignTxInputSegwit(tx *Tx, idx int, scriptCode []byte, amount uint64, priv [
 	return signDigest(h, priv)
 }
 
+// SignTxInputForkID signs input idx with the forkid (BCH-style BIP135) digest:
+// BIP143 over scriptCode/amount with hashType (forkValue<<8)|SIGHASH_FORKID|SIGHASH_ALL.
+// Returns the DER signature with the 0x41 byte appended — the byte all forkid
+// connectors push (bch.cpp:404, btg.cpp:269); the fork value only affects the
+// digest. Mirrors C++ m_cp.sign + push_back(SIGHASH_ALL|SIGHASH_FORKID).
+func SignTxInputForkID(tx *Tx, idx int, scriptCode []byte, amount uint64, forkValue uint32, priv []byte) ([]byte, error) {
+	if len(priv) != 32 {
+		return nil, errors.New("coins: private key must be 32 bytes")
+	}
+	h, err := tx.HashForSigningForkID(idx, scriptCode, amount, forkValue)
+	if err != nil {
+		return nil, err
+	}
+	return signDigestWithSighash(h, priv, SigHashForkID|SigHashAll)
+}
+
+// SignTxInputForCoin signs input idx for a coin's local-signing algorithm,
+// dispatching on the coin's SignatureKind: the legacy SIGHASH_ALL digest for
+// SigLegacy coins, the forkid BIP143 digest (committing the coin's ForkValue)
+// for SigForkID coins. script is the prevout script being executed (the inner
+// redeem script for HTLC spends, the P2PKH scriptPubKey for deposit funding
+// inputs); amount is the spent output's value (forkid path only).
+func SignTxInputForCoin(tx *Tx, idx int, script []byte, amount uint64, priv []byte, c Coin) ([]byte, error) {
+	if c.SignatureKind() == SigForkID {
+		return SignTxInputForkID(tx, idx, script, amount, c.ForkValue(), priv)
+	}
+	return SignTxInput(tx, idx, script, priv)
+}
+
 // signDigest signs a 32-byte digest and appends the SIGHASH_ALL byte.
 func signDigest(h [32]byte, priv []byte) ([]byte, error) {
+	return signDigestWithSighash(h, priv, SigHashAll)
+}
+
+// signDigestWithSighash signs a 32-byte digest and appends the given sighash
+// byte (SigHashAll for legacy/BIP143, SigHashForkID|SigHashAll for forkid).
+func signDigestWithSighash(h [32]byte, priv []byte, sighash byte) ([]byte, error) {
 	key, _ := btcec.PrivKeyFromBytes(priv)
 	sig := ecdsa.Sign(key, h[:])
 	der := sig.Serialize()
-	return append(der, byte(SigHashAll)), nil
+	return append(der, sighash), nil
 }
 
 // VerifyTxInput checks a DER+SIGHASH signature (from SignTxInput) against the
@@ -546,6 +615,24 @@ func VerifyTxInputSegwit(tx *Tx, idx int, scriptCode, pub []byte, amount uint64,
 		return false, errors.New("coins: unexpected sighash type")
 	}
 	h, err := tx.HashForSigningSegwit(idx, scriptCode, amount)
+	if err != nil {
+		return false, err
+	}
+	return verifyDigest(h, pub, sigWithSighash)
+}
+
+// VerifyTxInputForkID checks a DER+SIGHASH signature (from SignTxInputForkID)
+// against the 33-byte compressed pubkey for input idx, using the forkid BIP143
+// digest over scriptCode/amount and the coin's fork value. The signature's
+// trailing byte must be 0x41 (SIGHASH_ALL|SIGHASH_FORKID).
+func VerifyTxInputForkID(tx *Tx, idx int, scriptCode, pub []byte, amount uint64, forkValue uint32, sigWithSighash []byte) (bool, error) {
+	if len(sigWithSighash) < 1 {
+		return false, errors.New("coins: empty signature")
+	}
+	if sigWithSighash[len(sigWithSighash)-1] != SigHashForkID|SigHashAll {
+		return false, errors.New("coins: unexpected sighash type")
+	}
+	h, err := tx.HashForSigningForkID(idx, scriptCode, amount, forkValue)
 	if err != nil {
 		return false, err
 	}

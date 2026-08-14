@@ -20,6 +20,19 @@ const (
 	FamilyUTXOBCH FamilyKind = "utxo-bch"
 )
 
+// SignatureKind identifies how local HTLC signatures (refund/claim) are
+// produced for a coin. Mirrors the C++ connector's per-connector signing
+// override (xbridgewalletconnector{btc,bch,btg}.cpp createRefundTransaction):
+//   - SigLegacy: legacy SIGHASH_ALL (0x01) digest — BtcWalletConnector family.
+//   - SigForkID: BIP143 digest with a fork value committed in the sighash type
+//     (SIGHASH_FORKID, 0x40) — BCH/DEVAULT (fork value 0), BTG (79).
+type SignatureKind int
+
+const (
+	SigLegacy SignatureKind = iota
+	SigForkID
+)
+
 // Coin describes a UTXO-based blockchain traded over XBridge. The address
 // parameters are the version bytes / HRP the connected wallet uses; they drive
 // address decoding/encoding in address.go. NO coin values are hardcoded: every
@@ -42,6 +55,13 @@ type Coin struct {
 	// FamilyUTXOBCH. Empty for other families.
 	CashAddrPrefix string
 
+	// signature is the local-signing algorithm (see SignatureKind), and
+	// forkValue the BIP135 fork value committed in the digest for SigForkID
+	// coins. Both derive from CreateTxMethod, mirroring the C++ connector
+	// constants (no coin is hardcoded in the registry itself).
+	signature SignatureKind
+	forkValue uint32
+
 	// TxWithTimeField mirrors <COIN>.TxWithTimeField in xbridge.conf
 	// (xbridgeapp.cpp:993). When true, deposit/refund/claim transactions for this
 	// coin carry the extra 4-byte nTime field after nVersion on the wire (the
@@ -52,6 +72,14 @@ type Coin struct {
 
 // Family returns the chain family.
 func (c Coin) Family() FamilyKind { return c.family }
+
+// SignatureKind returns the local-signing algorithm for this coin.
+func (c Coin) SignatureKind() SignatureKind { return c.signature }
+
+// ForkValue returns the BIP135 fork value committed in the sighash type when
+// SignatureKind() == SigForkID (0 for BCH/DEVAULT — hashType 0x41; 79 for BTG —
+// hashType 0x4F41). Meaningless for SigLegacy coins.
+func (c Coin) ForkValue() uint32 { return c.forkValue }
 
 // registry is the runtime coin set, published atomically by InitFromConf.
 // Readers (Get/Has) dereference the pointer with no lock, so a
@@ -97,6 +125,8 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 		SegWit:          segWitFromMethod(c.CreateTxMethod),
 		family:          familyFromMethod(c.CreateTxMethod),
 		CashAddrPrefix:  cashAddrPrefixFromMethod(c.CreateTxMethod),
+		signature:       signatureKindFromMethod(c.CreateTxMethod),
+		forkValue:       forkValueFromMethod(c.CreateTxMethod),
 		TxWithTimeField: c.TxWithTimeField,
 	}, nil
 }
@@ -106,22 +136,65 @@ func FromConf(c *config.CoinConf) (Coin, error) {
 // C++'s default connector behavior.
 func familyFromMethod(m string) FamilyKind {
 	switch normalizeTicker(m) {
-	case "BCH":
+	case "BCH", "DEVAULT":
 		return FamilyUTXOBCH
 	default:
 		return FamilyUTXOBTC
 	}
 }
 
-// cashAddrPrefixFromMethod returns the CashAddr HRP for the BCH family. Empty
-// for other families. Mirrors C++'s cashaddr prefix constants; the method string
+// cashAddrPrefixFromMethod returns the CashAddr HRP for BCH-family coins.
+// Mirrors the C++ connectors' per-class prefix constants (bch.cpp:307
+// "bitcoincash", devault.cpp:278-279 overriding to "devault"); the method string
 // comes from conf so nothing is hardcoded in the registry itself.
 func cashAddrPrefixFromMethod(m string) string {
 	switch normalizeTicker(m) {
 	case "BCH":
 		return "bitcoincash"
+	case "DEVAULT":
+		return "devault"
 	default:
 		return ""
+	}
+}
+
+// signatureKindFromMethod maps a CreateTxMethod to its local-signing algorithm.
+// Mirrors the C++ connector classes: only the BCH-family (BCH/DEVAULT) and BTG
+// override createRefundTransaction/createPaymentTransaction with a forkid
+// sighash; the BTC-family base uses the legacy digest. Unmapped methods default
+// to legacy.
+func signatureKindFromMethod(m string) SignatureKind {
+	switch normalizeTicker(m) {
+	case "BCH", "DEVAULT", "BTG":
+		return SigForkID
+	default:
+		return SigLegacy
+	}
+}
+
+// forkValueFromMethod returns the BIP135 fork value committed in the sighash for
+// forkid coins. The values are the per-connector constants C++ bakes into its
+// connector classes (no coin is hardcoded in the registry itself):
+//   - DEVAULT: 0 — devault.cpp:171 explicitly disables
+//     SCRIPT_ENABLE_REPLAY_PROTECTION ("not supported at this time"), so the
+//     plain withForkId() hashType 0x41 stands.
+//   - BTG: 79 — btg.cpp:69 FORKID_IN_USE, digest hashType (79<<8)|0x41 = 0x4F41.
+//   - BCH: 0xffdead — bch.cpp:203-209,497-499: when the chain's median time is
+//     >= 1605441600 (BCH's permanent 2020-11-15 replay-protection upgrade) the
+//     connector rewrites the fork value to 0xff0000|(fork^0xdead) = 0xffdead,
+//     so the digest commits hashType 0xffdead41. Live BCH mainnet has been past
+//     that threshold continuously, so a thin client always signs with 0xffdead;
+//     the pre-upgrade (fork value 0) case no longer exists on a live chain. The
+//     fork value only affects the digest — the DER signature byte stays 0x41
+//     (SIGHASH_ALL|SIGHASH_FORKID).
+func forkValueFromMethod(m string) uint32 {
+	switch normalizeTicker(m) {
+	case "BCH":
+		return 0xffdead
+	case "BTG":
+		return 79
+	default:
+		return 0
 	}
 }
 
@@ -146,7 +219,7 @@ func decimalsFromCoin(coin uint64) int {
 // C++'s per-connector selection (no coin is hardcoded in the registry itself).
 func segWitFromMethod(m string) bool {
 	switch normalizeTicker(m) {
-	case "BTC", "LTC", "DGB":
+	case "BTC", "LTC", "DGB", "BTG":
 		return true
 	default:
 		return false
@@ -164,6 +237,8 @@ func bech32HRPFromMethod(m string) string {
 		return "ltc"
 	case "DGB":
 		return "dgb"
+	case "BTG":
+		return "btg"
 	default:
 		return ""
 	}

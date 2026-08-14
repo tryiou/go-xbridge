@@ -259,3 +259,60 @@ func TestFormatAmountFixed(t *testing.T) {
 		t.Errorf("FormatAmount(1 BTC) = %q, want \"1\"", got)
 	}
 }
+
+// TestCoinSignatureDescriptor pins the per-coin descriptors derived from
+// CreateTxMethod (CRYPTO-F77/F89): the BCH-family coins sign with the forkid
+// digest (fork value 0), BTG with fork value 79, plain BTC-family coins legacy.
+// The tables mirror the C++ connector classes, not hardcoded coin values.
+func TestCoinSignatureDescriptor(t *testing.T) {
+	cases := []struct {
+		method     string
+		family     FamilyKind
+		kind       SignatureKind
+		forkValue  uint32
+		cashPrefix string
+		bech32HRP  string
+		segwit     bool
+	}{
+		{"BTC", FamilyUTXOBTC, SigLegacy, 0, "", "bc", true},
+		{"BLOCK", FamilyUTXOBTC, SigLegacy, 0, "", "", false},
+		{"DOGE", FamilyUTXOBTC, SigLegacy, 0, "", "", false},
+		// BCH commits fork value 0xffdead (live mainnet replay protection,
+		// bch.cpp:203-209,497-499); DEVAULT disables it (devault.cpp:171).
+		{"BCH", FamilyUTXOBCH, SigForkID, 0xffdead, "bitcoincash", "", false},
+		{"DEVAULT", FamilyUTXOBCH, SigForkID, 0, "devault", "", false},
+		{"BTG", FamilyUTXOBTC, SigForkID, 79, "", "btg", true},
+		{"PART", FamilyUTXOBTC, SigLegacy, 0, "", "", false},
+	}
+	for _, c := range cases {
+		coin, err := FromConf(&config.CoinConf{
+			Ticker:         "T",
+			Title:          c.method,
+			CreateTxMethod: c.method,
+			AddressPrefix:  0,
+			ScriptPrefix:   5,
+			Coin:           100000000,
+		})
+		if err != nil {
+			t.Fatalf("FromConf(%s): %v", c.method, err)
+		}
+		if coin.Family() != c.family {
+			t.Errorf("%s: family = %q, want %q", c.method, coin.Family(), c.family)
+		}
+		if coin.SignatureKind() != c.kind {
+			t.Errorf("%s: signature kind = %v, want %v", c.method, coin.SignatureKind(), c.kind)
+		}
+		if coin.ForkValue() != c.forkValue {
+			t.Errorf("%s: fork value = %d, want %d", c.method, coin.ForkValue(), c.forkValue)
+		}
+		if coin.CashAddrPrefix != c.cashPrefix {
+			t.Errorf("%s: cashaddr prefix = %q, want %q", c.method, coin.CashAddrPrefix, c.cashPrefix)
+		}
+		if coin.Bech32HRP != c.bech32HRP {
+			t.Errorf("%s: bech32 HRP = %q, want %q", c.method, coin.Bech32HRP, c.bech32HRP)
+		}
+		if coin.SegWit != c.segwit {
+			t.Errorf("%s: segwit = %v, want %v", c.method, coin.SegWit, c.segwit)
+		}
+	}
+}
