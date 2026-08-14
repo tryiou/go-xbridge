@@ -59,9 +59,9 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | RPC-F20 | S3 | `dxGetOrderBook` price formula omits C++ +1/COIN bump | OPEN | B7 |
 | RPC-F21 | S3 | `dxGetOrderBook` equal-best-price tie-break nondeterministic | OPEN | B7 |
 | RPC-F22 | S3 | `dxGetOrderBook` int-width (Go `int` vs C++ int64_t) | OPEN | B7 |
-| RPC-F23 | S2 | `dxGetTokenBalances` `"Wallet"` key derivation/presence differ | OPEN | B7 |
-| RPC-F24 | S3 | `dxGetTokenBalances` key order (Go map-sorted, Wallet last) | OPEN | B7 |
-| RPC-F25 | S3 | `dxGetTokenBalances` precision (C++ per-UTXO double sum vs Go exact integer) | OPEN | B7 |
+| RPC-F23 | S2 | `dxGetTokenBalances` `"Wallet"` key derivation/presence differ | DOCUMENTED | no synthesized `Wallet` key — thin client exposes the BLOCK connector balance under its ticker (deliberate, `B7-rpc.md`) |
+| RPC-F24 | S3 | `dxGetTokenBalances` key order (Go map-sorted, Wallet last) | DOCUMENTED | C++ ticker order is race-dependent thread-completion order (non-conformable; same decision as F23) |
+| RPC-F25 | S3 | `dxGetTokenBalances` precision (C++ per-UTXO double sum vs Go exact integer) | FIXED | B7 `fix/rpc-surface` (golden `TestDxGetTokenBalancesSum`; agreement to the 6th decimal) |
 | RPC-F26 | S3 | `dxGetMyOrders` field order, param rejection, dedup, sort | OPEN | B7 |
 | RPC-F27 | S2 | `dxGetMyPartialOrderChain` chain membership differs (filters/sort) | OPEN | B7 |
 | RPC-F28 | S2 | `dxPartialOrderChainDetails` `p2sh_deposits` array length ≠ chain length | OPEN | B7 |

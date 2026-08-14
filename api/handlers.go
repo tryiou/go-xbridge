@@ -991,26 +991,6 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 		}
 		return l
 	}
-	// C++ dxGetTokenBalances always emits a "Wallet" key: the available balance of
-	// the native BLOCK coin used to pay service-node fees (availableBalance()/COIN,
-	// fixed-6 XBridge scale). Derive it from the BLOCK connector when loaded;
-	// otherwise fall back to the first configured exchange wallet so the key stays
-	// present.
-	var walletTicker, walletBalance string
-	if c, ok := coins.Get("BLOCK"); ok {
-		if conn, ok := h.Node.cfg().Connectors["BLOCK"]; ok && conn != nil {
-			if utxos, err := conn.ListUnspent(0); err == nil {
-				var total uint64
-				for _, u := range utxos {
-					total += u.Amount
-				}
-				if l := lockedOf(utxos); l < total {
-					total -= l
-				}
-				walletTicker, walletBalance = "BLOCK", formatBalanceNative(c, total)
-			}
-		}
-	}
 	for _, ticker := range h.Node.cfg().ExchangeWallets {
 		conn, ok := h.Node.cfg().Connectors[ticker]
 		if !ok || conn == nil {
@@ -1033,17 +1013,14 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			if l := lockedOf(utxos); l < avail {
 				avail -= l
 			}
-			bal := formatBalanceNative(c, avail)
-			out[ticker] = bal
-			if walletTicker == "" {
-				walletTicker = ticker
-				walletBalance = bal
-			}
+			out[ticker] = formatBalanceNative(c, avail)
 		}
 	}
-	if walletTicker != "" {
-		out["Wallet"] = walletBalance
-	}
+	// DOCUMENTED divergence (RPC-F23/F24): C++ always emits a "Wallet" key (the
+	// native BLOCK available balance). go-xbridge deliberately does NOT
+	// synthesize one — the thin client pays service-node fees from the BLOCK
+	// connector balance, which is already exposed under its ticker, and the
+	// C++ ticker ordering is race-dependent anyway. See register.md F23/F24.
 	return out, nil
 }
 

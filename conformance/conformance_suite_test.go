@@ -366,12 +366,13 @@ func TestRPCResponseShape(t *testing.T) {
 		// dxGetOrderBook: detail/maker/taker/asks/bids. CONFORMANT.
 		{method: "dxGetOrderBook", mode: "exact", refKeys: []string{
 			"detail", "maker", "taker", "asks", "bids"}},
-		// dxGetTokenBalances: flat object, "Wallet" FIRST then connectors in
-		// vector order (rpcxbridge.cpp:2532). CAND emits a map -> keys sorted,
-		// "Wallet" LAST (handlers.go:763). DIVERGENT (Group-3 finding
-		// dxGetTokenBalances/key-order).
+		// dxGetTokenBalances: DOCUMENTED divergence (RPC-F23/F24). C++ emits a
+		// "Wallet" key FIRST then connectors in thread-completion (race) order;
+		// go-xbridge deliberately emits NO "Wallet" key (the BLOCK connector
+		// balance is exposed under its own ticker) and a map -> sorted keys.
+		// See register.md F23/F24.
 		{method: "dxGetTokenBalances", mode: "set", div: true, id: "dxGetTokenBalances/key-order", refKeys: []string{
-			"Wallet", "BLOCK", "LTC"}},
+			"BLOCK", "LTC"}},
 		// dxGetMyOrders: 16 keys; C++ puts maker_address/taker_address at 3/6
 		// (rpcxbridge.cpp:2151-2171); CAND flattens the embedded orderBase first,
 		// emitting the addresses at 14/15 (response.go:50-54). DIVERGENT

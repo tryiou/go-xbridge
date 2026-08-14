@@ -198,9 +198,40 @@ func TestDxGetTokenBalances(t *testing.T) {
 	if m["BTC"] != "1.000000" {
 		t.Errorf("BTC balance = %v, want 1.000000", m["BTC"])
 	}
-	// C++ always emits a "Wallet" key (native BLOCK available balance).
-	if m["Wallet"] != "1.000000" {
-		t.Errorf("Wallet balance = %v, want 1.000000", m["Wallet"])
+	// DOCUMENTED divergence (RPC-F23/F24): no synthesized "Wallet" key — the
+	// thin client exposes the BLOCK connector balance under its own ticker and
+	// does not duplicate it into a wallet tag.
+	if _, hasWallet := m["Wallet"]; hasWallet {
+		t.Errorf("result contains a synthesized 'Wallet' key (deliberately removed, RPC-F23/F24): %v", m)
+	}
+}
+
+// TestDxGetTokenBalancesSum is the RPC-F25 regression pin: Go sums per-UTXO
+// native amounts as an EXACT integer (uint64) and renders formatBalanceNative,
+// while C++ sums them as doubles and prints %.6f. The two agree to the 6th
+// decimal for this vector (a double sum of 0.1+0.2+0.05 = 0.35000000000000003
+// also renders "0.350000"), so the test pins the exact uint64 accumulation and
+// 8-decimal scale rendering — catching a scale/coinconf or accumulation
+// regression rather than double-vs-int discrimination.
+func TestDxGetTokenBalancesSum(t *testing.T) {
+	ctx := newWalletTestCtx()
+	btc := ctx.Node.config.Connectors["BTC"].(*stubConn)
+	btc.utxos = []wallet.Utxo{
+		{TxID: "000000000000000000000000000000000000000000000000000000000000000a", Vout: 0, Amount: 10000000, Value: 0.1, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+		{TxID: "000000000000000000000000000000000000000000000000000000000000000b", Vout: 1, Amount: 20000000, Value: 0.2, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+		{TxID: "000000000000000000000000000000000000000000000000000000000000000c", Vout: 2, Amount: 5000000, Value: 0.05, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+	}
+	res, err := ctx.dxGetTokenBalances(nil)
+	if err != nil {
+		t.Fatalf("dxGetTokenBalances: %v", err)
+	}
+	m, ok := res.(map[string]string)
+	if !ok {
+		t.Fatalf("result = %v (%T), want map[string]string", res, res)
+	}
+	// 0.1 + 0.2 + 0.05 BTC = 0.35 BTC exactly in base units.
+	if m["BTC"] != "0.350000" {
+		t.Errorf("BTC balance = %v, want 0.350000 (exact integer sum, RPC-F25)", m["BTC"])
 	}
 }
 

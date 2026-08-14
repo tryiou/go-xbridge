@@ -292,10 +292,11 @@ defaulted or trailing parameter.
 **`dxGetTokenBalances`**
 - `params`: none.
 - `result`: object mapping each configured exchange-wallet ticker to its
-  spendable balance (6-decimal string, locked UTXOs subtracted) plus a
-  `"Wallet"` key with the BLOCK fee balance. (When no BLOCK connector is
-  loaded the `"Wallet"` key holds the first configured exchange wallet's
-  balance; it is omitted entirely when no wallet loads.)
+  spendable balance (6-decimal string, locked UTXOs subtracted). No `"Wallet"`
+  key is synthesized (documented divergence RPC-F23/F24): the BLOCK fee
+  balance is exposed under the `BLOCK` ticker, and C++'s key order is
+  race-dependent thread-completion order anyway. Empty object when no wallet
+  loads.
 
 **`dxGetNewTokenAddress`**
 - `params`: `ticker` (string).
