@@ -61,6 +61,11 @@ var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, func(currency string
 	xlog.Warn("cancel: no connector suppressed", "currency", currency, "count", total, "over", elapsed.Round(time.Second).String())
 })
 
+// walletSweepInterval is how often the background loop re-runs the C++
+// updateActiveWallets equivalent (admission + reachability re-probe),
+// xbridgeapp.cpp:3674-3677 re-posts every ~30 seconds. Overridable in tests.
+var walletSweepInterval = 30 * time.Second
+
 // Config tunes a Node.
 type Config struct {
 	// NodeAddr is the Blocknet service-node P2P address (host:port). Empty
@@ -92,6 +97,11 @@ type Config struct {
 	// wallet. Mirrors updateActiveWallets' valid/bad connection split
 	// (xbridgeapp.cpp:1104-1200).
 	CheckReachability bool
+	// Activator builds the active connector set (admission + reachability
+	// probe, with the C++ bad-wallet retry). The daemon passes the Activator it
+	// used at startup so failed-startup wallets stay "bad" until their retry
+	// window elapses; when nil, NewNode creates one.
+	Activator *wallet.Activator
 	// NetworkTokens is the full set of coins known from xbridge.conf.
 	NetworkTokens []string
 	// Network is the Blocknet network to discover on: "mainnet" (default),
@@ -151,6 +161,13 @@ type Node struct {
 	store  *Store
 	signer crypto.Signer
 	stop   chan struct{}
+
+	// activator builds the active connector set (admission + reachability
+	// probe, C++ bad-wallet retry). It is set from Config.Activator (or a fresh
+	// one) by NewNode so startup-failed wallets stay "bad" through the sweep;
+	// activatorMu guards the lazy path used by directly-constructed test nodes.
+	activator   *wallet.Activator
+	activatorMu sync.Mutex
 
 	// sessions is the set of in-flight swaps we are a party to (keyed by
 	// order-id hex). The live hub drives each one through its packet sequence;
@@ -219,12 +236,16 @@ type Node struct {
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		config:   cfg,
-		store:    store,
-		signer:   crypto.NewBtcSigner(),
-		stop:     make(chan struct{}),
-		sessions: map[string]*SwapSession{},
-		snReg:    servicenode.NewRegistry(),
+		config:    cfg,
+		store:     store,
+		signer:    crypto.NewBtcSigner(),
+		stop:      make(chan struct{}),
+		sessions:  map[string]*SwapSession{},
+		snReg:     servicenode.NewRegistry(),
+		activator: cfg.Activator,
+	}
+	if n.activator == nil {
+		n.activator = wallet.NewActivator()
 	}
 
 	// Restore local swaps persisted to DataDir (mirrors C++ loadOrders). This
@@ -326,44 +347,145 @@ func (n *Node) reloadConf() error {
 	if err != nil {
 		return fmt.Errorf("dxLoadXBridgeConf: load %s: %w", path, err)
 	}
-	if err := coins.InitFromConf(conf.Coins); err != nil {
+	// Static admission first: a coin failing the gates (or a stray section
+	// with COIN==0) never reaches the registry — C++ skips such wallets instead
+	// of aborting (xbridgeapp.cpp:1002-1040).
+	admitted := config.Admitted(conf.Coins)
+	if err := coins.InitFromConf(admitted); err != nil {
 		return fmt.Errorf("dxLoadXBridgeConf: coin registry: %w", err)
 	}
-	connectors := map[string]wallet.Connector{}
-	for ticker, cc := range conf.Coins {
-		conn, cerr := wallet.NewConnectorFromConf(cc)
-		if cerr != nil {
-			xlog.Warn("connector not configured after reload", "coin", ticker, "err", cerr)
-			continue
-		}
-		connectors[ticker] = conn
+	// Re-activate exactly the [Main].ExchangeWallets currencies. C++ clears
+	// bad-wallet designations first because the user explicitly asked for a
+	// wallet update (rpcxbridge.cpp:233), then re-applies gates + probe.
+	a := n.walletActivator()
+	a.ClearBad()
+	connectors, drops := a.Activate(admitted, conf.Main.ExchangeWallets, n.cfg().CheckReachability)
+	for _, d := range drops {
+		xlog.Warn("wallet not activated after reload", "coin", d.Ticker, "reason", d.Reason)
 	}
-	networkTokens := make([]string, 0, len(conf.Coins))
-	for t := range conf.Coins {
+	networkTokens := make([]string, 0, len(admitted))
+	for t := range admitted {
 		networkTokens = append(networkTokens, t)
 	}
 	sort.Strings(networkTokens)
 
 	fresh := &Config{
-		NodeAddr:         n.cfg().NodeAddr,
-		Magic:            n.cfg().Magic,
-		Confs:            conf.Coins,
-		Connectors:       connectors,
-		ExchangeWallets:  conf.Main.ExchangeWallets,
-		ShowAllOrders:    conf.Main.ShowAllOrders,
-		NetworkTokens:    networkTokens,
-		Network:          n.cfg().Network,
-		AddNodes:         n.cfg().AddNodes,
-		WalletVersion:    n.cfg().WalletVersion,
-		WalletVersionStr: n.cfg().WalletVersionStr,
-		DataDir:          n.cfg().DataDir,
-		ConfPath:         path,
+		NodeAddr:           n.cfg().NodeAddr,
+		Magic:              n.cfg().Magic,
+		Confs:              admitted,
+		Connectors:         connectors,
+		ExchangeWallets:    conf.Main.ExchangeWallets,
+		ForceShowAllOrders: n.cfg().ForceShowAllOrders,
+		// C++ showAllOrders() = conf OR the -dxnowallets override, and the flag
+		// survives a reload (gArgs is process-global, xbridgeapp.cpp:372).
+		ShowAllOrders:     conf.Main.ShowAllOrders || n.cfg().ForceShowAllOrders,
+		CheckReachability: n.cfg().CheckReachability,
+		NetworkTokens:     networkTokens,
+		Network:           n.cfg().Network,
+		AddNodes:          n.cfg().AddNodes,
+		WalletVersion:     n.cfg().WalletVersion,
+		WalletVersionStr:  n.cfg().WalletVersionStr,
+		DataDir:           n.cfg().DataDir,
+		ConfPath:          path,
+		PersistSecrets:    n.cfg().PersistSecrets,
+		Activator:         a, // the Activator actually used for this reload
 	}
 	n.cfgMu.Lock()
 	n.config = fresh
 	n.cfgMu.Unlock()
-	xlog.Info("reloaded xbridge.conf", "path", path, "coins", len(conf.Coins))
+	// Non-local orders for now-unconnected currencies are unusable; drop them
+	// unless showAllOrders says to keep showing the whole network
+	// (C++ clearNonLocalOrders, rpcxbridge.cpp:229-233).
+	if !fresh.ShowAllOrders {
+		n.store.PruneUnconnected(connectorTickerSet(connectors))
+	}
+	xlog.Info("reloaded xbridge.conf", "path", path, "coins", len(admitted),
+		"connectors", len(connectors), "drops", len(drops))
 	return nil
+}
+
+// connectorTickerSet is the set of tickers with an active connector.
+func connectorTickerSet(conns map[string]wallet.Connector) map[string]bool {
+	out := make(map[string]bool, len(conns))
+	for t := range conns {
+		out[t] = true
+	}
+	return out
+}
+
+// walletActivator returns the Node's wallet Activator, creating one on first
+// use for nodes built directly (tests) without NewNode.
+func (n *Node) walletActivator() *wallet.Activator {
+	n.activatorMu.Lock()
+	defer n.activatorMu.Unlock()
+	if n.activator == nil {
+		n.activator = wallet.NewActivator()
+	}
+	return n.activator
+}
+
+// sweepConnectors re-runs the C++ periodic updateActiveWallets
+// (xbridgeapp.cpp:3674-3677): against the in-memory settings (the conf file is
+// NOT re-read — only dxLoadXBridgeConf does that) it re-applies admission and
+// re-probes reachability, swapping in the fresh connector set when it changed.
+// Unlike reloadConf there is no clearNonLocalOrders pass (C++ only prunes on
+// dxLoadXBridgeConf). Runs on the engine's 30s tick.
+func (n *Node) sweepConnectors() {
+	c := n.cfg()
+	if c == nil || c.Connectors == nil {
+		return
+	}
+	conns, drops := n.walletActivator().Activate(c.Confs, c.ExchangeWallets, c.CheckReachability)
+	for _, d := range drops {
+		xlog.Warn("wallet not reachable", "coin", d.Ticker, "reason", d.Reason)
+	}
+	n.cfgMu.Lock()
+	defer n.cfgMu.Unlock()
+	// A dxLoadXBridgeConf that completed during the probe window is fresher
+	// than our snapshot — C++ serializes the two with m_updatingWalletsLock
+	// (rpcxbridge.cpp:226-227 refuses a reload mid-update). If the config was
+	// replaced since we snapshotted it, its connectors win; do not clobber.
+	if n.config != c {
+		return
+	}
+	if sameConnectorTickers(c.Connectors, conns) {
+		return
+	}
+	fresh := *c // shallow copy; only Connectors differs
+	fresh.Connectors = conns
+	n.config = &fresh
+	xlog.Info("wallet sweep updated connectors", "connectors", len(conns))
+}
+
+// sameConnectorTickers reports whether two connector maps name the same tickers
+// (the probe outcome is stable — no swap needed).
+func sameConnectorTickers(a, b map[string]wallet.Connector) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for t := range a {
+		if _, ok := b[t]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepLoop is the ~30s background wallet-update ticker (C++ updateActiveWallets
+// every ~30s, xbridgeapp.cpp:3674-3677). Started by Node.start, stopped via
+// Node.Close.
+func (n *Node) sweepLoop() {
+	defer n.wg.Done()
+	t := time.NewTicker(walletSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.stop:
+			return
+		case <-t.C:
+			n.sweepConnectors()
+		}
+	}
 }
 
 // blockConnector returns the connector for the BLOCK chain, whose block height

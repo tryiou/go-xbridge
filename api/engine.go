@@ -90,11 +90,12 @@ func (n *Node) start() {
 	n.tasks = make(chan workTask, 16)
 	n.results = make(chan workResult, engineWorkers)
 	n.pendingRefunds = map[string]bool{}
-	n.wg.Add(4) // reader, engine, blockLoop, statusLoop
+	n.wg.Add(5) // reader, engine, blockLoop, statusLoop, wallet sweep
 	go n.readerLoop()
 	go n.engineLoop()
 	go n.blockLoop()
 	go n.statusLoop()
+	go n.sweepLoop()
 	n.startWorkers()
 	n.engineRunning.Store(true)
 }

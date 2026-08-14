@@ -433,3 +433,37 @@ func TestLockedUtxoInfoFor(t *testing.T) {
 		t.Error("reserved funding key must not be excluded for another currency (LTC)")
 	}
 }
+
+// TestPruneUnconnected locks CFG-F87's clearNonLocalOrders port: non-local
+// orders whose from/to currency has no connector are removed; local orders are
+// always kept (C++ App::clearNonLocalOrders, xbridgeapp.cpp:3811-3821).
+func TestPruneUnconnected(t *testing.T) {
+	s := NewStore()
+	s.Add(&Order{ID: [32]byte{0x01}, FromCurrency: "BTC", ToCurrency: "BLOCK", Status: "open", Mine: true})
+	s.Add(&Order{ID: [32]byte{0x02}, FromCurrency: "BTC", ToCurrency: "LTC", Status: "open", Mine: false, Role: 'B'})
+	s.Add(&Order{ID: [32]byte{0x03}, FromCurrency: "LTC", ToCurrency: "BTC", Status: "open", Mine: false})
+	s.Add(&Order{ID: [32]byte{0x04}, FromCurrency: "BTC", ToCurrency: "DOGE", Status: "open", Mine: false, Role: 'B'})
+
+	s.PruneUnconnected(map[string]bool{"BTC": true, "LTC": true})
+
+	got := s.List()
+	if len(got) != 3 {
+		t.Fatalf("orders after prune = %d, want 3", len(got))
+	}
+	for _, o := range got {
+		if o.ID == [32]byte{0x04} {
+			t.Error("DOGE-currency order (no DOGE connector) survived PruneUnconnected")
+		}
+		if o.ID == [32]byte{0x01} && !o.Mine {
+			t.Error("local order lost its Mine flag")
+		}
+	}
+	// Local order kept regardless of currencies; BTC/LTC-connected order kept.
+	found := map[[32]byte]bool{}
+	for _, o := range got {
+		found[o.ID] = true
+	}
+	if !found[[32]byte{0x01}] || !found[[32]byte{0x02}] || !found[[32]byte{0x03}] {
+		t.Errorf("expected orders 0x01/0x02/0x03 kept, got %v", found)
+	}
+}

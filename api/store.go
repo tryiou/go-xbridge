@@ -311,6 +311,25 @@ func (s *Store) Mine() []*Order {
 	return out
 }
 
+// PruneUnconnected removes non-local orders whose from/to currency has no
+// connector, keeping local orders always. Mirrors C++ App::clearNonLocalOrders
+// (xbridgeapp.cpp:3811-3821), which dxLoadXBridgeConf invokes only when
+// showAllOrders is false: an order you hold no wallet for is unusable, so it is
+// dropped from the live book (local orders are kept regardless — you act on
+// them through the hub).
+func (s *Store) PruneUnconnected(kept map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, o := range s.orders {
+		if o.Mine {
+			continue
+		}
+		if !kept[o.FromCurrency] || !kept[o.ToCurrency] {
+			delete(s.orders, id)
+		}
+	}
+}
+
 // AddFill records a completed fill (used by dxGetOrderFills / dxGetOrderHistory).
 func (s *Store) AddFill(f fillEntry) {
 	s.mu.Lock()

@@ -168,27 +168,31 @@ func main() {
 		}
 	}
 
-	// Read coin connectors from xbridge.conf (never creates it).
+	// Read coin connectors from xbridge.conf (never creates it). Static
+	// admission runs first (CFG-F85): a coin failing the gates — or a stray
+	// section with COIN==0 — is skipped, never fatal, exactly as C++ skips
+	// wallets that fail updateActiveWallets (xbridgeapp.cpp:1002-1040).
 	conf, err := config.Load(*confPath)
 	if err != nil {
 		fatalf("xbridge.conf", "err", err)
 	}
-	if err := coins.InitFromConf(conf.Coins); err != nil {
+	admitted := config.Admitted(conf.Coins)
+	if err := coins.InitFromConf(admitted); err != nil {
 		fatalf("coin config", "err", err)
 	}
 
-	connectors := map[string]wallet.Connector{}
-	for ticker, cc := range conf.Coins {
-		conn, err := wallet.NewConnectorFromConf(cc)
-		if err != nil {
-			xlog.Warn("connector not configured", "coin", ticker, "err", err)
-			continue
-		}
-		connectors[ticker] = conn
+	// Connect exactly the [Main].ExchangeWallets currencies (CFG-F87), applying
+	// admission + the live reachability probe. The Activator is passed to the
+	// Node so failed-startup wallets stay "bad" for the retry window across the
+	// 30s sweep.
+	activator := wallet.NewActivator()
+	connectors, drops := activator.Activate(admitted, conf.Main.ExchangeWallets, true)
+	for _, d := range drops {
+		xlog.Warn("wallet not activated", "coin", d.Ticker, "reason", d.Reason)
 	}
 
-	networkTokens := make([]string, 0, len(conf.Coins))
-	for t := range conf.Coins {
+	networkTokens := make([]string, 0, len(admitted))
+	for t := range admitted {
 		networkTokens = append(networkTokens, t)
 	}
 	sort.Strings(networkTokens)
@@ -209,7 +213,7 @@ func main() {
 		Network:          *network,
 		AddNodes:         addNodes,
 		Magic:            magic,
-		Confs:            conf.Coins,
+		Confs:            admitted,
 		Connectors:       connectors,
 		ExchangeWallets:  conf.Main.ExchangeWallets,
 		NetworkTokens:    networkTokens,
@@ -224,8 +228,10 @@ func main() {
 		ShowAllOrders:      conf.Main.ShowAllOrders || *dxnowallets,
 		ForceShowAllOrders: *dxnowallets,
 		// Reachability probe on (faithful updateActiveWallets); disabled in
-		// tests only.
+		// tests only. The startup Activator is shared so failed wallets stay
+		// "bad" for the 300s retry window across the 30s sweep.
 		CheckReachability: true,
+		Activator:         activator,
 	}
 	node, err := api.NewNode(cfg, store)
 	if err != nil {
