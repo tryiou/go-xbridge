@@ -31,6 +31,24 @@ func (f xfloat) MarshalJSON() ([]byte, error) {
 	return []byte(s), nil
 }
 
+// xfloat8 renders a double as a JSON number with 8 fixed decimals, matching
+// C++ json_spirit write_string's precision_of_doubles=8 (std::fixed +
+// setprecision(8), json_spirit_writer_template.h:195). Used for the
+// dxGetOrderHistory OHLCV row (RPC-F17).
+type xfloat8 float64
+
+func (f xfloat8) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(f), 'f', 8, 64)), nil
+}
+
+// quantizePrice mirrors ccy::Asset::Price (currency.h:108-123): the to/from
+// ratio is rounded half-up onto the currency-basis grid. XBridge queries use
+// TransactionDescr::COIN = 1e6 as the basis, so prices land on the 1e-6 grid
+// (RPC-F17).
+func quantizePrice(price float64) float64 {
+	return math.Round(price*1e6) / 1e6
+}
+
 // fillOut is one entry of dxGetOrderFills' recent-fills list. Mirrors C++'s
 // 12-field object (id, time, maker, maker_size, taker, taker_size, order_type,
 // partial_minimum, partial_orig_maker_size, partial_orig_taker_size,
@@ -560,9 +578,6 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	if err != nil {
 		return nil, err
 	}
-	if granularity <= 0 {
-		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "invalid granularity")
-	}
 	start, _, err := spInt64(params, 2)
 	if err != nil {
 		return nil, err
@@ -570,12 +585,6 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	end, _, err := spInt64(params, 3)
 	if err != nil {
 		return nil, err
-	}
-	// C++ XSeries::earliestTime() = 2018-02-25 00:00:00 UTC = 1519516800 (util/xseries.h:108).
-	// Requests starting before this are rejected with "Start time too early."
-	const xSeriesEarliest = int64(1519516800)
-	if start < xSeriesEarliest {
-		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "Start time too early.")
 	}
 	orderIDs := false
 	if len(params) > 5 {
@@ -589,21 +598,56 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 			return nil, err
 		}
 	}
-	// C++ reads limit (params[7]) via get_int() when present (rpcxbridge.cpp:663);
-	// the thin client doesn't bound a BLOCK scan, but a wrong type must still
-	// throw the -1 envelope error.
+	limit := 0
 	if len(params) > 7 {
-		if _, _, err = spInt(params, 7); err != nil {
+		if limit, _, err = spInt(params, 7); err != nil {
 			return nil, err
 		}
 	}
 
-	if end <= start {
-		return []interface{}{}, nil
+	// xQuery ctor validations (util/xseries.h:91-101), in C++ order: the
+	// granularity whitelist, the aligned period bounds, then the limit range.
+	supportedGranularity := granularity == 60 || granularity == 300 || granularity == 900 ||
+		granularity == 3600 || granularity == 21600 || granularity == 86400
+	if !supportedGranularity {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "granularity="+strconv.FormatInt(granularity, 10)+" must be one of: 60,300,900,3600,21600,86400")
 	}
-	alignedStart := (start / granularity) * granularity
-	alignedEnd := ((end + granularity - 1) / granularity) * granularity
+	// get_start_time / get_end_time snap the boundaries onto the granularity
+	// grid (floor start, ceil end); a negative boundary snaps to epoch 0
+	// (util/xseries.h:131-142).
+	alignedStart := int64(0)
+	if start >= 0 {
+		alignedStart = (start / granularity) * granularity
+	}
+	alignedEnd := int64(0)
+	if end >= 0 {
+		alignedEnd = ((end + granularity - 1) / granularity) * granularity
+	}
+	// XSeries::earliestTime() = 2018-02-25 00:00:00 UTC = 1519516800
+	// (util/xseries.h:107-109). C++ compares the ALIGNED period.begin().
+	const xSeriesEarliest = int64(1519516800)
+	if alignedStart < xSeriesEarliest {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "Start time too early.")
+	}
+	if alignedEnd <= alignedStart { // time_period::is_null()
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "Start time >= end time.")
+	}
+	// oneDayFromNow = currentTime + 1 day (util/xseries.h:34).
+	if alignedEnd > int64(NowMicro()/1e6)+86400 {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "Start/end times are too large.")
+	}
+	if len(params) > 7 && (limit < 1 || limit > 2147483647) {
+		return nil, makeError(errInvalidParameters, "dxGetOrderHistory", "interval_limit must be in range 1 to 2147483647.")
+	}
 	numBuckets := (alignedEnd - alignedStart) / granularity
+	// C++ getChainXAggregateSeries caps the bucket count at interval_limit and
+	// shifts the window to the most-recent tail: period = [period.end -
+	// num_intervals*granularity, period.end] (xseries.cpp:106-112). The default
+	// limit is INT_MAX, so the cap only bites for an explicit small limit.
+	if len(params) > 7 && int64(limit) < numBuckets {
+		numBuckets = int64(limit)
+		alignedStart = alignedEnd - numBuckets*granularity
+	}
 
 	// C++ walk of the XSeries cache is replaced here by the thin client's local
 	// trade history (Store.Fills): OHLCV is aggregated from the fills this node
@@ -647,26 +691,51 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 		var open, high, low, close, volume float64
 		ids := make([]string, 0, len(bf))
 		for _, f := range bf {
+			inverse := f.Maker == taker && f.Taker == maker
 			makerNum, e1 := strconv.ParseFloat(f.MakerSize, 64)
 			takerNum, e2 := strconv.ParseFloat(f.TakerSize, 64)
-			if e1 != nil || e2 != nil || makerNum == 0 {
+			if e1 != nil || e2 != nil || makerNum == 0 || takerNum == 0 {
 				continue
 			}
-			price := takerNum / makerNum
-			if len(ids) == 0 {
-				open = price
+			// C++ price = ccy::Asset::Price{to, from} (currencypair.h:38-40):
+			// the to/from ratio quantized to the 1e-6 grid (currency.h:108-123).
+			// Volume = fromVolume (the FROM/maker side). For a with_inverse
+			// match the aggregate is inverted (xseries.cpp:176-185) and merged
+			// via updateXSeries with Transform::Invert (xseries.cpp:127-130):
+			// the QUANTIZED direct price is reciprocated WITHOUT re-quantizing,
+			// and the volume side swaps to the fill's TAKER amount.
+			price := quantizePrice(takerNum / makerNum)
+			vol := makerNum
+			if inverse {
+				if price == 0 {
+					price = 0 // C++ inverse() epsilon guard (xseries.cpp:178-179)
+				} else {
+					price = 1.0 / price
+				}
+				vol = takerNum
 			}
-			if price > high || high == 0 {
+			// The open gate mirrors C++ `if (open == 0)` (xseries.cpp:189-194),
+			// so a zero-quantized first price is overwritten by the next fill.
+			if open == 0 {
+				open, high, low = price, price, price
+			}
+			if price > high {
 				high = price
 			}
-			if price < low || low == 0 {
+			if price < low {
 				low = price
 			}
 			close = price
-			volume += takerNum
+			volume += vol
 			ids = append(ids, f.ID)
 		}
-		row := []interface{}{iso8601(uint64(bucketStart) * 1e6), xfloat(low), xfloat(high), xfloat(open), xfloat(close), xfloat(volume)}
+		// C++ row: [iso8601(x.timeEnd - offset), low, high, open, close, volume]
+		// (rpcxbridge.cpp:681-682). The default interval_timestamp is at_start
+		// (util/xseries.h:52; the 9th param is unreachable through the arity
+		// gate), so offset = granularity and the time is the bucket START. All
+		// OHLCV doubles render as fixed-8 JSON numbers (json_spirit
+		// write_string precision 8, json_spirit_writer_template.h:195).
+		row := []interface{}{iso8601(uint64(bucketStart) * 1e6), xfloat8(low), xfloat8(high), xfloat8(open), xfloat8(close), xfloat8(volume)}
 		if orderIDs {
 			row = append(row, ids)
 		}

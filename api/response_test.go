@@ -359,3 +359,45 @@ func TestMakeDryrunResponse(t *testing.T) {
 		t.Errorf("partial dryrun shape wrong: %+v", part)
 	}
 }
+
+// TestQuantizePrice locks in RPC-F17's price quantization: ccy::Asset::Price
+// rounds the to/from ratio half-up onto the 1e-6 grid (TransactionDescr::COIN
+// basis, currency.h:108-123).
+func TestQuantizePrice(t *testing.T) {
+	cases := []struct {
+		in, want float64
+	}{
+		{0.3333333333, 0.333333}, // rounds down
+		{0.3333335, 0.333334},    // half-up
+		{2.0, 2.0},
+		{0.00000049, 0.0},
+		{0.0000005, 0.000001}, // half-up onto the grid
+	}
+	for _, c := range cases {
+		if got := quantizePrice(c.in); got != c.want {
+			t.Errorf("quantizePrice(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestXFloat8Marshal locks in the fixed-8 JSON-number rendering C++ produces
+// via json_spirit write_string precision 8 (json_spirit_writer_template.h:195).
+func TestXFloat8Marshal(t *testing.T) {
+	for _, c := range []struct {
+		v    float64
+		want string
+	}{
+		{0.333334, "0.33333400"},
+		{0, "0.00000000"},
+		{1000.5, "1000.50000000"},
+		{1.1, "1.10000000"},
+	} {
+		b, err := json.Marshal(xfloat8(c.v))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != c.want {
+			t.Errorf("xfloat8(%v) = %s, want %s", c.v, string(b), c.want)
+		}
+	}
+}

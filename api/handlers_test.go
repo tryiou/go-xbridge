@@ -559,19 +559,19 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 			t.Fatalf("bucket = %v (%T), want 6 fields", b, b)
 		}
 		for _, v := range row[1:6] {
-			if f, ok := v.(xfloat); !ok || f != 0 {
+			if f, ok := v.(xfloat8); !ok || f != 0 {
 				t.Errorf("bucket field = %v, want 0", v)
 			}
 		}
 	}
-	// end <= start -> no buckets -> [].
-	endStart, e2 := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jnum(100), jnum(0), jnum(60),
-	})
-	if e2 == nil {
-		if arr, ok := endStart.([]interface{}); !ok || len(arr) != 0 {
-			t.Errorf("dxGetOrderHistory(end<=start) = %v (%T), want []", endStart, endStart)
-		}
+	// start >= end (both after the earliest) -> C++ errors "Start time >= end
+	// time." (util/xseries.h:94) — not an empty array.
+	if _, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(xEarly + 2000), jnum(xEarly + 1000), jnum(60),
+	}); err == nil {
+		t.Error("dxGetOrderHistory(start>=end) should error")
+	} else if err.Code != errInvalidParameters || !strings.Contains(err.Error, "Start time >= end time") {
+		t.Errorf("dxGetOrderHistory(start>=end) = %+v, want 1025 'Start time >= end time.'", err)
 	}
 	// Too few params -> error.
 	if _, err := ctx.dxGetOrderHistory(nil); err == nil {
@@ -589,11 +589,11 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 }
 
 // TestDxGetOrderHistoryBuckets verifies the OHLCV aggregation over local fills:
-// open/high/low/close from the taker/maker price ratio, volume = sum of taker
-// size, zero-filled empty slices, and the trailing order-id array when
-// order_ids=true. The time window is aligned to granularity boundaries
-// (matching C++ XSeries behavior), so the effective window may be wider
-// than the raw [start, end) range.
+// open/high/low/close from the QUANTIZED taker/maker price ratio, volume = sum
+// of the FROM/maker size (RPC-F16), zero-filled empty slices, and the trailing
+// order-id array when order_ids=true. The time window is aligned to granularity
+// boundaries (matching C++ XSeries behavior), so the effective window may be
+// wider than the raw [start, end) range.
 func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	ctx := newWalletTestCtx()
 	const xEarly = int64(1519516800)
@@ -628,14 +628,15 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	// bucket0: zero-filled.
 	b0 := arr[0].([]interface{})
 	for _, v := range b0[1:6] {
-		if v.(xfloat) != 0 {
+		if v.(xfloat8) != 0 {
 			t.Errorf("bucket0 field = %v, want 0", v)
 		}
 	}
-	// bucket1: open=2.0, high=4.0, low=2.0, close=4.0, volume=6.0
+	// bucket1: open=2.0, high=4.0, low=2.0, close=4.0, volume=2.0 (from/maker
+	// side, RPC-F16: 1.0+1.0, NOT the taker-side 6.0).
 	b1 := arr[1].([]interface{})
-	if b1[3].(xfloat) != 2.0 || b1[2].(xfloat) != 4.0 || b1[1].(xfloat) != 2.0 || b1[4].(xfloat) != 4.0 || b1[5].(xfloat) != 6.0 {
-		t.Errorf("bucket1 = %v, want [_,2,4,2,4,6]", b1)
+	if b1[3].(xfloat8) != 2.0 || b1[2].(xfloat8) != 4.0 || b1[1].(xfloat8) != 2.0 || b1[4].(xfloat8) != 4.0 || b1[5].(xfloat8) != 2.0 {
+		t.Errorf("bucket1 = %v, want [_,2,4,2,4,2]", b1)
 	}
 	// bucket1 trailing order-id array.
 	ids1 := b1[6].([]string)
@@ -644,13 +645,13 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	}
 	// bucket2: price = 2.0/2.0 = 1.0 (open=high=low=close), volume=2.0
 	b2 := arr[2].([]interface{})
-	if b2[1].(xfloat) != 1.0 || b2[2].(xfloat) != 1.0 || b2[3].(xfloat) != 1.0 || b2[4].(xfloat) != 1.0 || b2[5].(xfloat) != 2.0 {
+	if b2[1].(xfloat8) != 1.0 || b2[2].(xfloat8) != 1.0 || b2[3].(xfloat8) != 1.0 || b2[4].(xfloat8) != 1.0 || b2[5].(xfloat8) != 2.0 {
 		t.Errorf("bucket2 = %v, want [_,1,1,1,1,2]", b2)
 	}
 	// bucket3: zero-filled.
 	b3 := arr[3].([]interface{})
 	for _, v := range b3[1:6] {
-		if v.(xfloat) != 0 {
+		if v.(xfloat8) != 0 {
 			t.Errorf("bucket3 field = %v, want 0", v)
 		}
 	}
@@ -1241,5 +1242,160 @@ func TestDxCancelOrderNotFoundPadded(t *testing.T) {
 		t.Fatalf("dxCancelOrder(short) code = %d, want 1021", err.Code)
 	} else if err.Error != "Transaction "+strings.Repeat("0", 60)+"0abc not found" {
 		t.Errorf("dxCancelOrder(short) message = %q, want zero-padded 64-hex id", err.Error)
+	}
+}
+
+// TestDxGetOrderHistoryValidations locks in RPC-F18: the xQuery ctor rejects
+// bad queries with the EXACT C++ messages in C++ precedence order
+// (util/xseries.h:91-101): granularity whitelist, aligned start too early,
+// start >= end, end beyond now+1day, then the interval_limit range.
+func TestDxGetOrderHistoryValidations(t *testing.T) {
+	ctx := newWalletTestCtx()
+	const early = int64(1519516800) // XSeries earliest (2018-02-25)
+
+	hist := func(args ...interface{}) (interface{}, *rpcError) {
+		raw := make([]json.RawMessage, len(args))
+		for i, a := range args {
+			switch v := a.(type) {
+			case string:
+				raw[i] = jstr(v)
+			case int64:
+				raw[i] = jnum(v)
+			case bool:
+				b, _ := json.Marshal(v)
+				raw[i] = b
+			default:
+				t.Fatalf("bad arg %d: %v", i, a)
+			}
+		}
+		return ctx.dxGetOrderHistory(raw)
+	}
+	base := []interface{}{"BTC", "LTC", early + 1000, early + 1180, int64(60)}
+	expectErr := func(name string, args []interface{}, want string) {
+		if _, err := hist(args...); err == nil {
+			t.Errorf("%s: want error, got nil", name)
+		} else if err.Code != errInvalidParameters || err.Error != "Invalid parameters: "+want {
+			t.Errorf("%s = %+v, want 1025 %q", name, err, want)
+		}
+	}
+	ok := func(args []interface{}) {
+		if _, err := hist(args...); err != nil {
+			t.Errorf("valid query errored: %v", err)
+		}
+	}
+
+	// Bad granularity (whitelist of 60,300,900,3600,21600,86400).
+	badG := append([]interface{}{}, base...)
+	badG[4] = int64(45)
+	expectErr("bad granularity", badG, "granularity=45 must be one of: 60,300,900,3600,21600,86400")
+	// Granularity 0 / negative are also outside the whitelist.
+	zeroG := append([]interface{}{}, base...)
+	zeroG[4] = int64(0)
+	expectErr("zero granularity", zeroG, "granularity=0 must be one of: 60,300,900,3600,21600,86400")
+
+	// Start before the earliest (2018-02-25) -> too early.
+	tooEarly := append([]interface{}{}, base...)
+	tooEarly[2] = int64(1500000000)
+	expectErr("start too early", tooEarly, "Start time too early.")
+	// Negative start snaps to epoch 0 -> too early too.
+	negStart := append([]interface{}{}, base...)
+	negStart[2] = int64(-5)
+	expectErr("negative start", negStart, "Start time too early.")
+
+	// start >= end -> "Start time >= end time."
+	inv := append([]interface{}{}, base...)
+	inv[2] = int64(early + 2000)
+	inv[3] = int64(early + 1000)
+	expectErr("start >= end", inv, "Start time >= end time.")
+
+	// end beyond now + 1 day -> too large. Pin NowMicro.
+	orig := NowMicro
+	defer func() { NowMicro = orig }()
+	NowMicro = func() uint64 { return uint64(early+1180) * 1e6 }
+	tooLate := append([]interface{}{}, base...)
+	tooLate[3] = int64(early + 1180 + 2*86400)
+	expectErr("end too large", tooLate, "Start/end times are too large.")
+
+	// interval_limit out of range (1..2147483647).
+	badLimit := append([]interface{}{}, base...)
+	badLimit = append(badLimit, bool(false), bool(false), int64(0))
+	expectErr("limit 0", badLimit, "interval_limit must be in range 1 to 2147483647.")
+	goodLimit := append([]interface{}{}, base...)
+	goodLimit = append(goodLimit, bool(false), bool(false), int64(18000))
+	ok(goodLimit)
+}
+
+// TestDxGetOrderHistoryInverse locks in the with_inverse=true path (P2-1): a
+// fill whose pair is the INVERSE of the query is aggregated via the inverted
+// aggregate. C++ quantizes the DIRECT price (ccy::Asset::Price) then
+// reciprocates WITHOUT re-quantizing (xseries.cpp:176-185), and the volume
+// side swaps to the fill's taker amount (xseries.cpp:127-130). A fill ratio
+// that is not grid-exact discriminates: LTC 3.0 / BTC 1.0 direct price =
+// quantize(1/3) = 0.333333, inverted = 1/0.333333 = 3.000003 (NOT 3.000000).
+func TestDxGetOrderHistoryInverse(t *testing.T) {
+	ctx := newWalletTestCtx()
+	const xEarly = int64(1519516800)
+	// Query maker=BTC taker=LTC. This fill is LTC->BTC (inverse).
+	ctx.Store.AddFill(fillEntry{ID: "inv", Time: uint64(xEarly+1030) * 1e6, Maker: "LTC", Taker: "BTC", MakerSize: "3.0", TakerSize: "1.0"})
+
+	withInverse, _ := json.Marshal(true)
+	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(xEarly + 1000), jnum(xEarly + 1180), jnum(60),
+		json.RawMessage("false"), withInverse,
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderHistory(inverse): %v", err)
+	}
+	arr := res.([]interface{})
+	// The fill lands in bucket1 (xEarly+1020..xEarly+1080), window aligned to
+	// [xEarly+960, xEarly+1200) -> 4 buckets.
+	row := arr[1].([]interface{})
+	// Inverted price = 1/quantize(1.0/3.0) = 1/0.333333 = 3.0000030000030002,
+	// which C++ renders fixed-8 as "3.00000300" (NOT "3.00000000"). Assert the
+	// RENDERED strings since the float64 has trailing precision artifacts.
+	// Inverted volume = the fill's taker side = 1.0.
+	render := func(v interface{}) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	for i := 1; i <= 4; i++ {
+		if s := render(row[i]); s != "3.00000300" {
+			t.Errorf("inverse bucket1 field %d = %s, want 3.00000300", i, s)
+		}
+	}
+	if s := render(row[5]); s != "1.00000000" {
+		t.Errorf("inverse bucket1 volume = %s, want 1.00000000", s)
+	}
+}
+
+// TestDxGetOrderHistoryLimitTail locks in the interval_limit cap (P2-2): C++
+// getChainXAggregateSeries caps the bucket count at limit and shifts the
+// window to the most-recent tail (xseries.cpp:106-112). A 4-bucket window with
+// limit=1 returns ONLY the last bucket.
+func TestDxGetOrderHistoryLimitTail(t *testing.T) {
+	ctx := newWalletTestCtx()
+	const xEarly = int64(1519516800)
+	ctx.Store.AddFill(fillEntry{ID: "aaa", Time: uint64(xEarly+1030) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
+	ctx.Store.AddFill(fillEntry{ID: "ddd", Time: uint64(xEarly+1150) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "8.0"})
+
+	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(xEarly + 1000), jnum(xEarly + 1180), jnum(60),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("1"),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderHistory(limit=1): %v", err)
+	}
+	arr := res.([]interface{})
+	if len(arr) != 1 {
+		t.Fatalf("limit=1: got %d buckets, want 1", len(arr))
+	}
+	// Only the LAST bucket survives: the fill at xEarly+1150 (bucket3,
+	// [xEarly+1140, xEarly+1200)); the earlier one is outside the shifted tail.
+	row := arr[0].([]interface{})
+	if row[3].(xfloat8) != 8.0 || row[5].(xfloat8) != 1.0 {
+		t.Errorf("limit=1 tail bucket = %v, want open/close 8.0 (ddd only)", row)
 	}
 }
