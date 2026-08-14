@@ -109,8 +109,16 @@ func Load(path string) (*Conf, error) {
 
 	conf := &Conf{Coins: map[string]*CoinConf{}}
 	for name, kv := range parsed {
-		if strings.EqualFold(name, "Main") {
+		// boost property_tree is case-sensitive: only an exact "Main" section
+		// is the [Main] block; "[main]" is a coin section like any other.
+		if name == "Main" {
 			conf.Main = parseMain(kv)
+			continue
+		}
+		// C++ defines the Rpc.* keys (util/settings.h:49-65) but never reads
+		// them — [Rpc] is a dead section. Never treat it as a coin: a stock
+		// config carrying [Rpc] must not kill startup with "COIN not set".
+		if name == "Rpc" {
 			continue
 		}
 		cc := parseCoinConf(name, kv)
@@ -138,7 +146,9 @@ func parseINI(f *os.File) (map[string]map[string]string, error) {
 			continue
 		}
 		if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
-			cur = raw[1 : len(raw)-1]
+			// The bracketed name is trimmed (boost's ini parser does the same,
+			// ini_parser.hpp:110): "[ Main ]" is the "Main" section.
+			cur = strings.TrimSpace(raw[1 : len(raw)-1])
 			if _, ok := out[cur]; !ok {
 				out[cur] = map[string]string{}
 			}
@@ -161,16 +171,16 @@ func parseINI(f *os.File) (map[string]map[string]string, error) {
 	return out, nil
 }
 
-// section is a case-insensitive key/value view of one INI section.
+// section is a case-sensitive key/value view of one INI section. Boost
+// property_tree is case-sensitive ("COIN" != "coin", CFG-F89), so lookups are
+// exact — a miscased key reads as absent, exactly as it does in C++ (its
+// consequence downstream — the coin failing to load — is the admission pass's
+// concern, CFG-F85/F87, not the parser's).
 type section map[string]string
 
 func (s section) get(key string) (string, bool) {
-	for k, v := range s {
-		if strings.EqualFold(k, key) {
-			return v, true
-		}
-	}
-	return "", false
+	v, ok := s[key]
+	return v, ok
 }
 
 func (s section) str(key, def string) string {
@@ -229,15 +239,18 @@ func (s section) boolp(key string) bool {
 	}
 }
 
+// parseMain parses the [Main] section. ExchangeWallets mirrors C++
+// Settings::exchangeWallets (util/settings.cpp:143-166): the list splits on
+// ",", ";" or ":" and each symbol is validated/uppercased by ccy::Symbol
+// (currency.h:45-57) — length 1..8, no trimming (C++ does not trim).
 func parseMain(kv map[string]string) Main {
 	s := section(kv)
 	ew := s.str("ExchangeWallets", "")
 	wallets := []string{}
 	if ew != "" {
-		for _, t := range strings.Split(ew, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				wallets = append(wallets, t)
+		for _, raw := range strings.FieldsFunc(ew, isWalletSeparator) {
+			if sym := validateSymbol(raw); sym != "" {
+				wallets = append(wallets, sym)
 			}
 		}
 	}
@@ -248,11 +261,34 @@ func parseMain(kv map[string]string) Main {
 	}
 }
 
+func isWalletSeparator(r rune) bool {
+	return r == ',' || r == ';' || r == ':'
+}
+
+// validateSymbol mirrors ccy::Symbol::validate (src/xbridge/currency.h:45-57):
+// uppercases the symbol and enforces a length of 1..8 bytes; anything else is
+// invalid and returns "" (the C++ Symbol constructor throws on a bad length).
+// There is no charset check and no trimming — C++ does not filter the raw
+// bytes. The uppercase is byte-wise ASCII-only, matching C's ::toupper in the
+// C locale (bytes >= 0x80 are left unchanged, so the length guarantee holds).
+func validateSymbol(raw string) string {
+	if len(raw) < 1 || len(raw) > 8 {
+		return ""
+	}
+	out := []byte(raw)
+	for i := range out {
+		if out[i] >= 'a' && out[i] <= 'z' {
+			out[i] -= 'a' - 'A'
+		}
+	}
+	return string(out)
+}
+
 func parseCoinConf(name string, kv map[string]string) *CoinConf {
 	s := section(kv)
 	return &CoinConf{
 		Ticker:                    name,
-		Title:                     s.str("Title", name),
+		Title:                     s.str("Title", ""), // C++ Settings::get defaults a missing key to "" (settings.h:75-84), not the section name
 		Address:                   s.str("Address", ""),
 		Ip:                        s.str("Ip", ""),
 		Port:                      s.intp("Port", 0),
