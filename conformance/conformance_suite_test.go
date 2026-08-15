@@ -1271,34 +1271,12 @@ func TestWireServiceNodeVectors(t *testing.T) {
 // (e) State-machine vectors
 // ---------------------------------------------------------------------------
 
-// TestStateEnumVectors asserts Transaction::State and TransactionDescr::State
-// ordinals + string rendering. STATE_MACHINE.md Card 1.
+// TestStateEnumVectors asserts TransactionDescr::State ordinals + string
+// rendering. The exchange-side Transaction::State enum (Tr*) is the HUB's
+// machine and is not ported (this thin client never runs it) — see
+// swap/state.go and docs/architecture.md. Only the descriptor enum, which
+// reaches the wire and the dx* RPCs, is asserted here.
 func TestStateEnumVectors(t *testing.T) {
-	stateRows := []struct {
-		ord  swap.State
-		want string // C++ Transaction::strState
-	}{
-		{swap.TrInvalid, "trInvalid"},
-		{swap.TrNew, "trNew"},
-		{swap.TrJoined, "trJoined"},
-		{swap.TrHold, "trHold"},
-		{swap.TrInitialized, "trInitialized"},
-		{swap.TrCreated, "trCreated"},
-		{swap.TrSigned, "trSigned"},
-		{swap.TrCommited, "trCommited"}, // one 'm', C++ spelling
-		{swap.TrFinished, "trFinished"},
-		{swap.TrCancelled, "trCancelled"},
-		{swap.TrDropped, "trDropped"},
-	}
-	if len(stateRows) != 11 {
-		t.Fatalf("Transaction::State table has %d rows, want 11", len(stateRows))
-	}
-	for _, r := range stateRows {
-		if got := r.ord.String(); got != r.want {
-			t.Errorf("State(%d).String() = %q, want %q", int(r.ord), got, r.want)
-		}
-	}
-
 	descrRows := []struct {
 		ord  swap.DescrState
 		want string // C++ TransactionDescr::strState
@@ -1334,9 +1312,9 @@ func TestStateEnumVectors(t *testing.T) {
 		t.Errorf("critical DescrState ordinals wrong: created=%d open=%d accepting=%d",
 			swap.DescrCreated, swap.DescrOpen, swap.DescrAccepting)
 	}
-	// Unknown-ordinal rendering DIVERGES deliberately (Go safety) — C++ has UB
-	// (xbridgetransaction.cpp:204); Go renders trUnknown(N)/descrState(N).
-	// (STATE_MACHINE.md Card 1.1/1.2 note; not asserted as a conformance row.)
+	// Unknown-ordinal rendering DIVERGES deliberately (Go safety): C++ returns
+	// "unknown" for an out-of-range DescrState (xbridgetransactiondescr.h:686);
+	// Go renders descrState(N). Not asserted as a conformance row.
 }
 
 // TestTTLConstants asserts Transaction:: TTL constants.
@@ -1386,182 +1364,6 @@ func TestLocktimeConstants(t *testing.T) {
 			t.Errorf("%s = %d (present=%v), want %d", r.name, v, ok, r.want)
 		}
 	}
-}
-
-// TestStateTransitions encodes every legal transition and drives
-// swap.Transaction through them. STATE_MACHINE.md Card 2.
-func TestStateTransitions(t *testing.T) {
-	type tr struct {
-		from, to     string
-		trigger      string
-		participants string
-	}
-	rows := []tr{
-		{"trInvalid", "trNew", "order constructor (maker broadcast -> hub createTransaction)", "Maker (single)"},
-		{"trNew", "trJoined", "taker Accepting -> hub acceptTransaction -> tryJoin", "Hub (single, after taker)"},
-		{"trJoined", "trHold", "both HoldApply packets -> increaseStateCounter(trJoined)", "BOTH A and B (Source addrs)"},
-		{"trHold", "trInitialized", "both Initialized -> increaseStateCounter(trHold)", "BOTH A and B (Dest addrs)"},
-		{"trInitialized", "trCreated", "CreatedA+CreatedB -> increaseStateCounter(trInitialized)", "BOTH A and B (Source addrs)"},
-		{"trCreated", "trFinished", "ConfirmedA+ConfirmedB -> increaseStateCounter(trCreated)", "BOTH A and B (Dest addrs)"},
-		{"any", "trCancelled", "cancel() — cancel packet / reject / timeout", "either party / hub"},
-		{"trCancelled", "trDropped", "drop() from checkFinishedTransactions", "hub"},
-		{"any", "trFinished", "finish() + xbcTransactionFinished broadcast", "hub"},
-	}
-	if len(rows) != 9 {
-		t.Fatalf("transition table has %d rows, want 9", len(rows))
-	}
-
-	var srcA, srcB, dstA, dstB swap.Addr
-	copy(srcA[:], hx("0000000000000000000000000000000000000001"))
-	copy(srcB[:], hx("0000000000000000000000000000000000000002"))
-	copy(dstA[:], hx("0000000000000000000000000000000000000003"))
-	copy(dstB[:], hx("0000000000000000000000000000000000000004"))
-	var id [32]byte
-	copy(id[:], hx("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-
-	// T1: constructor -> trNew.
-	maker := swap.NewTransaction(id, "SYS", "LTC", 1_000_000, 500_000,
-		swap.Member{Source: srcA, Dest: dstA}, false, 0, time.Unix(1600000000, 0))
-	if maker.State != swap.TrNew {
-		t.Fatalf("T1: state = %v, want trNew", maker.State)
-	}
-
-	// T2: TryJoin -> trJoined (taker is the flipped order).
-	taker := swap.NewTransaction(id, "LTC", "SYS", 500_000, 1_000_000,
-		swap.Member{Source: srcB, Dest: dstB}, false, 0, time.Unix(1600000001, 0))
-	if !maker.TryJoin(taker) {
-		t.Fatal("T2: TryJoin rejected a compatible order")
-	}
-	if maker.State != swap.TrJoined {
-		t.Fatalf("T2: state = %v, want trJoined", maker.State)
-	}
-	// Incompatible join (amounts flipped) must not advance.
-	bad := swap.NewTransaction(id, "LTC", "SYS", 1_000_000, 500_000,
-		swap.Member{Source: srcB, Dest: dstB}, false, 0, time.Unix(1600000002, 0))
-	if bad.TryJoin(maker) {
-		t.Error("TryJoin accepted an incompatible (exact-mismatch) order")
-	}
-
-	// T3: trJoined -> trHold on BOTH Source confirmations.
-	if st := maker.IncreaseStateCounter(swap.TrJoined, srcA); st != swap.TrJoined {
-		t.Errorf("T3 single-A: state = %v, want trJoined (two-party gate)", st)
-	}
-	if st := maker.IncreaseStateCounter(swap.TrJoined, srcB); st != swap.TrHold {
-		t.Fatalf("T3: state = %v, want trHold", st)
-	}
-
-	// T4: trHold -> trInitialized on BOTH Dest confirmations.
-	if st := maker.IncreaseStateCounter(swap.TrHold, dstA); st != swap.TrHold {
-		t.Errorf("T4 single-A: state = %v, want trHold", st)
-	}
-	if st := maker.IncreaseStateCounter(swap.TrHold, dstB); st != swap.TrInitialized {
-		t.Fatalf("T4: state = %v, want trInitialized", st)
-	}
-
-	// T5: trInitialized -> trCreated on BOTH Source confirmations.
-	if st := maker.IncreaseStateCounter(swap.TrInitialized, srcA); st != swap.TrInitialized {
-		t.Errorf("T5 single-A: state = %v, want trInitialized", st)
-	}
-	if st := maker.IncreaseStateCounter(swap.TrInitialized, srcB); st != swap.TrCreated {
-		t.Fatalf("T5: state = %v, want trCreated", st)
-	}
-
-	// T6: trCreated -> trFinished on BOTH Dest confirmations.
-	if st := maker.IncreaseStateCounter(swap.TrCreated, dstA); st != swap.TrCreated {
-		t.Errorf("T6 single-A: state = %v, want trCreated", st)
-	}
-	if st := maker.IncreaseStateCounter(swap.TrCreated, dstB); st != swap.TrFinished {
-		t.Fatalf("T6: state = %v, want trFinished", st)
-	}
-
-	// T7/T9: cancel / finish from any state.
-	c1 := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: srcA, Dest: dstA}, false, 0, time.Unix(0, 0))
-	c1.Cancel()
-	if c1.State != swap.TrCancelled {
-		t.Errorf("T7: state = %v, want trCancelled", c1.State)
-	}
-	c1.Finish()
-	if c1.State != swap.TrFinished {
-		t.Errorf("T9: state = %v, want trFinished", c1.State)
-	}
-
-	// T8: drop from trCancelled.
-	d := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: srcA, Dest: dstA}, false, 0, time.Unix(0, 0))
-	d.Cancel()
-	d.Drop()
-	if d.State != swap.TrDropped {
-		t.Errorf("T8: state = %v, want trDropped", d.State)
-	}
-
-	// A confirmation from a non-participant must never advance the machine.
-	g := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: srcA, Dest: dstA}, false, 0, time.Unix(0, 0))
-	g.State = swap.TrJoined
-	if st := g.IncreaseStateCounter(swap.TrJoined, swap.Addr{}); st != swap.TrJoined {
-		t.Errorf("gate: stranger confirmation advanced to %v", st)
-	}
-	// Vestigial trSigned/trCommited are assigned by neither side.
-	if st := g.IncreaseStateCounter(swap.TrSigned, srcA); st != swap.TrInvalid {
-		t.Errorf("trSigned is not vestigial: state = %v", st)
-	}
-	if st := g.IncreaseStateCounter(swap.TrCommited, srcA); st != swap.TrInvalid {
-		t.Errorf("trCommited is not vestigial: state = %v", st)
-	}
-}
-
-// TestStateExpirySemantics asserts the strict-`>` TTL comparisons and the
-// block-height expiry. STATE_MACHINE.md Card 4.2/4.3.
-func TestStateExpirySemantics(t *testing.T) {
-	var id [32]byte
-	var a swap.Addr
-	now := time.Unix(1_600_000_000, 0)
-
-	// trNew: created age exactly at deadlineTTL is NOT expired; +1s is.
-	// (CreatedAt is pinned so ageCreated is exercised in isolation; a fresh
-	// transaction's ageLast is 0, which stays under pendingTTL.)
-	e := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: a, Dest: a}, false, 0, now)
-	e.CreatedAt = now.Unix() - int64(swap.DeadlineTTL)
-	if e.IsExpired(now) {
-		t.Error("age == DeadlineTTL must not be expired (strict >)")
-	}
-	if !e.IsExpired(now.Add(1 * time.Second)) {
-		t.Error("age == DeadlineTTL+1 must be expired")
-	}
-	// trNew: last-change age exactly at pendingTTL+1 IS expired.
-	e2 := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: a, Dest: a}, false, 0, now)
-	e2.LastAt = now.Unix() - int64(swap.PendingTTL+1)
-	if !e2.IsExpired(now) {
-		t.Error("age == PendingTTL+1 must be expired for trNew")
-	}
-
-	// State > trNew: last-change age strictly > TTL expires.
-	m := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: a, Dest: a}, false, 0, now)
-	m.State = swap.TrCreated
-	if m.IsExpired(now.Add(time.Duration(swap.TTL) * time.Second)) {
-		t.Error("age == TTL must not be expired (strict >)")
-	}
-	if !m.IsExpired(now.Add(time.Duration(swap.TTL+1) * time.Second)) {
-		t.Error("age == TTL+1 must be expired")
-	}
-
-	// Block-height expiry: exactly BlocksTTL blocks is NOT expired; +1 is.
-	b := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: a, Dest: a}, false, 0, now)
-	b.BlockNumber = 1000
-	if b.IsExpiredByBlockNumber(1000 + uint32(swap.BlocksTTL)) {
-		t.Error("blocks == BlocksTTL must not be expired")
-	}
-	if !b.IsExpiredByBlockNumber(1001 + uint32(swap.BlocksTTL)) {
-		t.Error("blocks == BlocksTTL+1 must be expired")
-	}
-	// Open (non-finished) order past trNew: block expiry never applies.
-	o := swap.NewTransaction(id, "SYS", "LTC", 1, 1, swap.Member{Source: a, Dest: a}, false, 0, now)
-	o.State = swap.TrCreated
-	if o.IsExpiredByBlockNumber(100_000_000) {
-		t.Error("open order must short-circuit block expiry (C++ :290-296)")
-	}
-	// The predicates are WIRED by the api layer: Store.PruneExpired applies the
-	// equivalent TTL/blocks predicates to the open book on the 15 s
-	// expirySweepInterval engine ticker (STATE-F72, B8). The store-level
-	// boundary tests live in api/store_expiry_test.go.
 }
 
 // ---------------------------------------------------------------------------
