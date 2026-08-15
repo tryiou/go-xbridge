@@ -66,6 +66,12 @@ var (
 	// fxLocktimeConstants -> go-xbridge/api locktime constants, which are
 	// unexported (api/swap.go, api/locktime.go). Return them by name.
 	fxLocktimeConstants func() map[string]int64
+
+	// fxOrderBookResultJSON -> go-xbridge/api orderBookResult.MarshalJSON via
+	// the conformance re-export, so the suite can assert the dxGetOrderBook
+	// detail-4 value SHAPE (flat ["price","amount",["ids"]]) without a live
+	// api.Handler fixture.
+	fxOrderBookResultJSON func(detail int, maker, taker string, asks, bids [][]interface{}) ([]byte, error)
 )
 
 // ---------------------------------------------------------------------------
@@ -552,6 +558,60 @@ func TestFormatXPriceVectors(t *testing.T) {
 	// (handlers.go:663-669). Observable only for tiny base-unit amounts.
 	// (finding dxGetOrderBook/price-formula.)
 	expect(t, "dxGetOrderBook/price-formula", true, fxFormatXPrice(3, 1), "0.335548")
+}
+
+// TestOrderBookDetail4FlatShape locks in the dxGetOrderBook detail-4 value
+// SHAPE via the real codec (orderBookResult.MarshalJSON). C++ emplace_backs
+// the best price, the best amount, and the ids array directly onto the
+// top-level asks/bids array (rpcxbridge.cpp:1952-1985), so the JSON is FLAT:
+//
+//	"asks": ["price", "amount", ["id", ...]]
+//
+// NOT the nested per-row form [["price","amount",["id",...]]] (which the old
+// golden baked). Empty sides render [] (C++ default-constructs an empty
+// Array).
+func TestOrderBookDetail4FlatShape(t *testing.T) {
+	if fxOrderBookResultJSON == nil {
+		t.Skip("FIXME fixture: wire fxOrderBookResultJSON to go-xbridge/api OrderBookResultJSON")
+	}
+	row := func(price, amount string, ids ...string) []interface{} {
+		out := []interface{}{price, amount}
+		iids := make([]interface{}, 0, len(ids))
+		for _, id := range ids {
+			iids = append(iids, id)
+		}
+		return append(out, iids)
+	}
+	// Flat: ["price","amount",["id"]] on the top-level array.
+	ask := row("0.200000", "1.500000", "aaaa")
+	bid := row("5.000000", "0.300000", "bbbb")
+	b, err := fxOrderBookResultJSON(4, "BTC", "LTC", [][]interface{}{ask}, [][]interface{}{bid})
+	if err != nil {
+		t.Fatalf("detail4 marshal: %v", err)
+	}
+	want := `{"detail":4,"maker":"BTC","taker":"LTC","asks":["0.200000","1.500000",["aaaa"]],"bids":["5.000000","0.300000",["bbbb"]]}`
+	if string(b) != want {
+		t.Errorf("detail4 flat JSON:\n got %s\nwant %s", string(b), want)
+	}
+
+	// Empty sides render [] (C++ default-constructed Array), not null.
+	b, err = fxOrderBookResultJSON(4, "BTC", "LTC", nil, nil)
+	if err != nil {
+		t.Fatalf("detail4 empty marshal: %v", err)
+	}
+	if want := `{"detail":4,"maker":"BTC","taker":"LTC","asks":[],"bids":[]}`; string(b) != want {
+		t.Errorf("detail4 empty JSON:\n got %s\nwant %s", string(b), want)
+	}
+
+	// Details 1/2/3 keep the per-row (nested) form — unchanged.
+	detail1 := [][]interface{}{row("0.200000", "1.500000", "aaaa")}
+	b, err = fxOrderBookResultJSON(1, "BTC", "LTC", detail1, [][]interface{}{})
+	if err != nil {
+		t.Fatalf("detail1 marshal: %v", err)
+	}
+	if want := `{"detail":1,"maker":"BTC","taker":"LTC","asks":[["0.200000","1.500000",["aaaa"]]],"bids":[]}`; string(b) != want {
+		t.Errorf("detail1 JSON:\n got %s\nwant %s", string(b), want)
+	}
 }
 
 // TestISO8601Vectors encodes xutil::iso8601 (ms, Z) vectors.
