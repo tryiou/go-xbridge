@@ -17,8 +17,9 @@ the user's own SPV wallets via JSON-RPC. It does not validate blocks, serve a
 blockchain, or run a service node.
 
 The port is organized bottom-up: `proto`/`p2p` (wire) → `coins` (transaction
-construction) → `wallet` (RPC/local signing) → `swap` (state machine) → `api`
-(dx* RPC + the three-party swap client driver) → `cmd/xbridged` (daemon).
+construction) → `wallet` (RPC/local signing) → `swap` (deposit/price/TTL shared
+helpers) → `api` (dx* RPC + the three-party swap client driver) → `cmd/xbridged`
+(daemon).
 
 ## Layout
 
@@ -32,7 +33,7 @@ construction) → `wallet` (RPC/local signing) → `swap` (state machine) → `a
 | `coins/` | Per-coin model: coin registry, amount parsing, address codec (base58/bech32/CashAddr), UTXO tx construction, HTLC deposit scripts, legacy + BIP143 signing. All coin definitions come from `xbridge.conf`. |
 | `config/` | Read-only INI loader mirroring `xbridgeapp.cpp::createConf()`. |
 | `wallet/` | `Connector` contract + two implementations: `RPCConnector` (drives a wallet/node over JSON-RPC) and `LocalConnector` (signs locally). |
-| `swap/` | `Transaction` state machine (port of `xbridgetransaction.*`) + the HTLC deposit layer (`DepositSpec`, `Session`). |
+| `swap/` | Shared swap-support types used by production: the HTLC deposit layer (`DepositSpec`), the partial-order price-drift check, the `TransactionDescr::State` ordinal map, and the TTL constants consumed by the store expiry logic. The two-party `Transaction` state machine is NOT ported — it is the hub's machine and this thin client never runs it; the live swap driver is `api.SwapSession`. |
 | `api/` | The `dx*` JSON-RPC surface (drop-in for dapps) + the three-party Maker ⇄ ServiceNode ⇄ Taker swap client driver, on a single-owner engine (see "Engine & concurrency"). |
 | `log/` | Dependency-free logging: size-based rotating file writer + multi-handler fanout. |
 | `cmd/xbridged` | The daemon. Flags: `-conf` (default `<home>/.blocknet/xbridge.conf`, fatal if missing), `-network`, `-node`, `-addnode`, `-rpcbind`, `-datadir`, etc. |
@@ -106,7 +107,8 @@ covers the three things every chain interaction needs:
    coin's `Decimals`.
 3. **Address codec** (`base58*.go`, `bech32.go`, `cashaddr.go`, `address.go`) —
    legacy (P2PKH/P2SH) and native segwit (P2WPKH/P2WSH/P2TR) addresses, plus BCH
-   CashAddr. `Address.ID()` exposes the 20-byte `swap.Addr` the swap layer uses.
+   CashAddr. `Address.ID()` exposes the 20-byte uint160 the swap layer uses
+   for envelope destinations and session addresses.
    The BCH family is selected by `CreateTxMethod` (`"BCH"` → `FamilyUTXOBCH`);
    BCH's legacy base58 version byte collides with BTC's, so BCH addresses decode
    **only** via `cashaddrDecode`.
@@ -187,95 +189,52 @@ type Connector interface {
   have no local source and return an error — the deposit flow supplies inputs
   and `prevTxs` explicitly.
 
-### `swap/` — swap state machine + deposit layer
+### `swap/` — shared swap-support types (deposit, price, descriptor enum, TTL)
 
-Canonical spec of the C++ `xbridgetransaction.{h,cpp}` port (the **highest-risk**
-part of the reimplementation, mirrored field-for-field and covered by
-`swap/transaction_test.go`).
+`swap` holds the swap-support types that production code actually uses. It is
+**not** the state machine: the C++ two-party `xbridgetransaction.{h,cpp}` gate
+is the **hub's** machine, and this thin client never runs it. The live swap
+driver is `api.SwapSession`/`clientState` (see "Client driver" below). Contents:
 
-**Roles.** A swap has exactly two members: **A (maker)** created the order
-(`xbcTransaction`); **B (taker)** created the complementary order that joins A's
-(`xbcTransactionAccepting` → `TryJoin`). Each member has a `Source` address
-(sends FROM) and a `Dest` address (receives TO), both 20-byte uint160 values.
-The maker order describes the trade from A's perspective: A gives
-`SourceCurrency:SourceAmount` and receives `DestCurrency:DestAmount`.
+- **`DepositSpec`** (`deposit.go`) describes one side's HTLC deposit:
+  `RedeemScript()` via `coins.BuildDepositUnlockScript`; `P2SHScript()` wraps
+  it; `BuildDepositTx` locks `Amount + fee2` into the P2SH (`fee2 =
+  minTxFee2(1,1)`, satisfying the C++ `depositP2SHAmount >= amount + 0.95*fee2`
+  check), spending funding UTXOs stamped `SEQUENCE_FINAL` (0xffffffff, matching
+  C++ `createRawTransaction(..., cltv=true)`); the CLTV-enabling non-final
+  sequence belongs on the *refund* spend only. The depositor generates a 33-byte
+  `Secret`; `SecretHash()` is HASH160(Secret); the counterparty adopts only the
+  `Hash`. Consumed by `api/swap.go`.
+- **`PartialOrderDriftCheck`** (`price.go`) — the price-integrity / satoshi-level
+  drift band for partial-order joins (C++ `xBridgePartialOrderDriftCheck`).
+  Consumed by `api/swap.go`.
+- **`DescrState`** (`state.go`) — the 16-value `TransactionDescr::State` enum
+  (`xbridgetransactiondescr.h:43-61`, canonical names at `:665-688`), the
+  ordinal map `DescrStateFromName`/`DescrStateOrdinal`. This is what actually
+  reaches the wire and the dx* RPCs, so it is the single source of truth for
+  those ordinals; `api/response.go` derives its map from it so the two layers
+  cannot drift.
+- **TTL constants** (`state.go`) — `LockTime` 600 s, `PendingTTL` 360 s,
+  `TTL` 3600 s, `DeadlineTTL` 604800 s, `BlocksTTL` 10080 blocks.
+  `TTL`/`DeadlineTTL`/`BlocksTTL` drive the store expiry logic
+  (`api/store.go`); `LockTime`/`PendingTTL` are asserted in the conformance
+  suite (and `PendingTTL` in a store-expiry boundary test).
 
-**States.** `trInvalid trNew trJoined trHold trInitialized trCreated trSigned
-trCommited trFinished trCancelled trDropped`. `trSigned`/`trCommited` exist in
-the enum but are **not** part of the `increaseStateCounter` progression
-(signing/commit happen in the `xbridgesession*` deposit/refund layer, not the
-two-confirmation gate). The gate walks:
-
-```
-trNew --TryJoin--> trJoined --(both Source)--> trHold
-   --(both Dest)--> trInitialized --(both Source)--> trCreated
-   --(both Dest)--> trFinished
-```
-
-`trCancelled`, `trDropped`, `trFinished` are terminal (`State.IsTerminal`).
-
-**Join (`TryJoin`).** A taker order `o` joins maker `t` iff: both are `trNew`;
-`t.SourceCurrency == o.DestCurrency` and `t.DestCurrency == o.SourceCurrency`;
-`t.PartialAllowed == o.PartialAllowed`; **non-partial:** exact amount equality;
-**partial:** `t.SourceAmount >= o.DestAmount`, `t.DestAmount >= o.SourceAmount`,
-`o.DestAmount >= t.MinFromAmount`, plus `xBridgePartialOrderDriftCheck`
-(price-integrity / satoshi-level drift band, ported in `swap/price.go`). On
-success `t.B = o.A` and state → `trJoined`.
-
-**Progression (`IncreaseStateCounter`).** Each phase requires **both** members
-to confirm before advancing, matching C++'s single `m_a_stateChanged`/
-`m_b_stateChanged` pair (the two flags are reused across phases, reset after
-each transition):
-
-| Current state | `from` must match | → next |
-|---------------|-------------------|--------|
-| `trJoined`    | `A.Source` & `B.Source` | `trHold` |
-| `trHold`      | `A.Dest` & `B.Dest`     | `trInitialized` |
-| `trInitialized` | `A.Source` & `B.Source` | `trCreated` |
-| `trCreated`   | `A.Dest` & `B.Dest`     | `trFinished` |
-
-An unrecognized `from` is a no-op; a `state` argument not equal to the current
-state returns `trInvalid` and leaves the state unchanged; phases outside the
-four handled (incl. `trSigned`/`trCommited`) return `trInvalid`.
-
-**Timing.** `LockTime` 600 s; `PendingTTL` 360 s (trNew idle expiry); `TTL`
-3600 s (post-trNew idle expiry); `DeadlineTTL` 604800 s (trNew creation
-deadline); `BlocksTTL` 10080 blocks. `IsExpired(now)`: `trNew` &&
-(age-from-creation > `DeadlineTTL` || age-since-last > `PendingTTL`) → expired;
-state > `trNew` && age-since-last > `TTL` → expired.
-`IsExpiredByBlockNumber(currentBlock)`: `trNew` && `currentBlock - BlockNumber >
-BlocksTTL` → expired (the block-height analog of `DeadlineTTL`; `BlockNumber` is
-the chain height at creation, set from `Connector.GetBlockCount`); state >
-`trNew` delegates to time-based `IsExpired`. Implemented in
-`swap/transaction.go`, unit-tested in `swap/transaction_test.go`.
-
-**Deposit layer** (`swap/deposit.go`, `swap/session.go`), ported at the
-construction + gating level:
-
-- `DepositSpec` describes one side's HTLC deposit: `RedeemScript()` via
-  `coins.BuildDepositUnlockScript`; `P2SHScript()` wraps it; `BuildDepositTx`
-  locks `Amount + fee2` into the P2SH (`fee2 = minTxFee2(1,1)`, satisfying the
-  C++ `depositP2SHAmount >= amount + 0.95*fee2` check), spending funding UTXOs
-  stamped `SEQUENCE_FINAL` (0xffffffff, matching C++ `createRawTransaction(
-  ..., cltv=true)`); the CLTV-enabling non-final sequence belongs on the *refund*
-  spend only. The depositor generates a 33-byte `Secret`; `SecretHash()` is
-  HASH160(Secret); the counterparty adopts only the `Hash`.
-- `Session` wraps a joined `Transaction` for the local `Role`.
-  `CreateLocalDeposit` generates the secret + builds the local `DepositSpec`
-  (maker locks SourceAmount/SourceCurrency, taker locks DestAmount/DestCurrency).
-  `AdoptCounterparty` records the revealed `Hash` + lockTime.
-  `ConfirmLocalDeposit`/`ConfirmOtherDeposit` advance the progression through
-  every gate once both sides' deposits confirm.
+The `DescrState`/TTL values are asserted against C++ in the conformance suite
+(`TestStateEnumVectors`, `TestTTLConstants`); the strict-`>` expiry boundary
+semantics are covered by `api/store_expiry_test.go` against the real store.
 
 **Client driver lives in `api/swap.go`, not `swap/`.** The XBridge **CLIENT**
 side of the Maker ⇄ ServiceNode HUB ⇄ Taker protocol: the local `SwapSession`
 responds to hub-originated packets and performs the on-chain work
 (build/broadcast the HTLC deposit, redeem the counterparty's deposit revealing
-the secret, pre-build the CLTV refund). Driven end-to-end by
-`TestSwapHandshake` in `api/swap_test.go` with fake connectors. The CLTV refund
-(`BuildRefundScriptSig`) and ELSE-branch payment (`BuildPaymentScriptSig`,
-revealing the secret) are built locally; the taker recovers the secret from the
-maker's payTx via `conn.GetRawTransaction(APayTxID)`.
+the secret, pre-build the CLTV refund). Its progression is the `clientState`
+enum (`csMaker → csHoldApplied → csInitialized → csCreatedA/B → csConfirmedA/B →
+csFinished`). Driven end-to-end by `TestSwapHandshake` in `api/swap_test.go`
+with fake connectors. The CLTV refund (`BuildRefundScriptSig`) and ELSE-branch
+payment (`BuildPaymentScriptSig`, revealing the secret) are built locally; the
+taker recovers the secret from the maker's payTx via
+`conn.GetRawTransaction(APayTxID)`.
 
 ### `api/` — `dx*` RPC + swap driver
 
@@ -393,7 +352,7 @@ The suite is hermetic — no live-network dials. Notable coverage:
 - `coins/` — BIP143 known-answer vectors, CashAddr round-trips, time-field
   sighash golden digests (C++ oracle), HTLC sign/verify.
 - `wallet/` — `httptest` JSON-RPC mock + a real P2SH HTLC sign/verify round-trip.
-- `swap/` — state-machine transition table, drift check, session gating.
+- `swap/` — descriptor-enum ordinals, TTL constants, deposit-build/sign, price-drift check.
 - `api/` — `TestSwapHandshake` drives the full three-party handshake end-to-end
   with fake connectors; `api/concurrency_test.go` proves the single-owner engine
   under `-race`: refund sweep interleaving with a deposit resume, no-fork

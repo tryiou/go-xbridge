@@ -260,8 +260,9 @@ trNew -> trJoined -> trHold -> trInitialized -> trCreated -> trSigned
 
 (`trSigned` / `trCommited` are vestigial — C++ never assigns them during the
 two-confirmation gate; the progression walks trJoined → trHold → trInitialized
-→ trCreated → trFinished via `IncreaseStateCounter`. See
-`docs/architecture.md` "swap/".)
+→ trCreated → trFinished via `increaseStateCounter`. This is the HUB-side
+machine: the go-xbridge thin client never runs it — its client progression is
+`api.SwapSession`/`clientState`, see `docs/architecture.md` "swap/".)
 ```
 
 High-level flow (hub = the **service node**; note this is *not* the maker — the

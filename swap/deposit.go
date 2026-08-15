@@ -14,26 +14,6 @@ import (
 	"go-xbridge/wallet"
 )
 
-// Role identifies which side of a swap the local node plays.
-type Role int
-
-const (
-	RoleMaker Role = iota // A — created the order
-	RoleTaker             // B — joined it
-)
-
-// String renders the swap role for logs.
-func (r Role) String() string {
-	switch r {
-	case RoleMaker:
-		return "maker"
-	case RoleTaker:
-		return "taker"
-	default:
-		return "role?"
-	}
-}
-
 // DepositSpec describes one participant's HTLC deposit, ported from the C++
 // deposit blob carried on xbcTransactionInit (command 8) and built by
 // XBridgeWalletConnector::createDepositUnlockScript. It locks Amount of
@@ -153,7 +133,7 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 // SignInput signs funding input idx of the deposit tx with priv (the funding
 // UTXO is the depositor's own P2PKH output), returning the DER+SIGHASH sig.
 // prevScript is that funding output's scriptPubKey; amount its value (needed
-// by the forkid digest — CRYPTO-F77). Dispatch happens on the coin's
+// by the forkid digest). Dispatch happens on the coin's
 // SignatureKind: forkid coins (BCH/DEVAULT/BTG) use the BIP143 forkid digest
 // and 0x41 sighash byte, everything else the legacy SIGHASH_ALL digest.
 func (d *DepositSpec) SignInput(tx *coins.Tx, idx int, prevScript []byte, amount uint64, priv []byte, c coins.Coin) ([]byte, error) {

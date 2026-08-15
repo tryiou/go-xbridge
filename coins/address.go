@@ -35,9 +35,10 @@ type Address struct {
 	WitnessVersion int
 }
 
-// ID returns the 20-byte uint160 identifier used by the swap layer
-// (swap.Addr). It is valid for P2PKH, P2SH, and P2WPKH; other kinds return
-// false (their identifier exceeds 20 bytes).
+// ID returns the 20-byte uint160 identifier used by the swap layer for the
+// envelope destination and session addresses (a 20-byte uint160). It is valid
+// for P2PKH, P2SH, and P2WPKH; other kinds return false (their identifier
+// exceeds 20 bytes).
 func (a Address) ID() ([20]byte, bool) {
 	if len(a.Hash) != 20 {
 		return [20]byte{}, false

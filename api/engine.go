@@ -64,8 +64,13 @@ type workResult struct {
 //
 // Deadlock rule: code that runs ON the engine goroutine (command closures,
 // handlePacket, task apply) must never call submit — it calls the internal
-// functions directly. Public wrappers (dispatchSwap, onRemoteCancel,
-// onRemoteReject, BroadcastRefund, checkRefunds) are the only submit callers.
+// functions directly (processSwap, handleRemoteCancel, handleRemoteReject,
+// scanRefunds). The submit-wrapping entry points (dispatchSwap,
+// onRemoteCancel, onRemoteReject, BroadcastRefund, checkRefunds) exist as
+// off-engine entry points for the test suite and any external callers. In
+// production the inbound packets are dispatched straight from handlePacket on
+// the engine goroutine, so those wrappers are exercised mainly by the test
+// suite.
 func (n *Node) submit(run func(), await bool) {
 	if !n.engineRunning.Load() {
 		run()
@@ -119,7 +124,7 @@ func (n *Node) start() {
 func (n *Node) readerLoop() {
 	defer n.wg.Done()
 	var lastErr error
-	// Hub misbehaviour score (STATE-F75). For a DIRECT hub connection, an
+	// Hub misbehaviour score. For a DIRECT hub connection, an
 	// xbridge envelope that fails transport decode accumulates +10 — the analog
 	// of C++'s Misbehaving +10 for a sub-min-size xbridge packet
 	// (net_processing.cpp:2874-2878) — and the connection is dropped at the ban

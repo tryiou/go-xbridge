@@ -1,71 +1,31 @@
-// Package swap is a Go port of the XBridge atomic-swap state machine
-// (src/xbridge/xbridgetransaction.{h,cpp}). It models the two-party
-// Transaction lifecycle: order join, the two-confirmation state progression,
-// and terminal/cancellation paths. See docs/architecture.md for the canonical
-// spec.
+// Package swap provides the shared XBridge swap-support types used by
+// production code: the HTLC deposit layer (DepositSpec, deposit.go), the
+// partial-order price-drift check (PartialOrderDriftCheck, price.go), the
+// TransactionDescr::State ordinal map surfaced by the dx* RPCs, and the TTL
+// constants consumed by the store expiry logic.
+//
+// The C++ two-party Transaction state machine (xbridgetransaction.{h,cpp}) is
+// the HUB's machine: this thin client never runs it. The live swap driver is
+// api.SwapSession/clientState (api/swap.go); that package owns the actual
+// handshake progression. The descriptor enum here is what actually reaches the
+// wire and the dx* RPCs, so it stays the single source of truth for those
+// ordinals (api/response.go derives its map from it).
 //
 // Ownership contract: this package is PURE — it holds no mutexes and no shared
-// mutable state. Session/Transaction values must never be shared across
-// goroutines; the api package owns them exclusively on its engine goroutine and
-// passes immutable snapshots (swapCtx) to worker goroutines, which never touch a
-// live Session/Transaction.
+// mutable state. Values must never be shared across goroutines; the api package
+// owns them exclusively on its engine goroutine and passes immutable snapshots
+// (swapCtx) to worker goroutines.
 package swap
 
 import "fmt"
 
-// State is a Transaction lifecycle state. Values mirror the C++ Transaction::State
-// enum (src/xbridge/xbridgetransaction.h:36-50) so wire/log strings line up.
-type State int
-
-const (
-	TrInvalid     State = 0
-	TrNew         State = 1
-	TrJoined      State = 2
-	TrHold        State = 3
-	TrInitialized State = 4
-	TrCreated     State = 5
-	TrSigned      State = 6
-	TrCommited    State = 7
-	TrFinished    State = 8
-	TrCancelled   State = 9
-	TrDropped     State = 10
-)
-
-// strStates mirrors C++ Transaction::strState (xbridgetransaction.cpp:198-201).
-var strStates = [...]string{
-	"trInvalid", "trNew", "trJoined", "trHold", "trInitialized",
-	"trCreated", "trSigned", "trCommited", "trFinished", "trCancelled", "trDropped",
-}
-
-// String returns the canonical state name.
-func (s State) String() string {
-	if s < 0 || int(s) >= len(strStates) {
-		return fmt.Sprintf("trUnknown(%d)", int(s))
-	}
-	return strStates[s]
-}
-
-// IsTerminal reports whether the transaction has reached an end state
-// (cancelled, finished, or dropped) — C++ Transaction::isFinished().
-func (s State) IsTerminal() bool {
-	return s == TrFinished || s == TrCancelled || s == TrDropped
-}
-
-// IsValid reports whether the transaction is in any state other than trInvalid
-// — C++ Transaction::isValid().
-func (s State) IsValid() bool { return s != TrInvalid }
-
 // ---------------------------------------------------------------------------
 // TransactionDescr::State — the client/wire descriptor status enum.
 //
-// The exchange-side machine above uses the 11-value Transaction::State
-// (xbridgetransaction.h). The transaction DESCRIPTOR that is serialized into
-// XBridge packets and surfaced by the dx* RPCs uses a richer 16-value enum
+// The transaction DESCRIPTOR that is serialized into XBridge packets and
+// surfaced by the dx* RPCs uses a richer 16-value enum
 // (xbridgetransactiondescr.h:43-61), which includes the rollback states
-// (rolled back=10, rollback failed=11) that the exchange machine lacks. The
-// previous port omitted this enum entirely, so a transaction in a rollback
-// state was unknowable to the swap layer and the dxCancelOrder "cannot cancel
-// once state >= trCreated" guard could not reason about it.
+// (rolled back=10, rollback failed=11) that the C++ exchange machine lacks.
 //
 // This DescrState is the single source of truth for those 16 ordinals and their
 // canonical names (xbridgetransactiondescr.h:665-688 strState); api/response.go
