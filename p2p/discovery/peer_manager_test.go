@@ -368,10 +368,17 @@ func TestPeerManagerSNListEcho(t *testing.T) {
 			return p2p.NewConn(client, m)
 		},
 	})
-	// Seed a stored accepted ping so the manager has something to echo.
-	pm.mu.Lock()
-	pm.rawPings[key] = payload
-	pm.mu.Unlock()
+	// Seed a stored accepted ping so the manager has something to echo. The
+	// raw payload now lives in the registry (the parallel rawPings map is
+	// gone); AddPing accepts an SPV-tier ping with a non-empty service list
+	// whose pubkey must be a fully-valid compressed key, so key[0]=0x02 fits.
+	if !pm.snReg.AddPing(servicenode.ServiceNode{
+		PubKey:   key,
+		Tier:     servicenode.TierSPV,
+		Services: []string{"BTC"},
+	}, payload) {
+		t.Fatal("seed AddPing rejected")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pm.Start(ctx)

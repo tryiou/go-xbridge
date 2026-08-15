@@ -288,7 +288,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 				}
 			case servicenode.CmdSNPing, servicenode.CmdSNListPing:
 				if sn, derr := servicenode.ParseServiceNodePing(payload); derr == nil {
-					n.snReg.AddPing(sn)
+					n.snReg.AddPing(sn, payload)
 				} else {
 					xlog.Warn("servicenode: SNPING/SNLISTPING parse failed", "err", derr)
 				}

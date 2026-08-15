@@ -525,6 +525,59 @@ func TestAddPingReturnsAccepted(t *testing.T) {
 	}
 }
 
+// TestAcceptedRawPings verifies the raw accepted ping payloads are stored per
+// pubkey (the SNLIST echo source) and returned sorted by pubkey, mirroring C++
+// which re-serializes its registry for SNLIST (net_processing.cpp:2992-3001).
+// The strict-newer gate must also keep the raw payload in sync: a rejected
+// (stale) ping must not clobber the stored payload.
+func TestAcceptedRawPings(t *testing.T) {
+	reg := NewRegistry()
+	base := uint32(time.Now().Unix()) - 200
+
+	keyA := pickPubkey(t, 0x0a)
+	keyB := pickPubkey(t, 0x0b)
+	rawA := []byte("raw-ping-A")
+	rawB := []byte("raw-ping-B")
+	rawStale := []byte("raw-ping-stale")
+
+	// Two accepted pings with distinct payloads; B's pubkey sorts before A's.
+	if !reg.AddPing(ServiceNode{PubKey: keyB, Tier: TierSPV, Services: []string{"BTC"}, PingTime: base}, rawB) {
+		t.Fatal("ping B must be accepted")
+	}
+	if !reg.AddPing(ServiceNode{PubKey: keyA, Tier: TierSPV, Services: []string{"BTC"}, PingTime: base + 1}, rawA) {
+		t.Fatal("ping A must be accepted")
+	}
+
+	keys, pings := reg.AcceptedRawPings()
+	if len(keys) != 2 || len(pings) != 2 {
+		t.Fatalf("AcceptedRawPings = %d keys/%d pings, want 2/2", len(keys), len(pings))
+	}
+	if !bytes.Equal(keys[0][:], keyB[:]) || !bytes.Equal(keys[1][:], keyA[:]) {
+		t.Errorf("keys not sorted by pubkey: %x, %x", keys[0], keys[1])
+	}
+	if !bytes.Equal(pings[0], rawB) || !bytes.Equal(pings[1], rawA) {
+		t.Errorf("payloads out of order: %q, %q", pings[0], pings[1])
+	}
+
+	// A stale (rejected) ping must NOT overwrite the stored raw payload.
+	if reg.AddPing(ServiceNode{PubKey: keyA, Tier: TierSPV, Services: []string{"BTC"}, PingTime: base}, rawStale) {
+		t.Fatal("stale ping must be rejected")
+	}
+	if _, pings := reg.AcceptedRawPings(); !bytes.Equal(pings[1], rawA) {
+		t.Errorf("stale ping clobbered raw payload: %q, want %q", pings[1], rawA)
+	}
+
+	// A NEWER accepted ping replaces the stored raw payload (both the pingTime
+	// gate and the payload stay in sync).
+	newRaw := []byte("raw-ping-A-newer")
+	if !reg.AddPing(ServiceNode{PubKey: keyA, Tier: TierSPV, Services: []string{"BTC"}, PingTime: base + 50}, newRaw) {
+		t.Fatal("newer ping must be accepted")
+	}
+	if _, pings := reg.AcceptedRawPings(); !bytes.Equal(pings[1], newRaw) {
+		t.Errorf("newer ping did not replace raw payload: %q, want %q", pings[1], newRaw)
+	}
+}
+
 // TestAddRegistrationClearsNode verifies a registration arriving AFTER a ping
 // resets the node: SNREGISTER carries no config on the wire (servicenode.h:355-
 // 384), so addSn stores version 0/empty services — the Go registry must never

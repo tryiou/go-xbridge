@@ -546,7 +546,14 @@ type Registry struct {
 	mu    sync.RWMutex
 	nodes map[[33]byte]*entry
 	pings map[[33]byte]uint32 // last RAW reported pingTime, addPing gate (servicenodemgr.h:843-852)
-	now   func() time.Time    // overridable in tests
+	// raw holds the raw accepted SNPING/SNLISTPING payload per pubkey, so the
+	// SNLIST echo can re-serialize byte-identically. C++ derives the SNLIST
+	// response from its registry (net_processing.cpp:2992-3001) rather than a
+	// parallel map; keeping the payload here (bounded by the registry's
+	// existing pubkey set, no independent network-learned map) removes the
+	// peer-manager's duplicate rawPings map.
+	raw map[[33]byte][]byte
+	now func() time.Time // overridable in tests
 }
 
 // NewRegistry builds an empty registry.
@@ -554,6 +561,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		nodes: make(map[[33]byte]*entry),
 		pings: make(map[[33]byte]uint32),
+		raw:   make(map[[33]byte][]byte),
 		now:   time.Now,
 	}
 }
@@ -593,8 +601,13 @@ func (r *Registry) AddRegistration(sn ServiceNode) {
 // node — C++ never knows it (:186-187). The stored pingtime is clamped like
 // updatePing (servicenode.h:254-260) and drives running() (:244-247).
 // It returns whether the ping was actually stored (the strict-newer gate
-// passed), which lets callers mirror the wire response set for SNLIST.
-func (r *Registry) AddPing(sn ServiceNode) bool {
+// passed), which lets callers mirror the wire response set for SNLIST. raw is
+// the optional raw SNPING/SNLISTPING payload: when supplied (only raw[0] is
+// used) and accepted, it is stored so the SNLIST echo can re-serialize
+// byte-identically to C++'s registry-derived response
+// (net_processing.cpp:2992-3001) without a parallel map in the caller. The
+// variadic form keeps the ~30 existing single-arg call sites unchanged.
+func (r *Registry) AddPing(sn ServiceNode, raw ...[]byte) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := sn.PubKey
@@ -613,11 +626,34 @@ func (r *Registry) AddPing(sn ServiceNode) bool {
 			e.xbridgeVersion = sn.XBridgeVersion
 			e.paymentAddress = sn.PaymentAddress
 			e.pingTime = clampPingTime(sn.PingTime, r.now().Unix())
+			if len(raw) > 0 {
+				r.raw[k] = append([]byte(nil), raw[0]...)
+			}
 			xlog.Debug("servicenode: ping stored", "pubkey", hex33(k), "services", len(e.services))
 			return true
 		}
 	}
 	return false
+}
+
+// AcceptedRawPings returns the stored raw ping payloads for the accepted pings,
+// keyed by pubkey, in ascending pubkey order. C++ answers SNLIST with one
+// SNLISTPING per known ping from its registry (net_processing.cpp:2992-3001);
+// this is the byte-identical echo source (sorted for deterministic ordering
+// across relays).
+func (r *Registry) AcceptedRawPings() ([][33]byte, [][]byte) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	keys := make([][33]byte, 0, len(r.raw))
+	for k := range r.raw {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	pings := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		pings = append(pings, append([]byte(nil), r.raw[k]...))
+	}
+	return keys, pings
 }
 
 // clampPingTime mirrors ServiceNode::updatePing (servicenode.h:254-260): a 0 or

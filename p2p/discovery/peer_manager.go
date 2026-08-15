@@ -1,12 +1,10 @@
 package discovery
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
-	"sort"
 	"sync"
 	"time"
 
@@ -81,13 +79,10 @@ type PeerManager struct {
 	// snReg is the servicenode registry, populated from SNREGISTER / SNPING /
 	// SNLISTPING P2P messages (mirrors a core XBridge wallet learning the
 	// network token set). Exposed via ServiceNodes() for dxGetNetworkTokens.
+	// The registry also keeps the raw accepted ping payloads (Registry.raw) so
+	// an inbound SNLIST is answered byte-identically, matching C++ which
+	// re-serializes from its registry (net_processing.cpp:2992-3001).
 	snReg *servicenode.Registry
-
-	// rawPings holds the last ACCEPTED ping payload per servicenode pubkey,
-	// so an inbound SNLIST can be answered with SNLISTPING messages that are
-	// byte-identical to the pings the peer relayed (C++ re-serializes its
-	// stored ServiceNodePing, which round-trips byte-for-byte).
-	rawPings map[[33]byte][]byte
 
 	// dialCooldown is how long a failed/used address is skipped before being
 	// re-candidated, so unreachable peers are not dialed every maintain tick.
@@ -157,7 +152,6 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		done:          make(chan struct{}),
 		peers:         make(map[string]*p2p.Conn),
 		snReg:         servicenode.NewRegistry(),
-		rawPings:      make(map[[33]byte][]byte),
 		dialCooldown:  dialCooldown,
 		banThreshold:  banThreshold,
 		banDuration:   banDuration,
@@ -445,27 +439,16 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 			}
 			// Mirror the strict-newer accept gate so SNLIST is answered with
 			// exactly the pings the registry keeps (servicenodemgr.h:843-852).
-			if m.snReg.AddPing(sn) {
-				m.mu.Lock()
-				m.rawPings[sn.PubKey] = msg.Payload
-				m.mu.Unlock()
-			}
+			// The raw payload travels into the registry so the SNLIST echo is
+			// byte-identical (C++ re-serializes from its registry,
+			// net_processing.cpp:2992-3001) — no parallel map here.
+			m.snReg.AddPing(sn, msg.Payload)
 		case servicenode.CmdSNList:
 			// C++ answers SNLIST with one SNLISTPING per known ping
-			// (net_processing.cpp:2992-3001); we echo the stored raw accepted
-			// pings (byte-identical to C++'s re-serialization). Sorted by
-			// pubkey for deterministic ordering across relays.
-			m.mu.Lock()
-			keys := make([][33]byte, 0, len(m.rawPings))
-			for k := range m.rawPings {
-				keys = append(keys, k)
-			}
-			pings := make([][]byte, 0, len(keys))
-			for _, k := range keys {
-				pings = append(pings, m.rawPings[k])
-			}
-			m.mu.Unlock()
-			sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+			// (net_processing.cpp:2992-3001); the registry echoes the stored
+			// raw accepted pings (byte-identical to C++'s re-serialization),
+			// sorted by pubkey for deterministic ordering across relays.
+			_, pings := m.snReg.AcceptedRawPings()
 			for _, raw := range pings {
 				if err := conn.SendCommand(servicenode.CmdSNListPing, raw); err != nil {
 					xlog.Debug("servicenode: SNLISTPING send failed", "peer", addr, "err", err)
