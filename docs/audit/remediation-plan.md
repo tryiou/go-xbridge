@@ -69,7 +69,7 @@ INV-F97–F100, STATE-F77/F78, CONC-F97–F102, SEC-F01, RPC-F59,
 CRYPTO-F84/F93–F96 (fixed; regression-covered), CFG-F86 (never-creates). Each
 is marked `FIXED`/`DOCUMENTED` in `register.md`.
 
-**Status (2026-08-13):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
+**Status (2026-08-15):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
 log-site removals, corrupt-file severity parity). **B3 merged** (deposit path:
 CRYPTO-F85/F86/F87/F78/F90/F97, STATE-F71, SEC-F03 — validated-deposit gate,

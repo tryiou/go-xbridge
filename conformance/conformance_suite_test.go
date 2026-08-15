@@ -1558,9 +1558,10 @@ func TestStateExpirySemantics(t *testing.T) {
 	if o.IsExpiredByBlockNumber(100_000_000) {
 		t.Error("open order must short-circuit block expiry (C++ :290-296)")
 	}
-	// The predicates are WIRED by the api layer: Store.PruneExpired applies them
-	// to the open book on the 15 s expirySweepInterval engine ticker (STATE-F72,
-	// B8). The store-level boundary tests live in api/store_expiry_test.go.
+	// The predicates are WIRED by the api layer: Store.PruneExpired applies the
+	// equivalent TTL/blocks predicates to the open book on the 15 s
+	// expirySweepInterval engine ticker (STATE-F72, B8). The store-level
+	// boundary tests live in api/store_expiry_test.go.
 }
 
 // ---------------------------------------------------------------------------

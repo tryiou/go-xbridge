@@ -687,14 +687,14 @@ appendix maps every old ID to its canonical home.
   FIXED — B2 `fix/wire-acceptingbody`.
 
 ### CRYPTO-F85 · S2 · No checkDepositTransaction in the Connector contract
-- C++ `Connector::checkDepositTransaction` has no Go analogue. OPEN (B3).
+- C++ `Connector::checkDepositTransaction` has no Go analogue. FIXED (B3): `wallet.CheckDepositTransaction` (interface + RPCConnector 1:1 port of `xbridgewalletconnectorbtc.cpp:1981-2194` + LocalConnector `ErrNoChainSource`) wired into `OnCreateB`/`OnConfirmA` with tri-state (wait→no reply / bad→Cancel / good→record); `wallet/rpc_test.go` goldens + `TestCreateBBadDepositCancels`/`TestCreateBWaitsOnNotReadyDeposit`.
 
 ### CRYPTO-F86 · S2 · buildDeposit broadcasts before the refund is built
 - Go broadcasts the deposit before constructing the refund; C++ builds first.
-  OPEN (B3).
+  FIXED (B3): sign → local txid → refund → broadcast; `TestDepositNotBroadcastWhenRefundFails`.
 
 ### CRYPTO-F87 · S2 · Deposit re-runs ListUnspent instead of usedCoins
-- C++ spends the maker's `xtx->usedCoins`; Go re-lists unspent. OPEN (B3).
+- C++ spends the maker's `xtx->usedCoins`; Go re-lists unspent. FIXED (B3): `Order.UsedCoins` recorded at make/take, `swapCtx.funding` snapshot consumed by `buildDeposit`; `TestDepositSpendsUsedCoins`.
 
 ### CRYPTO-F88 · S3 · Segwit/BIP143 signing dead code
 - Go `coins/tx.go` carried unused segwit/BIP143 signing paths. The "bech32
@@ -795,7 +795,7 @@ appendix maps every old ID to its canonical home.
   standalone code. OPEN (closed by B3).
 
 ### SEC-F04 · S2 · Plaintext secrets + debug-log leakage
-- Secrets logged in plaintext. OPEN (B6).
+- Secrets logged in plaintext. FIXED (B6): `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`.
 
 ---
 
