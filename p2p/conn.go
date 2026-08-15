@@ -8,11 +8,28 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xlog "go-xbridge/log"
 	"go-xbridge/proto"
 )
+
+// maxSendBufferSize caps the per-connection outbound queue. C++ PushMessage
+// grows vSendMsg without bound and pauses the peer once nSendSize exceeds
+// nSendBufferMaxSize (net.cpp:2721-2722), eventually disconnecting a peer that
+// cannot drain. A thin client has no socket-handler timeout machinery, so the
+// cap disconnect is immediate. Frames are never dropped while the writer is
+// alive: XBridge handshake frames are not safely retransmittable by the caller,
+// so dropping a CreatedA response would make the hub retransmit CreateA and
+// double-broadcast a deposit. (Frames queued after a write error are discarded
+// with the teardown, exactly as C++ discards vSendMsg on disconnect.)
+var maxSendBufferSize = 1 << 20
+
+// writeTimeout bounds a single net.Conn.Write on the writer goroutine, so a
+// peer that stops reading cannot wedge the writer forever. On expiry the write
+// fails and the connection is torn down (the reader loop observes the close).
+var writeTimeout = 30 * time.Second
 
 // dialDedup collapses repeated dial failures for the same address so a swarm
 // of unreachable peers does not bury the log. The first failure per address is
@@ -40,12 +57,40 @@ type Conn struct {
 	// be skipped by ReadPacket. Optional; nil means skip as before.
 	OnNonXBridge func(cmd string, payload []byte)
 
-	// writeMu serializes outbound frames. Multiple goroutines write to the
-	// same conn (the api feed/handlers, discovery read-loops), and the net
-	// package only guarantees atomicity of a single Write for TCP — not for
-	// every net.Conn transport (e.g. net.Pipe). Routing every write through
-	// this lock prevents frame interleaving and keeps ordering deterministic.
+	// writeMu serializes handshake-phase writes. Post-handshake frames go
+	// through the outbound queue, whose mutex provides the same serialization
+	// (the queue is drained by a single writer goroutine), so concurrent
+	// producers (the api engine, discovery read-loops) keep deterministic order
+	// without a socket-level lock.
 	writeMu sync.Mutex
+
+	// handshaken gates the buffered write path: the version/verack exchange
+	// writes synchronously (the conn is not yet shared); every later frame is
+	// enqueued for the writer goroutine so a slow peer can never block the
+	// caller (C++ PushMessage never blocks, net.cpp:2705-2730).
+	handshaken atomic.Bool
+
+	// sendMu guards the outbound queue. The queue is a growing slice (C++
+	// vSendMsg) capped by maxSendBufferSize; overflow disconnects the peer
+	// instead of dropping a frame. wake signals the writer; done is closed by
+	// Close to stop it.
+	sendMu     sync.Mutex
+	sendQ      [][]byte
+	sendBytes  int
+	overLimit  atomic.Bool
+	wake       chan struct{}
+	writerOnce sync.Once
+	writerDone chan struct{}
+	writerUp   atomic.Bool
+	done       chan struct{}
+	closeOnce  sync.Once
+	doneOnce   sync.Once
+
+	// lastErrMu guards lastErr, the most recent writer-side socket error so a
+	// later send observes a broken peer (C++ surfaces send failures on the
+	// socket-handler thread, never on PushMessage).
+	lastErrMu sync.Mutex
+	lastErr   error
 }
 
 // Dial connects to a Blocknet peer and completes the handshake.
@@ -68,7 +113,14 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 // caller is responsible for dialing; NewConn only performs version/verack and
 // takes ownership of nc (closing it on handshake failure).
 func NewConn(nc net.Conn, magic [4]byte) (*Conn, error) {
-	c := &Conn{netConn: nc, magic: magic, reader: bufio.NewReader(nc)}
+	c := &Conn{
+		netConn:    nc,
+		magic:      magic,
+		reader:     bufio.NewReader(nc),
+		wake:       make(chan struct{}, 1),
+		writerDone: make(chan struct{}),
+		done:       make(chan struct{}),
+	}
 	if err := c.handshake(); err != nil {
 		xlog.Debug("handshake failed", "addr", nc.RemoteAddr().String(), "err", err)
 		nc.Close()
@@ -126,6 +178,7 @@ func (c *Conn) handshake() error {
 			// Ignore unrelated messages during the handshake.
 		}
 	}
+	c.handshaken.Store(true)
 	return nil
 }
 
@@ -149,13 +202,131 @@ func (c *Conn) writeVerack() error {
 	return c.write(msg.Marshal())
 }
 
-// write serializes buf to the wire under writeMu. Every outbound frame goes
-// through here so concurrent senders cannot interleave on the underlying conn.
+// write serializes buf to the wire. During the handshake it writes
+// synchronously (the conn is not yet shared); afterwards it appends to the
+// outbound queue and returns immediately — the writer goroutine performs the
+// actual socket write, so a slow peer can never stall the caller (C++
+// PushMessage never blocks, net.cpp:2705-2730).
 func (c *Conn) write(buf []byte) error {
+	if !c.handshaken.Load() {
+		return c.writeSync(buf)
+	}
+	return c.enqueue(buf)
+}
+
+// writeSync performs a direct, blocking net.Conn.Write under writeMu. Used only
+// for the handshake phase, before the buffered writer exists and the conn is
+// shared.
+func (c *Conn) writeSync(buf []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_, err := c.netConn.Write(buf)
 	return err
+}
+
+// enqueue appends buf to the outbound queue and wakes the writer. It never
+// blocks on the socket and never drops a frame. When the queue exceeds the
+// maxSendBufferSize cap the peer is disconnected (C++ pauses the peer at the
+// cap, net.cpp:2721-2722, and disconnects a peer that cannot drain). If the
+// connection is already dead, the last recorded write error is returned so the
+// caller observes the break on the next send.
+func (c *Conn) enqueue(buf []byte) error {
+	if e := c.pendingErr(); e != nil {
+		return e
+	}
+	select {
+	case <-c.done:
+		return errors.New("p2p: connection closed")
+	default:
+	}
+	if c.overLimit.Load() {
+		return errors.New("p2p: send buffer over limit")
+	}
+	c.sendMu.Lock()
+	c.sendQ = append(c.sendQ, buf)
+	c.sendBytes += len(buf)
+	over := c.sendBytes > maxSendBufferSize
+	if over {
+		c.overLimit.Store(true)
+	}
+	c.sendMu.Unlock()
+	c.writerOnce.Do(c.startWriter)
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+	if over {
+		c.Close()
+		return errors.New("p2p: send buffer over limit; disconnected peer")
+	}
+	return nil
+}
+
+// startWriter launches the outbound writer goroutine: it drains the queue and
+// performs the socket writes, keeping callers of write() off the wire. It
+// exits when Close closes done (which also unblocks a pending write via the
+// underlying net.Conn close) or when a socket write fails, so a conn that is
+// closed — by the peer or by us — never leaks the goroutine.
+func (c *Conn) startWriter() {
+	c.writerUp.Store(true)
+	go func() {
+		defer close(c.writerDone)
+		for {
+			select {
+			case <-c.done:
+				return
+			case <-c.wake:
+			}
+			for {
+				c.sendMu.Lock()
+				if len(c.sendQ) == 0 {
+					c.sendMu.Unlock()
+					break
+				}
+				buf := c.sendQ[0]
+				c.sendQ = c.sendQ[1:]
+				c.sendBytes -= len(buf)
+				c.sendMu.Unlock()
+				if err := c.writeWithDeadline(buf); err != nil {
+					c.recordErr(err)
+					// Tear the connection down in BOTH directions (C++ sets
+					// fDisconnect on a send failure): closing netConn unblocks
+					// the reader loop, so the caller observes the break and can
+					// reconnect/ban instead of lingering on a half-dead conn
+					// whose every send fails forever.
+					c.teardown()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// writeWithDeadline writes one frame, bounding the socket write so a peer that
+// stops reading cannot wedge the writer forever.
+func (c *Conn) writeWithDeadline(buf []byte) error {
+	if err := c.netConn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	_, err := c.netConn.Write(buf)
+	if serr := c.netConn.SetWriteDeadline(time.Time{}); serr != nil && err == nil {
+		err = serr
+	}
+	return err
+}
+
+// pendingErr returns the last writer-side socket error, if any.
+func (c *Conn) pendingErr() error {
+	c.lastErrMu.Lock()
+	defer c.lastErrMu.Unlock()
+	return c.lastErr
+}
+
+// recordErr stores the writer-side socket error so later sends observe it.
+func (c *Conn) recordErr(err error) {
+	c.lastErrMu.Lock()
+	c.lastErr = err
+	c.lastErrMu.Unlock()
 }
 
 // ErrMalformedXBridge marks an xbridge transport envelope that failed decode
@@ -260,7 +431,29 @@ func (c *Conn) NetConn() net.Conn { return c.netConn }
 // callers that need to see non-XBridge traffic.
 func (c *Conn) ReadMessage() (*Message, error) { return c.readMessage() }
 
-func (c *Conn) Close() error { return c.netConn.Close() }
+// teardown closes the underlying connection and signals the writer without
+// waiting for the writer goroutine (which may itself be the caller). It is
+// safe to call concurrently from the writer and from Close: doneOnce guards
+// the single close of done, and net.Conn.Close is safe to call multiple times.
+func (c *Conn) teardown() error {
+	c.doneOnce.Do(func() { close(c.done) })
+	return c.netConn.Close()
+}
+
+// Close tears the connection down. It signals the writer (closing the
+// underlying net.Conn also unblocks any pending write), then waits for the
+// writer goroutine to exit, so no outbound goroutine leaks. Safe to call
+// multiple times and from any goroutine.
+func (c *Conn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		err = c.teardown()
+		if c.writerUp.Load() {
+			<-c.writerDone
+		}
+	})
+	return err
+}
 
 // WriteMessage sends a raw, already-constructed P2P message (any command).
 // Used by the discovery layer to exchange getaddr/addr/ping/pong directly.
