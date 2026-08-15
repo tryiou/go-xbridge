@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -507,18 +508,37 @@ func formatXPrice(p float64) string {
 // scales the three base-unit amounts by COIN, computes counterpartyDestAmount *
 // (sourceAmount/destAmount) in double precision, adds 1 scaled unit (1/COIN),
 // then scales back down and truncates — producing the taker-sent amount implied
-// by a partial take. Used by dxTakeOrder to recompute the swap sizes.
+// by a partial take. Used by dxTakeOrder to recompute the swap sizes. Each
+// operand converts to float64 BEFORE the COIN scaling so a wire-controlled
+// amount up to maxXSize (1e14) cannot wrap the uint64 multiply (C++ uses a
+// CAmount int64 here, but scaling in double preserves the result for every
+// non-overflowing amount and stays defined beyond it).
 func xBridgeSourceAmountFromPrice(counterpartyDestAmount, sourceAmount, destAmount uint64) uint64 {
 	const c = coinScale
 	if destAmount == 0 {
 		return 0
 	}
-	cda := float64(counterpartyDestAmount * c)
-	sa := float64(sourceAmount * c)
-	da := float64(destAmount * c)
+	cda := float64(counterpartyDestAmount) * c
+	sa := float64(sourceAmount) * c
+	da := float64(destAmount) * c
 	v := cda*(sa/da) + 1.0 // +1 scaled unit (C++ adds 1 before the /c normalize)
-	v /= float64(c)
-	out := uint64(v) // truncation toward zero (v >= 0)
+	// C++ truncates the +1'd double to CAmount (int64) BEFORE the integer /c
+	// (xutil.cpp:331-332: newSourceAmount = <double>; newSourceAmount /= c;).
+	// Truncating a double division instead could round a derived amount that
+	// lands within ~1 ulp below an integer up to the next unit. For values that
+	// fit CAmount mirror that order exactly; beyond it C++ overflows (UB) and
+	// the double normalize keeps this defined. A normalized value still >= 2^64
+	// (which requires wire amounts ~180,000x above maxXSize) cannot convert to
+	// uint64 definedly, so clamp to MaxUint64 rather than rely on the
+	// implementation-dependent conversion.
+	var out uint64
+	if v < float64(math.MaxInt64) {
+		out = uint64(v) / c
+	} else if q := v / float64(c); q < float64(^uint64(0)) {
+		out = uint64(q)
+	} else {
+		out = ^uint64(0)
+	}
 	if out < 1 {
 		return 1
 	}

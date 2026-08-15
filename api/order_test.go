@@ -84,6 +84,99 @@ func TestXBridgeSourceAmountFromPrice(t *testing.T) {
 	}
 }
 
+// TestXBridgeSourceAmountFromPriceCppVectors ports the C++ vector table from
+// src/test/xbridge_tests.cpp (xbridge_pricecheck) for the Source function. The
+// equality rows must reproduce C++ exactly; the inequality rows assert the
+// result is sensitive to the input (a changed counterparty amount must change
+// the derived taker amount).
+func TestXBridgeSourceAmountFromPriceCppVectors(t *testing.T) {
+	exact := []struct {
+		cda, sa, da uint64
+		want        uint64
+	}{
+		{100000, 10000, 100000, 10000},
+		{10, 1, 10, 1},
+		{100, 62, 100, 62},
+		{62, 11220000, 62, 11220000},
+		{199, 99, 199, 99},
+		{20999, 10999, 20999, 10999},
+	}
+	partial := []struct {
+		cda, sa, da uint64
+		want        uint64
+	}{
+		{8920, 10000, 100000, 892},
+		{2, 5, 10, 1},
+		{990, 1, 10, 99},
+		{27, 12345678, 9999, 33336},
+		{9090909090, 99, 9, 99999999990},
+		{1111, 1111, 1111, 1111},
+	}
+	for _, c := range append(exact, partial...) {
+		if got := xBridgeSourceAmountFromPrice(c.cda, c.sa, c.da); got != c.want {
+			t.Errorf("xBridgeSourceAmountFromPrice(%d, %d, %d) = %d, want %d", c.cda, c.sa, c.da, got, c.want)
+		}
+	}
+	// Inequality rows: changing only the source amount (2nd column) must move
+	// the derived amount (C++ asserts != on the same input pairs).
+	ineq := []struct {
+		cda, sa, da, want uint64
+	}{
+		{8920, 100000, 100000, 892},
+		{2, 20, 10, 1},
+		{990, 2, 10, 99},
+		{27, 123456789, 9999, 33336},
+		{9090909090, 990, 9, 99999999990},
+		{1111, 11112, 1111, 1111},
+	}
+	for _, c := range ineq {
+		if got := xBridgeSourceAmountFromPrice(c.cda, c.sa, c.da); got == c.want {
+			t.Errorf("xBridgeSourceAmountFromPrice(%d, %d, %d) = %d, must differ from %d (C++ != row)", c.cda, c.sa, c.da, got, c.want)
+		}
+	}
+}
+
+// TestXBridgeSourceAmountFromPriceNoOverflow guards against the uint64 wrap in
+// the COIN scaling. An equal-ratio order at the max accepted size (maxXSize =
+// 100,000,000 * COIN) must derive the source amount exactly; the old code
+// computed counterpartyDestAmount * coinScale in uint64 first, wrapping 1e20
+// mod 2^64 (the probe returned 7766279631452 instead of 100000000000000).
+// C++ uses a CAmount int64 here; scaling in double keeps the result matching
+// C++ for every non-overflowing input and defined beyond it.
+func TestXBridgeSourceAmountFromPriceNoOverflow(t *testing.T) {
+	if got := xBridgeSourceAmountFromPrice(maxXSize, maxXSize, maxXSize); got != maxXSize {
+		t.Errorf("equal-ratio at maxXSize = %d, want %d", got, maxXSize)
+	}
+}
+
+// TestXBridgeSourceAmountFromPriceTruncateFirst locks in C++'s normalize
+// ordering (xutil.cpp:331-332): the +1'd double is truncated to CAmount BEFORE
+// the integer /c. Truncating a double division instead can round a derived
+// amount that sits within ~1 ulp below an integer multiple of COIN up to the
+// next unit. The equal-ratio input at 9223372036854 base units (≈9.2M whole
+// coins, within maxXSize) is the boundary case: C++ returns 9223372036853,
+// while a double-divide-then-truncate produced 9223372036854.
+func TestXBridgeSourceAmountFromPriceTruncateFirst(t *testing.T) {
+	const cda = uint64(9223372036854)
+	if got := xBridgeSourceAmountFromPrice(cda, cda, cda); got != cda-1 {
+		t.Errorf("equal-ratio at %d = %d, want %d (C++ truncate-then-divide)", cda, got, cda-1)
+	}
+}
+
+// TestXBridgeSourceAmountFromPriceExtremeClamp exercises the fallback for
+// values beyond the CAmount range (C++ overflows there): the double normalize
+// must clamp to MaxUint64 rather than rely on the implementation-dependent
+// float64→uint64 conversion for values >= 2^64.
+func TestXBridgeSourceAmountFromPriceExtremeClamp(t *testing.T) {
+	got := xBridgeSourceAmountFromPrice(^uint64(0), ^uint64(0), ^uint64(0))
+	if got == 0 {
+		t.Fatal("extreme equal-ratio input returned 0, want a clamped nonzero amount")
+	}
+	if got != ^uint64(0) {
+		t.Errorf("extreme equal-ratio input = %d, want clamp to MaxUint64", got)
+	}
+}
+
 // TestMakePartialOrderResponse locks in C++ dxMakePartialOrder's SUCCESS render:
 // order_type is "partial" (not "exact"), the partial_* fields carry the real
 // values (not "0"), partial_repost echoes the repost flag, and status is
