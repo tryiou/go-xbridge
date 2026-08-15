@@ -1,7 +1,7 @@
 # B11 — Concurrency & lifecycle (CONC-F92–F94, INV-F98)
 
 Branch: `fix/concurrency` (off `main` @ B8 merge `bb783d0`).
-Status: MERGED into `main` @ `<merge-commit-hash>` (fast-forward).
+Status: MERGED into `main` @ `46c3a19` (fast-forward).
 C++ reference: Blocknet Core @ `e9ddbc2bd` (v4.4.1 era).
 Go subject: `p2p/conn.go`, `api/persist.go`, `api/engine.go`, `api/node.go`,
 `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/swap.go`,
