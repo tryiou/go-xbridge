@@ -79,6 +79,27 @@ func TestBase58RoundTrip(t *testing.T) {
 	}
 }
 
+// TestBase58DecodeLengthCap locks in the hardening bound on base58Decode input:
+// the big-int decode is O(n²), so an oversized wire-controlled string must be
+// rejected up front rather than amplified. maxBase58Len (128) is well above any
+// real base58check address (~46 chars) while capping the quadratic cost.
+func TestBase58DecodeLengthCap(t *testing.T) {
+	// 129 leading '1's — one past maxBase58Len. Even though every char is a
+	// valid base58 digit and '1's are the cheapest case, the length cap must
+	// fire before any decode work.
+	if _, err := base58Decode(strings.Repeat("1", maxBase58Len+1)); err == nil {
+		t.Fatalf("base58Decode(%d chars) succeeded, want length error", maxBase58Len+1)
+	}
+	// Exactly at the cap is still accepted (the boundary is inclusive).
+	if _, err := base58Decode(strings.Repeat("1", maxBase58Len)); err != nil {
+		t.Fatalf("base58Decode(%d chars) errored: %v", maxBase58Len, err)
+	}
+	// A real P2PKH address decodes fine (well under the cap).
+	if _, err := base58Decode("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"); err != nil {
+		t.Fatalf("base58Decode(real address) errored: %v", err)
+	}
+}
+
 func TestBase58CheckRejectsBadChecksum(t *testing.T) {
 	// A valid-looking BTC P2PKH address with its final char changed.
 	if _, _, err := base58CheckDecode("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3"); err == nil {
