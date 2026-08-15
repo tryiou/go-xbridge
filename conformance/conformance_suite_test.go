@@ -3,8 +3,8 @@
 // Package conformance_test is the behavioral/wire conformance suite for
 // go-xbridge against the Blocknet Core C++ XBridge contract.
 //
-// Reference vectors come from the 2026 audit documents (../docs/audit/), which
-// cite the C++ writers as ground truth. Run with:
+// Reference vectors are embedded inline as hex: captured live-wire packets and
+// C++ writer outputs, cited per vector against the C++ source. Run with:
 //
 //	cd conformance && go test -tags conformance -v ./...
 //
@@ -97,7 +97,7 @@ func addrEq(hexstr string, b []byte) bool { a := toAddr(hexstr); return bytes.Eq
 func pubEq(hexstr string, b []byte) bool  { p := toPub(hexstr); return bytes.Equal(p[:], b) }
 
 // expect asserts got==want with expected-fail semantics for DIVERGENT rows
-// (see the file header). id is the audit finding ID for divergent rows.
+// (see the file header). id is the divergent-row label for failure messages.
 func expect(t *testing.T, id string, divergent bool, got, want any) {
 	t.Helper()
 	eq := reflect.DeepEqual(got, want)
@@ -140,7 +140,7 @@ func mustBody(t *testing.T, cmd proto.XBridgeCommand, hexBody string) interface{
 // TestRPCErrorCodeText encodes, for every code in the C++ xbridge::Error enum
 // (xbridgeerror.cpp, mirrored 1:1 by go-xbridge/api response.go), the exact
 // error string template rendered with the argument C++ passes. The rows use
-// the exact quoted strings from RPC_CONFORMANCE.md's cards.
+// the exact quoted strings from the C++ writers.
 func TestRPCErrorCodeText(t *testing.T) {
 	if fxXbridgeErrorText == nil {
 		t.Skip("FIXME fixture: wire fxXbridgeErrorText to go-xbridge/api xbridgeErrorText")
@@ -156,7 +156,7 @@ func TestRPCErrorCodeText(t *testing.T) {
 		{0, "", "", false, ""},
 		{1001, "badkey", "Unauthorized badkey", false, ""},
 		{1002, "anything", "Internal Server Error", false, ""},
-		{1004, "No utxos were specified", "Bad Request No utxos were specified", false, ""}, // dxSplitInputs card
+		{1004, "No utxos were specified", "Bad Request No utxos were specified", false, ""}, // dxSplitInputs error row
 		{1004, "Cannot split utxo already in use: 0102:00", "Bad Request Cannot split utxo already in use: 0102:00", false, ""},
 		{1011, "SYS", "Invalid maker symbol SYS", false, ""},
 		{1012, "LTC", "Invalid taker symbol LTC", false, ""},
@@ -164,43 +164,43 @@ func TestRPCErrorCodeText(t *testing.T) {
 		{1016, "x", "Invalid time format, ISO 8601 date format required", false, ""},
 		{1017, "LTCXBTCLTCXBT", "Invalid coin LTCXBTCLTCXBT", false, ""},
 		{1018, "LTC", "No session for currency LTC", false, ""},
-		{1018, "Unable to connect to wallet: LTC", "No session for currency Unable to connect to wallet: LTC", false, ""}, // dxMakeOrder card
+		{1018, "Unable to connect to wallet: LTC", "No session for currency Unable to connect to wallet: LTC", false, ""}, // dxMakeOrder error row
 		{1019, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "Insufficient funds for 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", false, ""},
 		{1020, "x", "Funds not signed for x", false, ""},
-		{1021, "", "Transaction  not found", false, ""}, // dxTakeOrder card: C++ omits the id arg (double space)
+		{1021, "", "Transaction  not found", false, ""}, // dxTakeOrder error row: C++ omits the id arg (double space)
 		{1021, "00000000000000000000000000000000000000000000000000000000deadbeef",
-			"Transaction 00000000000000000000000000000000000000000000000000000000deadbeef not found", false, ""}, // dxGetOrder card: uint256 zero-padding
+			"Transaction 00000000000000000000000000000000000000000000000000000000deadbeef not found", false, ""}, // dxGetOrder error row: uint256 zero-padding
 		{1022, "x", "Unknown session for x", false, ""},
 		{1023, "x", "Revert tx failed for x", false, ""},
 		{1024, "x", "Invalid amount x", false, ""},
 		{1025, "(maker) (taker) (combined, default=true)[optional]",
-			"Invalid parameters: (maker) (taker) (combined, default=true)[optional]", false, ""}, // dxGetOrderFills card
+			"Invalid parameters: (maker) (taker) (combined, default=true)[optional]", false, ""}, // dxGetOrderFills error row
 		{1025, "This function does not accept any parameters.",
-			"Invalid parameters: This function does not accept any parameters.", false, ""}, // dxGetOrders card
-		{1025, "(id)", "Invalid parameters: (id)", false, ""},                 // dxGetOrder/dxCancelOrder card
-		{1025, "bad order id", "Invalid parameters: bad order id", false, ""}, // dxGetMyPartialOrderChain card
+			"Invalid parameters: This function does not accept any parameters.", false, ""}, // dxGetOrders error row
+		{1025, "(id)", "Invalid parameters: (id)", false, ""},                 // dxGetOrder/dxCancelOrder error row
+		{1025, "bad order id", "Invalid parameters: bad order id", false, ""}, // dxGetMyPartialOrderChain error row
 		{1025, "ageMillis must be an integer >= 0",
-			"Invalid parameters: ageMillis must be an integer >= 0", false, ""}, // dxFlushCancelledOrders card
+			"Invalid parameters: ageMillis must be an integer >= 0", false, ""}, // dxFlushCancelledOrders error row
 		{1025, "The maker_size/taker_size is too precise. The maximum precision supported is 6 digits.",
-			"Invalid parameters: The maker_size/taker_size is too precise. The maximum precision supported is 6 digits.", false, ""}, // dxMakeOrder card
+			"Invalid parameters: The maker_size/taker_size is too precise. The maximum precision supported is 6 digits.", false, ""}, // dxMakeOrder error row
 		{1026, ": LTC address is bad. Are you using the correct address?",
-			"Bad address : LTC address is bad. Are you using the correct address?", false, ""}, // dxTakeOrder card
+			"Bad address : LTC address is bad. Are you using the correct address?", false, ""}, // dxTakeOrder error row
 		{1026, "<addr>", "Bad address <addr>", false, ""},
 		{1027, "x", "Invalid signature x", false, ""},
-		{1028, "The order is already created", "invalid transaction state The order is already created", false, ""}, // dxCancelOrder card
+		{1028, "The order is already created", "invalid transaction state The order is already created", false, ""}, // dxCancelOrder error row
 		{1029, "", "Blocknet is not running as an exchange node", false, ""},
 		{1030, "", "Amount is dust (very small)", false, ""},                                  // template ignores the arg
 		{1031, "", "Blocknet wallet amount is too small to cover the fee payment", false, ""}, // template ignores the arg
-		{1032, "", "Could not find a service node with required services: ", false, ""},       // dxMakeOrder card: bare default branch
+		{1032, "", "Could not find a service node with required services: ", false, ""},       // dxMakeOrder error row: bare default branch
 		{1033, "", "The order information could not be written to the blockchain", false, ""},
 		{1034, "", "Partial orders not allowed for this transaction", false, ""},
 		// The pure formatter is CONFORMANT for any arg (template renders
-		// code+arg per C++). The audit's INSUFFICIENT_FUNDS-arg finding was a
-		// CALL-SITE divergence (CAND passed the literal "insufficient funds";
-		// C++ passes the currency/address) — fixed by B2 A7 (node.go:1306,1322
-		// now pass fromAddress). Promoted to a strict formatter assertion; the
-		// remaining call-site arg-selection divergences are tracked in
-		// register.md (RPC-F12, RPC-F18) and need the fxErrorName harness.
+		// code+arg per C++). The former INSUFFICIENT_FUNDS-arg divergence was a
+		// CALL-SITE divergence (the port passed the literal "insufficient funds";
+		// C++ passes the currency/address) — fixed so node.go:1683,1699
+		// now pass fromAddress. Promoted to a strict formatter assertion; the
+		// remaining call-site arg-selection divergences are asserted by the
+		// fxErrorName harness (not yet wired; those rows Skip).
 		{1019, "insufficient funds", "Insufficient funds for insufficient funds", false, ""},
 		{1032, "BTC/SYS", "Could not find a service node with required services: BTC/SYS", false, ""},
 		{1025, "(limit)[optional]", "Invalid parameters: (limit)[optional]", false, ""},
@@ -286,7 +286,7 @@ func TestRPCMethodNameField(t *testing.T) {
 			// DIVERGENT: the lowercase command is a separate C++ registration
 			// (rpcxbridge.cpp:3520); CAND has no dispatch entry -> envelope
 			// -32601 "Method not found" (bare), no business-error name.
-			// (RPC_CONFORMANCE.md Group-4 verdict; dispatch.go:38-63.)
+			// (dispatch.go:38-63.)
 			if strings.HasPrefix(got, "dxGetTradingData") {
 				div, id = true, "gettradingdata-missing"
 			}
@@ -337,7 +337,7 @@ func TestRPCResponseShape(t *testing.T) {
 		// dxMakeOrder: C++ interleaves addresses at 2/5 and block_id at 10
 		// (rpcxbridge.cpp:1048-1067). CAND embeds orderBase then appends
 		// maker_address/taker_address/block_id at 15/16/17 (response.go:57-62)
-		// and swaps updated_at/created_at. DIVERGENT (RPC_CONFORMANCE.md Group-2).
+		// and swaps updated_at/created_at. DIVERGENT (set-compare).
 		{method: "dxMakeOrder", mode: "set", div: true, id: "dxMakeOrder/field-order", refKeys: []string{
 			"id", "maker_address", "maker", "maker_size", "taker_address", "taker",
 			"taker_size", "created_at", "updated_at", "block_id", "order_type",
@@ -366,29 +366,28 @@ func TestRPCResponseShape(t *testing.T) {
 		// dxGetOrderBook: detail/maker/taker/asks/bids. CONFORMANT.
 		{method: "dxGetOrderBook", mode: "exact", refKeys: []string{
 			"detail", "maker", "taker", "asks", "bids"}},
-		// dxGetTokenBalances: DOCUMENTED divergence (RPC-F23/F24). C++ emits a
+		// dxGetTokenBalances: DOCUMENTED divergence. C++ emits a
 		// "Wallet" key FIRST then connectors in thread-completion (race) order;
 		// go-xbridge deliberately emits NO "Wallet" key (the BLOCK connector
 		// balance is exposed under its own ticker) and a map -> sorted keys.
-		// See register.md F23/F24.
 		{method: "dxGetTokenBalances", mode: "set", div: true, id: "dxGetTokenBalances/key-order", refKeys: []string{
 			"BLOCK", "LTC"}},
 		// dxGetMyOrders: 16 keys in C++ order (rpcxbridge.cpp:2151-2171) —
-		// maker_address/taker_address at 3/6. CONFORMANT (RPC-F26 fixed).
+		// maker_address/taker_address at 3/6. CONFORMANT.
 		{method: "dxGetMyOrders", mode: "exact", refKeys: []string{
 			"id", "maker", "maker_size", "maker_address", "taker", "taker_size",
 			"taker_address", "updated_at", "created_at", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"partial_repost", "partial_parent_id", "status"}},
 		// dxGetMyPartialOrderChain: same 16-key C++ order (rpcxbridge.cpp:2298-2319).
-		// CONFORMANT (RPC-F26 fix shared the orderDetailResult shape).
+		// CONFORMANT (shares the orderDetailResult shape).
 		{method: "dxGetMyPartialOrderChain", mode: "exact", refKeys: []string{
 			"id", "maker", "maker_size", "maker_address", "taker", "taker_size",
 			"taker_address", "updated_at", "created_at", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"partial_repost", "partial_parent_id", "status"}},
 		// dxPartialOrderChainDetails: 20 keys in C++ insertion order
-		// (rpcxbridge.cpp:2460-2480). CONFORMANT (RPC-F30 fixed: ordered struct).
+		// (rpcxbridge.cpp:2460-2480). CONFORMANT (ordered struct).
 		{method: "dxPartialOrderChainDetails", mode: "exact", refKeys: []string{
 			"first_order_id", "maker", "maker_address", "taker", "taker_address",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
@@ -400,29 +399,29 @@ func TestRPCResponseShape(t *testing.T) {
 		{method: "dxGetLockedUtxos", mode: "exact", refKeys: []string{"all_locked_utxo"}},
 		// dxGetLockedUtxos with-id: id first, then the pending/accepted currency
 		// key (rpcxbridge.cpp:2672-2677). CAND emits a map -> sorted keys.
-		// DIVERGENT (Group-4 finding dxGetLockedUtxos/key-order). The second key
+		// DIVERGENT (finding dxGetLockedUtxos/key-order). The second key
 		// is dynamic ("<cur>" or "<cur>_and_<cur>"); the fixture fills it.
 		{method: "dxGetLockedUtxos", mode: "set", div: true, id: "dxGetLockedUtxos/key-order", refKeys: []string{
 			"id", "<currency_key>"}},
 		// dxFlushCancelledOrders: ageMillis, now, durationMicrosec, flushedOrders
-		// (rpcxbridge.cpp:1474-1489). CONFORMANT (RPC-F36 fixed: ordered struct).
+		// (rpcxbridge.cpp:1474-1489). CONFORMANT (ordered struct).
 		{method: "dxFlushCancelledOrders", mode: "exact", refKeys: []string{
 			"ageMillis", "now", "durationMicrosec", "flushedOrders"}},
 		// dxGetTradingData record: timestamp, fee_txid, nodepubkey, id, taker,
 		// taker_size, maker, maker_size (rpcxbridge.cpp:2889-2898). CAND map ->
-		// sorted; fee_txid/nodepubkey always "" (F38/F39, Tier-3 thin-client
-		// limit). DIVERGENT (Group-4 finding dxGetTradingData/key-order).
+		// sorted; fee_txid/nodepubkey always "" (Tier-3 thin-client
+		// limit). DIVERGENT (finding dxGetTradingData/key-order).
 		{method: "dxGetTradingData", mode: "set", div: true, id: "dxGetTradingData/key-order", refKeys: []string{
 			"timestamp", "fee_txid", "nodepubkey", "id", "taker", "taker_size",
 			"maker", "maker_size"}},
 		// gettradingdata: different schema with a DUPLICATE "to" key
 		// (rpcxbridge.cpp:2761-2770). CAND has no dispatch entry -> -32601
-		// (F37: deliberate removal, documented). DIVERGENT (Group-4 finding
+		// (deliberate removal, documented). DIVERGENT (finding
 		// gettradingdata-missing).
 		{method: "gettradingdata", mode: "set", div: true, id: "gettradingdata-missing", refKeys: []string{
 			"timestamp", "txid", "to", "xid", "from", "fromAmount", "toAmount"}},
 		// dxSplitAddress: 8 keys in C++ order (rpcxbridge.cpp:3280-3289).
-		// CONFORMANT (RPC-F41-era ordered struct).
+		// CONFORMANT (ordered struct).
 		{method: "dxSplitAddress", mode: "exact", refKeys: []string{
 			"token", "include_fees", "split_amount_requested", "split_amount_with_fees",
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
@@ -430,14 +429,14 @@ func TestRPCResponseShape(t *testing.T) {
 		{method: "dxSplitInputs", mode: "exact", refKeys: []string{
 			"token", "include_fees", "split_amount_requested", "split_amount_with_fees",
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
-		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). F44/F45
-		// fixed (amount fixed-8, 1004 listunspent error); the remaining divergence
-		// is CAND map -> sorted key order (handlers.go:2016-2075). DIVERGENT
+		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). The
+		// amount is fixed-8 and listunspent failure is a 1004 error; the
+		// remaining divergence is CAND map -> sorted key order (handlers.go:2016-2075). DIVERGENT
 		// (finding dxGetUtxos/key-order).
 		{method: "dxGetUtxos", mode: "set", div: true, id: "dxGetUtxos/key-order", refKeys: []string{
 			"txid", "vout", "amount", "address", "scriptPubKey", "confirmations", "orderid"}},
-		// getnetworkinfo: 15 C++ fields (net.cpp:495-527). F46 fixed (all 15 now
-		// emitted); the remaining divergence is CAND map -> sorted key order
+		// getnetworkinfo: 15 C++ fields (net.cpp:495-527). All 15 now emitted;
+		// the remaining divergence is CAND map -> sorted key order
 		// (handlers.go:2082-2128). DIVERGENT (finding getnetworkinfo/fields).
 		{method: "getnetworkinfo", mode: "set", div: true, id: "getnetworkinfo/fields", refKeys: []string{
 			"version", "subversion", "protocolversion", "xbridgeprotocolversion",
@@ -492,8 +491,7 @@ func TestFormatXAmountVectors(t *testing.T) {
 		{1531409, "1.531409"},     // live-packet DOGE amount
 		{24500001, "24.500001"},   // live-packet BLOCK amount
 		// Truncation is exact integer division; the C++ +1/::COIN bump never
-		// reaches the 6th decimal for these integer base units (cross-cutting
-		// note, RPC_CONFORMANCE.md).
+		// reaches the 6th decimal for these integer base units.
 	}
 	for _, c := range cases {
 		if got := fxFormatXAmount(c.amt); got != c.want {
@@ -503,7 +501,7 @@ func TestFormatXAmountVectors(t *testing.T) {
 	// DIVERGENT: dxMakeOrder/dxMakePartialOrder success and dryrun emit the C++
 	// literal "0" for the three partial_* fields (rpcxbridge.cpp:1062-1064)
 	// where CAND renders formatXAmount(0) = "0.000000".
-	// (RPC_CONFORMANCE.md Group-2 finding dxMakeOrder/partial-literal.)
+	// (finding dxMakeOrder/partial-literal.)
 	expect(t, "dxMakeOrder/partial-literal", true, fxFormatXAmount(0), "0")
 }
 
@@ -541,8 +539,8 @@ func TestFormatXPriceVectors(t *testing.T) {
 		from, to uint64
 		want     string
 	}{
-		{1500000, 300000, "0.200000"}, // dxGetOrderBook card vector 1 ask
-		{1500000, 150000, "0.100000"}, // dxGetOrderBook card vector 1 ask
+		{1500000, 300000, "0.200000"}, // dxGetOrderBook vector 1 ask
+		{1500000, 150000, "0.100000"}, // dxGetOrderBook vector 1 ask
 	}
 	for _, c := range cases {
 		if got := fxFormatXPrice(c.from, c.to); got != c.want {
@@ -552,7 +550,7 @@ func TestFormatXPriceVectors(t *testing.T) {
 	// DIVERGENT: dxGetOrderBook price formula. C++ adds 1/::COIN to each amount
 	// before dividing (xutil.cpp:293-312); CAND uses a plain ratio
 	// (handlers.go:663-669). Observable only for tiny base-unit amounts.
-	// (RPC_CONFORMANCE.md Group-3 finding dxGetOrderBook/price-formula.)
+	// (finding dxGetOrderBook/price-formula.)
 	expect(t, "dxGetOrderBook/price-formula", true, fxFormatXPrice(3, 1), "0.335548")
 }
 
@@ -622,7 +620,7 @@ func TestParseXAmountVectors(t *testing.T) {
 func TestOHLCVEncodingVectors(t *testing.T) {
 	// These are reference strings; the CAND rendering is produced by encoding/json
 	// Marshal of a float64. Assert the C++ reference form is fixed-8 (documented
-	// divergence): RPC_CONFORMANCE.md Group-3 finding dxGetOrderHistory/encoding.
+	// divergence): finding dxGetOrderHistory/encoding.
 	expect(t, "dxGetOrderHistory/encoding", true, "0.0", "0.00000000")
 	expect(t, "dxGetOrderHistory/encoding", true, "6.0", "6.00000000")
 }
@@ -635,7 +633,7 @@ func TestOHLCVEncodingVectors(t *testing.T) {
 // TestWirePacketHeader asserts the 129-byte XBridge packet header for a known
 // body (cmd 22 xbcTransactionCancel, body = 32-byte id 0102..20 + reason
 // 0xfeedbeef, timestamp 0x178b6a56, deterministic key/sig).
-// WIRE_CONFORMANCE.md Card 1 VECTOR 1.1.
+// VECTOR 1.1 — deterministic packet header.
 func TestWirePacketHeader(t *testing.T) {
 	const bodyHex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20efbeedfe"
 	const wantHex = "3700000016000000566a8b178500000024000000" +
@@ -689,7 +687,7 @@ func TestWirePacketHeader(t *testing.T) {
 // TestWireDigestAndSign asserts the digest/sign recipe: SHA256 over the full
 // packet buffer (header incl. padding + body) with the 64-byte signature region
 // zeroed; 64-byte compact r||s; 33-byte compressed pubkey.
-// WIRE_CONFORMANCE.md Card 2 VECTOR 2.1.
+// VECTOR 2.1 — deterministic digest/signature.
 func TestWireDigestAndSign(t *testing.T) {
 	const digestHex = "737e49c1f8e2d852c7a98ffbe9a7bf0a5f8c2811591671c10efb2f87485193f7"
 	const sigHex = "a3dfdba8d803471627e9a70559e9e3c70e5e02b9a26f8e9988349e18f6824d9565" +
@@ -738,7 +736,7 @@ func TestWireDigestAndSign(t *testing.T) {
 }
 
 // TestWireSignKnownAnswer is the cross-implementation signing KAT:
-// CRYPTO_FEES_UTXO.md Card 1 — deterministic packet, key 0x00..01.
+// deterministic packet, key 0x00..01.
 func TestWireSignKnownAnswer(t *testing.T) {
 	const body = "XBRIDGE_PACKET_SIGNING_VECTOR"
 	const wantDigest = "fafbf7fe9a58ba56cef3d81371af05449b08478d7946987d5790b5dc8646bb2a"
@@ -751,9 +749,9 @@ func TestWireSignKnownAnswer(t *testing.T) {
 		OldSize: uint32(len(body)) + 97, Size: uint32(len(body)),
 		Body: []byte(body),
 	}
-	// NOTE: CRYPTO_FEES_UTXO.md Card 1 lists digest fafbf7fe…, but that constant
+	// NOTE: the captured KAT lists digest fafbf7fe…, but that constant
 	// does not reproduce under the documented construction (the scratch module's
-	// exact packet bytes are not stated). The card's pubkey and signature ARE
+	// exact packet bytes are not stated). The KAT's pubkey and signature ARE
 	// reproduced byte-for-byte below (and were cross-verified against libsecp256k1
 	// / coincurve), which pins the digest implicitly. Reconcile the digest literal
 	// once the scratch module is recovered. (FIXME fixture.)
@@ -776,8 +774,8 @@ func TestWireSignKnownAnswer(t *testing.T) {
 	}
 }
 
-// TestWireCommandBodies encodes every XBridgeCommand body hex vector from
-// WIRE_CONFORMANCE.md Card 4 (commands 2,3,4,5,6,7,8,9,10,11,12,13,18,19,20,
+// TestWireCommandBodies encodes every XBridgeCommand body hex vector
+// (commands 2,3,4,5,6,7,8,9,10,11,12,13,18,19,20,
 // 21,22,24,26,50) and asserts decode + the expected decoded fields.
 func TestWireCommandBodies(t *testing.T) {
 	cases := []struct {
@@ -852,7 +850,7 @@ func TestWireCommandBodies(t *testing.T) {
 	for _, c := range cases {
 		// Each command is a subtest so a skip does not abort the remaining
 		// body vectors. (cmd 2 xbcXChatMessage and cmd 50 xbcServicesPing have
-		// no C++ writer and their body types were removed on B5, WIRE-F67/F68.)
+		// no C++ writer and their body types were removed.)
 		t.Run(c.name, func(t *testing.T) {
 			if c.skip != "" {
 				t.Skipf("%s: %s", c.name, c.skip)
@@ -867,7 +865,7 @@ func TestWireCommandBodies(t *testing.T) {
 }
 
 // checkBodyFields asserts the expected decoded fields for each command body
-// (the "expected decoded fields" column of WIRE_CONFORMANCE.md Card 4).
+// (the decoded-fields column of the body vector table).
 func checkBodyFields(t *testing.T, name string, cmd proto.XBridgeCommand, v interface{}) {
 	t.Helper()
 	txid := "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
@@ -971,17 +969,18 @@ func checkBodyFields(t *testing.T, name string, cmd proto.XBridgeCommand, v inte
 	}
 }
 
-// TestWireMainnetFrame asserts the full mainnet Bitcoin frame for the Card-1
-// packet: magic a1a0a2a3, command "xbridge", varint envelope, 20-byte dest,
-// 8-byte µs timestamp, packet. WIRE_CONFORMANCE.md Card 3 VECTOR 3.1.
+// TestWireMainnetFrame asserts the full mainnet Bitcoin frame for the VECTOR
+// 1.1 packet: magic a1a0a2a3, command "xbridge", varint envelope, 20-byte dest,
+// 8-byte µs timestamp, packet. VECTOR 3.1 — mainnet frame.
 func TestWireMainnetFrame(t *testing.T) {
 	const envHex = "c1a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3" + "0000566a8b7b0100" +
 		"3700000016000000566a8b1785000000240000000284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
 		"a3dfdba8d803471627e9a70559e9e3c70e5e02b9a26f8e9988349e18f6824d9565d2fc6141951f6f8b8a5a9335b2a8a42d9dcd8b76099c0b137d91c1828060fe" +
 		"0000000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20efbeedfe"
-	// NOTE: the audit card prints the length in display order ("000000c2"); the
-	// wire field is little-endian, so 194 decodes as c2000000. The checksum
-	// (863c174d) is over the payload only and matches either spelling.
+	// NOTE: the captured-frame card prints the length in display order
+	// ("000000c2"); the wire field is little-endian, so 194 decodes as
+	// c2000000. The checksum (863c174d) is over the payload only and matches
+	// either spelling.
 	const frameHex = "a1a0a2a3" + "786272696467650000000000" + "c2000000" + "863c174d" + envHex
 
 	env := hx(envHex)
@@ -1026,10 +1025,10 @@ func TestWireMainnetFrame(t *testing.T) {
 }
 
 // TestWireFrameVectors asserts the verack and xbridge standalone frame vectors.
-// WIRE_CONFORMANCE.md Card 1 VECTOR 1.2/1.3.
+// VECTOR 1.2/1.3 — standalone frames.
 func TestWireFrameVectors(t *testing.T) {
 	// VECTOR 1.2 — verack frame (24 B, empty payload).
-	// NOTE: the audit card omits one NUL in the command field (11 bytes); the
+	// NOTE: the captured-frame card omits one NUL in the command field (11 bytes); the
 	// frame header requires 12, so the canonical wire form is used here.
 	const verackHex = "a1a0a2a3" + "76657261636b000000000000" + "00000000" + "5df6e0e2"
 	ck := p2p.Checksum(nil)
@@ -1069,7 +1068,7 @@ func TestWireFrameVectors(t *testing.T) {
 }
 
 // TestWireVersionVectors asserts the 105-byte version payload and the 26-byte
-// net_addr form. WIRE_CONFORMANCE.md Card 2 VECTOR 2.1 + Card 3 VECTOR 3.1.
+// net_addr form. VECTOR 2.1 + VECTOR 3.1 — version/net_addr.
 func TestWireVersionVectors(t *testing.T) {
 	const payloadHex = "39140100" + "0000000000000000" + "80b8706000000000" +
 		"000000000000000000000000000000000000ffff01020304a1c4" +
@@ -1089,7 +1088,7 @@ func TestWireVersionVectors(t *testing.T) {
 	if !v.AddrRecv.IP.Equal(net.ParseIP("1.2.3.4")) || v.AddrRecv.Port != 41412 {
 		t.Errorf("addr_recv: %+v", v.AddrRecv)
 	}
-	// NOTE: the audit card labels the nonce "0x8877665544332211" — that is the
+	// NOTE: the captured-frame card labels the nonce "0x8877665544332211" — that is the
 	// wire-byte display; LittleEndian decode of 88 77 66 55 44 33 22 11 is
 	// 0x1122334455667788.
 	if v.Nonce != 0x1122334455667788 || v.UserAgent != "/go-xbridge:0.1.0/" ||
@@ -1124,7 +1123,7 @@ func TestWireVersionVectors(t *testing.T) {
 }
 
 // TestWireAddrVectors asserts the addr-message payload (CompactSize count +
-// 30-byte records). WIRE_CONFORMANCE.md Card 3 VECTOR 3.2.
+// 30-byte records). VECTOR 3.2 — addr records.
 func TestWireAddrVectors(t *testing.T) {
 	const addrHex = "02" +
 		"80b87060" + "0100000000000000" + "00000000000000000000ffff05060708" + "a1c4" +
@@ -1140,7 +1139,7 @@ func TestWireAddrVectors(t *testing.T) {
 		!entries[0].IP.Equal(net.ParseIP("5.6.7.8")) || entries[0].Port != 41412 {
 		t.Errorf("entry[0]: %+v", entries[0])
 	}
-	// NOTE: the audit card captions the second record "nTime 1618000001" but its
+	// NOTE: the captured-frame card captions the second record "nTime 1618000001" but its
 	// own bytes 80b87061 decode (LE) to 0x6170b880 = 1634777216. The wire bytes
 	// are the contract; go-xbridge decodes them identically to C++.
 	if entries[1].Time != 1634777216 || entries[1].Services != 1 ||
@@ -1158,7 +1157,7 @@ func TestWireAddrVectors(t *testing.T) {
 }
 
 // TestWireEnvelopeVectors asserts the broadcast/addressed envelope payloads.
-// WIRE_CONFORMANCE.md Card 4 VECTOR 4.1/4.2/4.3.
+// VECTOR 4.1/4.2/4.3 — envelopes.
 func TestWireEnvelopeVectors(t *testing.T) {
 	// VECTOR 4.1 — broadcast envelope (33 B): dest 20x00, ts 1618000000000000 µs, packet 00010203.
 	const bcHex = "20" + "0000000000000000000000000000000000000000" + "00203ffb8fbf0500" + "00010203"
@@ -1182,9 +1181,9 @@ func TestWireEnvelopeVectors(t *testing.T) {
 
 	// VECTOR 4.3 — live captured envelope: varint fd b4 01 = 436, dest
 	// 6894ff…a48a, ts 4d27edd398560600, packet starts with version 55 / cmd 3.
-	// The audit doc supplies only the packet PREFIX of the 408-byte packet; the
+	// The capture supplies only the packet PREFIX of the 408-byte packet; the
 	// full payload must come from the envelope_test.go fixture (FIXME fixture).
-	// The audit doc's 4.3 vector continues into the packet ("37 00 00 00 03 00 00
+	// The 4.3 vector continues into the packet ("37 00 00 00 03 00 00
 	// 00 ..."); include that documented prefix so the full envelope prefix is
 	// present for the offset math.
 	live := hx("fdb401" + "6894ff47163a031d3ac8bfce10dfa3fbe290a48a" + "4d27edd398560600" + "3700000003000000")
@@ -1198,7 +1197,7 @@ func TestWireEnvelopeVectors(t *testing.T) {
 }
 
 // TestWireServiceNodeVectors asserts the SNREGISTER/SNPING payloads.
-// WIRE_CONFORMANCE.md Card 7 VECTOR 7.1/7.2.
+// VECTOR 7.1/7.2 — servicenode payloads.
 func TestWireServiceNodeVectors(t *testing.T) {
 	// VECTOR 7.1 — SNREGISTER (345 B).
 	snreg := hx(
@@ -1229,7 +1228,7 @@ func TestWireServiceNodeVectors(t *testing.T) {
 		t.Error("snr bestBlockHash mismatch")
 	}
 
-	// VECTOR 7.2 — SNPING (245 B). The audit doc spells the outer fields and the
+	// VECTOR 7.2 — SNPING (245 B). The capture spells the outer fields and the
 	// embedded ServiceNode layout (21 pubkey | 32 paymentAddress | 01 collateral
 	// | ... | 40e20100 | hash | 00) but abbreviates the embedded collateral
 	// byte-run with "...". We rebuild the embedded node deterministically
@@ -1251,10 +1250,10 @@ func TestWireServiceNodeVectors(t *testing.T) {
 	if len(ping) != 245 {
 		t.Fatalf("snping len = %d, want 245", len(ping))
 	}
-	// The doc's VECTOR 7.2 uses a SYNTHETIC pubkey (02 01 02 03 04 …) which is
+	// VECTOR 7.2 uses a SYNTHETIC pubkey (02 01 02 03 04 …) which is
 	// not a valid curve point, so ParseServiceNodePing consumes the full 245-byte
 	// layout and then fails the outer-pubkey validation — exactly the behavior
-	// the audit doc records ("the synthetic key fails fullyValidCPubKey at
+	// the capture records ("the synthetic key fails fullyValidCPubKey at
 	// validation, not at layout — proving the parser read every field to that
 	// point"). A valid-signature round-trip lives in servicenode_test.go
 	// (buildPing, TestWalletServicesParity). (FIXME fixture.)
@@ -1317,8 +1316,8 @@ func TestStateEnumVectors(t *testing.T) {
 	// Go renders descrState(N). Not asserted as a conformance row.
 }
 
-// TestTTLConstants asserts Transaction:: TTL constants.
-// STATE_MACHINE.md Card 4.1; CRYPTO_FEES_UTXO.md Card 6.
+// TestTTLConstants asserts the Transaction:: TTL constants.
+// VECTOR 4.1 — TTL constants.
 func TestTTLConstants(t *testing.T) {
 	rows := []struct {
 		name string
@@ -1340,7 +1339,7 @@ func TestTTLConstants(t *testing.T) {
 
 // TestLocktimeConstants asserts the locktime computation constants (all
 // unexported in go-xbridge/api; asserted via the fxLocktimeConstants fixture).
-// STATE_MACHINE.md Card 5.1; CRYPTO_FEES_UTXO.md Card 7.
+// VECTOR 5.1 — locktime constants.
 func TestLocktimeConstants(t *testing.T) {
 	if fxLocktimeConstants == nil {
 		t.Skip("FIXME fixture: wire fxLocktimeConstants to go-xbridge/api (swap.go, locktime.go) unexported constants")
@@ -1376,8 +1375,8 @@ func TestLocktimeConstants(t *testing.T) {
 // (-32700/-32600/-32601/-32603). HTTP status follows C++ routing: 400 for
 // -32600, 404 for -32601, 500 otherwise (api/httpStatusForCode). The fixture
 // renders the go-xbridge server's actual response bytes (FIXME). The
-// RPC_CONFORMANCE.md ENVELOPE & TRANSPORT section verified the byte
-// conventions on BOTH sides; the transport rows below are now strict.
+// envelope & transport conventions were verified on BOTH sides against the C++
+// writers; the transport rows below are now strict.
 func TestEnvelopeTransport(t *testing.T) {
 	// Reference byte strings (compact, no spaces, trailing \n; envelope key
 	// order result,error,id; envelope error object {code,message}). These are
@@ -1428,50 +1427,52 @@ func TestEnvelopeTransport(t *testing.T) {
 			ref: "result,error,id (both sides)"},
 		{name: "compact no-space + trailing newline",
 			ref: "no spaces after ':'/','; '\\n' appended (both sides)"},
-		// CONFORMANT (B4): C++ method-not-found is -32601 "Method not found"
+		// C++ method-not-found is -32601 "Method not found"
 		// (bare message), HTTP 404. The Go server emits the same bare message
 		// (api/server.go dispatchOne) and routes -32601 -> 404 (httpStatusForCode).
-		// (RPC-F48; api/server_test.go TestServerEnvelopeStatusCodes.)
+		// (api/server_test.go TestServerEnvelopeStatusCodes.)
 		{name: "method-not-found message/status",
 			ref:  `-32601 "Method not found" HTTP 404`,
 			cand: `-32601 "Method not found" HTTP 404`},
-		// CONFORMANT (B4): C++ emits -32600 for request-shape errors; the Go
+		// C++ emits -32600 for request-shape errors; the Go
 		// server now does too (api/server.go parseRequest; all three messages).
-		// (RPC-F48; api/server_test.go TestServerInvalidRequest.)
+		// (api/server_test.go TestServerInvalidRequest.)
 		{name: "RPC_INVALID_REQUEST -32600",
 			ref:  `-32600 "Missing method"/"Method must be a string"/"Params must be an array or object" HTTP 400`,
 			cand: `-32600 "Missing method"/"Method must be a string"/"Params must be an array or object" HTTP 400`},
-		// CONFORMANT (B4): auth model — C++ always authenticates (auto-cookie
-		// default) with an empty 401 body and never emits -401; the Go server is
-		// always-auth whenever ANY credential is configured (-rpcuser/-rpcpassword
-		// or -rpcauth), returns an empty 401 body + WWW-Authenticate, and drops
-		// the old custom -401 code. Residual documented divergence (RPC-F50): Go
-		// does not auto-create a cookie file and is default-open on loopback when
-		// NO credentials are configured (C++ is always authenticated).
-		// (RPC-F50; api/server_test.go TestServerRPCAuth/RpcAuthMultiUser/RpcAuthDelay.)
+		// Auth model — C++ accepts RPC credentials (-rpcuser/-rpcpassword or
+		// -rpcauth) and, when none are set, falls back to an auto-generated
+		// cookie; it always authenticates, answering an empty 401 body and never
+		// emitting -401. The Go server is always-auth whenever ANY credential is
+		// configured (-rpcuser/-rpcpassword or -rpcauth), returns an empty
+		// 401 body + WWW-Authenticate, and drops the old custom -401 code.
+		// Residual documented divergence: Go is default-open on loopback when
+		// NO credentials are configured (no auto-cookie; see docs/api.md
+		// §Calling convention).
+		// (api/server_test.go TestServerRPCAuth/RpcAuthMultiUser/RpcAuthDelay.)
 		{name: "auth model / -401",
 			ref:  "always-auth; 401 with empty body; no -401 code",
 			cand: "always-auth; 401 with empty body; no -401 code"},
-		// CONFORMANT (B4): oversized-request handling — C++ libevent cap 32 MiB
+		// Oversized-request handling — C++ libevent cap 32 MiB
 		// with a non-envelope HTTP error; the Go server now caps at 32 MiB
 		// (api/server.go rpcMaxBodyBytes) and replies 413 without a JSON envelope.
-		// (RPC-F49; api/server_test.go TestServerMaxBodyBytes.)
+		// (api/server_test.go TestServerMaxBodyBytes.)
 		{name: "oversized request cap",
 			ref:  "32 MiB, non-envelope HTTP error",
 			cand: "32 MiB, non-envelope HTTP error"},
-		// CONFORMANT (B4): batch requests are supported (C++ JSONRPCExecBatch;
+		// Batch requests are supported (C++ JSONRPCExecBatch;
 		// Go api/server.go execOne per element, always HTTP 200) and named
 		// params are rejected with -8 "Unknown named parameter <key>" — C++ dx*
 		// methods have empty argNames so transformNamedArguments rejects the
 		// first named key; the Go server mirrors that for the first key.
-		// (RPC-F51; api/server_test.go TestServerBatch/TestServerNamedParamsRejected.)
+		// (api/server_test.go TestServerBatch/TestServerNamedParamsRejected.)
 		{name: "batch / named params",
 			ref:  "batch (JSONRPCExecBatch) supported; named params rejected with -8 (dx* empty argNames)",
 			cand: "batch (JSONRPCExecBatch) supported; named params rejected with -8 (dx* empty argNames)"},
-		// CONFORMANT (B4): id echo on malformed body — C++ parses id first and
+		// id echo on malformed body — C++ parses id first and
 		// echoes it; the Go server parses id in parseRequest before dispatch and
 		// echoes it on pre-dispatch errors.
-		// (RPC-F48; api/server_test.go TestServerInvalidRequest.)
+		// (api/server_test.go TestServerInvalidRequest.)
 		{name: "id echo on malformed body",
 			ref:  "id parsed before dispatch; echoed on pre-dispatch errors",
 			cand: "id parsed before dispatch; echoed on pre-dispatch errors"},
