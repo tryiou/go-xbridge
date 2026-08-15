@@ -18,7 +18,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 	body := `[Main]
 ExchangeWallets=BTC,BLOCK,DOGE
 
@@ -50,7 +50,7 @@ COIN=100000000
 	if _, err := f.WriteString(body); err != nil {
 		panic(err)
 	}
-	f.Close()
+	_ = f.Close()
 	conf, err := config.Load(f.Name())
 	if err != nil {
 		panic(err)

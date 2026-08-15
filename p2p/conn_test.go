@@ -44,7 +44,7 @@ func readFrame(nc net.Conn) (*Message, error) {
 // net_processing.cpp:3117-3121).
 func TestConnWrongMagicRejected(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -66,7 +66,7 @@ func TestConnWrongMagicRejected(t *testing.T) {
 // the handshake (C++ net_processing.cpp:3138-3145).
 func TestConnChecksumFrameDropped(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -99,7 +99,7 @@ func TestConnChecksumFrameDropped(t *testing.T) {
 // C++ wire cap (MAX_PROTOCOL_MESSAGE_LENGTH, net.h:55) is fatal (disconnect).
 func TestConnOversizedLengthRejected(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -117,7 +117,7 @@ func TestConnOversizedLengthRejected(t *testing.T) {
 // checksum-drop, cap) is proven not to break a conforming peer exchange.
 func TestConnHandshakeOK(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -147,7 +147,7 @@ func TestConnHandshakeOK(t *testing.T) {
 // MIN_PEER_PROTO_VERSION is disconnected (C++ net_processing.cpp:1617-1626).
 func TestConnVersionBelowMinimum(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -168,7 +168,7 @@ func TestConnVersionBelowMinimum(t *testing.T) {
 // (C++ disconnects on a duplicate version, net_processing.cpp:1574-1582).
 func TestConnDuplicateVersion(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -209,7 +209,7 @@ func TestHandshakeTimeout(t *testing.T) {
 // (conforming) packet.
 func TestConnReadPacketVersionGate(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return

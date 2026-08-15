@@ -43,7 +43,7 @@ func pmWithFakePeer(t *testing.T, opts Options, msgs func(server net.Conn, magic
 		},
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	t.Cleanup(func() { cancel(); pm.Close() })
+	t.Cleanup(func() { cancel(); _ = pm.Close() })
 	pm.Start(ctx)
 	return pm, addr
 }

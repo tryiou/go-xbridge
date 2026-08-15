@@ -368,7 +368,7 @@ func (m *PeerManager) connectOne(addr string) {
 // readLoop processes messages from one peer until it errors or we're closed.
 func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 	defer func() {
-		conn.Close()
+		_ = conn.Close()
 		m.mu.Lock()
 		delete(m.peers, addr)
 		// nMisbehavior is per-connection: a disconnect (even a clean one) drops
@@ -563,7 +563,7 @@ func (m *PeerManager) misbehave(addr string, score int) {
 	xlog.Warn("peer misbehaving", "peer", addr, "score", score, "total", total, "banned", banned)
 	if banned && conn != nil {
 		// Closing unblocks readLoop; its defer removes the peer from the pool.
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -610,7 +610,7 @@ func (m *PeerManager) Close() error {
 		m.mu.Lock()
 		for _, c := range m.peers {
 			if c != nil {
-				c.Close()
+				_ = c.Close()
 			}
 		}
 		m.mu.Unlock()

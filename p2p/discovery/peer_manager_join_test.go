@@ -37,7 +37,7 @@ func TestPeerManagerCloseAbortsInflightDialAndJoins(t *testing.T) {
 	}
 
 	start := time.Now()
-	pm.Close()
+	_ = pm.Close()
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Close took %v — in-flight dial was not aborted", elapsed)
 	}
@@ -58,7 +58,7 @@ func TestPeerManagerCloseFastWithStalledHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	hold := make(chan struct{})
 	var releaseHold sync.Once
 	t.Cleanup(func() { releaseHold.Do(func() { close(hold) }) })
@@ -67,7 +67,7 @@ func TestPeerManagerCloseFastWithStalledHandshake(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		<-hold // accept and stall: never send a version
 	}()
 
@@ -91,7 +91,7 @@ func TestPeerManagerCloseFastWithStalledHandshake(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // let the handshake stall on the version exchange
 
 	start := time.Now()
-	pm.Close()
+	_ = pm.Close()
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Close took %v — stalled handshake was not aborted (want well under handshakeTimeout)", elapsed)
 	}

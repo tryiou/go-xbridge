@@ -166,6 +166,13 @@ func buildServiceNodeFeeTx(conn wallet.Connector, blkCoin coins.Coin, blkConf *c
 	if !ok {
 		return "", nil, makeError(errInsufficientFunds, "dxTakeOrder", "not accepting order, insufficient BLOCK funds for service node fee payment")
 	}
+	if blkConf == nil {
+		// A configured BLOCK connector implies its [BLOCK] conf exists, but a
+		// conf reload or a manually-constructed connector map could drop it;
+		// the fee amount scales by Coin so refuse rather than nil-deref
+		// (C++ maps any fee-prep failure to INSUFFICIENT_FUNDS).
+		return "", nil, makeError(errInsufficientFunds, "dxTakeOrder", "not accepting order, BLOCK conf missing")
+	}
 
 	native := float64(blkConf.Coin)
 	inputAmt := 0.0
@@ -176,7 +183,7 @@ func buildServiceNodeFeeTx(conn wallet.Connector, blkCoin coins.Coin, blkConf *c
 	changeAmt := uint64((inputAmt - serviceNodeFeeReal - feeAmt) * native)
 
 	tx := &coins.Tx{Version: 1}
-	if blkConf != nil && blkConf.TxVersion != 0 {
+	if blkConf.TxVersion != 0 {
 		tx.Version = int32(blkConf.TxVersion)
 	}
 	tx.WithTime = blkCoin.TxWithTimeField

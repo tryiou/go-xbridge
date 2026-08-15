@@ -37,7 +37,7 @@ func NewRotatingWriter(path string, maxBytes int64, backups int) (*rotatingWrite
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("log: stat log file: %w", err)
 	}
 	return &rotatingWriter{

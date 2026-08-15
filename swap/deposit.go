@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	//nolint:staticcheck // RIPEMD-160 is HASH160: the on-chain/wire identifier hash Bitcoin uses (C++ getKeyId); a modern replacement would break parity.
 	"golang.org/x/crypto/ripemd160"
 
 	xlog "go-xbridge/log"

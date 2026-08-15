@@ -16,7 +16,7 @@ func TestRotatingWriter_BasicWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRotatingWriter: %v", err)
 	}
-	defer rw.Close()
+	defer func() { _ = rw.Close() }()
 
 	msg := "hello\n"
 	if _, err := rw.Write([]byte(msg)); err != nil {
@@ -41,7 +41,7 @@ func TestRotatingWriter_Rotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRotatingWriter: %v", err)
 	}
-	defer rw.Close()
+	defer func() { _ = rw.Close() }()
 
 	// Each write is 10 bytes; after 2 writes (20) the 3rd forces a rotate.
 	for i := 0; i < 3; i++ {
@@ -79,7 +79,7 @@ func TestRotatingWriter_BackupShift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRotatingWriter: %v", err)
 	}
-	defer rw.Close()
+	defer func() { _ = rw.Close() }()
 
 	// Four 10-byte writes => 3 rotations => .1 and .2 should both exist.
 	for i := 0; i < 4; i++ {
