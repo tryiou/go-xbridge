@@ -43,7 +43,7 @@ func mustJSONMap(t *testing.T, v interface{}) map[string]interface{} {
 
 // jnum wraps a Go int64 as a JSON-RawMessage number param. C++ reads int params
 // via get_int()/get_int64(), which throw on a JSON string, so tests must pass
-// real JSON numbers (strict parsing, RPC-F01).
+// real JSON numbers (strict parsing).
 func jnum(n int64) json.RawMessage {
 	return json.RawMessage([]byte(strconv.FormatInt(n, 10)))
 }
@@ -191,7 +191,7 @@ func TestDxGetMyOrdersRead(t *testing.T) {
 	}
 }
 
-// TestDxGetMyOrdersDedupAndSort locks in the RPC-F26 behaviors: an order
+// TestDxGetMyOrdersDedupAndSort locks in the my-orders behaviors: an order
 // present in BOTH the live book and history renders once (C++ seen[] dedup,
 // rpcxbridge.cpp:2133-2138), and rows are ordered ascending by the raw
 // microsecond updated time, not the ISO-rendered millisecond string.
@@ -227,7 +227,7 @@ func TestDxGetMyOrdersDedupAndSort(t *testing.T) {
 	}
 }
 
-// TestDxGetMyOrdersFieldOrder locks in the RPC-F26 fix: maker_address /
+// TestDxGetMyOrdersFieldOrder locks in the field order: maker_address /
 // taker_address are emitted at JSON positions 3/6 (rpcxbridge.cpp:2151-2171),
 // not appended after orderBase.
 func TestDxGetMyOrdersFieldOrder(t *testing.T) {
@@ -250,7 +250,7 @@ func TestDxGetMyOrdersFieldOrder(t *testing.T) {
 	}
 }
 
-// TestDxPartialOrderChainDetailsKeyOrder locks in the RPC-F30 fix: the details
+// TestDxPartialOrderChainDetailsKeyOrder locks in the key order: the details
 // object emits keys in C++ pushKV insertion order (rpcxbridge.cpp:2460-2480),
 // not Go-map alphabetical order.
 func TestDxPartialOrderChainDetailsKeyOrder(t *testing.T) {
@@ -275,8 +275,8 @@ func TestDxPartialOrderChainDetailsKeyOrder(t *testing.T) {
 	}
 }
 
-// TestDxPartialOrderChainDetailsBadId locks in the RPC-F29 fix: the malformed /
-// null id error text is C++'s "bad order id" (rpcxbridge.cpp:2414), not
+// TestDxPartialOrderChainDetailsBadId locks in the bad-id error text: the
+// malformed / null id error is C++'s "bad order id" (rpcxbridge.cpp:2414), not
 // "Invalid order id [<id>]".
 func TestDxPartialOrderChainDetailsBadId(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -380,7 +380,7 @@ func TestDxGetOrderBookRead(t *testing.T) {
 //	level 3 (full, capped):    [price, amount, id]   — asks descending (worst→best)
 //	level 4 (best + ids):      [price, amount, [ids]]
 //
-// This also cements the refuted audit-D1 claim: detail 1 is [price,size,count]
+// This also cements the C++ shape: detail 1 is [price,size,count]
 // in C++ too, not a different shape.
 func TestDxGetOrderBookDetailLevels(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -605,8 +605,8 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 		t.Fatalf("dxGetLockedUtxos all_locked_utxo = %v", m["all_locked_utxo"])
 	}
 
-	// id -> object keyed by id and the order's currency key. RPC-F32: an order
-	// with nothing reserved errors 1021, so the stub BTC utxo is reserved
+	// id -> object keyed by id and the order's currency key. An order with
+	// nothing reserved errors 1021, so the stub BTC utxo is reserved
 	// (replaces the utxo-less seedOrder {0x01} record, same id).
 	o = seedOrderWithUtxo(ctx, [32]byte{})
 	id := dispID(o.ID)
@@ -618,7 +618,7 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 	if m["id"] != id {
 		t.Errorf("dxGetLockedUtxos id = %v, want %v", m["id"], id)
 	}
-	// RPC-F33: a made (Mine) order lives in the accepted map from creation
+	// A made (Mine) order lives in the accepted map from creation
 	// (xbridgeapp.cpp:2034), so even an open order keys by maker_and_taker.
 	if _, ok := m["BTC_and_BTC"].([]string); !ok {
 		t.Errorf("dxGetLockedUtxos missing BTC_and_BTC key: %v", m)
@@ -633,7 +633,7 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 	if fo, _ := m["flushedOrders"].([]interface{}); len(fo) != 0 {
 		t.Fatalf("dxFlushCancelledOrders (empty) = %v", res)
 	}
-	// RPC-F35: a cancelled order is pruned from the live book on the next
+	// A cancelled order is pruned from the live book on the next
 	// flush (C++ erases trCancelled from m_transactions, xbridgeapp.cpp:1336).
 	ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
 		ord.Status = "canceled"
@@ -646,9 +646,9 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 	}
 }
 
-// TestFlushCancelledPrunesBookAndHistory locks in RPC-F35 (C++ erases
-// trCancelled orders from BOTH m_transactions and m_historicTransactions,
-// xbridgeapp.cpp:1331-1354) and RPC-F36 ordering/key-order: the flushed list is
+// TestFlushCancelledPrunesBookAndHistory locks in the flush semantics (C++
+// erases trCancelled orders from BOTH m_transactions and m_historicTransactions,
+// xbridgeapp.cpp:1331-1354) and the ordering/key-order: the flushed list is
 // the live-book block (uint256 id order) followed by the history block, and the
 // result object emits ageMillis, now, durationMicrosec, flushedOrders.
 func TestFlushCancelledPrunesBookAndHistory(t *testing.T) {
@@ -684,7 +684,7 @@ func TestFlushCancelledPrunesBookAndHistory(t *testing.T) {
 	if h := ctx.Store.History(); len(h) != 0 {
 		t.Errorf("cancelled history entry still present after flush: %v", h)
 	}
-	// RPC-F36 key order (rpcxbridge.cpp:1474-1489).
+	// Key order (rpcxbridge.cpp:1474-1489).
 	b, _ := json.Marshal(res)
 	s := string(b)
 	want := []string{"ageMillis", "now", "durationMicrosec", "flushedOrders"}
@@ -713,7 +713,7 @@ func TestDxGetLockedUtxosKeyByState(t *testing.T) {
 			ID: id, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1500000,
 			ToCurrency: "SYS", ToAmount: 300000, Created: 1, Updated: 1,
 			Status: status, Mine: true,
-			// RPC-F32: an order must have reserved utxos or the handler 1021s.
+			// An order must have reserved utxos or the handler 1021s.
 			// Each order reserves a DISTINCT utxo (byOrder maps one owner per
 			// "txid:vout", so sharing the stub utxo would make ownership
 			// nondeterministic).
@@ -748,8 +748,8 @@ func TestDxGetLockedUtxosKeyByState(t *testing.T) {
 	}
 
 	// Now connect the taker wallet: both the open and created MADE orders must
-	// keep the dual key (they are in the accepted map, RPC-F33 — the old code
-	// single-keyed a made open order on the status ordinal alone).
+	// keep the dual key (they are in the accepted map — a made order single-keys
+	// on the status ordinal alone only when it is not in the accepted map).
 	ctx.Node.config.Connectors["SYS"] = &stubConn{ticker: "SYS", addr: btcAddr}
 	openID, _ := add(0x12, "open")
 	if k := lockedKey(openID); k != "BTC_and_SYS" {
@@ -813,7 +813,7 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 
 // TestDxGetOrderHistoryBuckets verifies the OHLCV aggregation over local fills:
 // open/high/low/close from the QUANTIZED taker/maker price ratio, volume = sum
-// of the FROM/maker size (RPC-F16), zero-filled empty slices, and the trailing
+// of the FROM/maker size, zero-filled empty slices, and the trailing
 // order-id array when order_ids=true. The time window is aligned to granularity
 // boundaries (matching C++ XSeries behavior), so the effective window may be
 // wider than the raw [start, end) range.
@@ -856,7 +856,7 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 		}
 	}
 	// bucket1: open=2.0, high=4.0, low=2.0, close=4.0, volume=2.0 (from/maker
-	// side, RPC-F16: 1.0+1.0, NOT the taker-side 6.0).
+	// side: 1.0+1.0, NOT the taker-side 6.0).
 	b1 := arr[1].([]interface{})
 	if b1[3].(xfloat8) != 2.0 || b1[2].(xfloat8) != 4.0 || b1[1].(xfloat8) != 2.0 || b1[4].(xfloat8) != 4.0 || b1[5].(xfloat8) != 2.0 {
 		t.Errorf("bucket1 = %v, want [_,2,4,2,4,2]", b1)
@@ -1000,7 +1000,7 @@ func TestDxPartialOrderChainDetailsAggregate(t *testing.T) {
 	if m["total_reported_notsent"] != formatXAmount(1500000+200) {
 		t.Errorf("total_reported_notsent = %v, want %v", m["total_reported_notsent"], formatXAmount(1500200))
 	}
-	// RPC-F28: p2sh_deposits carries ONE entry per chain order, empty strings
+	// p2sh_deposits carries ONE entry per chain order, empty strings
 	// included, so callers can index by position against `orders`.
 	if p, _ := m["p2sh_deposits"].([]interface{}); len(p) != 3 {
 		t.Errorf("p2sh_deposits should have 3 per-order entries, got %v", m["p2sh_deposits"])
@@ -1013,7 +1013,7 @@ func TestDxLoadConfAndTokens(t *testing.T) {
 	if ls, _ := lt.([]string); len(ls) != 1 || ls[0] != "BTC" {
 		t.Errorf("dxGetLocalTokens = %v", lt)
 	}
-	// RPC-F54: the network list is the pure SN service union; with no connected
+	// The network list is the pure SN service union; with no connected
 	// servicenodes it is empty (no config fallback).
 	nt, _ := ctx.dxGetNetworkTokens(nil)
 	if ns, _ := nt.([]string); len(ns) != 0 {
@@ -1021,7 +1021,7 @@ func TestDxLoadConfAndTokens(t *testing.T) {
 	}
 	// Reload from the same conf succeeds and rebuilds the connectors
 	// (the fixture conf now carries Ip/Port), so dxGetLocalTokens keeps
-	// reflecting the loaded wallet connectors (F53).
+	// reflecting the loaded wallet connectors.
 	if res, err := ctx.dxLoadXBridgeConf(nil); err != nil || res != true {
 		t.Fatalf("dxLoadXBridgeConf = %v %v", res, err)
 	}
@@ -1031,9 +1031,9 @@ func TestDxLoadConfAndTokens(t *testing.T) {
 	}
 }
 
-// TestDxGetLocalTokensConnectedOnly locks RPC-F53: dxGetLocalTokens reflects
-// the loaded wallet connectors, not the config's ExchangeWallets list (which
-// may name unconnected/duplicate tickers).
+// TestDxGetLocalTokensConnectedOnly locks the local-tokens behavior:
+// dxGetLocalTokens reflects the loaded wallet connectors, not the config's
+// ExchangeWallets list (which may name unconnected/duplicate tickers).
 func TestDxGetLocalTokensConnectedOnly(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// Config names DOGE in ExchangeWallets but no DOGE connector is loaded.
@@ -1051,9 +1051,9 @@ func TestDxGetLocalTokensConnectedOnly(t *testing.T) {
 	}
 }
 
-// TestDxLoadConfFailureFalse locks RPC-F56: a reload failure is a successful
-// envelope whose bool result is false (C++ uret(success), rpcxbridge.cpp:229-234),
-// not a business error.
+// TestDxLoadConfFailureFalse locks the load-conf failure shape: a reload
+// failure is a successful envelope whose bool result is false (C++ uret(success),
+// rpcxbridge.cpp:229-234), not a business error.
 func TestDxLoadConfFailureFalse(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// No ConfPath configured -> reloadConf fails (node.go:307-310).
@@ -1132,7 +1132,7 @@ func TestDxCancelOrderNoLiveSession(t *testing.T) {
 
 // TestDxSplitInputsBadBoolParam verifies a malformed (non-boolean) flag errors
 // out as the C++-thrown envelope error (code -1, "JSON value is not a boolean
-// as expected") instead of silently defaulting (Module F; RPC-F01).
+// as expected") instead of silently defaulting.
 func TestDxSplitInputsBadBoolParam(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// C++ requires exactly 7 params: ticker, splitamount, address, include_fees,
@@ -1177,7 +1177,7 @@ func TestGetNetworkInfo(t *testing.T) {
 	if m["subversion"] != "/Blocknet:4.4.1/" {
 		t.Errorf("subversion = %v, want /Blocknet:4.4.1/", m["subversion"])
 	}
-	// F46 alignment with real blocknetd (rpc/net.cpp:495-527, version.h).
+	// Alignment with real blocknetd (rpc/net.cpp:495-527, version.h).
 	if m["protocolversion"] != 70713 {
 		t.Errorf("protocolversion = %v, want 70713", m["protocolversion"])
 	}
@@ -1282,7 +1282,7 @@ func TestDxLoadConfHotReload(t *testing.T) {
 		t.Errorf("after reload: coins.Has BTC=%v DOGE=%v", coins.Has("BTC"), coins.Has("DOGE"))
 	}
 	// The reload rebuilt connectors for both coins, so dxGetLocalTokens reflects
-	// the connected wallet set (F53).
+	// the connected wallet set.
 	lt, _ := ctx.dxGetLocalTokens(nil)
 	gotLocal := map[string]bool{}
 	for _, tk := range lt.([]string) {
@@ -1304,7 +1304,7 @@ func TestDxLoadConfHotReload(t *testing.T) {
 
 // TestDxLoadConfHotReloadMissingPath verifies that a node started without a
 // conf path (ConfPath empty) reports the failure as a false result — not an
-// error — mirroring C++ uret(success) (RPC-F56).
+// error — mirroring C++ uret(success).
 func TestDxLoadConfHotReloadMissingPath(t *testing.T) {
 	node := &Node{config: &Config{}, store: NewStore(), signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}
 	ctx := &HandlerCtx{Store: NewStore(), Node: node}
@@ -1315,10 +1315,11 @@ func TestDxLoadConfHotReloadMissingPath(t *testing.T) {
 	}
 }
 
-// TestDxGetOrdersSortedById locks in RPC-F03: C++ iterates m_transactions
-// (std::map<uint256>) in LSB-first byte order (uint256.h:45-49), so Go's
-// map-ordered Store.List() must be sorted by orderIDLess — NOT display-hex
-// ascending. Three open BTC/BTC orders; the LSB order is B < A < C while
+// TestDxGetOrdersSortedById locks in the id-sort behavior: C++ iterates
+// m_transactions (std::map<uint256>) in LSB-first byte order (uint256.h:45-49),
+// so Go's map-ordered Store.List() must be sorted by orderIDLess — NOT
+// display-hex ascending. Three open BTC/BTC orders; the LSB order is B < A < C
+// while
 // display-hex ascending would give A < C < B.
 func TestDxGetOrdersSortedById(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -1354,7 +1355,7 @@ func TestDxGetOrdersSortedById(t *testing.T) {
 	}
 }
 
-// TestDxGetOrdersSixtySecondBoundary locks in RPC-F04: the 60 s filter on
+// TestDxGetOrdersSixtySecondBoundary locks in the 60 s filter: the filter on
 // canceled/finished/expired orders drops exactly when
 // floor(now) - txtime >= 61e6, mirroring C++
 // (second_clock - txtime).total_seconds() > 60 (rpcxbridge.cpp:439).
@@ -1410,9 +1411,10 @@ func TestDxGetOrdersSixtySecondBoundary(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderNotFoundPadded locks in RPC-F06: dxGetOrder renders the
-// not-found message with the PARSED id's GetHex (rpcxbridge.cpp:785), so a
-// short/malformed id is zero-padded to 64 hex chars, not echoed raw.
+// TestDxGetOrderNotFoundPadded locks in the not-found id rendering:
+// dxGetOrder renders the not-found message with the PARSED id's GetHex
+// (rpcxbridge.cpp:785), so a short/malformed id is zero-padded to 64 hex
+// chars, not echoed raw.
 func TestDxGetOrderNotFoundPadded(t *testing.T) {
 	ctx := newWalletTestCtx()
 	if _, err := ctx.dxGetOrder([]json.RawMessage{jstr("deadbeef")}); err == nil {
@@ -1430,11 +1432,12 @@ func TestDxGetOrderNotFoundPadded(t *testing.T) {
 	}
 }
 
-// TestDxCancelOrderShortId locks in RPC-F05: dxCancelOrder rejects a NULL
-// uint256S id with 1025 "Invalid order id [<raw param>]" (rpcxbridge.cpp:
-// 1345-1353). A short-but-valid hex id ("abc") is NOT null — it is left-padded
-// to 64 hex and misses the store -> 1021; only genuinely unparseable input
-// ("zz", "0x", empty) parses to the null id and hits the 1025 gate.
+// TestDxCancelOrderShortId locks in the cancel-id parsing: dxCancelOrder
+// rejects a NULL uint256S id with 1025 "Invalid order id [<raw param>]"
+// (rpcxbridge.cpp:1345-1353). A short-but-valid hex id ("abc") is NOT null — it
+// is left-padded to 64 hex and misses the store -> 1021; only genuinely
+// unparseable input ("zz", "0x", empty) parses to the null id and hits the
+// 1025 gate.
 func TestDxCancelOrderShortId(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx)
@@ -1466,8 +1469,8 @@ func TestDxCancelOrderShortId(t *testing.T) {
 	}
 }
 
-// TestDxCancelOrderSideEffectBeforeValidation locks in RPC-F07's to-connector
-// case: C++ cancels the order FIRST (cancelXBridgeTransaction,
+// TestDxCancelOrderSideEffectBeforeValidation locks in the side-effect
+// ordering: C++ cancels the order FIRST (cancelXBridgeTransaction,
 // xbridgeapp.cpp:2468-2501) and only then resolves the connectors to build the
 // result (rpcxbridge.cpp:1364-1385). A missing TO connector must NOT prevent
 // the cancel side effect — the order is cancelled, and only the result build
@@ -1500,7 +1503,7 @@ func TestDxCancelOrderSideEffectBeforeValidation(t *testing.T) {
 	}
 }
 
-// TestDxCancelOrderFromConnectorGate locks in RPC-F08's from-connector gate:
+// TestDxCancelOrderFromConnectorGate locks in the from-connector gate:
 // C++ cancelXBridgeTransaction requires the FROM-currency wallet connector
 // BEFORE broadcasting the cancel (xbridgeapp.cpp:2489-2495). A missing
 // from-currency session prevents the cancel side effect entirely, surfaced as
@@ -1529,7 +1532,7 @@ func TestDxCancelOrderFromConnectorGate(t *testing.T) {
 	}
 }
 
-// TestDxCancelOrderNonLocal locks in RPC-F08's isLocal branch: C++
+// TestDxCancelOrderNonLocal locks in the non-local cancel branch: C++
 // cancelXBridgeTransaction refuses to cancel an order this node does not own
 // with TRANSACTION_NOT_FOUND, surfaced via makeError(res, __FUNCTION__) with
 // an EMPTY argument — the double-space "Transaction  not found"
@@ -1579,8 +1582,8 @@ func TestDxCancelOrderNotFoundPadded(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderHistoryValidations locks in RPC-F18: the xQuery ctor rejects
-// bad queries with the EXACT C++ messages in C++ precedence order
+// TestDxGetOrderHistoryValidations locks in the xQuery ctor rejections: bad
+// queries fail with the EXACT C++ messages in C++ precedence order
 // (util/xseries.h:91-101): granularity whitelist, aligned start too early,
 // start >= end, end beyond now+1day, then the interval_limit range.
 func TestDxGetOrderHistoryValidations(t *testing.T) {
@@ -1734,11 +1737,90 @@ func TestDxGetOrderHistoryLimitTail(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderBookPriceBump locks in RPC-F20: dxGetOrderBook prices use
-// C++'s xBridgeValueFromAmount formula — a/COIN + 1/::COIN on each amount
-// before dividing (xutil.cpp:293-312). Observable only for tiny base-unit
-// amounts: an ask from=3, to=1 renders 0.335548 (the plain ratio would be
-// 0.333333) and the inverse bid from=3, to=1 renders 2.980198 (plain 3.000000).
+// TestDxGetOrderHistoryDefaultCap locks in the default hard cap on the
+// dxGetOrderHistory bucket grid: an absent-limit request spanning the whole
+// 2018→now window at the 60 s granularity must NOT allocate ~4.3M buckets
+// (C++'s INT_MAX IntervalLimit default, util/xseries.h:42). Go hard-caps the
+// default at defaultOrderHistoryMaxBuckets and shifts the window to the
+// most-recent tail, so the result is bounded and the returned time series
+// always ends at the aligned end time. An explicit interval_limit is
+// unaffected (covered by TestDxGetOrderHistoryLimitTail /
+// TestDxGetOrderHistoryValidations).
+func TestDxGetOrderHistoryDefaultCap(t *testing.T) {
+	ctx := newWalletTestCtx()
+	const xEarly = int64(1519516800) // XSeries earliest (2018-02-25)
+	// Pin NowMicro so end <= now+1day passes and the aligned end is stable.
+	now := uint64(1600000000) * 1e6
+	orig := NowMicro
+	defer func() { NowMicro = orig }()
+	NowMicro = func() uint64 { return now }
+
+	start, end := xEarly, int64(1600080000) // 2018-02-25 → 2020-09-14
+	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(start), jnum(end), jnum(60),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderHistory(full range, no limit): %v", err)
+	}
+	arr := res.([]interface{})
+	if len(arr) != defaultOrderHistoryMaxBuckets {
+		t.Fatalf("absent-limit full-range query returned %d buckets, want cap %d",
+			len(arr), defaultOrderHistoryMaxBuckets)
+	}
+	// The window is the most-recent tail: first bucket start = alignedEnd -
+	// numBuckets*granularity; last bucket start = alignedEnd - granularity.
+	// C++ getChainXAggregateSeries shifts to the tail identically
+	// (xseries.cpp:106-112). The row time is the bucket START (interval_timestamp
+	// default at_start). Assert one literal ISO-8601 string so the alignment
+	// math is not tautological with the handler's own formulas.
+	alignedEnd := ((end + 60 - 1) / 60) * 60
+	wantFirstStart := alignedEnd - int64(defaultOrderHistoryMaxBuckets)*60
+	firstRow := arr[0].([]interface{})
+	if got := iso8601(uint64(wantFirstStart) * 1e6); got != firstRow[0] {
+		t.Errorf("first bucket time = %v, want %s (tail start)", firstRow[0], got)
+	}
+	if firstRow[0] != "2020-07-07T00:00:00.000Z" {
+		t.Errorf("first bucket time = %v, want literal 2020-07-07T00:00:00.000Z (tail start)", firstRow[0])
+	}
+	lastRow := arr[len(arr)-1].([]interface{})
+	if got := iso8601(uint64(alignedEnd-60) * 1e6); got != lastRow[0] {
+		t.Errorf("last bucket time = %v, want %s (aligned end - granularity)", lastRow[0], got)
+	}
+	// A fill placed before the shifted window must be excluded (only the tail
+	// survives), mirroring TestDxGetOrderHistoryLimitTail's explicit-limit case.
+	// order_ids=true so the row carries the ids array at index 6.
+	ctx.Store.AddFill(fillEntry{ID: "old", Time: uint64(xEarly+1000) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
+	resNoOld, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(start), jnum(end), jnum(60),
+		json.RawMessage("true"),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderHistory(full range, no limit, stale fill): %v", err)
+	}
+	for _, row := range resNoOld.([]interface{}) {
+		if ids, ok := row.([]interface{})[6].([]string); ok && len(ids) > 0 {
+			t.Errorf("pre-window fill leaked into capped tail: %v", ids)
+		}
+	}
+	// Explicit limit must still override the default (limit=1 → exactly 1 row).
+	resLimit, err := ctx.dxGetOrderHistory([]json.RawMessage{
+		jstr("BTC"), jstr("LTC"), jnum(start), jnum(end), jnum(60),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("1"),
+	})
+	if err != nil {
+		t.Fatalf("dxGetOrderHistory(limit=1): %v", err)
+	}
+	if got := len(resLimit.([]interface{})); got != 1 {
+		t.Errorf("limit=1 returned %d buckets, want 1", got)
+	}
+}
+
+// TestDxGetOrderBookPriceBump locks in the order-book price bump:
+// dxGetOrderBook prices use C++'s xBridgeValueFromAmount formula — a/COIN +
+// 1/::COIN on each amount before dividing (xutil.cpp:293-312). Observable only
+// for tiny base-unit amounts: an ask from=3, to=1 renders 0.335548 (the plain
+// ratio would be 0.333333) and the inverse bid from=3, to=1 renders 2.980198
+// (plain 3.000000).
 func TestDxGetOrderBookPriceBump(t *testing.T) {
 	ctx := newWalletTestCtx()
 	ctx.Store.Add(&Order{
@@ -1769,9 +1851,9 @@ func TestDxGetOrderBookPriceBump(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderBookTieBreak locks in RPC-F21: equal-price best orders are
-// broken by the smallest raw id (orderIDLess), so detail 4's first id is the
-// smallest-id order regardless of insertion order.
+// TestDxGetOrderBookTieBreak locks in the tie-break: equal-price best orders
+// are broken by the smallest raw id (orderIDLess), so detail 4's first id is
+// the smallest-id order regardless of insertion order.
 func TestDxGetOrderBookTieBreak(t *testing.T) {
 	ctx := newWalletTestCtx()
 	big := [32]byte{0x02}
@@ -1799,8 +1881,8 @@ func TestDxGetOrderBookTieBreak(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderBookDetail4Golden locks in RPC-F57: detail 4 rows are
-// [[price, amount, [ids]]] — the ids array NESTED inside the row array
+// TestDxGetOrderBookDetail4Golden locks in the detail-4 nesting: detail 4 rows
+// are [[price, amount, [ids]]] — the ids array NESTED inside the row array
 // (rpcxbridge.cpp:1905-1926).
 func TestDxGetOrderBookDetail4Golden(t *testing.T) {
 	ctx := newWalletTestCtx()

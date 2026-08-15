@@ -67,14 +67,14 @@ func Lookup(method string) Handler {
 }
 
 // ---------------------------------------------------------------------------
-// Arity gates (RPC-F52).
+// Arity gates.
 //
 // C++ enforces each dx* method's param count up front. The old-style methods
 // return a business 1025 result error with the exact param-list string
 // (uret(makeError(INVALID_PARAMETERS, __FUNCTION__, <msg>))); the throw
 // methods throw the full RPCHelpMan help text as an envelope error code -1
 // (rpc/server.cpp:584-586). checkArity runs before the handler so the gates are
-// centralized and match C++ per method (see remediation/B4-http.md).
+// centralized and match C++ per method.
 // ---------------------------------------------------------------------------
 
 type arityKind int
@@ -96,12 +96,17 @@ type aritySpec struct {
 
 var arity = map[string]aritySpec{
 	// Business 1025 gates (exact C++ makeError arg).
-	"dxGetNewTokenAddress":   {1, 1, arityBusiness, "(ticker)"},
-	"dxLoadXBridgeConf":      {0, 0, arityBusiness, "This function does not accept any parameter."},
-	"dxGetLocalTokens":       {0, 0, arityBusiness, "This function does not accept any parameter."},
-	"dxGetNetworkTokens":     {0, 0, arityBusiness, "This function does not accept any parameters."},
-	"dxGetOrders":            {0, 0, arityBusiness, "This function does not accept any parameters."},
-	"dxGetOrderFills":        {2, 3, arityBusiness, "(maker) (taker) (combined, default=true)[optional]"},
+	"dxGetNewTokenAddress": {1, 1, arityBusiness, "(ticker)"},
+	"dxLoadXBridgeConf":    {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetLocalTokens":     {0, 0, arityBusiness, "This function does not accept any parameter."},
+	"dxGetNetworkTokens":   {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrders":          {0, 0, arityBusiness, "This function does not accept any parameters."},
+	"dxGetOrderFills":      {2, 3, arityBusiness, "(maker) (taker) (combined, default=true)[optional]"},
+	// The help text for the (limit) default is byte-faithful to C++'s
+	// IntervalLimit default (2147483647, rpcxbridge.cpp:603). Go's ACTUAL
+	// absent-limit behavior hard-caps the bucket grid at
+	// defaultOrderHistoryMaxBuckets (see dxGetOrderHistory); the help string
+	// stays C++-identical.
 	"dxGetOrderHistory":      {5, 8, arityBusiness, "(maker) (taker) (start time) (end time) (granularity) (order_ids, default=false)[optional] (with_inverse, default=false)[optional] (limit, default=2147483647)[optional]"},
 	"dxGetOrder":             {1, 1, arityBusiness, "(id)"},
 	"dxCancelOrder":          {1, 1, arityBusiness, "(id)"},
@@ -121,7 +126,7 @@ var arity = map[string]aritySpec{
 	"dxSplitInputs":              {3, 7, arityThrow, helpDxSplitInputs},
 	"dxGetUtxos":                 {1, 2, arityThrow, helpDxGetUtxos},
 	"dxGetTradingData":           {0, 2, arityThrow, helpDxGetTradingData},
-	// getnetworkinfo is a Go shim with its own gate (B7/F46).
+	// getnetworkinfo is a Go shim with its own gate.
 }
 
 // checkArity returns the C++ arity violation for method with n params, or nil
@@ -142,7 +147,7 @@ func checkArity(method string, n int) *rpcError {
 }
 
 // ---------------------------------------------------------------------------
-// Strict positional parameter parsing (RPC-F01).
+// Strict positional parameter parsing.
 //
 // C++ reads dx* params either through json_spirit (Array params; a wrong/null
 // value type throws std::runtime_error) or directly through UniValue
