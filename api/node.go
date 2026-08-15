@@ -859,7 +859,123 @@ func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
 	if n.store.HasOrder(hexEncode(o.ID[:])) {
 		return
 	}
-	n.store.Add(o)
+	// SEC-F02: an inbound order is booked only after its maker-currency UTXO
+	// ownership proofs verify against the chain (the C++ snode gate,
+	// xbridgesession.cpp:535-575). The wallet I/O runs on a worker so the
+	// engine never blocks; without a connector for the maker currency there is
+	// nothing to verify against and the order is booked as before (CFG-F87
+	// prunes unconnected orders unless ShowAllOrders).
+	n.verifyAndBook(o)
+}
+
+// verifyAndBook verifies o's maker UTXO ownership proofs (when a FromCurrency
+// connector exists) and books the order only on success, mirroring the C++ snode
+// gate (processTransaction, xbridgesession.cpp:535-575: getTxOut existence +
+// verifyMessage per entry; reject when the surviving entries do not cover the
+// order amount, :571-577). Runs on the engine goroutine; the wallet I/O itself
+// is offloaded to a worker so the engine never blocks on an RPC.
+func (n *Node) verifyAndBook(o *Order) {
+	idHex := hexEncode(o.ID[:])
+	// cmd-4 pending broadcasts carry no UTXO entries, so there is nothing to
+	// verify (C++ trader parity: the snode verifies). With no config, connector
+	// or coin for the maker currency there is also nothing to verify against;
+	// the order is booked as before (CFG-F87 prunes unconnected orders unless
+	// ShowAllOrders).
+	if len(o.Utxos) == 0 || n.cfg() == nil {
+		n.store.Add(o)
+		return
+	}
+	cfg := n.cfg()
+	conn := cfg.Connectors[o.FromCurrency]
+	coin, hasCoin := coins.Get(o.FromCurrency)
+	if conn == nil || !hasCoin {
+		n.store.Add(o)
+		return
+	}
+	utxos := make([]proto.UtxoEntry, len(o.Utxos))
+	copy(utxos, o.Utxos)
+	task := workTask{
+		orderID: idHex,
+		run: func() (any, error) {
+			return verifyOrderUtxos(conn, coin, utxos, o.FromAmount)
+		},
+		apply: func(v any, err error) {
+			ok, _ := v.(bool)
+			if err != nil || !ok {
+				xlog.Warn("inbound order not booked: maker utxo proofs failed", "order", idHex, "err", err)
+				return
+			}
+			// Re-check under the store: a relayed copy may have been booked (or
+			// the order canceled) while the proof was being verified.
+			if n.store.HasOrder(idHex) {
+				return
+			}
+			n.store.Add(o)
+		},
+	}
+	if !n.engineRunning.Load() {
+		v, err := safeTaskRun(task)
+		task.apply(v, err)
+		return
+	}
+	select {
+	case n.tasks <- task:
+	default:
+		// Engine busy: drop the ingest; the order is re-broadcast periodically
+		// and re-ingested then.
+		xlog.Warn("ingest verification dropped, engine busy", "order", idHex)
+	}
+}
+
+// verifyOrderUtxos checks each maker UTXO against the chain, mirroring the C++
+// snode gate (xbridgesession.cpp:535-575 / :1100-1140): the output must exist
+// on-chain (getTxOut) and the embedded BIP137 proof must verify against the
+// chain amount and the entry's address (C++ entry.toString() after getTxOut
+// reloads the amount). Bad entries are skipped (C++ `continue`); the order is
+// bookable only when the surviving entries cover the maker's fromAmount in
+// XBridge base (C++ xBridgeAmountFromReal(commonAmount) < samount -> reject,
+// :571-577).
+func verifyOrderUtxos(conn wallet.Connector, c coins.Coin, utxos []proto.UtxoEntry, required uint64) (bool, error) {
+	var sum float64
+	valid := 0
+	for _, e := range utxos {
+		var rev [32]byte
+		for i := 0; i < 32; i++ {
+			rev[i] = e.TxID[31-i]
+		}
+		txid := hexEncode(rev[:]) // wire little-endian -> display hex
+		u, ok, err := conn.GetTxOut(txid, e.Vout)
+		if err != nil {
+			// C++ maps gettxout / verifymessage RPC failures to a per-entry
+			// skip (return false -> continue, xbridgewalletconnectorbtc.cpp:669),
+			// not a whole-order failure.
+			xlog.Warn("order utxo proof skipped: gettxout failed", "txid", txid, "err", err)
+			continue
+		}
+		if !ok {
+			continue // output unknown or spent
+		}
+		// The entry's 20-byte raw address is the P2PKH hash (XBridge funding
+		// proofs are p2pkh signmessage); re-encode to the coin's string form.
+		a := coins.Address{Coin: c, Kind: coins.P2PKH, Prefix: c.P2PKH, Hash: e.RawAddress[:]}
+		address := a.String()
+		if address == "" {
+			continue
+		}
+		ok, err = conn.VerifyMessage(address, e.Signature[:], utxoChallenge(txid, e.Vout, u.Value, address))
+		if err != nil {
+			xlog.Warn("order utxo proof skipped: verifymessage failed", "txid", txid, "err", err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		sum += u.Value
+		valid++
+	}
+	// C++ rejects when no valid entry survives, regardless of the required
+	// amount (utxoItems.empty(), xbridgesession.cpp:566-570).
+	return valid > 0 && sum*float64(coinScale) >= float64(required), nil
 }
 
 // logNetworkStatus emits a single aggregated snapshot of discovery health:

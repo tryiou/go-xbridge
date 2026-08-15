@@ -137,3 +137,10 @@ func (l *LocalConnector) SignMessage(address, message string) ([]byte, error) {
 func (l *LocalConnector) VerifyMessage(address string, sig []byte, message string) (bool, error) {
 	return false, errors.New("wallet: LocalConnector does not support verifymessage")
 }
+
+// GetTxOut has no local blockchain source: a local-only connector cannot fetch
+// an arbitrary output's chain data. The inbound-proof verifier treats the
+// unsupported result as "cannot judge" (fails the verification).
+func (l *LocalConnector) GetTxOut(txid string, vout uint32) (Utxo, bool, error) {
+	return Utxo{}, false, ErrNoChainSource
+}

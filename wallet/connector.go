@@ -162,4 +162,12 @@ type Connector interface {
 	// VerifyMessage checks a BIP137 proof (address, sig, message) against this
 	// wallet's chain. Used by the taker to validate the maker's UTXO proofs.
 	VerifyMessage(address string, sig []byte, message string) (bool, error)
+	// GetTxOut fetches an unspent output's chain data (whole-coin value in
+	// Value, display-order TxID/Vout) via gettxout, mirroring C++
+	// rpc::gettxout (xbridgewalletconnectorbtc.cpp:659-712). ok=false when the
+	// output is unknown or spent (gettxout result null / RPC error), which the
+	// inbound-proof verifier treats as "the entry cannot hold". Used to validate
+	// counterparty order UTXOs before booking (C++ processTransaction,
+	// xbridgesession.cpp:535-575).
+	GetTxOut(txid string, vout uint32) (Utxo, bool, error)
 }

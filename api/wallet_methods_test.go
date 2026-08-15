@@ -41,6 +41,9 @@ type stubConn struct {
 	// getNewAddrErr, when set, makes GetNewAddress fail (dxGetNewTokenAddress
 	// empty-array case, RPC-F55).
 	getNewAddrErr error
+	// verifyFail, when set, makes VerifyMessage reject every proof (forged
+	// inbound-order proof tests, SEC-F02).
+	verifyFail bool
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -102,7 +105,19 @@ func (s *stubConn) SignMessage(address, message string) ([]byte, error) {
 	}, nil
 }
 func (s *stubConn) VerifyMessage(address string, sig []byte, message string) (bool, error) {
+	if s.verifyFail {
+		return false, nil
+	}
 	return len(sig) == 65, nil
+}
+
+func (s *stubConn) GetTxOut(txid string, vout uint32) (wallet.Utxo, bool, error) {
+	for _, u := range s.utxos {
+		if u.TxID == txid && u.Vout == vout {
+			return u, true, nil
+		}
+	}
+	return wallet.Utxo{}, false, nil
 }
 
 // valid BTC P2PKH address (prefix 0x00), used as both destination and change.

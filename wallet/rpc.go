@@ -506,6 +506,38 @@ func (c *RPCConnector) getTxOutConfirmations(txid string, vout uint32) (confs in
 	return *out.Confirmations, true
 }
 
+// GetTxOut fetches an unspent output's chain data via gettxout (mirroring C++
+// rpc::gettxout, xbridgewalletconnectorbtc.cpp:659-712: the whole-coin "value",
+// plus confirmations). ok=false when the output is unknown/spent or the RPC
+// errors — the inbound-proof verifier treats that as "the entry cannot hold".
+// The address, when the wallet reports one, rides along for diagnostics; the
+// verifier uses the entry's own decoded address for the challenge.
+func (c *RPCConnector) GetTxOut(txid string, vout uint32) (Utxo, bool, error) {
+	var out struct {
+		Confirmations *int     `json:"confirmations"`
+		Value         *float64 `json:"value"`
+		ScriptPubKey  struct {
+			Addresses []string `json:"addresses"`
+		} `json:"scriptPubKey"`
+	}
+	if err := c.cli.Call("gettxout", []interface{}{txid, vout}, &out); err != nil {
+		// C++ rpc::gettxout also maps an RPC failure to false (the caller
+		// skips the entry); the error is surfaced for the caller's log.
+		return Utxo{}, false, err
+	}
+	if out.Value == nil {
+		return Utxo{}, false, nil
+	}
+	u := Utxo{TxID: txid, Vout: vout, Value: *out.Value}
+	if out.Confirmations != nil {
+		u.Confirmations = *out.Confirmations
+	}
+	if len(out.ScriptPubKey.Addresses) > 0 {
+		u.Address = out.ScriptPubKey.Addresses[0]
+	}
+	return u, true, nil
+}
+
 // CheckDepositTransaction validates a counterparty deposit against the expected
 // p2sh script and amount. It is a 1:1 port of
 // BtcWalletConnector::checkDepositTransaction (xbridgewalletconnectorbtc.cpp:

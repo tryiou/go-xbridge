@@ -375,6 +375,20 @@ func (f *fakeConnector) VerifyMessage(address string, sig []byte, message string
 	return len(sig) == 65, nil
 }
 
+// GetTxOut reports the fixture funding set: a txid:vout matching the funding or
+// funders utxo returns it (whole-coin Value) as the chain does; anything else
+// is unknown/spent.
+func (f *fakeConnector) GetTxOut(txid string, vout uint32) (wallet.Utxo, bool, error) {
+	cands := []wallet.Utxo{f.funding}
+	cands = append(cands, f.funders...)
+	for _, u := range cands {
+		if u.TxID == txid && u.Vout == vout {
+			return u, true, nil
+		}
+	}
+	return wallet.Utxo{}, false, nil
+}
+
 var errNotFound = errorString("not found")
 
 type errorString string
