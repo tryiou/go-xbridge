@@ -638,7 +638,7 @@ Every finding was double-checked by a verification subagent that re-traced the f
 
 ### INV-F98 · S4 · DOC · `docs/protocol.md` says order `Created` is unix seconds; the wire carries microseconds
 - REF: `total_microseconds()` (`xutil.cpp:280`) — µs in the wire body and envelope timestamp.
-- CAND: `docs/protocol.md:366` — says seconds; Go code correctly passes through µs (`store.go:517-519`).
+- CAND: `docs/protocol.md:395` (§4.2 notes) — said seconds; Go code correctly passes through µs (`store.go:517-519`).
 - IMPACT: documentation-only; a reader would build a wrong encoder.
 - FIX: correct the doc.
 

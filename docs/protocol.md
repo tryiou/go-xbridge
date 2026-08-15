@@ -392,7 +392,11 @@ Notes:
   includes it (`:3666`). Go's `Marshal` always writes it (`proto/body_types.go:204`)
   but Go only receives cmd 4, never sends it, so readers tolerate its absence
   (`proto/body_types.go:255-262`).
-- **`Created`** (3, 4) is the order creation time (unix seconds).
+- **`Created`** (3, 4) is the order creation time in **microseconds since the
+  Unix epoch** — the wire writers use `total_microseconds()` (`xutil.cpp:280`),
+  and Go passes the u64 through unchanged (`api/store.go` `NowMicro`), so an
+  encoder must emit µs, not seconds. (The 8-byte P2P *envelope* timestamp is
+  also µs; only the packet *header* `timestamp` is seconds — §2.1.)
 - `xbcXChatMessage` (2) carries a raw serialized Bitcoin P2P message as its
   entire body (no inner structure); `xbcServicesPing` (50) is a sequence of
   null-terminated service-name strings (typed in Go but no C++ live writer — see
