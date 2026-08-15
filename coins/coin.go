@@ -277,6 +277,21 @@ func Has(ticker string) bool {
 	return ok
 }
 
+// Snapshot returns a consistent copy of the whole registry under a single
+// atomic load, so a caller that needs several coins at once sees a mutually
+// consistent set. Use this rather than repeated Get calls:
+// two Gets straddling a dxLoadXBridgeConf Store could observe a mixed set
+// (e.g. one currency from the old registry and one from the new), whereas one
+// Snapshot never can. The returned Coin values are immutable copies.
+func Snapshot() map[string]Coin {
+	m := *registry.Load()
+	out := make(map[string]Coin, len(m))
+	for t, c := range m {
+		out[t] = c
+	}
+	return out
+}
+
 func normalizeTicker(t string) string {
 	out := make([]byte, 0, len(t))
 	for i := 0; i < len(t); i++ {

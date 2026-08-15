@@ -298,17 +298,19 @@ type swapCtx struct {
 	refundHex        string
 
 	// connectors / confs are shallow snapshots of the live config taken at
-	// enqueue time (CONC-F94). A dxLoadXBridgeConf or the 30s wallet sweep
-	// swaps n.config with NEW connector/confs objects; the worker task must
-	// build against the set that was current when the swap started — the C++
-	// session holds the connector pointer it captured, so a mid-task reload
-	// cannot swap which wallet a deposit/claim is built against. Interfaces and
-	// config pointers are immutable references, so holding them is race-free.
-	// (The coin registry is resolved at build time via the atomic
-	// coins.Get(cur); a reload that drops a coin mid-task would fail that
-	// build with a clean "unknown coin" error rather than redirect it.)
+	// enqueue time; coinsMap is a value copy of the coin registry's entries
+	// for this session's two currencies, taken under one atomic load
+	// (CONC-F94). A dxLoadXBridgeConf or the 30s wallet sweep swaps n.config
+	// with NEW connector/confs objects and re-publishes the coin registry; the
+	// worker task must build against the set that was current when the swap
+	// started — the C++ session holds the connector pointer it captured, so a
+	// mid-task reload cannot swap which wallet a deposit/claim is built
+	// against, nor the coin parameters (decimals/prefix/codec) the transaction
+	// is built with. Interfaces, config pointers, and Coin values are
+	// immutable, so holding them is race-free.
 	connectors map[string]wallet.Connector
 	confs      map[string]*config.CoinConf
+	coinsMap   map[string]coins.Coin
 
 	// ourDepositP2SH is the exact value of OUR deposit's P2SH output as built by
 	// BuildDepositTx (Amount+fee2, output 0). buildRefundTx commits it to the
@@ -340,6 +342,14 @@ func (s *SwapSession) snapshot() swapCtx {
 			confs[t] = c
 		}
 	}
+	coinsMap := make(map[string]coins.Coin, 2)
+	snap := coins.Snapshot()
+	if src, ok := snap[s.srcCur]; ok {
+		coinsMap[s.srcCur] = src
+	}
+	if dst, ok := snap[s.dstCur]; ok {
+		coinsMap[s.dstCur] = dst
+	}
 	return swapCtx{
 		n:                s.n,
 		id:               s.id,
@@ -367,6 +377,7 @@ func (s *SwapSession) snapshot() swapCtx {
 		refundHex:        s.refundHex,
 		connectors:       connectors,
 		confs:            confs,
+		coinsMap:         coinsMap,
 		funding:          s.n.orderFunding(s.id),
 	}
 }
@@ -1456,7 +1467,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if conn == nil {
 		return depositOutcome{}, fmt.Errorf("api: no connector for %s", cur)
 	}
-	coin, ok := coins.Get(cur)
+	coin, ok := c.coin(cur)
 	if !ok {
 		return depositOutcome{}, fmt.Errorf("api: unknown coin %s", cur)
 	}
@@ -1567,7 +1578,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 // our source address, spendable only after the deposit's lockTime. Runs on a
 // worker in the two-phase handshake (reads only this snapshot + config).
 func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, error) {
-	coin, ok := coins.Get(cur)
+	coin, ok := c.coin(cur)
 	if !ok {
 		return "", fmt.Errorf("api: unknown coin %s", cur)
 	}
@@ -1623,7 +1634,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 // handshake (reads only this snapshot + config); ConfirmB sets c.secret to the
 // recovered preimage before calling.
 func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, err error) {
-	depositCoin, ok := coins.Get(c.dstCur)
+	depositCoin, ok := c.coin(c.dstCur)
 	if !ok {
 		return "", "", fmt.Errorf("api: unknown coin %s", c.dstCur)
 	}
@@ -1697,7 +1708,7 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 
 // destScript returns the P2PKH output script for addr on cur.
 func (c *swapCtx) destScript(cur, addrStr string) ([]byte, error) {
-	coin, ok := coins.Get(cur)
+	coin, ok := c.coin(cur)
 	if !ok {
 		return nil, fmt.Errorf("api: unknown coin %s", cur)
 	}
@@ -1726,6 +1737,20 @@ func (c *swapCtx) conf(cur string) *config.CoinConf {
 		return c.confs[cur]
 	}
 	return nil
+}
+
+// coin returns the coin value for cur from this task's snapshot (CONC-F94), so
+// a mid-task reload cannot change the decimals/prefix/codec a deposit, refund,
+// or claim is built with — the C++ session holds the coin parameters it
+// captured at task start. The snapshot covers the session's own two currencies
+// (srcCur/dstCur); anything else reports not-found, mirroring the live
+// registry's unknown-coin semantics.
+func (c *swapCtx) coin(cur string) (coins.Coin, bool) {
+	if c.coinsMap == nil {
+		return coins.Coin{}, false
+	}
+	coin, ok := c.coinsMap[cur]
+	return coin, ok
 }
 
 // txVersion returns the per-coin transaction version to stamp on the deposit,

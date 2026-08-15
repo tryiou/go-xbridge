@@ -183,3 +183,36 @@ func TestConcurrentInitFromConfGet(t *testing.T) {
 		t.Fatalf("BTC lost from registry after reloads: ok=%v", ok)
 	}
 }
+
+// TestSnapshot proves Snapshot returns the whole registry under one atomic
+// load and reflects a subsequent reload as a single consistent set.
+func TestSnapshot(t *testing.T) {
+	saved := registry.Load()
+	defer registry.Store(saved)
+
+	base := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC"},
+	}
+	if err := InitFromConf(base); err != nil {
+		t.Fatal(err)
+	}
+	snap := Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("Snapshot after init = %d coins, want 1", len(snap))
+	}
+	if c, ok := snap["BTC"]; !ok || c.P2PKH != 0 {
+		t.Fatalf("Snapshot missing/partial BTC: ok=%v p2pkh=%d", ok, c.P2PKH)
+	}
+	ltc := map[string]*config.CoinConf{}
+	for k, v := range base {
+		ltc[k] = v
+	}
+	ltc["LTC"] = &config.CoinConf{Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC"}
+	if err := InitFromConf(ltc); err != nil {
+		t.Fatal(err)
+	}
+	snap = Snapshot()
+	if len(snap) != 2 || snap["BTC"].P2PKH != 0 || snap["LTC"].P2PKH != 48 {
+		t.Fatalf("Snapshot after adding LTC = %+v", snap)
+	}
+}
