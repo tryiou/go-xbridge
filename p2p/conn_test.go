@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -202,6 +203,50 @@ func TestHandshakeTimeout(t *testing.T) {
 	}
 }
 
+// TestHandshakeStallTimesOut locks the handshake READ bound: a peer that sends
+// its version message but then never sends verack must fail the handshake
+// within handshakeTimeout — NOT be left open for idleReadTimeout. This guards
+// the readMessage deadline re-arm (which is gated on handshaken) against
+// overriding handshake()'s own shorter read deadline mid-exchange.
+func TestHandshakeStallTimesOut(t *testing.T) {
+	// Shorten the handshake window so the test does not wait 60 seconds.
+	oldH := handshakeTimeout
+	handshakeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { handshakeTimeout = oldH })
+	// The idle window must be far larger than the handshake window (100×),
+	// proving the stall is bounded by the handshake deadline, not the idle
+	// deadline — while still small enough that a gating regression fails fast
+	// in CI rather than hanging for the full idle window.
+	oldI := idleReadTimeout
+	idleReadTimeout = 10 * time.Second
+	t.Cleanup(func() { idleReadTimeout = oldI })
+
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+	go func() {
+		if _, err := readFrame(server); err != nil { // our version
+			return
+		}
+		v := versionPayloadForTest(BitcoinProtocolVersion)
+		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
+		// Read our verack so the client's write succeeds, then never send our
+		// own verack: the client blocks reading it until the handshake deadline
+		// fires. (Without this read, the client would fail on its verack WRITE
+		// deadline instead, not exercising the read bound this test guards.)
+		_, _ = readFrame(server) // our verack
+	}()
+
+	start := time.Now()
+	_, err := NewConn(client, MainnetMagic)
+	if err == nil {
+		t.Fatal("expected handshake to fail for a peer that never sends verack")
+	}
+	if elapsed := time.Since(start); elapsed >= idleReadTimeout {
+		t.Fatalf("handshake took %v — the stall was bounded by idleReadTimeout, not handshakeTimeout", elapsed)
+	}
+}
+
 // TestConnReadPacketVersionGate asserts ReadPacket rejects an inbound packet
 // whose header version differs from XBRIDGE_PROTOCOL_VERSION, mirroring the
 // C++ gate (xbridgesession.cpp:343-368, xbridgeapp.cpp:648,737). The wrong-
@@ -248,5 +293,47 @@ func TestConnReadPacketVersionGate(t *testing.T) {
 	}
 	if pkt.Version != proto.ProtocolVersion {
 		t.Fatalf("packet version = %d, want %d", pkt.Version, proto.ProtocolVersion)
+	}
+}
+
+// TestConnIdleReadTimeout verifies the post-handshake slowloris guard: a peer
+// that completes the handshake and then goes silent must surface a read
+// timeout (C++ disconnects on TIMEOUT_INTERVAL idle, net.h:45 / net.cpp:1068).
+// The deadline is re-armed per frame, so this is an IDLE timeout, not a
+// total-connection bound.
+func TestConnIdleReadTimeout(t *testing.T) {
+	// Shorten the idle window so the test does not wait 20 minutes.
+	old := idleReadTimeout
+	idleReadTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { idleReadTimeout = old })
+
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	go func() {
+		if _, err := readFrame(server); err != nil { // our version
+			return
+		}
+		v := versionPayloadForTest(BitcoinProtocolVersion)
+		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
+		if _, err := readFrame(server); err != nil { // our verack
+			return
+		}
+		writeFrame(server, Message{Magic: MainnetMagic, Command: "verack", Checksum: Checksum(nil)})
+		// Handshake complete; say nothing more. ReadPacket must time out.
+	}()
+
+	conn, err := NewConn(client, MainnetMagic)
+	if err != nil {
+		t.Fatalf("handshake failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, _, err = conn.ReadPacket()
+	if err == nil {
+		t.Fatal("expected idle read timeout after silent handshake")
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("ReadPacket err = %v, want a timeout", err)
 	}
 }

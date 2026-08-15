@@ -62,8 +62,7 @@ func main() {
 	}
 
 	deadline := time.Now().Add(*listen)
-	_ = c.NetConn().SetReadDeadline(deadline)
-	fmt.Printf("reading raw messages for up to %s (xbridge command = %q)…\n", *listen, p2p.XBridgeNetCommand)
+	fmt.Printf("reading raw messages for up to %s (xbridge command = %q; a silent peer is bounded by the p2p idle read timeout)…\n", *listen, p2p.XBridgeNetCommand)
 	var dumpF *os.File
 	if *dump != "" {
 		var derr error

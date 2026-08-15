@@ -3,6 +3,8 @@ package api
 import (
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -10,6 +12,15 @@ import (
 	"go-xbridge/p2p"
 	"go-xbridge/proto"
 )
+
+// isReadTimeout reports whether err is a network timeout — the idle read
+// deadline the p2p layer re-arms per frame (p2p idleReadTimeout, mirroring
+// C++ TIMEOUT_INTERVAL, net.h:45 / net.cpp:1068). It matches both the wrapped
+// os.ErrDeadlineExceeded and the net.Error.Timeout() form.
+func isReadTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
 
 // engineWorkers is the size of the wallet-RPC worker pool. Refund sweeps (and,
 // from stage 4, the deposit/claim two-phase handshake) offload wallet I/O here
@@ -146,6 +157,14 @@ func (n *Node) readerLoop() {
 					return
 				}
 				xlog.Warn("hub misbehaving", "peer", peer, "score", hubScore, "err", err)
+			} else if isReadTimeout(err) {
+				// Idle read deadline (p2p idleReadTimeout, mirroring C++
+				// TIMEOUT_INTERVAL disconnect, net.cpp:1068): the hub went
+				// silent. Close the connection instead of retrying forever —
+				// a permanent stall would otherwise spin this loop.
+				xlog.Warn("hub idle timeout, disconnecting", "peer", peer, "err", err)
+				_ = n.conn.Close()
+				return
 			} else if !errors.Is(err, lastErr) {
 				xlog.Debug("peer read failed", "peer", peer, "err", err)
 				lastErr = err

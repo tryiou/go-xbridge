@@ -144,6 +144,14 @@ The handshake sends `version`, then reads until it has seen both the peer's
 messages are ignored. A 60 s deadline bounds the exchange (C++
 `DEFAULT_PEER_CONNECT_TIMEOUT`, `net.h:83`).
 
+After the handshake, each frame read is bounded by a 20 min idle deadline
+(`p2p idleReadTimeout`, mirroring C++ `TIMEOUT_INTERVAL` and the `nLastRecv`
+disconnect, `net.h:45` / `net.cpp:1068`); the deadline is re-armed per complete
+frame, so it is an idle timeout since the last frame, not a total-connection
+bound. A peer that goes silent is disconnected (the direct hub path closes the
+connection in `api`'s `readerLoop`; discovery peers are dropped and re-dialed
+by the `PeerManager`).
+
 #### 1.3.1 `net_addr` / CAddress layout
 
 Each `version`-message addr field is the legacy 26-byte CAddress:

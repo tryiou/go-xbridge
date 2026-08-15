@@ -43,7 +43,16 @@ var dialDedup = xlog.NewDedupe(60*time.Second, func(addr string, total int, elap
 // handshakeTimeout bounds the version/verack exchange so a misbehaving peer
 // cannot hang Dial indefinitely. It mirrors C++ DEFAULT_PEER_CONNECT_TIMEOUT =
 // 60 s (net.h:83), the deadline C++ gives a peer to send its first message.
-const handshakeTimeout = 60 * time.Second
+var handshakeTimeout = 60 * time.Second
+
+// idleReadTimeout bounds a single frame read AFTER the handshake: a peer that
+// completes the version/verack exchange and then stops sending would otherwise
+// pin the reader goroutine forever (slowloris). C++ disconnects a peer that
+// goes silent for TIMEOUT_INTERVAL = 20 min (net.h:45, the nLastRecv check at
+// net.cpp:1068); the deadline here is re-armed per frame, so it is an IDLE
+// timeout (20 min since the last complete frame), not a total-connection bound.
+// A var (not a const) so tests can shorten it.
+var idleReadTimeout = 20 * time.Minute
 
 // Conn is a thin XBridge peer connection over the Bitcoin P2P transport.
 // It performs the version/verack handshake and streams decoded XBridge packets.
@@ -446,6 +455,16 @@ func (c *Conn) WritePacket(p *proto.Packet, dest [20]byte) error {
 
 func (c *Conn) readMessage() (*Message, error) {
 	for {
+		// Post-handshake only: re-arm the idle read deadline per frame, so a
+		// peer that stops sending times out after idleReadTimeout (C++
+		// TIMEOUT_INTERVAL, net.h:45 / net.cpp:1068). During the handshake this
+		// must NOT touch the deadline — handshake() sets its own 60 s bound
+		// (handshakeTimeout), and overriding it here would widen the handshake
+		// slowloris window 20x. handshaken is set at the end of handshake();
+		// reads are single-goroutine, so the load is race-free.
+		if c.handshaken.Load() {
+			_ = c.netConn.SetReadDeadline(time.Now().Add(idleReadTimeout))
+		}
 		hdr := make([]byte, 4+cmdSize+8)
 		if _, err := io.ReadFull(c.reader, hdr); err != nil {
 			return nil, err
@@ -476,6 +495,12 @@ func (c *Conn) readMessage() (*Message, error) {
 			// (net_processing.cpp:3117-3121).
 			return nil, errors.New("p2p: unexpected network magic")
 		}
+		// Clear the frame deadline once a complete message arrived, so a
+		// subsequent frame re-arms it fresh. Only meaningful post-handshake;
+		// during the handshake the caller owns the deadline.
+		if c.handshaken.Load() {
+			_ = c.netConn.SetReadDeadline(time.Time{})
+		}
 		return msg, nil
 	}
 }
@@ -484,7 +509,12 @@ func (c *Conn) readMessage() (*Message, error) {
 // the handshake, or nil if it was not seen/parsed.
 func (c *Conn) PeerVersion() *VersionMessage { return c.peerVersion }
 
-// NetConn returns the underlying TCP connection (e.g. to set a read deadline).
+// NetConn returns the underlying TCP connection. The p2p layer owns the socket
+// deadlines: handshake() sets the 60 s exchange deadline, and readMessage
+// re-arms a per-frame read deadline afterward (idleReadTimeout, mirroring C++
+// TIMEOUT_INTERVAL, net.h:45). Caller-set deadlines on the returned conn are
+// overwritten/cleared and must not be relied on — use NetConn for socket-level
+// inspection (e.g. RemoteAddr), not for read deadlines.
 func (c *Conn) NetConn() net.Conn { return c.netConn }
 
 // ReadMessage reads the next raw P2P message (any command), skipping nothing.
