@@ -1,7 +1,7 @@
 # B8 — State-machinery (STATE-F72–F75, STATE-F79, SEC-F02)
 
 Branch: `fix/state-machinery` (off `main` @ B10 merge `b3a29af`).
-Status: MERGED into `main` @ `<merge-commit-hash>` (fast-forward).
+Status: MERGED into `main` @ `2f48c98` (fast-forward).
 C++ reference: Blocknet Core @ `e9ddbc2bd` (v4.4.1 era).
 Go subject: `api/engine.go`, `api/store.go`, `api/node.go`, `api/swap.go`,
 `api/order.go`, `api/persist.go`, `api/response.go`, `api/cancel_reason.go`,
