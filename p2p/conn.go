@@ -111,8 +111,10 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 
 // DialContext is the context-aware dial used by the discovery PeerManager: the
 // dial aborts the moment ctx is cancelled (Close), so an in-flight connect is
-// interrupted immediately instead of running out its timeout. The handshake
-// itself is bounded by handshakeTimeout inside NewConn.
+// interrupted immediately instead of running out its timeout. The version
+// handshake is bounded by handshakeTimeout inside NewConn and aborts on ctx
+// cancellation via NewConnCtx, so a peer that stalls the handshake cannot hold
+// a manager Close past the cancellation.
 func DialContext(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	nc, err := d.DialContext(ctx, "tcp", addr)
@@ -122,7 +124,7 @@ func DialContext(ctx context.Context, addr string, magic [4]byte, timeout time.D
 		}
 		return nil, err
 	}
-	return NewConn(nc, magic)
+	return NewConnCtx(ctx, nc, magic)
 }
 
 // NewConn completes the handshake over an already-established transport (e.g. a
@@ -142,6 +144,48 @@ func NewConn(nc net.Conn, magic [4]byte) (*Conn, error) {
 		xlog.Debug("handshake failed", "addr", nc.RemoteAddr().String(), "err", err)
 		nc.Close()
 		return nil, err
+	}
+	return c, nil
+}
+
+// NewConnCtx is like NewConn, but aborts the version/verack handshake the
+// moment ctx is cancelled: it closes nc, unblocking the handshake's blocking
+// read/write on the underlying net.Conn, and returns ctx.Err(). DialContext
+// uses it so a discovery PeerManager shutdown interrupts an in-flight handshake
+// instead of waiting out handshakeTimeout; C++ joins its connect threads on
+// shutdown, so a peer that accepts TCP but never speaks cannot wedge the join.
+// The canceller goroutine is joined before returning, so nothing leaks, and a
+// handshake that completes concurrently with a cancel is torn down rather than
+// handed to a caller that is closing the peer.
+func NewConnCtx(ctx context.Context, nc net.Conn, magic [4]byte) (*Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			nc.Close()
+		case <-stop:
+		}
+	}()
+	c, err := NewConn(nc, magic)
+	close(stop)
+	<-done
+	if err != nil {
+		// The close that unblocked the handshake usually surfaces as a raw net
+		// error; when the context is the cause, report the cancellation the
+		// caller can act on (the manager is closing the peer either way).
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		c.Close()
+		return nil, ctx.Err()
 	}
 	return c, nil
 }

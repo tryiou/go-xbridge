@@ -598,10 +598,11 @@ func (m *PeerManager) liveCount() int {
 // connections, and joins every goroutine (maintain, connectOne, per-peer
 // readLoop) before returning, mirroring C++'s join_all on shutdown
 // (xbridgeapp.cpp:530-544). The dial phase is cancelled immediately via the
-// manager context; a peer that accepts TCP but stalls the version handshake can
-// hold the join up to handshakeTimeout (60s, bounded and non-additive — peers
-// proceed concurrently). Safe to call multiple times. Start must not be called
-// concurrently with Close.
+// manager context, and p2p.DialContext aborts an in-flight version handshake
+// on that cancellation (NewConnCtx), so even a peer that accepts TCP but
+// stalls the version exchange cannot hold the join past the cancellation
+// (holds for the default Dialer). Safe to call multiple times. Start must not
+// be called concurrently with Close.
 func (m *PeerManager) Close() error {
 	m.once.Do(func() {
 		m.cancel()
