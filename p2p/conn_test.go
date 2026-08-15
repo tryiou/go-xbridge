@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"go-xbridge/proto"
 )
 
 // versionPayloadForTest marshals a minimal version payload with the given
@@ -197,5 +199,54 @@ func TestConnDuplicateVersion(t *testing.T) {
 func TestHandshakeTimeout(t *testing.T) {
 	if handshakeTimeout != 60*time.Second {
 		t.Fatalf("handshakeTimeout = %v, want 60s (C++ DEFAULT_PEER_CONNECT_TIMEOUT)", handshakeTimeout)
+	}
+}
+
+// TestConnReadPacketVersionGate asserts ReadPacket rejects an inbound packet
+// whose header version differs from XBRIDGE_PROTOCOL_VERSION, mirroring the
+// C++ gate (xbridgesession.cpp:343-368, xbridgeapp.cpp:648,737). The wrong-
+// version packet is dropped and the connection stays usable for the next
+// (conforming) packet.
+func TestConnReadPacketVersionGate(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		if _, err := readFrame(server); err != nil { // our version
+			return
+		}
+		v := versionPayloadForTest(BitcoinProtocolVersion)
+		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
+		if _, err := readFrame(server); err != nil { // our verack
+			return
+		}
+		writeFrame(server, Message{Magic: MainnetMagic, Command: "verack", Checksum: Checksum(nil)})
+		// A wrong-version packet (54) first: the gate must drop it.
+		bad := &proto.Packet{
+			Version: 54,
+			Command: proto.XbcTransaction,
+		}
+		badPayload := encodeXBridgePayload(bad.Marshal(), [20]byte{})
+		writeFrame(server, Message{Magic: MainnetMagic, Command: XBridgeNetCommand, Payload: badPayload, Checksum: Checksum(badPayload)})
+		// Then a conforming packet that must still be readable.
+		good := proto.NewPacket(proto.XbcTransaction, nil)
+		goodPayload := encodeXBridgePayload(good.Marshal(), [20]byte{})
+		writeFrame(server, Message{Magic: MainnetMagic, Command: XBridgeNetCommand, Payload: goodPayload, Checksum: Checksum(goodPayload)})
+	}()
+
+	conn, err := NewConn(client, MainnetMagic)
+	if err != nil {
+		t.Fatalf("handshake failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, _, err := conn.ReadPacket(); err == nil {
+		t.Fatal("expected wrong-version packet to be dropped")
+	}
+	pkt, _, err := conn.ReadPacket()
+	if err != nil {
+		t.Fatalf("conforming packet after the dropped one: %v", err)
+	}
+	if pkt.Version != proto.ProtocolVersion {
+		t.Fatalf("packet version = %d, want %d", pkt.Version, proto.ProtocolVersion)
 	}
 }

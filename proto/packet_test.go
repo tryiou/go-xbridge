@@ -69,3 +69,40 @@ func TestUnmarshalTrailingBytes(t *testing.T) {
 		t.Fatalf("body = %x, want %x", p.Body, body)
 	}
 }
+
+// TestUnmarshalRejectsWrongVersion locks in the inbound protocol-version gate:
+// C++ drops any packet whose header version differs from
+// XBRIDGE_PROTOCOL_VERSION before parsing the body or verifying the signature
+// (Session::checkXBridgePacketVersion, xbridgesession.cpp:343-368, called from
+// App::onMessageReceived/onBroadcastReceived, xbridgeapp.cpp:648,737). The
+// wrong-version packet is rejected with the version error even when its
+// declared body is otherwise oversized, proving the gate fires before body
+// validation.
+func TestUnmarshalRejectsWrongVersion(t *testing.T) {
+	for _, ver := range []uint32{0, 54, 56, 0xFFFFFFFF} {
+		buf := make([]byte, HeaderSize)
+		binary.LittleEndian.PutUint32(buf[offVersion:], ver)
+		binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
+		if _, err := Unmarshal(buf); err == nil {
+			t.Fatalf("version %d: expected error, got parsed packet", ver)
+		}
+	}
+
+	// A wrong-version packet with an absurd declared body must report the
+	// version mismatch, not the body-size error: the gate runs first.
+	buf := make([]byte, HeaderSize)
+	binary.LittleEndian.PutUint32(buf[offVersion:], 54)
+	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
+	binary.LittleEndian.PutUint32(buf[offSize:], MaxBodySize+1)
+	if _, err := Unmarshal(buf); err == nil || err.Error() != "xbridge: unsupported protocol version" {
+		t.Fatalf("wrong-version oversized-body: err = %v, want unsupported protocol version", err)
+	}
+
+	// Control: a matching-version packet still parses.
+	buf = make([]byte, HeaderSize)
+	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
+	if _, err := Unmarshal(buf); err != nil {
+		t.Fatalf("protocol version %d: %v", ProtocolVersion, err)
+	}
+}
