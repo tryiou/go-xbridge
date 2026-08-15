@@ -106,7 +106,7 @@ func Load(path string) (*Conf, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: cannot open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	parsed, err := parseINI(f)
 	if err != nil {
@@ -218,18 +218,6 @@ func (s section) uintp(key string, def uint64) uint64 {
 		return def
 	}
 	return n
-}
-
-func (s section) floatp(key string, def float64) float64 {
-	v, ok := s.get(key)
-	if !ok || v == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-	if err != nil {
-		return def
-	}
-	return f
 }
 
 func (s section) boolp(key string) bool {

@@ -116,7 +116,7 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 		xlog.Error("rpc transport failed", "coin", c.ticker, "method", method, "url", c.url, "err", err)
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		xlog.Error("rpc read failed", "coin", c.ticker, "method", method, "err", err)

@@ -465,7 +465,7 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 	// (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified against it — a
 	// forged Finished can never disable the refund watcher. An order without a
 	// known SNodePubkey cannot be authenticated and stays unpinned, causing
-	// dispatchSwap to drop all hub packets for it.
+	// processSwap to drop all hub packets for it.
 	s.hubKey = decodePub33(o.SNodePubkey)
 	s.hub = o.HubAddress
 	n.sessions[hexEncode(o.ID[:])] = s
@@ -1309,13 +1309,6 @@ func (n *Node) pruneSessions() {
 	}
 }
 
-// checkRefunds is the public entry point for the refund sweep. The engine
-// ticker drives scanRefunds directly; this wrapper exists for tests and
-// external callers and routes through submit so production stays engine-owned.
-func (n *Node) checkRefunds() {
-	n.submit(n.scanRefunds, false)
-}
-
 // enqueueRefund schedules a fund-recovery refund broadcast for orderID: the
 // live session's pre-signed refund when present, else the order's stored refund
 // hex (the escape-hatch fallback, trying each deposit chain). Fire-and-forget
@@ -1407,14 +1400,6 @@ func (n *Node) BroadcastRefund(orderID string) (string, error) {
 // ---------------------------------------------------------------------------
 // Deposit / claim / refund construction
 // ---------------------------------------------------------------------------
-
-// computeLockTime returns the absolute block height for OUR deposit on srcCur
-// (mirrors C++: currentBlock + target/blockTime). See computeLockTimeFor for the
-// general form used to validate a counterparty's lockTime on THEIR coin. It
-// delegates to a swapCtx snapshot, keeping the logic in the worker-safe type.
-func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
-	return s.snapshot().computeLockTimeFor(s.srcCur, isMaker)
-}
 
 // computeLockTimeFor returns the absolute block height to embed in the deposit
 // HTLC for a given coin (mirrors C++ lockTime(): currentBlock + target/blockTime).

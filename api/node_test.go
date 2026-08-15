@@ -124,11 +124,11 @@ func (c *captureXConn) snapshotDests() [][20]byte {
 }
 
 // TestDispatchSwapSignsOutbound closes the untested outbound boundary: a hub
-// packet dispatched through dispatchSwap must produce exactly one signed
+// packet dispatched through processSwap must produce exactly one signed
 // outbound packet, with the right command, whose signature verifies with our
 // public key. This proves the trust boundary writes what the C++ hub expects.
 func TestDispatchSwapSignsOutbound(t *testing.T) {
-	coins.InitFromConf(map[string]*config.CoinConf{
+	_ = coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 
@@ -189,7 +189,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	}
 
 	// OnHold drives the maker's response to a hub xbcTransactionHold.
-	n.dispatchSwap(hubPkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	n.processSwap(hubPkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		return s.OnHold(&proto.HoldBody{HubAddress: coins.KeyID(hubPub[:]), ID: id, FromAmount: 2e8, ToAmount: 1e8})
 	})
 
@@ -220,7 +220,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 // 20-byte id; unknown coins and malformed addresses surface as *rpcError (no
 // silent default, no panic).
 func TestDecodeAddr(t *testing.T) {
-	coins.InitFromConf(map[string]*config.CoinConf{
+	_ = coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 
@@ -301,7 +301,7 @@ func TestRemoteCancelObservedOpen(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	if n.store.Get(idHex) != nil {
 		t.Fatal("observed open order should have been removed from live store")
@@ -327,7 +327,7 @@ func TestRemoteCancelLocalOpenRebroadcast(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	got := n.store.Get(idHex)
 	if got == nil {
@@ -355,7 +355,7 @@ func TestRemoteCancelCreatedDepositSent(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 2}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 2})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 2})
 
 	got := n.store.Get(idHex)
 	if got == nil {
@@ -383,7 +383,7 @@ func TestRemoteCancelAlreadyCanceled(t *testing.T) {
 	before := len(n.store.History())
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	if len(n.store.History()) != before {
 		t.Fatal("already-cancelled order must not produce a new history entry")
@@ -407,7 +407,7 @@ func TestRemoteCancelCreatedNoDeposit(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	got := n.store.Get(idHex)
 	if got == nil || got.Status != "canceled" {
@@ -429,7 +429,7 @@ func TestRemoteCancelCounterpartyRedeemed(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	if got := n.store.Get(idHex); got == nil || got.Status != "created" {
 		t.Fatal("counterparty-redeemed order must ignore cancel (stay 'created')")
@@ -449,7 +449,7 @@ func TestRemoteCancelCreatedNoRefund(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	if got := n.store.Get(idHex); got == nil || got.Status != "canceled" {
 		t.Fatal("created+no-refund order must become 'canceled'")
@@ -460,7 +460,7 @@ func TestRemoteCancelCreatedNoRefund(t *testing.T) {
 // branch: a cancel signed by one of the session's member keys triggers
 // sendCancelTransaction (a broadcast xbcTransactionCancel).
 func TestRemoteCancelExchangeBranch(t *testing.T) {
-	coins.InitFromConf(map[string]*config.CoinConf{
+	_ = coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 	mPriv := make([]byte, 32)
@@ -480,7 +480,7 @@ func TestRemoteCancelExchangeBranch(t *testing.T) {
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 3}).Marshal(), mPriv)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 3})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 3})
 
 	pkts := n.conn.(*captureXConn).snapshot()
 	if len(pkts) != 1 {
@@ -507,7 +507,7 @@ func TestRemoteRejectRestoresToPending(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 4}).Marshal(), snodePriv)
-	n.onRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 4})
+	n.handleRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 4})
 
 	got := n.store.Get(idHex)
 	if got == nil {
@@ -543,7 +543,7 @@ func TestRemoteRejectIgnoredForMaker(t *testing.T) {
 	n.store.Add(o)
 
 	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
-	n.onRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 1})
+	n.handleRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 1})
 
 	got := n.store.Get(idHex)
 	if got == nil || got.Status != "accepting" || got.Role != 'A' {
@@ -569,7 +569,7 @@ func TestRemoteCancelBadSignature(t *testing.T) {
 	before := len(n.store.History())
 
 	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), bad)
-	n.onRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	if len(n.store.History()) != before {
 		t.Fatal("bad-signature cancel must not produce a history entry")

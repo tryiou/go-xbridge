@@ -682,6 +682,9 @@ func TestCreateSigHashGolden(t *testing.T) {
 		sn.BestBlockHash[i] = 0x22
 	}
 
+	if got := serializeSigHashFields(sn); !bytes.Equal(got, b) {
+		t.Fatalf("serializeSigHashFields layout = %x, want hand-assembled %x", got, b)
+	}
 	if got := crypto.DoubleSHA256(serializeSigHashFields(sn)); got != want {
 		t.Fatalf("CreateSigHash = %x, want %x", got, want)
 	}

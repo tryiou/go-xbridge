@@ -27,9 +27,36 @@ Go scaffold.
 go build ./...          # build all packages
 go vet ./...            # static checks
 go test ./...           # unit tests
+golangci-lint run ./... # lint gate (.golangci.yml): errcheck, ineffassign,
+                        # staticcheck, unused
 ```
 
 Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
+
+The lint gate is wired into CI (`ci.yml` `lint` job, golangci-lint v2.11.4) and
+must stay green: **never** silence a finding with a blanket nolint or a
+`//nolint:staticcheck` without a per-site justification (the RIPEMD-160 import
+sites in `coins/htlc.go` and `swap/deposit.go` are the template — HASH160 is
+the on-chain/wire identifier hash, so a replacement would break parity).
+
+## Dead-code hygiene
+
+Dead code is enforced by the lint gate's `unused` linter and verified
+entry-point-scoped with `x/tools` deadcode:
+
+```bash
+go run golang.org/x/tools/cmd/deadcode@latest ./cmd/xbridged
+```
+
+`deadcode` is **entry-point-scoped**: it reports every symbol unreachable from
+the `xbridged` main, including legitimately-exported library surface (e.g.
+`wallet.LocalConnector`, `crypto.SignCompact`, the `log` logger API, the
+`coins` tx-verify helpers) that an embedding app or the test suite exercises.
+That is not dead code — only symbols with **no caller anywhere** (production or
+tests) should be deleted, and a deletion must also drop its documentation
+claims. The engine dispatch points (`processSwap`, `handleRemoteCancel`,
+`handleRemoteReject`, `scanRefunds`) are the production paths; off-engine
+callers marshal them onto the engine goroutine with `submit`.
 
 ## Hard rules
 

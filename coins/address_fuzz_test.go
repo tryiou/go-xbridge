@@ -10,7 +10,7 @@ func init() {
 	// Register a BTC coin so the fuzz target has a real address codec to
 	// exercise. Tests that call InitFromConf with their own set may replace the
 	// global registry; the target guards on a missing coin and returns safely.
-	InitFromConf(map[string]*config.CoinConf{
+	_ = InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 }

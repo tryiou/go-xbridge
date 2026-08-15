@@ -589,7 +589,9 @@ func TestDxGetOrderFillsRead(t *testing.T) {
 
 func TestDxGetLockedAndFlush(t *testing.T) {
 	ctx := newWalletTestCtx()
-	o := seedOrder(ctx)
+	// Side effect only: seed the store with the standard open made order; the
+	// value is replaced below by seedOrderWithUtxo (same id, reserved utxo).
+	seedOrder(ctx)
 
 	// No id -> all_locked_utxo (empty; backing not wired yet).
 	res, err := ctx.dxGetLockedUtxos(nil)
@@ -608,7 +610,7 @@ func TestDxGetLockedAndFlush(t *testing.T) {
 	// id -> object keyed by id and the order's currency key. An order with
 	// nothing reserved errors 1021, so the stub BTC utxo is reserved
 	// (replaces the utxo-less seedOrder {0x01} record, same id).
-	o = seedOrderWithUtxo(ctx, [32]byte{})
+	o := seedOrderWithUtxo(ctx, [32]byte{})
 	id := dispID(o.ID)
 	res, _ = ctx.dxGetLockedUtxos([]json.RawMessage{jstr(id)})
 	m, ok = res.(map[string]interface{})

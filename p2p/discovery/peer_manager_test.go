@@ -170,7 +170,7 @@ func TestPeerManagerFakePeer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pm.Start(ctx)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	type res struct {
 		pkt  *proto.Packet
@@ -322,7 +322,7 @@ func TestPeerManagerIgnoresGetaddr(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pm.Start(ctx)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -375,7 +375,7 @@ func TestPeerManagerSNListEcho(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pm.Start(ctx)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -412,7 +412,7 @@ func TestPeerManagerAddrCapDropped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pm.Start(ctx)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for pm.AddrCount() < 1 && time.Now().Before(deadline) {

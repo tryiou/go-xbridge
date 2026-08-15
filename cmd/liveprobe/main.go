@@ -49,7 +49,7 @@ func main() {
 		rawDiag(*addr, magic)
 		return
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	fmt.Println("handshake OK")
 
 	if pv := c.PeerVersion(); pv != nil {
@@ -71,16 +71,13 @@ func main() {
 		if derr != nil {
 			fatal("open dump: %v", derr)
 		}
-		defer dumpF.Close()
+		defer func() { _ = dumpF.Close() }()
 	}
 	count := 0
 	var parsed, parseErrs int
 	var bodyOK, bodyErr int
 	cmdCounts := map[uint32]int{}
-	for {
-		if time.Now().After(deadline) {
-			break
-		}
+	for time.Now().Before(deadline) {
 		m, err := c.ReadMessage()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -98,7 +95,7 @@ func main() {
 			count, m.Command, len(m.Payload), hex.EncodeToString(m.Checksum[:]), tag)
 		if m.Command == p2p.XBridgeNetCommand {
 			if dumpF != nil {
-				fmt.Fprintf(dumpF, "%s\n", hex.EncodeToString(m.Payload))
+				_, _ = fmt.Fprintf(dumpF, "%s\n", hex.EncodeToString(m.Payload))
 			}
 			// Verify the proto codec parses the live packet.
 			pktBytes, derr := p2p.DecodeXBridgePayload(m.Payload)
@@ -146,7 +143,7 @@ func rawDiag(addr string, magic [4]byte) {
 		fmt.Printf("raw dial: %v\n", err)
 		return
 	}
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 	vm := p2p.NewVersion(nc.RemoteAddr())
 	payload := vm.Marshal()
 	msg := p2p.Message{Magic: magic, Command: "version", Payload: payload, Checksum: p2p.Checksum(payload)}

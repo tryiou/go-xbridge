@@ -135,7 +135,7 @@ func TestReaderLoopHubSubThresholdNoBan(t *testing.T) {
 	go func() {
 		n.readerLoop()
 	}()
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	time.Sleep(300 * time.Millisecond)
 	// Not banned: the conn is still usable.
 	if err := conn.WritePacket(proto.NewPacket(proto.XbcTransactionCancel, make([]byte, 36)), [20]byte{}); err != nil {

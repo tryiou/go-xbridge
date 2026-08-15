@@ -183,7 +183,7 @@ func (s *shortSigConn) SignMessage(address, message string) ([]byte, error) {
 // guard (C++ INVALID_SIGNATURE, xbridgeapp.cpp:1705): a wallet returning a
 // short proof fails the order build instead of silently padding/truncating.
 func TestBuildUtxoProofsRejectsShortSig(t *testing.T) {
-	coins.InitFromConf(map[string]*config.CoinConf{
+	_ = coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
 	})
 	c, ok := coins.Get("BTC")

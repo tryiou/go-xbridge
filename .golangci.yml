@@ -1,0 +1,25 @@
+# Lint gate for go-xbridge. Enforces the tool-verified clean baseline:
+# dead code must not return, error returns must not be dropped silently, and
+# staticcheck's static analysis must stay green. Run with `golangci-lint run ./...`.
+#
+# The conformance module (conformance/, separate go.mod, build-tagged
+# `conformance`) is intentionally not linted here: it is covered by its own
+# conformance test run in CI and by parity stage F.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Check ignored return values in test files too, so a dropped error in a
+      # test helper cannot mask a broken assertion path.
+      check-type-assertions: false
+      check-blank: false

@@ -217,7 +217,7 @@ func TestServerRpcAuthDelay(t *testing.T) {
 	}
 
 	start = time.Now()
-	rec = callRPC(t, srv, `{"id":2}`) // missing Authorization header
+	callRPC(t, srv, `{"id":2}`) // missing Authorization header
 	if elapsed := time.Since(start); elapsed >= srv.failDelay {
 		t.Errorf("missing-header request slept %v, want immediate 401", elapsed)
 	}

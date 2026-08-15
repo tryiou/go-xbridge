@@ -150,7 +150,7 @@ func TestConnWriterExitsOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConn: %v", err)
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	pkt := proto.NewPacket(proto.XbcTransactionCancel, make([]byte, 36))
 	if err := conn.WritePacket(pkt, [20]byte{}); err != nil {
 		t.Fatalf("WritePacket: %v", err)
@@ -174,7 +174,7 @@ func TestConnWriteErrorSurfacesOnNextSend(t *testing.T) {
 		t.Fatalf("NewConn: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	server.Close() // abrupt peer close
+	_ = server.Close() // abrupt peer close
 
 	pkt := proto.NewPacket(proto.XbcTransactionCancel, make([]byte, 36))
 	deadline := time.Now().Add(2 * time.Second)
@@ -200,7 +200,7 @@ func TestConnCloseConcurrentWithWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConn: %v", err)
 	}
-	server.Close() // a write will now error and make the writer tear down
+	_ = server.Close() // a write will now error and make the writer tear down
 
 	pkt := proto.NewPacket(proto.XbcTransactionCancel, make([]byte, 36))
 	var wg sync.WaitGroup
@@ -233,7 +233,7 @@ func TestConnReadOnlyNoWriterGoroutine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConn: %v", err)
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	if conn.writerUp.Load() {
 		t.Fatal("writer goroutine must not start without a post-handshake write")
 	}

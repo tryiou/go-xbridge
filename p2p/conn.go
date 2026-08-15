@@ -142,7 +142,7 @@ func NewConn(nc net.Conn, magic [4]byte) (*Conn, error) {
 	}
 	if err := c.handshake(); err != nil {
 		xlog.Debug("handshake failed", "addr", nc.RemoteAddr().String(), "err", err)
-		nc.Close()
+		_ = nc.Close()
 		return nil, err
 	}
 	return c, nil
@@ -167,7 +167,7 @@ func NewConnCtx(ctx context.Context, nc net.Conn, magic [4]byte) (*Conn, error) 
 		defer close(done)
 		select {
 		case <-ctx.Done():
-			nc.Close()
+			_ = nc.Close()
 		case <-stop:
 		}
 	}()
@@ -184,7 +184,7 @@ func NewConnCtx(ctx context.Context, nc net.Conn, magic [4]byte) (*Conn, error) 
 		return nil, err
 	}
 	if ctx.Err() != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, ctx.Err()
 	}
 	return c, nil
@@ -201,13 +201,13 @@ func NewConnCtx(ctx context.Context, nc net.Conn, magic [4]byte) (*Conn, error) 
 // ignored. A deadline bounds the whole exchange (see handshakeTimeout).
 func (c *Conn) handshake() error {
 	_ = c.netConn.SetDeadline(time.Now().Add(handshakeTimeout))
-	defer c.netConn.SetDeadline(time.Time{})
+	defer func() { _ = c.netConn.SetDeadline(time.Time{}) }()
 
 	if err := c.writeVersion(); err != nil {
 		return err
 	}
 	seenVersion, seenVerack := false, false
-	for !(seenVersion && seenVerack) {
+	for !seenVersion || !seenVerack {
 		msg, err := c.readMessage()
 		if err != nil {
 			return err
@@ -317,7 +317,7 @@ func (c *Conn) enqueue(buf []byte) error {
 	default:
 	}
 	if over {
-		c.Close()
+		_ = c.Close()
 		return errors.New("p2p: send buffer over limit; disconnected peer")
 	}
 	return nil
@@ -355,7 +355,7 @@ func (c *Conn) startWriter() {
 					// the reader loop, so the caller observes the break and can
 					// reconnect/ban instead of lingering on a half-dead conn
 					// whose every send fails forever.
-					c.teardown()
+					_ = c.teardown()
 					return
 				}
 			}

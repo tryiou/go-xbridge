@@ -3,9 +3,9 @@ name: ci
 # Self-contained go-xbridge CI. The go-xbridge repository has no access to the
 # sibling blocknet_core / tools repositories, so the full cross-repo parity
 # gate (stages A-E of `make parity` in tools/) cannot run here. This workflow
-# runs everything that is hermetic to this repo: build, vet, gofmt, the full
-# unit suite under -race, and stage F (the conformance module, build-tagged
-# `conformance`) in isolation.
+# runs everything that is hermetic to this repo: build, vet, gofmt, the lint
+# gate (.golangci.yml), the full unit suite under -race, and stage F (the
+# conformance module, build-tagged `conformance`) in isolation.
 #
 # The A-E stages remain the operator-run gate: `make parity` + `make canary`
 # from tools/ on a checkout that also contains blocknet_core. A red parity
@@ -63,3 +63,24 @@ jobs:
       - name: conformance (parity stage F)
         working-directory: conformance
         run: go test -tags conformance -count=1 ./... -timeout 120s
+
+  lint:
+    name: golangci-lint
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # Pin the toolchain version whose baseline produced the green gate
+          # (v2.11.4, built with go1.26.1). Upgrade deliberately, not by drift.
+          version: v2.11.4
+          args: --timeout 5m
+

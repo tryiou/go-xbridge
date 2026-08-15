@@ -19,18 +19,6 @@ import (
 	"go-xbridge/wallet"
 )
 
-// xfloat is a float64 that always serializes with a decimal point in JSON,
-// matching C++ UniValue(double) behavior (e.g. 0.0 not 0).
-type xfloat float64
-
-func (f xfloat) MarshalJSON() ([]byte, error) {
-	s := strconv.FormatFloat(float64(f), 'f', -1, 64)
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
-	}
-	return []byte(s), nil
-}
-
 // xfloat8 renders a double as a JSON number with 8 fixed decimals, matching
 // C++ json_spirit write_string's precision_of_doubles=8 (std::fixed +
 // setprecision(8), json_spirit_writer_template.h:195). Used for the
@@ -1616,7 +1604,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if err != nil {
 		return nil, makeError(errInvalidParameters, method, "invalid split amount")
 	}
-	cc, _ := h.Node.cfg().Confs[ticker]
+	cc := h.Node.cfg().Confs[ticker]
 	relayFee, _ := conn.GetRelayFee()
 	// C++ dust gate on the minimum split amount (xbridgewalletconnectorbtc.cpp:2635).
 	if isDustNative(xBridgeValueFromAmount(targetXB), cc, relayFee, coinNativeScale(c)) {

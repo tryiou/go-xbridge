@@ -51,7 +51,7 @@ func mockRPC(t *testing.T) *httptest.Server {
 		lastReq = req
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
-		res := func(raw string) { enc.Encode(rpcResponse{Result: json.RawMessage(raw), ID: req.ID}) }
+		res := func(raw string) { _ = enc.Encode(rpcResponse{Result: json.RawMessage(raw), ID: req.ID}) }
 		switch req.Method {
 		case "getnewaddress":
 			res(`"bc1qw508d6qezfhxq0t9wy3j9tg9z4r0r8e0j0q0w"`)
@@ -252,11 +252,11 @@ func TestListUnspentFiltering(t *testing.T) {
 	]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req rpcRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Method == "listunspent" && len(req.Params) != 0 {
 			t.Errorf("listunspent params = %v, want empty", req.Params)
 		}
-		json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(body), ID: req.ID})
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(body), ID: req.ID})
 	}))
 	defer srv.Close()
 
@@ -284,17 +284,17 @@ func TestSignRawTransactionFallback(t *testing.T) {
 	var calls []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req rpcRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		calls = append(calls, req.Method)
 		enc := json.NewEncoder(w)
 		switch req.Method {
 		case "signrawtransaction":
 			// Simulate a newer wallet that removed the legacy RPC.
-			enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
+			_ = enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
 		case "signrawtransactionwithwallet":
-			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
 		default:
-			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
 		}
 	}))
 	defer srv.Close()
@@ -318,17 +318,17 @@ func TestSignRawTransactionLegacyPrimary(t *testing.T) {
 	var calls []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req rpcRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		calls = append(calls, req.Method)
 		enc := json.NewEncoder(w)
 		switch req.Method {
 		case "signrawtransaction":
-			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"beef","complete":true}`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"beef","complete":true}`), ID: req.ID})
 		case "signrawtransactionwithwallet":
 			t.Error("modern RPC must not be called when legacy succeeds")
-			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"WRONG","complete":true}`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"WRONG","complete":true}`), ID: req.ID})
 		default:
-			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
 		}
 	}))
 	defer srv.Close()
@@ -355,16 +355,16 @@ func TestSignRawTransactionPayloadMatchesCpp(t *testing.T) {
 	var got [][]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req rpcRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		got = append(got, req.Params)
 		enc := json.NewEncoder(w)
 		switch req.Method {
 		case "signrawtransaction":
-			enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
+			_ = enc.Encode(rpcResponse{Error: &rpcError{Code: -32601, Message: "Method not found"}, ID: req.ID})
 		case "signrawtransactionwithwallet":
-			enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hex":"cafe","complete":true}`), ID: req.ID})
 		default:
-			enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
 		}
 	}))
 	defer srv.Close()
@@ -430,7 +430,7 @@ func slowRPC(delay time.Duration) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(delay)
 		enc := json.NewEncoder(w)
-		enc.Encode(rpcResponse{Result: json.RawMessage(`"ok"`), ID: "1"})
+		_ = enc.Encode(rpcResponse{Result: json.RawMessage(`"ok"`), ID: "1"})
 	}))
 }
 
@@ -469,7 +469,7 @@ func captureServer(t *testing.T) (*httptest.Server, *[]byte) {
 		b, _ := io.ReadAll(r.Body)
 		got = b
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
 	}))
 	return srv, &got
 }
@@ -532,7 +532,7 @@ func TestRPCClientContentTypeHeader(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, present = r.Header["Content-Type"]
 				gotCT = r.Header.Get("Content-Type")
-				json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
+				_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`0`), ID: "x"})
 			}))
 			defer srv.Close()
 			c := NewRPCClient(srv.URL, "u", "p", "1.0", tc.contentType, false, 0, "BTC")
@@ -687,9 +687,9 @@ func newCheckDepositServer(t *testing.T, cfg *checkDepositServer) *httptest.Serv
 		}
 		cfg.calls = append(cfg.calls, req.Method)
 		enc := json.NewEncoder(w)
-		respond := func(res string) { enc.Encode(rpcResponse{Result: json.RawMessage(res), ID: req.ID}) }
+		respond := func(res string) { _ = enc.Encode(rpcResponse{Result: json.RawMessage(res), ID: req.ID}) }
 		respondErr := func(msg string) {
-			enc.Encode(rpcResponse{Error: &rpcError{Code: -5, Message: msg}, ID: req.ID})
+			_ = enc.Encode(rpcResponse{Error: &rpcError{Code: -5, Message: msg}, ID: req.ID})
 		}
 		switch req.Method {
 		case "getrawtransaction":

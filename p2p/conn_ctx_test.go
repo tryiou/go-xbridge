@@ -17,7 +17,7 @@ import (
 // until the far end reads/writes), and closing the pipe on cancel unblocks it.
 func TestConnHandshakeAbortsOnCtxCancel(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -44,7 +44,7 @@ func TestConnHandshakeAbortsOnCtxCancel(t *testing.T) {
 // canceller goroutine never mis-errors a healthy handshake.
 func TestConnCtxUncancelledHandshakesOK(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	go func() {
 		if _, err := readFrame(server); err != nil { // our version
 			return
@@ -79,7 +79,7 @@ func TestDialContextAbortsHandshakeStall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	hold := make(chan struct{})
 	var releaseHold sync.Once
 	t.Cleanup(func() { releaseHold.Do(func() { close(hold) }) })
@@ -88,7 +88,7 @@ func TestDialContextAbortsHandshakeStall(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		<-hold // accept and stall: never send a version
 	}()
 

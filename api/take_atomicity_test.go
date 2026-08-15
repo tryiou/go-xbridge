@@ -163,7 +163,7 @@ func TestTakeOrderCancelRaceNoBroadcast(t *testing.T) {
 				t.Errorf("sign cancel: %v", err)
 				return
 			}
-			n.onRemoteCancel(pkt, body)
+			n.submit(func() { n.handleRemoteCancel(pkt, body) }, false)
 		}()
 		wg.Wait()
 	}

@@ -173,11 +173,11 @@ var writeSwaps = func(path string, data []byte) error {
 		return fmt.Errorf("api: open swap tmp: %w", err)
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("api: write swap tmp: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("api: fsync swap tmp: %w", err)
 	}
 	if err := f.Close(); err != nil {
@@ -368,7 +368,7 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 
 // restoreSwap rebuilds an Order (and, for live records, a SwapSession) from a
 // persisted record and registers them on n (mirroring C++ loadOrders). Active
-// swaps are re-driven by dispatchSwap when the hub's packets arrive
+// swaps are re-driven by processSwap when the hub's packets arrive
 // post-restart; terminal records (finished, or terminal-status with no refund
 // still owed) route into Store.history like C++ routes trFinished/trCancelled
 // to m_historicTransactions. The caller is the NewNode restore block

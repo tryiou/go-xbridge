@@ -65,12 +65,8 @@ type workResult struct {
 // Deadlock rule: code that runs ON the engine goroutine (command closures,
 // handlePacket, task apply) must never call submit — it calls the internal
 // functions directly (processSwap, handleRemoteCancel, handleRemoteReject,
-// scanRefunds). The submit-wrapping entry points (dispatchSwap,
-// onRemoteCancel, onRemoteReject, BroadcastRefund, checkRefunds) exist as
-// off-engine entry points for the test suite and any external callers. In
-// production the inbound packets are dispatched straight from handlePacket on
-// the engine goroutine, so those wrappers are exercised mainly by the test
-// suite.
+// scanRefunds). Off-engine callers (RPC handlers, tests, BroadcastRefund) go
+// through submit to marshal the same work onto the engine goroutine.
 func (n *Node) submit(run func(), await bool) {
 	if !n.engineRunning.Load() {
 		run()
@@ -146,7 +142,7 @@ func (n *Node) readerLoop() {
 				hubScore += 10
 				if hubScore >= hubBanThreshold {
 					xlog.Error("hub banned: malformed xbridge envelope flood", "peer", peer)
-					n.conn.Close()
+					_ = n.conn.Close()
 					return
 				}
 				xlog.Warn("hub misbehaving", "peer", peer, "score", hubScore, "err", err)

@@ -293,10 +293,12 @@ so the swap handshake and the refund sweep can never race each other.
   persist). `await` is the retransmit guard: any hub packet arriving while a
   task is in flight is dropped, so a deposit/claim is broadcast at most once.
 - **`submit(run, await)`** queues a handler/HTTP command for the engine; when
-  the engine is not started (single-threaded tests) it runs inline. Public
-  wrappers (`dispatchSwap`, `onRemoteCancel/Reject`, `checkRefunds`) are the
-  only `submit` callers; code already on the engine calls the internal functions
-  directly.
+  the engine is not started (single-threaded tests) it runs inline. Off-engine
+  callers marshal work onto the engine with `submit`: the RPC handlers
+  (`MakeOrder` node.go:1617, `TakeOrder` node.go:2037, `CancelOrder`
+  node.go:2156) and the `BroadcastRefund` escape hatch (swap.go:1389); tests
+  drive the same path. Code already on the engine calls the internal functions
+  directly (`processSwap`, `handleRemoteCancel`/`Reject`, `scanRefunds`).
 - **Ticker duties**: `scanRefunds` auto-broadcasts due pre-signed refunds (posting
   worker tasks, never doing I/O on the engine), `pruneSessions` drops terminal
   sessions so the live set stays bounded, and every 4th tick persists.

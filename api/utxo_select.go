@@ -158,7 +158,7 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 	utxos := make([]wallet.Utxo, len(outputs))
 	copy(utxos, outputs)
 
-	var totalAmountNeeded int64 = int64(requiredAmount) // fees == 0 at this point
+	var totalAmountNeeded = int64(requiredAmount) // fees == 0 at this point
 	totalExactSplitSizeNeeded := int64((requiredSplitSize + requiredFeePerUtxo) * requiredUtxoCount)
 	var totalRemainderNeeded int64
 	if requiredRemainder > 0 {
@@ -198,7 +198,6 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 	// Exact match of the required utxos; no prep-tx fees needed here.
 	totalAmountNeeded = int64(requiredAmount) + int64(fees)
 	if (len(outputsForUse) == int(requiredUtxoCount) || (requiredRemainder > 0 && len(outputsForUse) == int(requiredUtxoCount)+1)) && totalAmountNeeded-usedAmount <= 0 {
-		exactUtxoMatch = true
 		return outputsForUse, uint64(usedAmount), fees, true, true
 	}
 
@@ -222,7 +221,6 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 
 		totalAmountNeeded = int64(requiredAmount) + int64(fees)
 		if len(outputsForUse) >= int(requiredUtxoCount) && totalAmountNeeded-usedAmount <= 0 {
-			exactUtxoMatch = true
 			return outputsForUse, uint64(usedAmount), fees, true, true
 		}
 	} else {
