@@ -190,13 +190,15 @@ defaulted or trailing parameter.
 **`dxGetOrderBook`**
 - `params`: `detail` (int 1–4), `maker` (string), `taker` (string),
   `max_orders` (int, default `50`).
-- `result`: `{"detail":…,"maker":…,"taker":…,"asks":[…],"bids":[…]}`. Each side
-  entry is a row whose shape depends on `detail`:
-  - `1` — best bid/ask only: `[price, amount, count_at_price]`.
-  - `2` — aggregated levels, capped at `max_orders`: `[price, amount, count]`.
+- `result`: `{"detail":…,"maker":…,"taker":…,"asks":[…],"bids":[…]}`. The side
+  value depends on `detail`:
+  - `1` — best bid/ask only, as a row array: `[price, amount, count_at_price]`.
+  - `2` — aggregated levels capped at `max_orders`: `[price, amount, count]`.
   - `3` — full per-side list capped at `max_orders`, with ids:
     `[price, amount, order_id]`.
-  - `4` — best bid/ask only: `[price, amount, [order_ids_at_price]]`.
+  - `4` — best bid/ask only: the side value IS the flat triplet
+    `[price, amount, [order_ids_at_price]]` (C++ `rpcxbridge.cpp:1952-1985`),
+    not a nested row array.
 - `errors`: 1015 (detail outside 1–4), 1025 (missing/other params).
 
 **`dxGetOrderFills`**
@@ -385,8 +387,8 @@ view, so three families of commands are bounded by what this node has observed:
 
 ## Divergences from blocknetd
 
-The known response-shape differences — order-book detail-4 nesting,
-`dxGetMyPartialOrderChain` unknown-id behavior, `dxSplitInputs` utxo schema,
-per-command amount formats — are described inline at each command above, and
-the wire contract they derive from is [`docs/protocol.md`](protocol.md). This
-document is the stable contract for the port as built.
+The known response-shape differences — `dxGetMyPartialOrderChain` unknown-id
+behavior, `dxSplitInputs` utxo schema, per-command amount formats — are
+described inline at each command above, and the wire contract they derive from
+is [`docs/protocol.md`](protocol.md). This document is the stable contract for
+the port as built.

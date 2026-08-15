@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -201,6 +202,45 @@ type orderBookResult struct {
 	Taker  string          `json:"taker"`
 	Asks   [][]interface{} `json:"asks"`
 	Bids   [][]interface{} `json:"bids"`
+}
+
+// MarshalJSON renders the dxGetOrderBook response. Details 1/2/3 emit the
+// per-row arrays unchanged, but detail 4 must be FLAT to match C++: C++
+// emplace_backs the best price, the best amount, then the ids array directly
+// onto the top-level asks/bids array (rpcxbridge.cpp:1952-1985), so its JSON
+// is ["price","amount",["id",...]] — not [["price","amount",["id",...]]].
+// Detail 4 stores at most one best row per side (the handler emits a single
+// best bid/ask, handlers.go:973-982), so the codec un-wraps Asks[0]/Bids[0]
+// to the flat form; an empty side renders [] (C++ default-constructs an empty
+// Array). A nil side slice renders [] for every detail — the codec is total
+// even when a caller did not pre-initialize the side arrays.
+func (o orderBookResult) MarshalJSON() ([]byte, error) {
+	asks, bids := interface{}(o.Asks), interface{}(o.Bids)
+	if o.Asks == nil {
+		asks = [][]interface{}{}
+	}
+	if o.Bids == nil {
+		bids = [][]interface{}{}
+	}
+	if o.Detail == 4 {
+		if len(o.Asks) > 0 {
+			asks = o.Asks[0]
+		} else {
+			asks = []interface{}{}
+		}
+		if len(o.Bids) > 0 {
+			bids = o.Bids[0]
+		} else {
+			bids = []interface{}{}
+		}
+	}
+	return json.Marshal(struct {
+		Detail int         `json:"detail"`
+		Maker  string      `json:"maker"`
+		Taker  string      `json:"taker"`
+		Asks   interface{} `json:"asks"`
+		Bids   interface{} `json:"bids"`
+	}{o.Detail, o.Maker, o.Taker, asks, bids})
 }
 
 // ---------------------------------------------------------------------------

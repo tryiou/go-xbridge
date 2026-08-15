@@ -28,4 +28,5 @@ func init() {
 	fxISO8601 = api.ISO8601
 	fxParseXAmount = api.ParseXAmount
 	fxLocktimeConstants = api.LocktimeConstants
+	fxOrderBookResultJSON = api.OrderBookResultJSON
 }

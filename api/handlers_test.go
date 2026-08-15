@@ -1883,9 +1883,10 @@ func TestDxGetOrderBookTieBreak(t *testing.T) {
 	}
 }
 
-// TestDxGetOrderBookDetail4Golden locks in the detail-4 nesting: detail 4 rows
-// are [[price, amount, [ids]]] — the ids array NESTED inside the row array
-// (rpcxbridge.cpp:1905-1926).
+// TestDxGetOrderBookDetail4Golden locks in the detail-4 FLAT shape: C++ emits
+// the best price, the best amount, and the ids array directly on the top-level
+// asks/bids array — ["price","amount",["ids"]] (rpcxbridge.cpp:1952-1985) —
+// NOT a nested row array.
 func TestDxGetOrderBookDetail4Golden(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx) // BTC/BTC open order; a BTC/BTC ask (maker==taker) and bid
@@ -1898,7 +1899,7 @@ func TestDxGetOrderBookDetail4Golden(t *testing.T) {
 		t.Fatal(merr)
 	}
 	id := dispID(o.ID)
-	want := `{"detail":4,"maker":"BTC","taker":"BTC","asks":[["0.200000","1.500000",["` + id + `"]]],"bids":[["5.000000","0.300000",["` + id + `"]]]}`
+	want := `{"detail":4,"maker":"BTC","taker":"BTC","asks":["0.200000","1.500000",["` + id + `"]],"bids":["5.000000","0.300000",["` + id + `"]]}`
 	if string(b) != want {
 		t.Errorf("detail4 JSON:\n got %s\nwant %s", string(b), want)
 	}

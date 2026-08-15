@@ -3,6 +3,8 @@
 package api
 
 import (
+	"encoding/json"
+
 	"go-xbridge/coins"
 )
 
@@ -61,4 +63,15 @@ func LocktimeConstants() map[string]int64 {
 		"XLOCKTIME_DRIFT_SECONDS":             xLockTimeDriftSeconds,
 		"LOCKTIME_THRESHOLD":                  lockTimeThreshold,
 	}
+}
+
+// OrderBookResultJSON re-exports the dxGetOrderBook result codec
+// (orderBookResult.MarshalJSON) so the conformance suite can assert the
+// detail-4 value SHAPE (flat ["price","amount",["ids"]] vs the nested row
+// form) — the suite has no live api.Handler fixture to drive dxGetOrderBook
+// itself. Mirrors the RPC marshaling path exactly.
+func OrderBookResultJSON(detail int, maker, taker string, asks, bids [][]interface{}) ([]byte, error) {
+	return json.Marshal(orderBookResult{
+		Detail: detail, Maker: maker, Taker: taker, Asks: asks, Bids: bids,
+	})
 }
