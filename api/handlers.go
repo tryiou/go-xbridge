@@ -1862,7 +1862,7 @@ func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
 }
 
 // legacyOutputScript builds a P2PKH/P2SH output script for addr. Native segwit
-// destinations are rejected in A1 (BIP143 signing not yet implemented).
+// destinations are rejected here (BIP143 signing not yet implemented).
 func legacyOutputScript(c coins.Coin, addr string) ([]byte, *rpcError) {
 	a, err := c.DecodeAddress(addr)
 	if err != nil {
@@ -1876,7 +1876,7 @@ func legacyOutputScript(c coins.Coin, addr string) ([]byte, *rpcError) {
 	case coins.P2SH:
 		return coins.BuildP2SHScript(h), nil
 	default:
-		return nil, makeError(errInvalidAddress, "dxSplit", "segwit destinations not supported for split in A1: "+addr)
+		return nil, makeError(errInvalidAddress, "dxSplit", "segwit destinations not supported for split: "+addr)
 	}
 }
 

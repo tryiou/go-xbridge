@@ -178,10 +178,10 @@ func parseINI(f *os.File) (map[string]map[string]string, error) {
 }
 
 // section is a case-sensitive key/value view of one INI section. Boost
-// property_tree is case-sensitive ("COIN" != "coin", CFG-F89), so lookups are
+// property_tree is case-sensitive ("COIN" != "coin"), so lookups are
 // exact — a miscased key reads as absent, exactly as it does in C++ (its
 // consequence downstream — the coin failing to load — is the admission pass's
-// concern, CFG-F85/F87, not the parser's).
+// concern, not the parser's).
 type section map[string]string
 
 func (s section) get(key string) (string, bool) {

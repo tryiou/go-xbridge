@@ -444,7 +444,7 @@ func hasDupCollateral(collateral []CollateralUTXO) bool {
 // ServiceNode::isValid (servicenode.h:398-484). The on-chain checks it cannot
 // make — block ancestry (:401) and collateral utxo existence/amount/ownership
 // (:447-478, total >= COLLATERAL_SPV) — need a full chain index and are
-// documented as a thin-client limitation in docs/audit/register.md (WIRE-F71).
+// skipped as a thin-client limitation (docs/architecture.md §p2p/servicenode/).
 func registrationValid(sn ServiceNode) bool {
 	if sn.Tier != TierSPV {
 		return false // servicenode.h:409
@@ -752,7 +752,7 @@ func (r *Registry) Known(key [33]byte) bool {
 // servicenode (its CKeyID, servicenode.h:180). XBridge uses it as the
 // service-node fee destination on the accepting side (xbridgeapp.cpp:2394-2401);
 // the Go taker looks it up by hub pubkey when building the AcceptingBody fee
-// transaction (B2). An unknown pubkey returns false.
+// transaction. An unknown pubkey returns false.
 func (r *Registry) PaymentAddress(key [33]byte) ([20]byte, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

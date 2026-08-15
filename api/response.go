@@ -76,7 +76,7 @@ type orderDetailResult struct {
 // byte-level JSON order is 1:1 (encoding/json emits fields in declaration
 // order). p2sh_deposits / p2sh_deposits_counterparty carry one entry PER CHAIN
 // ORDER (empty string when an order has no deposit txid) so callers can index
-// them against `orders` (RPC-F28).
+// them against `orders`.
 type partialChainDetailsResult struct {
 	FirstOrderID             string   `json:"first_order_id"`
 	Maker                    string   `json:"maker"`
@@ -102,7 +102,7 @@ type partialChainDetailsResult struct {
 
 // flushCancelledResult is the dxFlushCancelledOrders success object. Field ORDER
 // matches the C++ writer (rpcxbridge.cpp:1474-1489): ageMillis, now,
-// durationMicrosec, flushedOrders (RPC-F36).
+// durationMicrosec, flushedOrders.
 type flushCancelledResult struct {
 	AgeMillis        int64             `json:"ageMillis"`
 	Now              string            `json:"now"`
@@ -121,7 +121,7 @@ type flushedOrderOut struct {
 // splitTxResult is the dxSplitAddress / dxSplitInputs success object. Field
 // ORDER matches the C++ writer (rpcxbridge.cpp:3280-3289 / 3394-3403): token,
 // include_fees, split_amount_requested, split_amount_with_fees, split_utxo_count,
-// split_total, txid, rawtx (RPC-F36-style ordered emission).
+// split_total, txid, rawtx.
 type splitTxResult struct {
 	Token                string `json:"token"`
 	IncludeFees          bool   `json:"include_fees"`
@@ -217,7 +217,7 @@ type rpcError struct {
 	// error:{code,message}, HTTP status per httpStatusForCode) as opposed to the
 	// Blocknet business-error-in-result convention (HTTP 200). C++ surfaces
 	// param-type/arity/help violations as thrown RPC errors (envelope), while
-	// business gates stay in the result — see remediation/B4-http.md.
+	// business gates stay in the result (docs/api.md §Transport).
 	envelope bool
 }
 
@@ -373,7 +373,7 @@ func formatXAmount(amt uint64) string {
 // way C++ UtxoEntry::toString() streams it (xbridgewalletconnector.cpp:25-30):
 // the double with the stream's default precision 6 (defaultfloat, not fixed), so
 // "0.1", "1", "0.123457". strconv 'g' 6 matches defaultfloat/6 including the
-// %e threshold (exponent >= 6). Used by dxGetLockedUtxos (RPC-F31); registry
+// %e threshold (exponent >= 6). Used by dxGetLockedUtxos; registry
 // scale is irrelevant because C++ streams the raw wallet double.
 func nativeAmountString(v float64) string {
 	return strconv.FormatFloat(v, 'g', 6, 64)

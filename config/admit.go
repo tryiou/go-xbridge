@@ -30,7 +30,7 @@ const (
 // supportedCreateTxMethods is the method set go-xbridge genuinely implements.
 // C++ also dispatches BCD/PART/STEALTH/XST (xbridgeapp.cpp:1052-1086), but
 // those transaction formats are not portable to a thin client and are deferred
-// (CRYPTO-F98 for PART, CRYPTO-F99 for BCD, documented; STEALTH/XST appear in
+// (documented for PART and BCD; STEALTH/XST appear in
 // no live manifest conf); admitting them would build BTC-format transactions
 // for a chain that rejects them. Go therefore refuses them at admission instead
 // of broadcasting malformed transactions. LTC is accepted as a deliberate Go

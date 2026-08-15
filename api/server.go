@@ -124,8 +124,8 @@ func parseRpcAuthEntry(entry string) (user, salt, hash string, ok bool) {
 const basicRealm = "jsonrpc"
 
 // authConfigured reports whether any credentials are configured. When none are,
-// the daemon is open (loopback-default bind; documented divergence — C++ would
-// auto-generate a cookie, which go-xbridge deliberately does not).
+// the daemon is open (loopback-default bind; documented divergence — see
+// docs/api.md §Calling convention).
 func (s *Server) authConfigured() bool {
 	return s.user != "" || len(s.authUsers) > 0
 }
@@ -180,7 +180,7 @@ func parseBasicAuth(h string) (user, pass string, ok bool) {
 	return string(b[:i]), string(b[i+1:]), true
 }
 
-// rpcMaxBodyBytes caps the JSON-RPC request body (RPC-F49): C++ sets
+// rpcMaxBodyBytes caps the JSON-RPC request body: C++ sets
 // evhttp_set_max_body_size to MAX_SIZE = 0x02000000 (32 MiB) — serialize.h:27,
 // httpserver.cpp:395. A body larger than this is rejected with a non-envelope
 // HTTP 413 (libevent behavior) instead of being buffered in whole.
@@ -195,7 +195,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("JSONRPC server handles only POST requests"))
 		return
 	}
-	// RPC auth gate (SEC-F01 / RPC-F50): authentication is always enforced when
+	// RPC auth gate: authentication is always enforced when
 	// credentials are configured (the daemon is never open-by-default in that
 	// case). A failed attempt is met with an empty-body 401 + challenge; bad
 	// (present) credentials additionally trigger the C++ 250 ms sleep that
@@ -211,7 +211,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	// Bound the request body (RPC-F49): read it fully through MaxBytesReader so
+	// Bound the request body: read it fully through MaxBytesReader so
 	// an oversized body is rejected (non-envelope 413, matching libevent)
 	// instead of buffered unbounded.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rpcMaxBodyBytes))
@@ -289,7 +289,7 @@ func (s *Server) dispatchOne(raw rawRequest) rpcResponse {
 		xlog.Warn("rpc transport error", "code", -32601, "method", method)
 		return envelopeResponse(makeEnvelopeError(-32601, "Method not found"), id)
 	}
-	// Arity gate (RPC-F52): business 1025 for the old-style methods, envelope
+	// Arity gate: business 1025 for the old-style methods, envelope
 	// -1 with the C++ help text for the throw methods.
 	if aerr := checkArity(method, len(params)); aerr != nil {
 		if aerr.envelope {

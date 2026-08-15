@@ -85,14 +85,13 @@ func isLoopbackAddr(addr string) bool {
 }
 
 func main() {
-	// RPC bind defaults to loopback only (SEC-F01), mirroring blocknetd's
+	// RPC bind defaults to loopback only, mirroring blocknetd's
 	// httpserver.cpp:308 loopback default. An explicit -rpcbind (host:port) is
 	// required to expose the JSON-RPC surface beyond localhost.
 	rpcBind := flag.String("rpcbind", "127.0.0.1:41414", "JSON-RPC listen address (host:port); defaults to loopback, set explicitly to bind elsewhere")
-	// RPC auth (SEC-F01 / RPC-F50): enforced whenever ANY credential is set —
+	// RPC auth is enforced whenever ANY credential is set —
 	// -rpcuser/-rpcpassword (both required) or -rpcauth user:salt$hash entries
-	// (comma-separated, HMAC-SHA256 parity with blocknetd). No cookie auth is
-	// generated (documented divergence from C++; see docs/audit/register.md).
+	// (comma-separated, HMAC-SHA256 parity with blocknetd).
 	rpcUser := flag.String("rpcuser", "", "RPC Basic auth username (requires -rpcpassword)")
 	rpcPass := flag.String("rpcpassword", "", "RPC Basic auth password (requires -rpcuser)")
 	rpcAuth := flag.String("rpcauth", "", "RPC multi-user auth entries, comma-separated, format user:salt$hash")
@@ -169,7 +168,7 @@ func main() {
 	}
 
 	// Read coin connectors from xbridge.conf (never creates it). Static
-	// admission runs first (CFG-F85): a coin failing the gates — or a stray
+	// admission runs first: a coin failing the gates — or a stray
 	// section with COIN==0 — is skipped, never fatal, exactly as C++ skips
 	// wallets that fail updateActiveWallets (xbridgeapp.cpp:1002-1040).
 	conf, err := config.Load(*confPath)
@@ -181,7 +180,7 @@ func main() {
 		fatalf("coin config", "err", err)
 	}
 
-	// Connect exactly the [Main].ExchangeWallets currencies (CFG-F87), applying
+	// Connect exactly the [Main].ExchangeWallets currencies, applying
 	// admission + the live reachability probe. The Activator is passed to the
 	// Node so failed-startup wallets stay "bad" for the retry window across the
 	// 30s sweep.
@@ -241,9 +240,9 @@ func main() {
 
 	ctx := &api.HandlerCtx{Store: store, Node: node}
 	srv := api.NewServer(ctx)
-	// SEC-F01 / RPC-F50: auth is enforced whenever ANY credential is configured
+	// Auth is enforced whenever ANY credential is configured
 	// (-rpcuser+-rpcpassword or -rpcauth). With none, the loopback-default bind
-	// is open (no cookie; documented divergence).
+	// is open (documented divergence; docs/api.md §Calling convention).
 	var rpcauthList []string
 	for _, e := range strings.Split(*rpcAuth, ",") {
 		if e = strings.TrimSpace(e); e != "" {
@@ -275,7 +274,7 @@ func main() {
 			"showallorders", cfg.ShowAllOrders, "enableexchange", *enableExchange)
 	}
 	// httpSrv is kept by name so shutdown can drain in-flight RPC handlers
-	// (srv.Shutdown) instead of exiting under them. Timeouts (RPC-F58): the
+	// (srv.Shutdown) instead of exiting under them. Timeouts: the
 	// read/write timeout mirrors C++ -rpcservertimeout (evhttp_set_timeout,
 	// httpserver.cpp:393, DEFAULT_HTTP_SERVER_TIMEOUT=30); the header and idle
 	// timeouts are Go-side hardening (no C++ counterpart).

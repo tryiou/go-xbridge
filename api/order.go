@@ -59,7 +59,7 @@ type Order struct {
 	RefundTx       string   // refund txid, for dxCancelOrder ("" when no deposit)
 	BinTxId        string   // our HTLC deposit txid (dxPartialOrderChainDetails p2sh_deposits)
 	OBinTxId       string   // counterparty HTLC deposit txid (p2sh_deposits_counterparty)
-	// Validated counterparty deposit out-params (CRYPTO-F90): the C++
+	// Validated counterparty deposit out-params: the C++
 	// checkDepositTransaction results recorded when we accepted the
 	// counterparty's deposit — oBinTxVout (counterPartyVoutN), oBinTxP2SHAmount,
 	// oOverpayment (xbridgesession.cpp:2511/2571, 2973/2981). P2SHAmount and
@@ -78,8 +78,8 @@ type Order struct {
 
 	// UsedCoins is the caller's selected funding utxo set (C++ xtx->usedCoins):
 	// for a take it is the taker's funding selection attached to the Accepting
-	// body; for a make it is the maker's selection. B3 consumes it when building
-	// deposits instead of re-running ListUnspent.
+	// body; for a make it is the maker's selection. The deposit builder consumes
+	// it instead of re-running ListUnspent.
 	UsedCoins []wallet.Utxo
 	// FeeUtxos is the BLOCK utxo set that funded the service-node fee tx of a
 	// take. LockedUtxoInfo reserves them for the order's lifetime so a second
