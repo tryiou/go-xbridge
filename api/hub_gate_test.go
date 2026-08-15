@@ -152,6 +152,68 @@ func TestMakeOrderEmptyRegistry(t *testing.T) {
 	}
 }
 
+// TestMakeOrderMissingMakerConnectorNoSession verifies dxMakeOrder surfaces
+// NO_SESSION (1018) when the maker's wallet connector is absent, rather than
+// panicking on a nil-interface ListUnspent. The maker connector handle is
+// fetched once at the connector gate and reused for the funding enumeration, so
+// a dxLoadXBridgeConf reload between the two must not leave the funding path
+// with a nil connector.
+func TestMakeOrderMissingMakerConnectorNoSession(t *testing.T) {
+	reg := servicenode.NewRegistry()
+	_, hubPub, _, _ := hubKey(t, 0x53)
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+	})
+	n, _ := newHubNode(reg)
+	// Drop the maker wallet: the connector gate must error, not deref a nil
+	// interface in the ListUnspent that follows it.
+	delete(n.config.Connectors, "BTC")
+
+	o, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+	})
+	if rerr == nil {
+		t.Fatal("MakeOrder(missing maker connector) = nil error, want NO_SESSION")
+	}
+	if rerr.Code != errNoSession {
+		t.Fatalf("MakeOrder(missing maker connector) code = %d, want %d", rerr.Code, errNoSession)
+	}
+	if want := "No session for currency Unable to connect to wallet: BTC"; rerr.Error != want {
+		t.Errorf("MakeOrder(missing maker connector) message = %q, want %q", rerr.Error, want)
+	}
+	if o != nil {
+		t.Fatalf("expected nil order, got %+v", o)
+	}
+}
+
+// TestMakeOrderMissingTakerConnectorNoSession mirrors the maker side for the
+// taker currency: the taker connector gate is a presence check (no funding
+// follows), and it must also surface NO_SESSION rather than proceed.
+func TestMakeOrderMissingTakerConnectorNoSession(t *testing.T) {
+	reg := servicenode.NewRegistry()
+	_, hubPub, _, _ := hubKey(t, 0x54)
+	reg.AddPing(servicenode.ServiceNode{
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+	})
+	n, _ := newHubNode(reg)
+	delete(n.config.Connectors, "SYS")
+
+	o, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+	})
+	if rerr == nil || rerr.Code != errNoSession {
+		t.Fatalf("MakeOrder(missing taker connector) = %v, want NO_SESSION", rerr)
+	}
+	if want := "No session for currency Unable to connect to wallet: SYS"; rerr.Error != want {
+		t.Errorf("MakeOrder(missing taker connector) message = %q, want %q", rerr.Error, want)
+	}
+	if o != nil {
+		t.Fatalf("expected nil order, got %+v", o)
+	}
+}
+
 // TestMakeOrderDryRunSkipsHubGate verifies the hub gate does not block Go's
 // dry-run preview: with an empty registry and no hub, a dry-run make still
 // succeeds (validation/render only; nothing broadcast, no session created) and

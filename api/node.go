@@ -1276,8 +1276,13 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		hubAddr = coins.KeyID(hubKey[:])
 	}
 
-	// Per-currency connector (NO_SESSION) gate.
-	if _, e := n.connector(p.Maker); e != nil {
+	// Per-currency connector (NO_SESSION) gate. The maker connector handle is
+	// fetched once and reused below: dxLoadXBridgeConf can swap the config
+	// between the gate and the ListUnspent, and a second lookup there could
+	// return nil after the swap (an already-held handle stays valid, so a
+	// single fetch removes the reload race).
+	makerConn, cerr := n.connector(p.Maker)
+	if cerr != nil {
 		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
 	}
 	if _, e := n.connector(p.Taker); e != nil {
@@ -1368,7 +1373,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	// (C++ getAllLockedUtxos :1614 — per-token) and, when use_all_funds is
 	// false, those not owned by the maker address (:1621-1627). getUnspent
 	// failure fails the order.
-	conn, _ := n.connector(p.Maker)
+	conn := makerConn
 	minConf := 0
 	if cc != nil {
 		minConf = cc.Confirmations
@@ -1772,8 +1777,12 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 
 	// C++ dxTakeOrder:1216-1217 requires both legs to have live connectors
 	// before proceeding (the same NO_SESSION check repeats inside
-	// acceptXBridgeTransaction at xbridgeapp.cpp:2137-2140).
-	if _, e := n.connector(o.ToCurrency); e != nil {
+	// acceptXBridgeTransaction at xbridgeapp.cpp:2137-2140). The to-currency
+	// handle is fetched once and reused below — a dxLoadXBridgeConf swap
+	// between this gate and the ListUnspent must not yield a nil connector
+	// (an already-held handle stays valid, so a single fetch removes the race).
+	toConn, cerr := n.connector(o.ToCurrency)
+	if cerr != nil {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", "Unable to connect to wallet: "+o.ToCurrency)
 	}
 	if _, e := n.connector(o.FromCurrency); e != nil {
@@ -1910,7 +1919,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// Confirmations value. This is the SECOND enumeration of the taker wallet:
 	// checkAcceptParams above already ran one via getWalletBalance→getUnspent
 	// (xbridgeapp.cpp:2279 -> xbridgewalletconnector.cpp:55), exactly as C++.
-	conn, _ := n.connector(o.ToCurrency)
+	conn := toConn
 	outputs, err := conn.ListUnspent(1)
 	if err != nil {
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
