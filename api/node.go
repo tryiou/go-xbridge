@@ -125,13 +125,13 @@ type Config struct {
 	// ConfPath is the path the daemon loaded xbridge.conf from. dxLoadXBridgeConf
 	// hot-reloads from this path, mirroring C++'s reload-from-the-same-conf
 	// behaviour. Empty disables hot-reload: the RPC returns a false result
-	// (C++ uret(success), RPC-F56).
+	// (C++ uret(success), rpcxbridge.cpp:229-234).
 	ConfPath string
 	// PersistSecrets controls whether each trade's per-trade M keypair, HTLC
 	// secret, and pre-signed refund are written to the swap-state file. On by
 	// default, mirroring C++ saveOrders()/orders.dat (an in-flight swap can be
 	// rebuilt and auto-refunded post-restart). Set -persistsecrets=false to
-	// keep the swap-state file free of signing material (SEC-F04); a restarted
+	// keep the swap-state file free of signing material; a restarted
 	// mid-flight swap then cannot auto-refund or re-sign a cancel.
 	PersistSecrets bool
 }
@@ -200,7 +200,7 @@ type Node struct {
 	wg sync.WaitGroup
 
 	// persistMu guards persistLatest, the newest swap-file write job awaiting
-	// the background persistLoop (CONC-F92b). persistSignal is a buffered(1)
+	// the background persistLoop. persistSignal is a buffered(1)
 	// wake for persistLoop; publishLatest coalesces by overwriting the slot, so
 	// a burst of engine persists collapses into the newest snapshot and an
 	// in-flight write is never duplicated.
@@ -234,7 +234,7 @@ type Node struct {
 	// snReg is the servicenode registry learned from SNREGISTER / SNPING /
 	// SNLISTPING P2P messages (the same wire source a core XBridge wallet
 	// uses). dxGetNetworkTokens is the pure union of its WalletServices()
-	// (the live network token set, C++ walletServices(), RPC-F54).
+	// (the live network token set, C++ walletServices(), xbridgeapp.cpp:2758).
 	snReg *servicenode.Registry
 
 	// exchangeStarted mirrors C++ Exchange::instance().isStarted(). It is true
@@ -871,12 +871,12 @@ func (n *Node) ingestPending(b *proto.PendingTransactionBody, snode string) {
 	if n.store.HasOrder(hexEncode(o.ID[:])) {
 		return
 	}
-	// SEC-F02: an inbound order is booked only after its maker-currency UTXO
+	// An inbound order is booked only after its maker-currency UTXO
 	// ownership proofs verify against the chain (the C++ snode gate,
 	// xbridgesession.cpp:535-575). The wallet I/O runs on a worker so the
 	// engine never blocks; without a connector for the maker currency there is
-	// nothing to verify against and the order is booked as before (CFG-F87
-	// prunes unconnected orders unless ShowAllOrders).
+	// nothing to verify against and the order is booked as before (pruning
+	// removes unconnected orders unless ShowAllOrders).
 	n.verifyAndBook(o)
 }
 
@@ -891,7 +891,7 @@ func (n *Node) verifyAndBook(o *Order) {
 	// cmd-4 pending broadcasts carry no UTXO entries, so there is nothing to
 	// verify (C++ trader parity: the snode verifies). With no config, connector
 	// or coin for the maker currency there is also nothing to verify against;
-	// the order is booked as before (CFG-F87 prunes unconnected orders unless
+	// the order is booked as before (pruning removes unconnected orders unless
 	// ShowAllOrders).
 	if len(o.Utxos) == 0 || n.cfg() == nil {
 		n.store.Add(o)
@@ -1013,7 +1013,7 @@ func (n *Node) logNetworkStatus() {
 
 // NetworkTokens returns the tokens advertised by servicenodes on the P2P
 // network (C++ walletServices(), xbridgeapp.cpp:2758) — the pure SN service
-// union with NO config fallback (RPC-F54). The servicenode set is learned from
+// union with NO config fallback. The servicenode set is learned from
 // SNREGISTER / SNPING / SNLISTPING messages via the registry; only SPV-tier
 // xbridge tokens matching ^[^:]+$ (excluding xr/xrs) from servicenodes pinged
 // within the 5-minute running window are included. Empty when no servicenodes
@@ -1051,7 +1051,7 @@ func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdNam
 // sends it addressed to the session's pinned hub. Runs on the engine goroutine
 // (or inline when the engine is not started).
 //
-// STATE-F78 (hub-key auth): every handshake packet is re-verified against the
+// Hub-key auth: every handshake packet is re-verified against the
 // session's TRUSTED hub key before dispatch — mirroring C++
 // xbridgesession.cpp:1364 packet->verify(xtx->sPubKey). The trusted key is
 // pinned at session creation for BOTH roles (maker: the hub chosen at make
@@ -1107,7 +1107,7 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 }
 
 // verifyHubPacket authenticates a hub-originated handshake packet against the
-// session's trusted hub key (STATE-F78, C++ packet->verify(xtx->sPubKey)). The
+// session's trusted hub key (C++ packet->verify(xtx->sPubKey)). The
 // trusted key is pinned at session creation for BOTH roles — the maker's chosen
 // servicenode, the taker's order SNodePubkey — never learned from network
 // packets. A packet signed by any other key is dropped before it reaches the
@@ -1271,7 +1271,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			// (or run one) before any make can succeed (C++ :1515). C++ emits
 			// makeError(statusCode, __FUNCTION__) with NO argument — the bare
 			// "Could not find a service node with required services: " text
-			// (rpcxbridge.cpp:1036-1037, RPC-F12).
+			// (rpcxbridge.cpp:1036-1037).
 			xlog.Warn("dxMakeOrder refused: no service-node registry (empty snReg)", "maker", p.Maker, "taker", p.Taker)
 			return nil, makeError(errNoServiceNode, "dxMakeOrder", "")
 		}
@@ -1319,7 +1319,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		// the coin's NATIVE base units (partialMinimum * COIN) against the
 		// native dust threshold (xbridgewalletconnectorbtc.cpp:1900-1904).
 		// minFrom is XBridge 1e6 base, so scale it up with the same double
-		// arithmetic C++ uses before comparing (RPC-F13). minimum_size is not
+		// arithmetic C++ uses before comparing. minimum_size is not
 		// precision-validated (unlike maker/taker sizes), so parseXAmount
 		// truncates to 6 decimals; a sub-6-decimal min like "0.0000546" (native
 		// 5460, NOT dust in C++) truncates to 0.000054 (native 5400, dust here)
@@ -1412,7 +1412,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if !ok {
 		return nil, makeError(errInsufficientFunds, "dxMakeOrder", "insufficient funds")
 	}
-	// CRYPTO-F87: the exact funding set the maker's deposit must spend (C++
+	// The exact funding set the maker's deposit must spend (C++
 	// xtx->usedCoins). autoSplit rebuilds it from the prep-tx outputs below;
 	// otherwise the plain selection stands.
 	funding := outputsForUse
@@ -1587,7 +1587,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	o.MakerKey = hexEncode(mPub[:])
 	o.OrigFromCurrency = p.Maker
 	o.OrigToCurrency = p.Taker
-	// CRYPTO-F87: record the make-time selection as the deposit's funding set
+	// Record the make-time selection as the deposit's funding set
 	// (C++ xtx->usedCoins, set at take-order time xbridgeapp.cpp:2350); the
 	// deposit path consumes o.UsedCoins instead of re-running ListUnspent.
 	o.UsedCoins = funding
@@ -1614,7 +1614,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		// State mutation (store.Add, session registration, SEND, persist) runs
 		// on the engine goroutine, which owns the book and session maps.
 		//
-		// CONC-F101: the response must render a store snapshot COPY, never the live
+		// The response must render a store snapshot COPY, never the live
 		// record. The engine may concurrently write the live order (a relayed
 		// self-echo bumps Updated via store.Touch, or a remote cancel writes
 		// Status), so returning the live pointer to the HTTP handler would race
@@ -1720,7 +1720,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 
 	// C++ parses and validates the amount BEFORE the transaction lookup
 	// (rpcxbridge.cpp:1151-1161): an explicit amount <= 0 errors 1025 with the
-	// RAW string even when the order id is unknown (RPC-F14).
+	// RAW string even when the order id is unknown.
 	var takeAmount uint64
 	if p.Amount != "" {
 		a, err := parseXAmount(p.Amount)
@@ -1793,8 +1793,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// 1219-1225 isValidAddress). An invalid address is INVALID_ADDRESS, but a
 	// prior gate failure wins. C++ checks the TO address (against the order's
 	// from-currency connector) FIRST, then the FROM address; both messages use
-	// the C++ arg ": <cur> address is bad. Are you using the correct address?"
-	// (RPC-F15).
+	// the C++ arg ": <cur> address is bad. Are you using the correct address?".
 	toID, e := decodeAddr("dxTakeOrder", o.FromCurrency, p.ToAddress)
 	if e != nil {
 		return orderListResult{}, takeBadAddressErr(o.FromCurrency, e)
@@ -2033,64 +2032,94 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
-	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
-		n.store.ReleaseReserve(key)
-		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
-	}
-	// State mutation (store update, session registration, persist) runs on the
-	// engine goroutine, which owns the book and session maps. The take applies
-	// a TARGETED store update (never *stored = *o) so a concurrent engine-side
-	// field update (e.g. a remote cancel) is not clobbered.
+	// The Accepting broadcast and the local state commit run on the engine as
+	// ONE serialized unit (authoritative re-check → wire write → store
+	// commit), so a cancel/expiry can no longer land between the wire write
+	// and the re-check: a take that leaves the wire is a take that was
+	// committed (C++ acceptXBridgeTransaction does the same on its single
+	// thread, xbridgeapp.cpp:2122-2380). The take applies a TARGETED store
+	// update (never *stored = *o) so a concurrent engine-side field update
+	// (e.g. a remote cancel) is not clobbered.
 	var result *Order
+	var terr *rpcError
 	n.submit(func() {
-		// Authoritative re-check on the engine: the order may have been
-		// cancelled/removed since the HTTP snapshot.
-		if n.store.Get(key) == nil {
-			n.store.ReleaseReserve(key)
-			return
-		}
-		now := NowMicro()
-		makerKey := hexEncode(tPub[:])
-		// Local taker: set our per-trade M key and capture the original
-		// (maker-facing) currencies BEFORE the take reorients the order
-		// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
-		// On a reject these Orig* values restore the order to pending.
-		o.Updated = now
-		o.Status = "accepting"
-		o.Role = 'B'
-		o.MakerKey = makerKey
-		o.OrigFromCurrency = o.FromCurrency
-		o.OrigToCurrency = o.ToCurrency
-		o.Utxos = proofs
-		o.UsedCoins = usedCoins
-		o.FeeUtxos = feeInputs
-		o.UtxoCurrency = o.ToCurrency // taker funding coins live on the take's from-currency
-		// Publish the take's mutations to the book under the store lock.
-		n.store.Update(key, func(stored *Order) {
-			stored.Updated = now
-			stored.Status = "accepting"
-			stored.Role = 'B'
-			stored.MakerKey = makerKey
-			stored.OrigFromCurrency = o.FromCurrency
-			stored.OrigToCurrency = o.ToCurrency
-			stored.Utxos = proofs
-			stored.UsedCoins = usedCoins
-			stored.FeeUtxos = feeInputs
-			stored.UtxoCurrency = o.ToCurrency
-		})
-		// The committed Utxos/FeeUtxos now carry the reserved keys (LockedUtxoInfo
-		// reads them off the order), so the in-flight reservation is exhausted.
-		n.store.ReleaseReserve(key)
-		// Begin driving the client-side deposit handshake for this taken order.
-		n.newTakerSession(o, p, tPrivArr, tPub)
-		// Persist the new local swap (incl. its per-trade M keypair) to disk.
-		n.persist()
-		result = n.store.Get(key)
+		result, terr = n.commitTake(key, o, p, pkt, tPrivArr, tPub, proofs, usedCoins, feeInputs)
 	}, true)
+	if terr != nil {
+		return orderListResult{}, terr
+	}
 	if result == nil {
+		// Either the re-check found the order cancelled/removed (the reserve
+		// was released inside commitTake) or submit bailed on n.stop before
+		// the closure ran (the reserve is still held) — release defensively so
+		// the reservation can never leak on the stop path. (A submit that
+		// bailed at the await stage while the closure was still queued can, on
+		// n.stop, race a later engine broadcast of the same take; the take
+		// either returns here as not-found or the engine commits it — both are
+		// teardown-only, matching MakeOrder.)
+		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errTxNotFound, "dxTakeOrder", p.ID)
 	}
 	return result.toTakeResult(fromSize, toSize), nil
+}
+
+// commitTake runs on the engine: the authoritative re-check that the order is
+// still live, the Accepting broadcast, and the local taker-state commit for a
+// taken order. It returns the committed order, or (nil, nil) when the order
+// was cancelled/removed since the HTTP snapshot — in that case the reservation
+// is released and NO packet is broadcast (a take must never leave the wire
+// that the engine then refuses). The caller holds the reservation
+// (ReserveForTake); it is released on every path. The write runs here, after
+// the re-check, so the broadcast and the commit are one engine-serialized
+// unit.
+func (n *Node) commitTake(key string, o *Order, p TakeOrderParams, pkt *proto.Packet, tPrivArr [32]byte, tPub [33]byte, proofs []proto.UtxoEntry, usedCoins, feeInputs []wallet.Utxo) (*Order, *rpcError) {
+	// Authoritative re-check on the engine: the order may have been
+	// cancelled/removed since the HTTP snapshot.
+	if n.store.Get(key) == nil {
+		n.store.ReleaseReserve(key)
+		return nil, nil
+	}
+	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
+		n.store.ReleaseReserve(key)
+		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
+	}
+	now := NowMicro()
+	makerKey := hexEncode(tPub[:])
+	// Local taker: set our per-trade M key and capture the original
+	// (maker-facing) currencies BEFORE the take reorients the order
+	// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
+	// On a reject these Orig* values restore the order to pending.
+	o.Updated = now
+	o.Status = "accepting"
+	o.Role = 'B'
+	o.MakerKey = makerKey
+	o.OrigFromCurrency = o.FromCurrency
+	o.OrigToCurrency = o.ToCurrency
+	o.Utxos = proofs
+	o.UsedCoins = usedCoins
+	o.FeeUtxos = feeInputs
+	o.UtxoCurrency = o.ToCurrency // taker funding coins live on the take's from-currency
+	// Publish the take's mutations to the book under the store lock.
+	n.store.Update(key, func(stored *Order) {
+		stored.Updated = now
+		stored.Status = "accepting"
+		stored.Role = 'B'
+		stored.MakerKey = makerKey
+		stored.OrigFromCurrency = o.FromCurrency
+		stored.OrigToCurrency = o.ToCurrency
+		stored.Utxos = proofs
+		stored.UsedCoins = usedCoins
+		stored.FeeUtxos = feeInputs
+		stored.UtxoCurrency = o.ToCurrency
+	})
+	// The committed Utxos/FeeUtxos now carry the reserved keys (LockedUtxoInfo
+	// reads them off the order), so the in-flight reservation is exhausted.
+	n.store.ReleaseReserve(key)
+	// Begin driving the client-side deposit handshake for this taken order.
+	n.newTakerSession(o, p, tPrivArr, tPub)
+	// Persist the new local swap (incl. its per-trade M keypair) to disk.
+	n.persist()
+	return n.store.Get(key), nil
 }
 
 // CancelOrderParams are the parsed dxCancelOrder arguments.
@@ -2168,7 +2197,7 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 		// The cancelled order stays in the live book (status "canceled"); C++
 		// dxFlushCancelledOrders scans m_transactions + m_historicTransactions
 		// for trCancelled entries and erases them (xbridgeapp.cpp:1331-1354),
-		// so no separate cancelled ledger is needed (RPC-F35).
+		// so no separate cancelled ledger is needed.
 		// Best-effort fund recovery: if a deposit was already broadcast, return
 		// it via the pre-signed CLTV refund rather than leaving it locked at
 		// the hub. Fire-and-forget; outcomes are logged by the refund apply.
