@@ -62,10 +62,10 @@ Ip=127.0.0.1
 Port=22555
 `
 
-// TestReloadAppliesEWKeying locks CFG-F87: after dxLoadXBridgeConf, exactly the
+// TestReloadAppliesEWKeying: after dxLoadXBridgeConf, exactly the
 // [Main].ExchangeWallets currencies are connected — DOGE passes the static
 // gates but is not in ExchangeWallets, so it gets no connector, and
-// dxGetLocalTokens reflects only the connected set (RPC-F53).
+// dxGetLocalTokens reflects only the connected set.
 func TestReloadAppliesEWKeying(t *testing.T) {
 	ctx := reloadTestCtx(t, ewKeyingConf)
 	if res, err := ctx.dxLoadXBridgeConf(nil); err != nil || res != true {
@@ -81,7 +81,7 @@ func TestReloadAppliesEWKeying(t *testing.T) {
 	}
 }
 
-// TestReloadPrunesUnconnectedOrders locks CFG-F87's order clearing: when
+// TestReloadPrunesUnconnectedOrders locks the order clearing: when
 // ShowAllOrders is false, non-local orders whose currency has no connector are
 // dropped; local orders always survive. With ShowAllOrders=true everything is
 // kept (C++ clearNonLocalOrders, rpcxbridge.cpp:229-233).
@@ -147,7 +147,7 @@ func TestReloadPreservesFlagOverrides(t *testing.T) {
 	}
 }
 
-// TestSweepConnectors locks CFG-F87's periodic updateActiveWallets sweep: a
+// TestSweepConnectors locks the periodic updateActiveWallets sweep: a
 // wallet that becomes unreachable is disconnected on the next sweep and
 // reconnected when it recovers. The sweep never prunes orders (C++ only prunes
 // on dxLoadXBridgeConf).

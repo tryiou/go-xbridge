@@ -8,7 +8,7 @@ import (
 	xlog "go-xbridge/log"
 )
 
-// TestNodeCloseFlushesDedupeSweepers — CONC-F93 proof at the api boundary.
+// TestNodeCloseFlushesDedupeSweepers at the api boundary.
 // Node.Close must call xlog.FlushAll, so a library-level Close (not just the
 // daemon's main.go) stops every Dedupe sweeper and emits any pending summary
 // instead of leaking the goroutine.

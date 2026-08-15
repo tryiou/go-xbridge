@@ -30,7 +30,7 @@ func handshakePeer(t *testing.T, server net.Conn, release chan struct{}) {
 	}()
 }
 
-// TestConnWriteSlowPeerNonBlocking — CONC-F92 proof. A peer that stops reading
+// TestConnWriteSlowPeerNonBlocking. A peer that stops reading
 // must not stall WritePacket: frames are buffered by the writer goroutine, and
 // when the buffered queue exceeds the (test-lowered) cap the peer is
 // disconnected exactly like C++ pauses-then-disconnects a peer whose send

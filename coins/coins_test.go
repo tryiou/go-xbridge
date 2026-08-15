@@ -262,7 +262,7 @@ func TestFormatAmountFixed(t *testing.T) {
 }
 
 // TestCoinSignatureDescriptor pins the per-coin descriptors derived from
-// CreateTxMethod (CRYPTO-F77/F89): the BCH-family coins sign with the forkid
+// CreateTxMethod: the BCH-family coins sign with the forkid
 // digest (fork value 0), BTG with fork value 79, plain BTC-family coins legacy.
 // The tables mirror the C++ connector classes, not hardcoded coin values.
 func TestCoinSignatureDescriptor(t *testing.T) {
@@ -324,7 +324,7 @@ func twenty() []byte {
 		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
 }
 
-// TestBTGAddressRoundTrip (CRYPTO-F89) verifies the BTG connector is a forkid
+// TestBTGAddressRoundTrip verifies the BTG connector is a forkid
 // coin with native segwit (bech32 HRP "btg"): base58check P2PKH/P2SH (version
 // bytes 38/23, as in the manifest bitcoingold conf) and bech32 segwit
 // addresses all round-trip through encode/decode.
@@ -368,11 +368,11 @@ func TestBTGAddressRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDevaultAddressCashaddr (CRYPTO-F89) verifies the DEVAULT connector is
+// TestDevaultAddressCashaddr verifies the DEVAULT connector is
 // classified as the BCH family with cashaddr HRP "devault" (devault.cpp:274-280)
 // and fork value 0 (replay protection disabled, devault.cpp:171): a cashaddr
 // address round-trips and legacy base58check input is rejected (the documented
-// F81 hardening — the BCH-family decoder is cashaddr-only).
+// cashaddr-only hardening — the BCH-family decoder is cashaddr-only).
 func TestDevaultAddressCashaddr(t *testing.T) {
 	dev, err := FromConf(&config.CoinConf{
 		Ticker: "DVT", Title: "DeVault", CreateTxMethod: "DEVAULT",
@@ -397,8 +397,8 @@ func TestDevaultAddressCashaddr(t *testing.T) {
 		t.Fatalf("DEVAULT cashaddr round-trip failed: err=%v kind=%v addr=%q", err, a.Kind, addr)
 	}
 	// Legacy base58check input is rejected — the BCH-family decoder is
-	// cashaddr-only (documented F81 hardening).
+	// cashaddr-only (documented hardening).
 	if _, err := dev.DecodeAddress(base58CheckEncode(0, twenty())); err == nil {
-		t.Error("DEVAULT accepted a legacy base58check address (F81 hardening)")
+		t.Error("DEVAULT accepted a legacy base58check address (cashaddr-only hardening)")
 	}
 }

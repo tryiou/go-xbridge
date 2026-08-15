@@ -19,7 +19,7 @@ func TestEstimateFeeMatchesCppVsize(t *testing.T) {
 	if got := estimateFee(cc, 3, 2); got != 3220 {
 		t.Errorf("estimateFee(3in,2out,FeePerByte=5) = %d, want 3220", got)
 	}
-	// CRYPTO-F78: the deposit fee uses nOut=3 (minTxFee1(nIn,3), C++
+	// The deposit fee uses nOut=3 (minTxFee1(nIn,3), C++
 	// xbridgesession.cpp:1994/:2526). 2in/3out, FeePerByte=5 → (384+102)*5 = 2430.
 	if got := estimateFee(cc, 2, 3); got != 2430 {
 		t.Errorf("estimateFee(2in,3out,FeePerByte=5) = %d, want 2430", got)

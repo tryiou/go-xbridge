@@ -45,7 +45,7 @@ func setupTwoCoinNode(t *testing.T) (*Node, *captureXConn, *gatedConnector, *fak
 	return n, cc, gated, ltc
 }
 
-// TestConcurrentRefundSweepAndDepositTask — CONC-F97 proof. The refund sweep
+// TestConcurrentRefundSweepAndDepositTask. The refund sweep
 // (scanRefunds, engine-owned) reads session A's await/refundHex/state while A's
 // deposit resume writes them, and posts session B's due pre-signed refund to a
 // worker. -race is the pass criteria; the broadcast-count invariants prove
@@ -139,7 +139,7 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 	}
 }
 
-// TestForceRefundTakesSweepGuard — CONC-F102 proof. A force-refund (enqueueRefund,
+// TestForceRefundTakesSweepGuard. A force-refund (enqueueRefund,
 // e.g. from CancelOrder/BroadcastRefund) must take the pendingRefunds guard so
 // the sweep (scanRefunds) cannot enqueue a second broadcast of the same refund
 // hex while the force-refund is in flight. With the force task parked in the
@@ -172,8 +172,9 @@ func TestForceRefundTakesSweepGuard(t *testing.T) {
 		t.Fatalf("force-refund never reached SendRawTransaction (calls=%d)", gated.callCount())
 	}
 
-	// The sweep runs while the force-refund is still in flight. With the CONC-F102
-	// guard set, it must skip this order — exactly one broadcast attempt total.
+	// The sweep runs while the force-refund is still in flight. With the
+	// pendingRefunds guard set, it must skip this order — exactly one broadcast
+	// attempt total.
 	n.submit(func() { n.scanRefunds() }, true)
 	deadline = time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -308,7 +309,7 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The taker's funding wallet must clear the B2 pre-checks: eight 300 BTC
+	// The taker's funding wallet must clear the take pre-checks: eight 300 BTC
 	// utxos cover the 100-BTC order (selectUtxos gt path) one per concurrent
 	// take, and the BLOCK connector holds eight distinct 1.0 BLOCK p2pkh utxos
 	// so each take can reserve its own service-node fee funder (take #1 locks
@@ -414,7 +415,7 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 	}
 }
 
-// TestConcurrentTakeOrderDistinctOrdersExclusiveReservation — B2 Finding 1.
+// TestConcurrentTakeOrderDistinctOrdersExclusiveReservation.
 // Eight concurrent takes of eight DISTINCT orders draw from one SHARED scarce
 // pool (3 funding utxos + 3 BLOCK fee utxos). The atomic reservation
 // (ReserveForTake) must guarantee no two orders ever claim the same key, so

@@ -2,7 +2,7 @@ package api
 
 import "testing"
 
-// TestArityBusinessMethods locks in the RPC-F52 arity gates for the old-style
+// TestArityBusinessMethods locks in the arity gates for the old-style
 // dx* methods: wrong param counts return the C++ business 1025 result-error
 // with the exact makeError arg (HTTP 200).
 func TestArityBusinessMethods(t *testing.T) {

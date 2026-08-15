@@ -18,7 +18,7 @@ import (
 
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an
 // error (not a nil-interface panic) when the destination currency's wallet
-// connector is absent — the exact crash the audit flagged at api/swap.go:225.
+// connector is absent — the nil-interface panic at api/swap.go:225.
 // Before the fix, s.n.cfg().Connectors[cur] returned a nil interface and the
 // SendRawTransaction call panicked, killing the feed goroutine (and process).
 func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
@@ -130,7 +130,7 @@ func seedHub(node *Node, pub [33]byte) {
 	node.snReg = reg
 }
 
-// TestDispatchSwapDropsForgedFinished is the STATE-F78 regression test: a Finished
+// TestDispatchSwapDropsForgedFinished is the trusted-hub-key regression test: a Finished
 // packet NOT signed by the session's trusted hub key must be dropped before it
 // reaches OnFinished, so it can never set csFinished and disable the refund
 // watcher (swap.go:473). A Finished signed by the real hub still processes.
@@ -311,11 +311,11 @@ func TestDispatchSwapTakerRejectsUnpinnedHub(t *testing.T) {
 	}
 }
 
-// TestSecF03CompositeRefusal is the SEC-F03 composite acceptance: the HTLC
-// composition is sound, and with B3's validated-deposit gate the taker AND the
+// TestUnvalidatedDepositRefusedBothLegs is the composite acceptance: the HTLC
+// composition is sound, and with the validated-deposit gate the taker AND the
 // maker refuse an unvalidated counterparty deposit end-to-end — the hostile
 // outcome (theft, not recoverable lockup) is killed on both legs.
-func TestSecF03CompositeRefusal(t *testing.T) {
+func TestUnvalidatedDepositRefusedBothLegs(t *testing.T) {
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
 		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
@@ -339,7 +339,7 @@ func TestSecF03CompositeRefusal(t *testing.T) {
 	makerNode.conn = makerCC
 	takerNode.conn = takerCC
 	var orderID [32]byte
-	s3h := hash20("sec-f03-order")
+	s3h := hash20("unvalidated-deposit-order")
 	copy(orderID[:], s3h[:])
 	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6, Status: "created"}
 	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6, Status: "created"}

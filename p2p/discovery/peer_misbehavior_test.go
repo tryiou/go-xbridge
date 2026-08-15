@@ -78,7 +78,7 @@ func waitBanned(t *testing.T, pm *PeerManager, addr string) {
 	t.Fatalf("peer %s: banned=%v peers=%d, want banned with no live peer", addr, pm.isBanned(addr), len(pm.Peers()))
 }
 
-// TestPeerManagerMisbehaveXBridgeBan locks in STATE-F75 for the discovery pool:
+// TestPeerManagerMisbehaveXBridgeBan locks in the hub ban for the discovery pool:
 // ten undersized xbridge envelopes (+10 each, C++ net_processing.cpp:2874-2878)
 // take a peer to the 100-point ban threshold — it is disconnected and excluded
 // from re-candidating.

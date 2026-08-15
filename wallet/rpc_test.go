@@ -194,7 +194,7 @@ func TestRPCConnector(t *testing.T) {
 	})
 }
 
-// TestRevHashHexCapturedBlockHash (CRYPTO-F83) pins the block-hash byte order
+// TestRevHashHexCapturedBlockHash pins the block-hash byte order
 // against a real captured block hash (the Bitcoin genesis block, display
 // order). getblockhash returns display order; the XBridge wire carries the
 // internal (little-endian) bytes, which the C++ base_blob<256>::SetHex
@@ -346,7 +346,7 @@ func TestSignRawTransactionLegacyPrimary(t *testing.T) {
 	}
 }
 
-// TestSignRawTransactionPayloadMatchesCpp (CRYPTO-F91) pins the signrawtransaction
+// TestSignRawTransactionPayloadMatchesCpp pins the signrawtransaction
 // request payload to the C++ form (xbridgewalletconnectorbtc.cpp:1055-1089):
 // [rawtx, prevtxs|null, keys|null]. The old port sent "ALL" in the privkeys
 // slot (position 3) — a sighash type string where C++ sends JSON null — and

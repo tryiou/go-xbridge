@@ -10,7 +10,7 @@ func TestEffectiveDust(t *testing.T) {
 	// C++: dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460
 	// (xbridgewalletconnectorbtc.cpp:1526). The conf-provided dust source is
 	// `MinimumAmount` (C++ maps it onto the exchange wallets' dustAmount,
-	// xbridgeexchange.cpp:145; it never reads a `DustAmount` key — CFG-F91).
+	// xbridgeexchange.cpp:145; it never reads a `DustAmount` key).
 	// Coin=1e8 (BTC-like) unless noted.
 	const coin = uint64(100_000_000)
 	tests := []struct {

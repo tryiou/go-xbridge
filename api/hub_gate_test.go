@@ -115,7 +115,7 @@ func hubKey(t *testing.T, seed byte) ([32]byte, [33]byte, string, [20]byte) {
 }
 
 // TestMakeOrderNoRegistry verifies dxMakeOrder fails with NO_SERVICE_NODE (1032)
-// when no service-node registry is configured (C++ makeTransaction:1515). RPC-F12:
+// when no service-node registry is configured (C++ makeTransaction:1515).
 // C++ emits makeError(statusCode, __FUNCTION__) with NO argument, so the message
 // is the bare "Could not find a service node with required services: " (the
 // maker/taker pair is NOT appended).
@@ -178,7 +178,7 @@ func TestMakeOrderDryRunSkipsHubGate(t *testing.T) {
 }
 
 // TestMakeOrderReturnsStoreCopy proves dxMakeOrder returns a snapshot COPY of
-// the stored order, never the store's live record (CONC-F101). On the old code the
+// the stored order, never the store's live record. On the old code the
 // returned *Order WAS the live record: the HTTP handler rendered
 // makeOrderResponse() on it while the engine could concurrently write it (a
 // relayed self-echo bumps Updated via store.Touch; a remote cancel writes
@@ -369,7 +369,7 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 	if ab.HubAddress != hubAddr {
 		t.Fatalf("Accepting body hubAddress = %x, want %x", ab.HubAddress, hubAddr)
 	}
-	// CRYPTO-F84: the Accepting must carry a real service-node fee tx AND the taker's
+	// The Accepting must carry a real service-node fee tx AND the taker's
 	// signed funding utxo entries — an empty pair is dropped by the hub
 	// (xbridgesession.cpp:848-916, crBadFeeTx). The body must be >= 188 bytes.
 	if len(ab.ServiceNodeFeeTx) == 0 {
@@ -608,7 +608,7 @@ func TestTakeOrderUnfundedBLOCKFee(t *testing.T) {
 }
 
 // zeroBalanceConn is a stubConn whose wallet reports no balance, modeling a
-// configured-but-empty BLOCK wallet for the A1 availableBalance gate.
+// configured-but-empty BLOCK wallet for the availableBalance gate.
 type zeroBalanceConn struct{ *stubConn }
 
 func (z *zeroBalanceConn) GetBalance() (uint64, error) { return 0, nil }
@@ -627,7 +627,7 @@ func newHubNodeEmptyBlockWallet(reg *servicenode.Registry) (*Node, *captureXConn
 	return n, cc
 }
 
-// TestTakeOrderEmptyBlockWallet proves the A1 availableBalance gate fails a
+// TestTakeOrderEmptyBlockWallet proves the availableBalance gate fails a
 // take with INSUFFICIENT_FUNDS_DX when the BLOCK wallet is configured but its
 // balance is below the service-node fee (C++ acceptXBridgeTransaction:2161)
 // and nothing is broadcast.
@@ -770,7 +770,7 @@ func TestTakeOrderBadAddressAfterFundsGate(t *testing.T) {
 	}
 }
 
-// TestMakePartialDustNativeScale locks in RPC-F13: the partial minimum_size is
+// TestMakePartialDustNativeScale locks in the partial minimum_size being
 // compared in the coin's NATIVE base units (partialMinimum * COIN < dustAmount,
 // xbridgewalletconnectorbtc.cpp:1900-1904), NOT in XBridge 1e6 base against a
 // native dust value. buildHubNode confs set no conf dust (MinimumAmount), so
@@ -799,7 +799,7 @@ func TestMakePartialDustNativeScale(t *testing.T) {
 	}
 }
 
-// TestTakeOrderBadAddressMessage locks in RPC-F15's address errors: C++ checks
+// TestTakeOrderBadAddressMessage locks in the address errors: C++ checks
 // the TO address first (against the order's from-currency connector) and each
 // message uses the arg ": <cur> address is bad. Are you using the correct
 // address?" with name dxTakeOrder (rpcxbridge.cpp:1219-1225) — not the
@@ -834,7 +834,7 @@ func TestTakeOrderBadAddressMessage(t *testing.T) {
 }
 
 // TestTakeOrderOwnOrder locks in C++ isLocal() -> 1025 "Unable to accept your
-// own order." (rpcxbridge.cpp:1210-1212, RPC-F15): Mine is the Go isLocal
+// own order." (rpcxbridge.cpp:1210-1212): Mine is the Go isLocal
 // proxy, so a local maker order cannot be taken.
 func TestTakeOrderOwnOrder(t *testing.T) {
 	reg, pubHex, hubAddr := pinnedHub(t, 0x6a)
@@ -853,7 +853,7 @@ func TestTakeOrderOwnOrder(t *testing.T) {
 
 // TestTakeOrderNotFoundBare locks in C++ dxTakeOrder's not-found message:
 // makeError(TRANSACTION_NOT_FOUND, __FUNCTION__) with NO argument — the
-// double-space "Transaction  not found" (rpcxbridge.cpp:1176-1179, RPC-F15).
+// double-space "Transaction  not found" (rpcxbridge.cpp:1176-1179).
 func TestTakeOrderNotFoundBare(t *testing.T) {
 	n, _ := newHubNode(nil)
 	var id [32]byte

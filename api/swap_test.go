@@ -98,7 +98,7 @@ type fakeConnector struct {
 
 	// funders, when non-nil, is the UTXO set reported by ListUnspent, used by
 	// tests where multiple concurrent takes must each reserve a distinct
-	// funding utxo (the B2 funding path locks take #1's selection, so a
+	// funding utxo (the take-input reservation locks take #1's selection, so a
 	// single-utxo fixture starves later takes).
 	funders []wallet.Utxo
 
@@ -151,7 +151,7 @@ func (f *fakeConnector) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx
 		return "", false, err
 	}
 	// Dispatch on the coin's SignatureKind so a BCH fixture signs the P2PKH
-	// funding input with the forkid digest (CRYPTO-F77), like a real BCH wallet.
+	// funding input with the forkid digest, like a real BCH wallet.
 	// coins.Get on an unseeded registry returns the zero coin (SigLegacy), so
 	// legacy-family tests are unaffected.
 	coin, _ := coins.Get(f.ticker)
@@ -250,8 +250,8 @@ func (f *fakeConnector) minTxFeeWhole(nIn, nOut int) float64 {
 
 // CheckDepositTransaction is the in-memory twin of RPCConnector.
 // CheckDepositTransaction: it validates a counterparty deposit against its own
-// broadcast log (plus the known funding UTXOs as prevout sources), so the F85
-// wiring tests can drive the full C++ tri-state (ready / bad / wait) without a
+// broadcast log (plus the known funding UTXOs as prevout sources), so the
+// deposit-check wiring tests can drive the full C++ tri-state (ready / bad / wait) without a
 // wallet.
 func (f *fakeConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (wallet.DepositCheck, error) {
 	dc := wallet.DepositCheck{}
@@ -425,7 +425,7 @@ func toArr33(b []byte) [33]byte {
 }
 
 // withUsedCoins stores o in n.store with its funding set recorded, mirroring
-// production MakeOrder/TakeOrder which populate Order.UsedCoins (CRYPTO-F87):
+// production MakeOrder/TakeOrder which populate Order.UsedCoins:
 // the deposit path consumes o.UsedCoins, never a fresh ListUnspent. Tests create
 // sessions directly, so they must seed the record.
 func withUsedCoins(t *testing.T, n *Node, o *Order, funding []wallet.Utxo) *Order {
@@ -523,7 +523,7 @@ func TestSwapHandshake(t *testing.T) {
 
 	// 1) Hold (hub→both) → HoldApply. The body carries the TAKER's give
 	// (FromAmount=order.to=2e6) and take (ToAmount=order.from=2.5e6); both
-	// parties' verifyHold accepts it (STATE-F71).
+	// parties' verifyHold accepts it.
 	if _, _, err := makerSession.OnHold(&proto.HoldBody{HubAddress: hub, ID: orderID, FromAmount: 2e6, ToAmount: 2.5e6}); err != nil {
 		t.Fatalf("maker OnHold: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestSwapHandshake(t *testing.T) {
 	}
 
 	// 2) Init (hub→each) → Initialized. ClientAddress is the destination address;
-	// the full order details must match the session (STATE-F71 intended-OR).
+	// the full order details must match the session (intended-OR verification).
 	mkInit := &proto.InitBody{
 		ClientAddress: ltcHash, HubAddress: hub, ID: orderID,
 		FromAddress: hash20("maker-btc-dest"), FromCurrency: "BTC", FromAmount: 2.5e6,
@@ -696,7 +696,7 @@ func TestDepositNativeScale(t *testing.T) {
 	takerSession.hub = hub
 	makerSecret := makerSession.secret
 
-	const fee = 588  // (192*1 + 34*3) * 2 sat/vB (CRYPTO-F78: minTxFee1(nIn,3))
+	const fee = 588  // (192*1 + 34*3) * 2 sat/vB (minTxFee1(nIn,3))
 	const fee2 = 452 // (192*1 + 34*1) * 2 sat/vB
 
 	// Maker deposit A (BTC): locks native(fromXBridgeAmt(2.5e6)) + fee2.
@@ -714,10 +714,10 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("deposit A change = %d, want %d", got, 5e8-nativeAmt-fee-fee2)
 	}
 
-	// Pre-signed refund pays the FULL nominal native amount (CRYPTO-F90: the
+	// Pre-signed refund pays the FULL nominal native amount (the
 	// deposit's locked fee2 is the refund's implicit miner fee; C++ refund output
 	// = outAmount, xbridgesession.cpp:2149) and spends the deposit via its
-	// LOCALLY-derived txid (CRYPTO-F86).
+	// LOCALLY-derived txid.
 	refund := deserializeHex(t, createdA.RefTx)
 	if got := refund.Outputs[0].Value; got != nativeAmt {
 		t.Fatalf("refund output = %d, want native %d (full nominal; fee2 is the implicit fee)", got, nativeAmt)
@@ -741,7 +741,7 @@ func TestDepositNativeScale(t *testing.T) {
 		t.Fatalf("deposit B p2sh value = %d, want %d", got, nativeTaker+fee2)
 	}
 
-	// Maker redeems deposit B (CRYPTO-F90): output = validated p2sh value − fee2
+	// Maker redeems deposit B: output = validated p2sh value − fee2
 	// = the full nominal native amount (the deposit's locked fee2 is the claim's
 	// miner fee; the excess, here 0, would be retained by the redeemer).
 	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: createdB.BDepositTxID, BLockTime: createdB.BLockTime})
@@ -783,7 +783,7 @@ func deserializeHex(t *testing.T, hexStr string) *coins.Tx {
 	return tx
 }
 
-// TestDepositSpendsUsedCoins (CRYPTO-F87) proves buildDeposit consumes the
+// TestDepositSpendsUsedCoins proves buildDeposit consumes the
 // recorded Order.UsedCoins (C++ xtx->usedCoins), never a fresh ListUnspent: the
 // connector reports TWO funders but the order records only one, so the deposit
 // must spend exactly the recorded one.
@@ -827,7 +827,7 @@ func TestDepositSpendsUsedCoins(t *testing.T) {
 	}
 }
 
-// TestRedeemCounterpartyPayout (CRYPTO-F90) proves the claim spends the
+// TestRedeemCounterpartyPayout proves the claim spends the
 // VALIDATED counterparty deposit — the exact p2sh output value at its recorded
 // vout — and the redeemer keeps the excess: a B-deposit locked with a 0.001 LTC
 // excess over nominal+fee2 is claimed for the full p2sh minus the redeem fee.
@@ -908,7 +908,7 @@ func TestRedeemCounterpartyPayout(t *testing.T) {
 	}
 }
 
-// TestHoldInitVerification (STATE-F71) proves the hub-driven Hold/Init packets
+// TestHoldInitVerification proves the hub-driven Hold/Init packets
 // are re-verified against the order: a mismatched amount (Hold) or ANY
 // single-field mismatch (Init, intended-OR) is dropped with NO response and no
 // state advance; matching packets pass and advance the state.
@@ -996,7 +996,7 @@ func TestHoldInitVerification(t *testing.T) {
 	}
 }
 
-// TestDepositNotBroadcastWhenRefundFails (CRYPTO-F86) proves the build order:
+// TestDepositNotBroadcastWhenRefundFails proves the build order:
 // the deposit must be signed and the CLTV refund pre-built BEFORE the broadcast,
 // so a refund-build failure never strands a broadcast deposit without an escape
 // hatch (C++ builds deposit → refund → then broadcasts). An undecodable
@@ -1030,11 +1030,12 @@ func TestDepositNotBroadcastWhenRefundFails(t *testing.T) {
 		t.Fatal("expected refund-build failure (bad refund destination)")
 	}
 	if got := len(btc.broadcasts); got != 0 {
-		t.Fatalf("deposit broadcast %d time(s) despite refund-build failure; the refund must be pre-built before broadcasting (CRYPTO-F86)", got)
+		t.Fatalf("deposit broadcast %d time(s) despite refund-build failure; "+
+			"the refund must be pre-built before broadcasting", got)
 	}
 }
 
-// TestBCHRefundForkidSigned (CRYPTO-F77) proves the maker's pre-signed BCH CLTV
+// TestBCHRefundForkidSigned proves the maker's pre-signed BCH CLTV
 // refund is produced with the BCH forkid sighash: the DER signature carries the
 // 0x41 (SIGHASH_ALL|SIGHASH_FORKID) byte and verifies against the forkid BIP143
 // digest committing fork value 0xffdead (live mainnet replay protection,
@@ -1130,7 +1131,7 @@ func TestBCHRefundForkidSigned(t *testing.T) {
 	}
 }
 
-// TestCreateBBadDepositCancels (CRYPTO-F85) proves the taker refuses a
+// TestCreateBBadDepositCancels proves the taker refuses a
 // definitively bad maker A-deposit: the check fails (no matching p2sh script),
 // so OnCreateB must wire-Cancel (crBadADepositTx=14) and roll back locally with
 // NO CreatedB response and NO deposit of our own.
@@ -1200,7 +1201,7 @@ func TestCreateBBadDepositCancels(t *testing.T) {
 	}
 }
 
-// TestCreateBWaitsOnNotReadyDeposit (CRYPTO-F85) proves the "wait" leg: an
+// TestCreateBWaitsOnNotReadyDeposit proves the "wait" leg: an
 // A-deposit the connector cannot yet find is ErrDepositNotReady → OnCreateB
 // sends NO response (C++ processLater — the hub retransmits) and NO cancel, and
 // the order is left untouched.
@@ -1442,7 +1443,7 @@ func TestSecretFromScriptSig(t *testing.T) {
 	}
 }
 
-// TestSecretFromPayTxScansAllInputs (CRYPTO-F92) proves secretFromPayTx scans
+// TestSecretFromPayTxScansAllInputs proves secretFromPayTx scans
 // every input's scriptSig, matching C++ getSecretFromPaymentTransaction which
 // iterates all vins (xbridgewalletconnectorbtc.cpp:2241-2276). The
 // secret-bearing input is at index 1 — the pre-fix code read only Inputs[0]

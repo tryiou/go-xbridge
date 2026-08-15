@@ -41,7 +41,7 @@ func TestAdmitConstantsMatchCpp(t *testing.T) {
 	}
 }
 
-// TestAdmitGates locks CFG-F85: the static wallet-admission gates ported from
+// TestAdmitGates locks the static wallet-admission gates ported from
 // xbridgeapp.cpp:1002-1040, using the exact C++ boundary values.
 func TestAdmitGates(t *testing.T) {
 	cases := []struct {
@@ -100,9 +100,9 @@ func TestAdmitGates(t *testing.T) {
 	}
 }
 
-// TestAdmitCreateTxMethod locks CFG-F91's method-dispatch fix: ETH and unknown
+// TestAdmitCreateTxMethod locks the method-dispatch gate: ETH and unknown
 // methods are rejected (C++ xbridgeapp.cpp:1043-1090), and the non-portable
-// connectors deferred under CRYPTO-F98 (PART) / CRYPTO-F99 (BCD), plus
+// connectors deferred for PART and BCD, plus
 // STEALTH/XST (in no live manifest conf), are refused rather than built as
 // BTC-format connectors.
 func TestAdmitCreateTxMethod(t *testing.T) {
@@ -124,7 +124,7 @@ func TestAdmitCreateTxMethod(t *testing.T) {
 	}
 }
 
-// TestAdmittedFilters lock CFG-F85's registry consequence: Admitted returns
+// TestAdmittedFilters lock the registry consequence: Admitted returns
 // exactly the coins passing the static gates.
 func TestAdmittedFilters(t *testing.T) {
 	good := baseAdmitted()

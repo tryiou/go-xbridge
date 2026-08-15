@@ -144,7 +144,7 @@ func mustSign(t *testing.T, tx *coins.Tx, idx int) []byte {
 	return ss[1 : 1+n]
 }
 
-// TestLocalConnectorSignAfterRegistryFlip — CONC-F94 closure. LocalConnector
+// TestLocalConnectorSignAfterRegistryFlip closure. LocalConnector
 // must bind its coin's serializeWithTimeField flag at construction: a reload
 // that flips the live registry mid-run must not re-interpret the txHex a
 // signer is re-serializing. The connector is built while the registry is empty

@@ -10,7 +10,7 @@ import (
 	"go-xbridge/p2p"
 )
 
-// TestPeerManagerCloseAbortsInflightDialAndJoins — CONC-F93 proof. Close must
+// TestPeerManagerCloseAbortsInflightDialAndJoins. Close must
 // cancel an in-flight dial (so it never waits out the dial timeout) and join
 // every tracked goroutine before returning, mirroring C++ join_all on shutdown
 // (xbridgeapp.cpp:530-544).
@@ -48,7 +48,7 @@ func TestPeerManagerCloseAbortsInflightDialAndJoins(t *testing.T) {
 	}
 }
 
-// TestPeerManagerCloseFastWithStalledHandshake — CONC-F92 closure. A peer that
+// TestPeerManagerCloseFastWithStalledHandshake closure. A peer that
 // accepts TCP but never sends a version must not hold Close up to
 // handshakeTimeout: DialContext aborts the in-flight handshake the moment the
 // manager context is cancelled (NewConnCtx), so connectOne returns promptly and

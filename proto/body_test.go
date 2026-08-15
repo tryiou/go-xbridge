@@ -197,7 +197,7 @@ func TestAcceptingBodyGolden(t *testing.T) {
 // TestAcceptingBodySizeFloor locks the hub's drop gate: an Accepting packet is
 // only accepted when the body is >= 188 bytes (xbridgesession.cpp:855). A real
 // take — non-trivial fee tx plus at least one utxo entry (121 bytes each) — must
-// clear it; the CRYPTO-F84 bug's empty-fee/empty-utxos body did not.
+// clear it; the empty-fee/empty-utxos body did not.
 func TestAcceptingBodySizeFloor(t *testing.T) {
 	b := &AcceptingBody{
 		HubAddress:       [20]byte{1},
@@ -294,7 +294,7 @@ func TestSwapBodiesRoundTrip(t *testing.T) {
 
 // TestDecodeBodyRejectsUnwriterCommands asserts commands with no C++ writer on
 // either side (xbcXChatMessage 2, xbcServicesPing 50) are rejected by DecodeBody
-// rather than mis-decoded by a speculative body type (WIRE-F67/F68).
+// rather than mis-decoded by a speculative body type.
 func TestDecodeBodyRejectsUnwriterCommands(t *testing.T) {
 	for _, cmd := range []XBridgeCommand{XbcXChatMessage, XbcServicesPing} {
 		if v, err := DecodeBody(cmd, []byte{0x01}); err == nil {

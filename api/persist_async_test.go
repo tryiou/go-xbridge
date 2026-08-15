@@ -27,7 +27,7 @@ func addLocalOrder(n *Node, seed byte) {
 	n.store.Add(o)
 }
 
-// TestPersistDoesNotBlockEngine — CONC-F92b proof. A slow disk (parked
+// TestPersistDoesNotBlockEngine — a slow disk (parked
 // writeSwaps) must not stall the engine: persist() snapshots + publishes
 // non-blocking, the persistLoop does the fsync, and the engine keeps processing
 // awaited commands.

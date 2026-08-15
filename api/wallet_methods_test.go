@@ -33,16 +33,16 @@ type stubConn struct {
 	depositCheck    *wallet.DepositCheck
 	depositCheckErr error
 	// sendErr, when set, makes SendRawTransaction fail (dxSplit submit-failure
-	// tests, RPC-F43).
+	// tests).
 	sendErr error
 	// listUnspentErr, when set, makes ListUnspent fail (dxGetUtxos
-	// listunspent-failure case, RPC-F45).
+	// listunspent-failure case).
 	listUnspentErr error
 	// getNewAddrErr, when set, makes GetNewAddress fail (dxGetNewTokenAddress
-	// empty-array case, RPC-F55).
+	// empty-array case).
 	getNewAddrErr error
 	// verifyFail, when set, makes VerifyMessage reject every proof (forged
-	// inbound-order proof tests, SEC-F02).
+	// inbound-order proof tests).
 	verifyFail bool
 }
 
@@ -191,7 +191,7 @@ func TestDxGetNewTokenAddressNoConnector(t *testing.T) {
 	}
 }
 
-// TestDxGetNewTokenAddressGetNewAddrError locks RPC-F55: a GetNewAddress
+// TestDxGetNewTokenAddressGetNewAddrError locks in the behavior: a GetNewAddress
 // failure yields an empty array (C++ getNewTokenAddress() returns an empty
 // string, rpcxbridge.cpp:186-190), never a business error.
 func TestDxGetNewTokenAddressGetNewAddrError(t *testing.T) {
@@ -218,7 +218,7 @@ func TestDxGetUtxos(t *testing.T) {
 	}
 	// C++ renders the amount fixed to the coin's decimal places
 	// (xBridgeStringValueFromPrice(amount, conn->COIN), rpcxbridge.cpp:3483):
-	// 1 BTC -> "1.00000000" (RPC-F44).
+	// 1 BTC -> "1.00000000".
 	if arr[0]["amount"] != "1.00000000" {
 		t.Errorf("amount = %v, want 1.00000000", arr[0]["amount"])
 	}
@@ -237,7 +237,7 @@ func TestDxGetUtxos(t *testing.T) {
 
 // TestDxGetUtxosListUnspentError locks the C++ listunspent-failure contract
 // (rpcxbridge.cpp:3476): 1004 BAD_REQUEST named after __FUNCTION__ with the
-// fixed text "failed to get unspent transaction outputs" (RPC-F45).
+// fixed text "failed to get unspent transaction outputs".
 func TestDxGetUtxosListUnspentError(t *testing.T) {
 	ctx := newWalletTestCtx()
 	ctx.Node.cfg().Connectors["BTC"].(*stubConn).listUnspentErr = stubErr("wallet rpc down")
@@ -272,15 +272,15 @@ func TestDxGetTokenBalances(t *testing.T) {
 	if m["BTC"] != "1.000000" {
 		t.Errorf("BTC balance = %v, want 1.000000", m["BTC"])
 	}
-	// DOCUMENTED divergence (RPC-F23/F24): no synthesized "Wallet" key — the
+	// DOCUMENTED divergence: no synthesized "Wallet" key — the
 	// thin client exposes the BLOCK connector balance under its own ticker and
 	// does not duplicate it into a wallet tag.
 	if _, hasWallet := m["Wallet"]; hasWallet {
-		t.Errorf("result contains a synthesized 'Wallet' key (deliberately removed, RPC-F23/F24): %v", m)
+		t.Errorf("result contains a synthesized 'Wallet' key (deliberately removed): %v", m)
 	}
 }
 
-// TestDxGetTokenBalancesSum is the RPC-F25 regression pin: Go sums per-UTXO
+// TestDxGetTokenBalancesSum is the regression pin: Go sums per-UTXO
 // native amounts as an EXACT integer (uint64) and renders formatBalanceNative,
 // while C++ sums them as doubles and prints %.6f. The two agree to the 6th
 // decimal for this vector (a double sum of 0.1+0.2+0.05 = 0.35000000000000003
@@ -305,7 +305,7 @@ func TestDxGetTokenBalancesSum(t *testing.T) {
 	}
 	// 0.1 + 0.2 + 0.05 BTC = 0.35 BTC exactly in base units.
 	if m["BTC"] != "0.350000" {
-		t.Errorf("BTC balance = %v, want 0.350000 (exact integer sum, RPC-F25)", m["BTC"])
+		t.Errorf("BTC balance = %v, want 0.350000 (exact integer sum)", m["BTC"])
 	}
 }
 
@@ -350,7 +350,7 @@ func TestDxSplitAddressNoConnector(t *testing.T) {
 	}
 }
 
-// TestDxSplitFeesPerUtxo locks in RPC-F41: split_amount_with_fees is the split
+// TestDxSplitFeesPerUtxo locks in the fee math: split_amount_with_fees is the split
 // size plus feesPerUtxo = minTxFee1(1,3) + minTxFee2(1,1), added only when
 // include_fees. For BTC (FeePerByte=2): fee1 = (192+102)*2 = 588 -> 5 XB units,
 // fee2 = (192+34)*2 = 452 -> 4 XB units, feesPerUtxo = 9.
@@ -378,7 +378,7 @@ func TestDxSplitFeesPerUtxo(t *testing.T) {
 	}
 }
 
-// TestDxSplitInputsTxidVoutOnly locks in RPC-F40: dxSplitInputs entries need only
+// TestDxSplitInputsTxidVoutOnly locks in the input shape: dxSplitInputs entries need only
 // txid+vout (the documented example, rpcxbridge.cpp:3347); amount/script are
 // resolved from the wallet's unspent list.
 func TestDxSplitInputsTxidVoutOnly(t *testing.T) {
@@ -414,7 +414,7 @@ func TestDxSplitInputsLockedUtxo(t *testing.T) {
 	}
 }
 
-// TestDxSplitChangeToRequestedAddress locks in RPC-F42: ALL outputs (split and
+// TestDxSplitChangeToRequestedAddress locks in the output script behavior: ALL outputs (split and
 // change) use the REQUESTED address's script. The stub signs without modifying
 // the tx, so the raw tx decodes to the actual outputs; a fresh change address
 // would produce a different script.
@@ -456,7 +456,7 @@ func TestDxSplitChangeToRequestedAddress(t *testing.T) {
 	}
 }
 
-// TestDxSplitSubmitFailure locks in RPC-F43: a submit failure is 1004
+// TestDxSplitSubmitFailure locks in the failure shape: a submit failure is 1004
 // BAD_REQUEST named after the actual method (rpcxbridge.cpp:3278/3392).
 func TestDxSplitSubmitFailure(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -479,7 +479,7 @@ func TestDxTokenListsFromConf(t *testing.T) {
 	if ls, _ := local.([]string); len(ls) != 1 || ls[0] != "BTC" {
 		t.Errorf("local tokens = %v", local)
 	}
-	// RPC-F54: dxGetNetworkTokens is the pure SN service union — the config's
+	// dxGetNetworkTokens is the pure SN service union — the config's
 	// NetworkTokens/ExchangeWallets do NOT contribute, so with no connected
 	// servicenodes it is empty even though the config names BTC.
 	net, err := ctx.dxGetNetworkTokens(nil)
@@ -493,7 +493,7 @@ func TestDxTokenListsFromConf(t *testing.T) {
 
 // TestDxGetNetworkTokensLive verifies the live servicenode union: tokens
 // learned from SNREGISTER / SNPING messages (the same wire source a core
-// XBridge wallet uses) are returned as the network list (RPC-F54).
+// XBridge wallet uses) are returned as the network list.
 func TestDxGetNetworkTokensLive(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// Simulate two SPV servicenodes advertising their supported tokens via

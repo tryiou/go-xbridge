@@ -98,7 +98,7 @@ func TestServerEnvelopeAndError(t *testing.T) {
 	ctx := newTestCtx()
 	srv := NewServer(ctx)
 
-	// Unknown method -> envelope error, result null, HTTP 404 (RPC-F47/F48).
+	// Unknown method -> envelope error, result null, HTTP 404.
 	rec := callRPC(t, srv, `{"method":"dxNope","params":[],"id":1}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -141,10 +141,10 @@ func callRPC(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder 
 	return rec
 }
 
-// TestServerRPCAuth verifies RPC-F50: with -rpcuser/-rpcpassword configured, the
+// TestServerRPCAuth verifies the auth gate: with -rpcuser/-rpcpassword configured, the
 // JSON-RPC server requires valid HTTP Basic credentials — an empty-body 401 +
 // WWW-Authenticate challenge otherwise; without credentials configured, requests
-// pass through unchanged (the loopback-default contract; no cookie).
+// pass through unchanged (the loopback-default contract).
 func TestServerRPCAuth(t *testing.T) {
 	ctx := newTestCtx()
 	srv := NewServer(ctx)
@@ -285,7 +285,7 @@ func TestServerNoCredsOpen(t *testing.T) {
 	}
 }
 
-// TestServerMaxBodyBytes verifies RPC-F49: an oversized JSON-RPC body is rejected
+// TestServerMaxBodyBytes verifies the body cap: an oversized JSON-RPC body is rejected
 // by the http.MaxBytesReader gate (32 MiB cap, C++ MAX_SIZE) rather than
 // buffered/decoded unbounded, and the reply is a non-envelope 413 (libevent).
 func TestServerMaxBodyBytes(t *testing.T) {
@@ -320,7 +320,7 @@ func TestServerPostOnly405(t *testing.T) {
 func TestServerParseErrorStatus500(t *testing.T) {
 	ctx := newTestCtx()
 	srv := NewServer(ctx)
-	// Malformed JSON body -> -32700, HTTP 500 (RPC-F47).
+	// Malformed JSON body -> -32700, HTTP 500.
 	rec := callRPC(t, srv, `{"method":`)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("parse-error status = %d, want 500", rec.Code)
