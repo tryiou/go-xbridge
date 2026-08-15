@@ -105,6 +105,18 @@ func Unmarshal(data []byte) (*Packet, error) {
 		OldSize:   binary.LittleEndian.Uint32(data[offOldSize:]),
 		Size:      binary.LittleEndian.Uint32(data[offSize:]),
 	}
+	// Inbound protocol-version gate: C++ rejects any packet whose header
+	// version differs from XBRIDGE_PROTOCOL_VERSION before parsing the body or
+	// verifying the signature (Session::checkXBridgePacketVersion,
+	// xbridgesession.cpp:343-368, called at the top of App::onMessageReceived
+	// and App::onBroadcastReceived, xbridgeapp.cpp:648,737). The drop is
+	// silent: no misbehaviour penalty is scored (the C++ state.DoS() is a
+	// TODO comment). Checking here covers every inbound path, since all wire
+	// bytes reach the engine through Unmarshal.
+	if p.Version != ProtocolVersion {
+		xlog.Debug("proto: packet unmarshal failed", "err", "unsupported protocol version", "version", p.Version, "want", ProtocolVersion)
+		return nil, errors.New("xbridge: unsupported protocol version")
+	}
 	copy(p.Pubkey[:], data[PubkeyOffset:PubkeyOffset+PubkeySize])
 	copy(p.Signature[:], data[SigOffset:SigOffset+SigSize])
 	// p.Size is untrusted. Reject absurd sizes up front (cheap), then verify it
