@@ -316,10 +316,11 @@ a peer or fsync; join discovery goroutines + stop Dedupe on Close; snapshot
 connectors at task start (reload-mid-task race test). **DONE** — merged to
 `main`; register rows CONC-F92/F93/F94 + INV-F98 → `FIXED` (B11); branch doc
 `B11-concurrency.md`. Residuals documented: `p2p.Conn` write errors surface on
-the next send (C++ surfacing on the socket-handler thread); a handshake-stall
-peer can hold discovery `Close` up to `handshakeTimeout`; the coin registry is
-still resolved at build time via the atomic `coins.Get` (a reload dropping a
-coin fails a mid-task build cleanly rather than redirecting it).
+the next send (C++ surfacing on the socket-handler thread). Follow-up
+`fix/concurrency-followup`: the handshake-stall Close bound is closed
+(`NewConnCtx` aborts the version handshake on ctx cancellation) and the coin
+registry is snapshotted into `swapCtx` at enqueue (`coins.Snapshot`), so a
+reload mid-task can no longer change the coin parameters a build uses.
 
 ## Register + audit.md hygiene
 
