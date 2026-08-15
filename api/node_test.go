@@ -491,6 +491,50 @@ func TestRemoteCancelExchangeBranch(t *testing.T) {
 	}
 }
 
+// TestCancelOrderBroadcastsCrRpcRequest locks in the dxCancelOrder cancel
+// reason: C++ broadcasts crRpcRequest (10) for an RPC-initiated cancel
+// (rpcxbridge.cpp:1370), and the reason rides as the CancelBody uint32 on the
+// wire (xbridgesession.cpp:3571). A regression here would silently send reason
+// 0 (crUnknown) to the counterparty.
+func TestCancelOrderBroadcastsCrRpcRequest(t *testing.T) {
+	_ = coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
+	})
+	mPriv := make([]byte, 32)
+	mPriv[0] = 0x7b
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, idHex := mustID(t)
+
+	n := newCancelTestNode(&captureXConn{})
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Mine: true, Status: "open", SNodePubkey: hexPub(t, mPriv)}
+	o.ID = decodeID(t, idHex)
+	n.store.Add(o)
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
+
+	if _, rerr := n.CancelOrder(CancelOrderParams{ID: idHex}); rerr != nil {
+		t.Fatalf("CancelOrder: %+v", rerr)
+	}
+
+	pkts := n.conn.(*captureXConn).snapshot()
+	if len(pkts) != 1 {
+		t.Fatalf("broadcast packets = %d, want exactly one", len(pkts))
+	}
+	if pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("command = %v, want XbcTransactionCancel", pkts[0].Command)
+	}
+	var cancel proto.CancelBody
+	if err := cancel.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("cancel body: %v", err)
+	}
+	if cancel.Reason != uint32(crRpcRequest) {
+		t.Fatalf("cancel reason = %d, want %d (crRpcRequest)", cancel.Reason, crRpcRequest)
+	}
+}
+
 // TestRemoteRejectRestoresToPending: a role-'B' accepting order rejected with a
 // valid snode signature is restored to "open", role cleared, never cancelled.
 func TestRemoteRejectRestoresToPending(t *testing.T) {

@@ -2149,7 +2149,11 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 	if cfg == nil || cfg.Connectors[o.FromCurrency] == nil {
 		return nil, makeError(errNoSession, "dxCancelOrder", "")
 	}
-	var reason uint32 = 0
+	// C++ dxCancelOrder cancels with crRpcRequest (rpcxbridge.cpp:1370:
+	// cancelXBridgeTransaction(id, crRpcRequest)); crUserRequest (2) is the
+	// shutdown-cancel path only (xbridgeapp.cpp:2526). The reason rides as the
+	// CancelBody uint32 on the wire (xbridgesession.cpp:3571).
+	reason := uint32(crRpcRequest)
 	var rerr *rpcError
 	// State mutation (cancel packet, store update, refund, persist) runs on the
 	// engine goroutine, which owns the session and book maps.
