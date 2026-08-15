@@ -1,0 +1,65 @@
+name: ci
+
+# Self-contained go-xbridge CI. The go-xbridge repository has no access to the
+# sibling blocknet_core / tools repositories, so the full cross-repo parity
+# gate (stages A-E of `make parity` in tools/) cannot run here. This workflow
+# runs everything that is hermetic to this repo: build, vet, gofmt, the full
+# unit suite under -race, and stage F (the conformance module, build-tagged
+# `conformance`) in isolation.
+#
+# The A-E stages remain the operator-run gate: `make parity` + `make canary`
+# from tools/ on a checkout that also contains blocknet_core. A red parity
+# still blocks a release even when this CI is green.
+
+on:
+  push:
+    branches: ["main", "fix/**", "ci/**"]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build-vet-gofmt-test-race-conformance
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Matches the module go directive (go 1.25.0). The race detector
+          # needs a C toolchain, which ubuntu-latest provides.
+          go-version: "1.25.x"
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go mod tidy check
+        run: go mod tidy -diff
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      - name: conformance (parity stage F)
+        working-directory: conformance
+        run: go test -tags conformance -count=1 ./... -timeout 120s
