@@ -93,8 +93,9 @@ thin client and are skipped (a thin-client limitation).
 
 `BtcSigner` over `btcd/btcec/v2`: 64-byte compact ECDSA over `Packet.Digest()`.
 `VerifyAgainst` checks a signature against an explicit 33-byte hex pubkey (C++
-`packet->verify(pubkey)`), used to verify cancel/reject packets against the
-order's `mPubKey`/`oPubKey`/`sPubKey`. External dependencies are
+`packet->verify(pubkey)`, which requires the header pubkey field to equal the
+given key first), used to verify cancel/reject packets against the order's
+`mPubKey`/`oPubKey`/`sPubKey`. External dependencies are
 `btcd/btcec/v2`, `dcrd/dcrec/secp256k1/v4` and `golang.org/x/crypto` (ripemd160);
 see `go.mod`.
 
