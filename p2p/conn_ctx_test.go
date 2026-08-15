@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// TestConnHandshakeAbortsOnCtxCancel — CONC-F92 closure. NewConnCtx must abort
+// TestConnHandshakeAbortsOnCtxCancel closure. NewConnCtx must abort
 // an in-flight version/verack handshake the moment its context is cancelled
 // (instead of waiting out handshakeTimeout), so a PeerManager Close is not
 // wedged by a peer that accepts a connection but never speaks. The peer here
@@ -70,7 +70,7 @@ func TestConnCtxUncancelledHandshakesOK(t *testing.T) {
 	_ = c.Close()
 }
 
-// TestDialContextAbortsHandshakeStall — CONC-F92 closure at the dial boundary.
+// TestDialContextAbortsHandshakeStall closure at the dial boundary.
 // A real listener accepts the TCP connection but never sends a version; a
 // cancelled context must abort the in-flight handshake promptly (not after
 // handshakeTimeout), which is what keeps a discovery PeerManager Close bounded.

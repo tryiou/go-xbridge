@@ -300,7 +300,7 @@ func (c *RPCConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (strin
 			Amount:       amt,
 		})
 	}
-	// CRYPTO-F91: the signrawtransaction payload matches C++ exactly
+	// The signrawtransaction payload matches C++ exactly
 	// (xbridgewalletconnectorbtc.cpp:1055-1089): [rawtx, prevtxs|null, keys|null].
 	// Position 3 is the privkeys ARRAY (null here — the wallet owns the keys),
 	// not a sighash type: the pre-fix code sent "ALL" there, which landed in the

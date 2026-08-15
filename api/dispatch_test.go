@@ -23,7 +23,7 @@ func assertEnv(t *testing.T, name string, err *rpcError, wantMsg string) {
 	}
 }
 
-// TestStrictParamEnvelopeErrors locks in the RPC-F01 error channel: C++ throws
+// TestStrictParamEnvelopeErrors locks in the error channel: C++ throws
 // a std::runtime_error (json_spirit / UniValue) for a present-but-wrong-type or
 // null param, which surfaces as a JSON-RPC envelope error (code -1). The Go
 // parsers must reproduce the exact C++ message, not a business 1025 result.
@@ -160,7 +160,7 @@ func TestJsonTypeOf(t *testing.T) {
 	}
 }
 
-// TestNoSessionNameIsMethodName verifies RPC-F02: NO_SESSION errors carry the
+// TestNoSessionNameIsMethodName verifies NO_SESSION errors carry the
 // handler's method name (C++ __FUNCTION__), never the hardcoded "dx".
 func TestNoSessionNameIsMethodName(t *testing.T) {
 	ctx := &HandlerCtx{Store: NewStore(), Node: &Node{}}

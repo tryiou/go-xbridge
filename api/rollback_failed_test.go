@@ -42,8 +42,8 @@ func refundHexFixture() string {
 	return hex.EncodeToString(rtx.Serialize())
 }
 
-// TestRollbackFailedStatusOnRefundBroadcastFailure locks in STATE-F74: a
-// refund-broadcast failure writes the trRollbackFailed descriptor state
+// TestRollbackFailedStatusOnRefundBroadcastFailure locks in the rollback-failed
+// state: a refund-broadcast failure writes the trRollbackFailed descriptor state
 // ("rollback failed", C++ xbridgesession.cpp:3908) on the rollback path, and a
 // later successful retry restores "rolled back" (C++ trRollbackFailed ->
 // trRollback, :3912-3913).

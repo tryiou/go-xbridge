@@ -149,7 +149,7 @@ func TestLoadMissing(t *testing.T) {
 	}
 }
 
-// TestLoadSkipsRpcSection locks CFG-F84: [Rpc] is a dead section in C++
+// TestLoadSkipsRpcSection locks the [Rpc] handling: [Rpc] is a dead section in C++
 // (util/settings.h:49-65) and must not be parsed as a coin (which would abort
 // startup with "COIN not set"). The section must simply not appear in Coins.
 func TestLoadSkipsRpcSection(t *testing.T) {
@@ -179,7 +179,7 @@ BlockTime=600
 	}
 }
 
-// TestExchangeWalletsCppSemantics locks CFG-F88: ExchangeWallets splits on
+// TestExchangeWalletsCppSemantics locks the ExchangeWallets parsing: it splits on
 // ",", ";" or ":" and each symbol is uppercased/validated by ccy::Symbol
 // (length 1..8, no trimming — util/settings.cpp:143-166, currency.h:45-57).
 func TestExchangeWalletsCppSemantics(t *testing.T) {
@@ -242,7 +242,7 @@ ExchangeWallets=BTCABC12, ,LTC,
 	}
 }
 
-// TestCaseSensitiveKeys locks CFG-F89: key and section lookups are exact-case
+// TestCaseSensitiveKeys locks the case-sensitivity: key and section lookups are exact-case
 // (boost property_tree). A miscased key reads as absent; "[main]" is a coin
 // section, not the [Main] block.
 func TestCaseSensitiveKeys(t *testing.T) {
@@ -272,7 +272,7 @@ BlockTime=600
 	}
 }
 
-// TestTitleDefaultsEmpty locks CFG-F91: C++ Settings::get returns "" for a
+// TestTitleDefaultsEmpty locks the title default: C++ Settings::get returns "" for a
 // missing key (settings.h:75-84), so Title defaults to "" — not the section
 // name (the pre-fix Go default).
 func TestTitleDefaultsEmpty(t *testing.T) {

@@ -181,7 +181,7 @@ magics and default ports are in [`docs/protocol.md`](docs/protocol.md).
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
 | `-rpcbind` | `127.0.0.1:41414` | JSON-RPC listen address `host:port` for the `dx*` API. Defaults to **loopback only**; set explicitly to bind elsewhere. |
-| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth for RPC. Enforced only when **both** are set (no cookie fallback); a non-loopback `-rpcbind` without auth logs a warning. |
+| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth for RPC. Enforced only when **both** are set; a non-loopback `-rpcbind` without auth logs a warning. |
 | `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
 | `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
 | `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
@@ -240,8 +240,7 @@ Steps (params shown positionally — wrap them in the `"params"` array as above)
     validated on-chain against its expected p2sh script, amount, confirmations,
     sequences, prevouts, and fees (`wallet.CheckDepositTransaction`, C++
     `checkDepositTransaction` parity); a bad deposit is wire-cancelled and rolled
-    back, so a never-established trust basis cannot be turned into theft (B3,
-    CRYPTO-F85/F90, SEC-F03).
+    back, so a never-established trust basis cannot be turned into theft.
  5. **Cancel** an open order: `dxCancelOrder <order_id>`.
 
 Full field/param contracts for every `dx*` command (positional params, response
@@ -286,6 +285,5 @@ fills only) are documented under "Tier 3" there.
 | [`docs/protocol.md`](docs/protocol.md) | The XBridge wire contract: transport, packet layout, commands, swap handshake, signing. |
 | [`docs/api.md`](docs/api.md) | The `dx*` JSON-RPC surface (params, response shapes, error codes). |
 | [`docs/architecture.md`](docs/architecture.md) | Contributor guide: package-by-package code architecture, build/test/verify, conventions. |
-| [`docs/audit/`](docs/audit/README.md) | C++↔Go audit home: canonical register (`audit/register.md`), per-finding detail, axis evidence, verify reports. |
 | [`conformance/`](conformance/) | Behavioral/wire conformance suite (external Go module, build-tag `conformance`; runs via `make parity` stage F). |
 | [`CLAUDE.md`](CLAUDE.md) | Repo conventions and hard rules for coding agents/contributors. |

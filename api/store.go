@@ -28,7 +28,7 @@ import (
 // tracked in a separate ledger — they stay in the live book (status "canceled")
 // and history until dxFlushCancelledOrders prunes them, mirroring C++ which
 // erases trCancelled entries from m_transactions and m_historicTransactions
-// (xbridgeapp.cpp:1331-1354, RPC-F35).
+// (xbridgeapp.cpp:1331-1354).
 type Store struct {
 	mu      sync.RWMutex
 	orders  map[string]*Order
@@ -57,8 +57,8 @@ type reservedKeys struct {
 }
 
 const (
-	maxStoreFills   = 1000 // bound on s.fills (CONC-F99: bounded history)
-	maxStoreHistory = 1000 // bound on s.history (CONC-F99: bounded history)
+	maxStoreFills   = 1000 // bound on s.fills (bounded history)
+	maxStoreHistory = 1000 // bound on s.history (bounded history)
 )
 
 // trimOldest returns s with at most max elements, dropping the oldest entries
@@ -685,12 +685,12 @@ func (s *Store) ReleaseReserve(key string) {
 // FlushCancelled prunes cancelled orders whose txtime is older than
 // minAgeMillis from BOTH the live book and history, mirroring C++
 // App::flushCancelledOrders (xbridgeapp.cpp:1331-1354) which erases
-// trCancelled transactions from m_transactions AND m_historicTransactions
-// (RPC-F35). keepTime = now - minAgeMillis(ms); orders with txtime < keepTime
+// trCancelled transactions from m_transactions AND m_historicTransactions.
+// keepTime = now - minAgeMillis(ms); orders with txtime < keepTime
 // are removed and returned (the rest are kept). A minAgeMillis of 0 prunes
 // everything regardless of age. The returned list is ordered the way C++
 // iterates its std::maps — the live book first, then history, each in
-// uint256-ascending (id) order (RPC-F36).
+// uint256-ascending (id) order.
 func (s *Store) FlushCancelled(minAgeMillis uint64) []flushedOrder {
 	s.mu.Lock()
 	defer s.mu.Unlock()

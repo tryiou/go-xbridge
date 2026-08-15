@@ -121,7 +121,7 @@ func swapStatePath(dir string) string {
 // finished/cancelled trades remain visible after restart. The marshal (CPU,
 // consistent snapshot) runs on the engine goroutine — it reads n.sessions,
 // which the engine alone owns — while the disk write runs on the background
-// persistLoop goroutine (CONC-F92b), so the engine never blocks on fsync.
+// persistLoop goroutine, so the engine never blocks on fsync.
 func snapshotSwaps(n *Node) ([]byte, error) {
 	ps := make([]persistedSwap, 0, len(n.sessions))
 	for _, o := range n.store.List() {
@@ -225,7 +225,7 @@ type persistJob struct {
 }
 
 // persist flushes local swap state to disk without blocking the engine on
-// fsync (CONC-F92b). The snapshot (marshal of the swapFile env, reading the
+// fsync. The snapshot (marshal of the swapFile env, reading the
 // engine-owned n.sessions) is built on the engine goroutine; the actual
 // temp-write/fsync/rename runs on the background persistLoop goroutine, so a
 // slow disk never stalls packet processing — C++ saveOrders likewise runs on

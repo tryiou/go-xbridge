@@ -9,7 +9,7 @@ import (
 	"go-xbridge/proto"
 )
 
-// TestNewPrivateKeyFullRange (CRYPTO-F82) pins the full-range generation: every
+// TestNewPrivateKeyFullRange pins the full-range generation: every
 // key is a valid secp256k1 scalar in [1, N-1], and across enough draws the top
 // bit is set at least once — proving the generator no longer clears it (the
 // pre-fix code forced b[0]&=0x7f, discarding a bit of entropy).
@@ -33,7 +33,7 @@ func TestNewPrivateKeyFullRange(t *testing.T) {
 		}
 	}
 	if !topBitSet {
-		t.Error("no generated key had the top bit set; generation still biased (CRYPTO-F82)")
+		t.Error("no generated key had the top bit set; generation still biased")
 	}
 }
 
@@ -152,10 +152,10 @@ func TestSignWrongKeyLength(t *testing.T) {
 // deterministic ECDSA. We cannot fetch an external C++ vector from this sandbox,
 // so this test pins the property that matters for interop: the same key and
 // same digest always produce the identical 64-byte compact signature (a
-// tampered/flaky signer would diverge and fail here). TODO(audit): validate
-// this exact signature against a live C++ node (e.g. the reachable
-// coreproxy.airdns.org:42111 XBridge hub) to close the [VERIFY] item; the one
-// remaining live cross-check.
+// tampered/flaky signer would diverge and fail here). TODO: validate this exact
+// signature against a live C++ node (e.g. the reachable
+// coreproxy.airdns.org:42111 XBridge hub) as the one remaining live
+// cross-check.
 func TestSignDeterministicKAT(t *testing.T) {
 	signer := NewBtcSigner()
 

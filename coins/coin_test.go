@@ -93,7 +93,7 @@ func TestFromConfNoHardcoding(t *testing.T) {
 	}
 }
 
-// TestFromConfCashAddrPrefix locks CFG-F91: the conf `CashAddrPrefix` value
+// TestFromConfCashAddrPrefix locks the cashaddr prefix: the conf `CashAddrPrefix` value
 // wins over the method-derived class constant, with C++'s fallbacks (bch.cpp:
 // 306-308, devault.cpp:278-280) when empty / "bitcoincash" on DEVAULT.
 func TestFromConfCashAddrPrefix(t *testing.T) {

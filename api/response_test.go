@@ -276,7 +276,7 @@ func TestOrderIDLess(t *testing.T) {
 	}
 }
 
-// TestMakeOrderResponseLayoutB locks in RPC-F09's field ORDER: the dxMakeOrder
+// TestMakeOrderResponseLayoutB locks in the field ORDER: the dxMakeOrder
 // SUCCESS object is Layout B — created_at BEFORE updated_at, maker_address
 // 2nd, taker_address 5th, block_id 10th (rpcxbridge.cpp:1047-1067). A struct
 // field reorder (or embedding the old Layout A base) breaks this golden.
@@ -306,8 +306,8 @@ func TestMakeOrderResponseLayoutB(t *testing.T) {
 	}
 }
 
-// TestMakeDryrunResponse locks in RPC-F10: the dxMakeOrder / dxMakePartialOrder
-// dryrun objects carry the ZERO id, no created_at/updated_at/block_id, and the
+// TestMakeDryrunResponse locks in the dryrun object shape: the dxMakeOrder /
+// dxMakePartialOrder dryrun objects carry the ZERO id, no created_at/updated_at/block_id, and the
 // maker/taker addresses AFTER maker_size/taker_size (rpcxbridge.cpp:1004-1021,
 // 3106-3122).
 func TestMakeDryrunResponse(t *testing.T) {
@@ -360,7 +360,7 @@ func TestMakeDryrunResponse(t *testing.T) {
 	}
 }
 
-// TestQuantizePrice locks in RPC-F17's price quantization: ccy::Asset::Price
+// TestQuantizePrice locks in the price quantization: ccy::Asset::Price
 // rounds the to/from ratio half-up onto the 1e-6 grid (TransactionDescr::COIN
 // basis, currency.h:108-123).
 func TestQuantizePrice(t *testing.T) {

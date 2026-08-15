@@ -36,7 +36,8 @@ func FormatBalanceNative(decimals, native uint64) string {
 // FormatXPrice re-exports formatXPrice over a plain ratio (denominator /
 // numerator). The suite's signature mirrors the C++ price formula call sites
 // (xutil.cpp:293-312); Go renders the plain ratio, which is itself the
-// documented DIVERGENT behavior for dxGetOrderBook (RPC-F20).
+// documented DIVERGENT behavior for dxGetOrderBook (see the conformance
+// suite's TestFormatXPriceVectors row dxGetOrderBook/price-formula).
 func FormatXPrice(numerator, denominator uint64) string {
 	return formatXPrice(float64(denominator) / float64(numerator))
 }

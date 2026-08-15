@@ -969,8 +969,8 @@ func DecodeBody(cmd XBridgeCommand, body []byte) (interface{}, error) {
 		// XbcXChatMessage (2) and XbcServicesPing (50) have no C++ writer on
 		// either side (xbridgesession.cpp:373-375, servicenodemgr.h:113-117)
 		// and are never sent on the live wire, so their former speculative
-		// body types were removed (WIRE-F67/F68). A received packet of either
-		// command is an explicit unsupported-command error here.
+		// body types were removed. A received packet of either command is an
+		// explicit unsupported-command error here.
 		return nil, errors.New("xbridge: no typed body for command " + cmd.String())
 	}
 }

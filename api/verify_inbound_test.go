@@ -27,7 +27,7 @@ func proofEntries(t *testing.T, ctx *HandlerCtx) []proto.UtxoEntry {
 	return entries
 }
 
-// TestVerifyOrderUtxosValid locks in SEC-F02's happy path: an order whose maker
+// TestVerifyOrderUtxosValid locks in the happy path: an order whose maker
 // UTXO proofs verify against the chain (getTxOut existence + BIP137 signature)
 // and whose surviving entries cover the fromAmount is bookable (C++ snode
 // processTransaction, xbridgesession.cpp:535-577).
@@ -114,8 +114,8 @@ func TestVerifyAndBookValid(t *testing.T) {
 	}
 }
 
-// TestVerifyAndBookForged proves a forged-proof order is NOT booked (SEC-F02
-// core: an inbound order whose maker utxo proofs fail never enters the book).
+// TestVerifyAndBookForged proves a forged-proof order is NOT booked (the
+// core rule: an inbound order whose maker utxo proofs fail never enters the book).
 func TestVerifyAndBookForged(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := &Order{
@@ -132,8 +132,8 @@ func TestVerifyAndBookForged(t *testing.T) {
 }
 
 // TestVerifyAndBookNoConnector proves an order for a currency with no connector
-// is booked without verification (there is nothing to verify against; CFG-F87
-// prunes unconnected orders unless ShowAllOrders). The C++ trader behaves the
+// is booked without verification (there is nothing to verify against; the
+// reload prune removes unconnected orders unless ShowAllOrders). The C++ trader behaves the
 // same way for cmd-4 broadcasts, which carry no UTXO entries at all.
 func TestVerifyAndBookNoConnector(t *testing.T) {
 	ctx := newWalletTestCtx()

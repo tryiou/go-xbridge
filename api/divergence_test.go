@@ -95,7 +95,7 @@ func TestDxPartialOrderChainDetailsInvalidId(t *testing.T) {
 
 // TestDxPartialOrderChainDetailsDeposits verifies the per-order deposit txids
 // (BinTxId / OBinTxId) are emitted in p2sh_deposits / p2sh_deposits_counterparty,
-// one entry per chain order (empty strings included — RPC-F28).
+// one entry per chain order (empty strings included).
 // T2.3.
 func TestDxPartialOrderChainDetailsDeposits(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -132,7 +132,7 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 		wallet.Utxo{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0, Amount: 100000000, Value: 1.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 	)}
 	// The take's service-node fee prep requires a funded BLOCK connector
-	// (CRYPTO-F84, C++ acceptXBridgeTransaction :2236). Reward the shared ctx with the
+	// (C++ acceptXBridgeTransaction :2236). Reward the shared ctx with the
 	// default BLOCK conf + a 1.0 BLOCK p2pkh funder, matching newHubNode.
 	ctx.Node.config.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
 	// Two BLOCK funders: take #1 locks its fee utxo (LockedUtxoInfo reserves a
@@ -180,7 +180,7 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	}
 
 	// Amount "0" is NOT a full take: C++ rejects an explicit amount <= 0 with
-	// 1025 carrying the raw string (rpcxbridge.cpp:1151-1161, RPC-F14).
+	// 1025 carrying the raw string (rpcxbridge.cpp:1151-1161).
 	if _, err := ctx.dxTakeOrder([]json.RawMessage{jstr(id), jstr(btcAddr), jstr(btcAddr2), jstr("0")}); err == nil {
 		t.Fatal("dxTakeOrder (amount 0) should error")
 	} else if err.Code != errInvalidParameters || err.Error != "Invalid parameters: The amount cannot be less than or equal to 0: 0" {
@@ -204,7 +204,7 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	}
 }
 
-// TestTakeOrderFundingRejectsNonP2PKH — B2 Finding 2. C++ getUnspent only funds
+// TestTakeOrderFundingRejectsNonP2PKH. C++ getUnspent only funds
 // a taker with 25-byte P2PKH outputs (unspentP2PKH,
 // xbridgewalletconnectorbtc.cpp:1605-1638); a P2SH/multisig/OP_RETURN output is
 // never spendable by the deposit path and must never enter the
@@ -375,7 +375,7 @@ func TestDxLockedUtxoNativeAmount(t *testing.T) {
 	}
 }
 
-// TestDxGetLockedUtxosNoReserved locks in RPC-F32: C++ getUtxoItems(id) fails
+// TestDxGetLockedUtxosNoReserved locks in the behavior: C++ getUtxoItems(id) fails
 // (-> 1021 TRANSACTION_NOT_FOUND, rpcxbridge.cpp:2637) when the id has no locked
 // utxos reserved (m_utxoTxMap miss). A live order with nothing reserved must
 // error 1021, not return [].
@@ -388,7 +388,7 @@ func TestDxGetLockedUtxosNoReserved(t *testing.T) {
 	}
 }
 
-// TestDxGetLockedUtxosIdEchoNormalized locks in RPC-F34: the echoed id is the
+// TestDxGetLockedUtxosIdEchoNormalized locks in the id echo: the echoed id is the
 // C++ display-hex (GetHex) of the parsed value, never the raw param
 // (rpcxbridge.cpp:2672). A short id left-pads to the full 64-hex form.
 func TestDxGetLockedUtxosIdEchoNormalized(t *testing.T) {
@@ -404,7 +404,7 @@ func TestDxGetLockedUtxosIdEchoNormalized(t *testing.T) {
 	}
 }
 
-// TestDxGetLockedUtxosAmountDefaultDouble locks in RPC-F31: the amount is the
+// TestDxGetLockedUtxosAmountDefaultDouble locks in the amount encoding: the amount is the
 // native whole-coin double streamed with the C++ default precision 6
 // (UtxoEntry::toString, xbridgewalletconnector.cpp:25-30), so 0.1234567 renders
 // "0.123457" — NOT the registry fixed-decimals / XBridge 1e6 forms the previous
@@ -425,7 +425,7 @@ func TestDxGetLockedUtxosAmountDefaultDouble(t *testing.T) {
 	}
 }
 
-// TestDxGetLockedUtxosTerminalOrder locks in RPC-F32 for a finished/canceled
+// TestDxGetLockedUtxosTerminalOrder locks in the no-reserved behavior for a finished/canceled
 // order still in the live store (status flipped, MoveToHistory not yet run):
 // lockedInfoLocked skips terminal orders (store.go:378-380) so the id has no
 // locked utxos -> 1021, matching C++ where a finished transaction is in
@@ -445,7 +445,7 @@ func TestDxGetLockedUtxosTerminalOrder(t *testing.T) {
 // TestFlushCancelledUnderflow verifies a huge ageMillis does not underflow uint64
 // (keepTime stays large so every old entry is pruned) and age 0 prunes all
 // remaining entries. It drives the C++-faithful path: cancelled orders are
-// pruned from the LIVE BOOK and history (xbridgeapp.cpp:1331-1354, RPC-F35).
+// pruned from the LIVE BOOK and history (xbridgeapp.cpp:1331-1354).
 // T1.4.
 func TestFlushCancelledUnderflow(t *testing.T) {
 	s := NewStore()

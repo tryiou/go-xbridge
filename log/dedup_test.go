@@ -245,7 +245,7 @@ func TestFlushAll(t *testing.T) {
 // TestDedupe_RestartReRegisters — a later Event after Flush restarts the sweep
 // goroutine AND re-registers it, so a subsequent FlushAll still sees and stops
 // it. Without the re-registration a restarted sweeper would be invisible to
-// FlushAll and leak forever (the CONC-F93 gap the daemon's shutdown FlushAll
+// FlushAll and leak forever (the gap the daemon's shutdown FlushAll
 // used to miss).
 func TestDedupe_RestartReRegisters(t *testing.T) {
 	cap1 := &captureSummaries{}

@@ -122,7 +122,7 @@ type SwapSession struct {
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
 
-	// Validated counterparty deposit (CRYPTO-F90): the C++
+	// Validated counterparty deposit: the C++
 	// checkDepositTransaction out-params recorded when we accept the
 	// counterparty's deposit (CreateB for the taker's A-check, ConfirmA for the
 	// maker's B-check). P2SHNative is the exact matched output value in the
@@ -131,8 +131,13 @@ type SwapSession struct {
 	theirP2SHNative  uint64
 	theirOverpayment uint64
 
-	hub    [20]byte // service-node address, pinned at session creation (maker: chosen at MakeOrder; taker: order's HubAddress)
-	hubKey [33]byte // trusted hub service-node pubkey (C++ xtx->sPubKey): pinned at creation for BOTH roles (maker: the SN chosen at make; taker: order's SNodePubkey); every hub handshake packet is re-verified against it (STATE-F78)
+	// hub is the service-node address, pinned at session creation (maker:
+	// chosen at MakeOrder; taker: order's HubAddress).
+	hub [20]byte
+	// hubKey is the trusted hub service-node pubkey (C++ xtx->sPubKey), pinned
+	// at creation for BOTH roles (maker: the SN chosen at make; taker: order's
+	// SNodePubkey); every hub handshake packet is re-verified against it.
+	hubKey [33]byte
 	state  clientState
 
 	// await is true while a two-phase handshake task (deposit/claim) for this
@@ -153,7 +158,7 @@ type depositOutcome struct {
 
 // confirmOutcome is the worker-produced result of a claim (ConfirmA/B). secret
 // is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA). check
-// carries the validated counterparty deposit (ConfirmA's F85 check; zero for
+// carries the validated counterparty deposit (ConfirmA's deposit check; zero for
 // ConfirmB, whose check ran at CreateB).
 type confirmOutcome struct {
 	secret  [33]byte
@@ -216,8 +221,8 @@ func (s *SwapSession) failSelfCancel(terr error) bool {
 }
 
 // createdBOutcome is the worker result of the taker's CreateB task: the built
-// deposit plus the validated counterparty A-deposit (CRYPTO-F90 — the resume
-// records DepositVout/P2SHAmount/Excess on the session for the F90 redeem).
+// deposit plus the validated counterparty A-deposit (the resume
+// records DepositVout/P2SHAmount/Excess on the session for the redeem).
 type createdBOutcome struct {
 	out   depositOutcome
 	check wallet.DepositCheck
@@ -243,7 +248,7 @@ func (c *swapCtx) counterpartyDepositScriptHex(hash [20]byte) string {
 
 // checkCounterpartyDeposit validates the counterparty's deposit against the
 // expected p2sh script and amount before we commit our own deposit or redeem
-// theirs (CRYPTO-F85 — C++ checkDepositTransaction call sites
+// theirs (C++ checkDepositTransaction call sites
 // xbridgesession.cpp:2495/2957). expectedAmount is XBridge 1e6 base. Tri-state:
 // ErrDepositNotReady and ErrNoChainSource are returned as errors (the caller
 // sends NO response — C++ processLater / the connector cannot judge); a
@@ -299,8 +304,8 @@ type swapCtx struct {
 
 	// connectors / confs are shallow snapshots of the live config taken at
 	// enqueue time; coinsMap is a value copy of the coin registry's entries
-	// for this session's two currencies, taken under one atomic load
-	// (CONC-F94). A dxLoadXBridgeConf or the 30s wallet sweep swaps n.config
+	// for this session's two currencies, taken under one atomic load.
+	// A dxLoadXBridgeConf or the 30s wallet sweep swaps n.config
 	// with NEW connector/confs objects and re-publishes the coin registry; the
 	// worker task must build against the set that was current when the swap
 	// started — the C++ session holds the connector pointer it captured, so a
@@ -314,19 +319,19 @@ type swapCtx struct {
 
 	// ourDepositP2SH is the exact value of OUR deposit's P2SH output as built by
 	// BuildDepositTx (Amount+fee2, output 0). buildRefundTx commits it to the
-	// forkid digest (CRYPTO-F77), so the committed value is structural rather
+	// forkid digest, so the committed value is structural rather
 	// than recomputed — immune to a conf hot-reload landing between buildDeposit
 	// and buildRefundTx.
 	ourDepositP2SH uint64
 
 	// funding is the deposit's exact funding set — the make/take-time selection
-	// recorded as Order.UsedCoins (CRYPTO-F87, C++ xtx->usedCoins). buildDeposit
+	// recorded as Order.UsedCoins (C++ xtx->usedCoins). buildDeposit
 	// spends exactly this, never a fresh ListUnspent.
 	funding []wallet.Utxo
 }
 
 // snapshot copies the session's fields a worker task needs, plus shallow
-// snapshots of the live connector/confs sets (CONC-F94). It runs on the engine
+// snapshots of the live connector/confs sets. It runs on the engine
 // goroutine (stage 1), so reading live session state and the cfg-guarded config
 // here is safe.
 func (s *SwapSession) snapshot() swapCtx {
@@ -383,8 +388,8 @@ func (s *SwapSession) snapshot() swapCtx {
 }
 
 // orderFunding returns the order's recorded funding set (Order.UsedCoins) for
-// the deposit to spend — C++ xtx->usedCoins, populated at make/take time
-// (CRYPTO-F87). store.Get returns a deep copy, so the worker can hold this
+// the deposit to spend — C++ xtx->usedCoins, populated at make/take time.
+// store.Get returns a deep copy, so the worker can hold this
 // without racing the engine.
 func (n *Node) orderFunding(id [32]byte) []wallet.Utxo {
 	o := n.store.Get(hexEncode(id[:]))
@@ -424,7 +429,7 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [
 		secretHash:    coins.KeyID(xpk[:]),
 		state:         csMaker,
 	}
-	// STATE-F78: the maker's trusted hub key is the servicenode chosen at make
+	// The maker's trusted hub key is the servicenode chosen at make
 	// time (C++ xtx->sPubKey = findNodeWithService result). It is pinned HERE,
 	// at session creation — never learned from network packets — so every hub
 	// handshake packet (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified
@@ -454,7 +459,7 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 		pubKey:        pub,
 		state:         csTaker,
 	}
-	// STATE-F78: the taker's trusted hub key is the servicenode that broadcast
+	// The taker's trusted hub key is the servicenode that broadcast
 	// the order (C++ xtx->sPubKey = the SN whose header signed the order). It is
 	// pinned HERE, at session creation, so every hub handshake packet
 	// (Hold/Init/CreateA/B/ConfirmA/B/Finished) is re-verified against it — a
@@ -482,7 +487,7 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 	if !ok {
 		return 0, nil, fmt.Errorf("api: unknown coin %s", s.srcCur)
 	}
-	// STATE-F71: re-verify the hub-relayed give/take amounts against the order
+	// Re-verify the hub-relayed give/take amounts against the order
 	// (C++ processTransactionHold, xbridgesession.cpp:1404-1471). Any mismatch
 	// is dropped with NO reply (C++ return true) — the hub retransmits.
 	if err := s.verifyHold(b); err != nil {
@@ -548,13 +553,13 @@ func (s *SwapSession) verifyHold(b *proto.HoldBody) error {
 // OnInit (hub→each) → Initialized (9): echo back our destination address.
 func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
-	// STATE-F71: C++ processTransactionInit drops once already initialized
+	// C++ processTransactionInit drops once already initialized
 	// (xbridgesession.cpp:1725-1732).
 	if s.state >= csInitialized {
 		xlog.Info("Init ignored: swap already initialized", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
 	}
-	// STATE-F71: full order-detail re-verification with the INTENDED OR
+	// Full order-detail re-verification with the INTENDED OR
 	// semantics (reject on ANY single-field mismatch). C++ :1750-1756 uses a
 	// buggy && (only rejects when EVERY field differs); the intended — and
 	// secure — behavior is to reject on any mismatch. Documented divergence.
@@ -631,7 +636,7 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateA received by taker session %s", orderID)
 	}
-	// STATE-F77: C++ processTransactionCreateA drops a CreateA once the transaction
+	// C++ processTransactionCreateA drops a CreateA once the transaction
 	// already reached trCreated (xbridgesession.cpp:1947). A retransmit arriving
 	// AFTER our deposit completed (await is cleared) must not re-broadcast a
 	// second deposit.
@@ -724,7 +729,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: CreateB received by maker session %s", orderID)
 	}
-	// STATE-F77: C++ processTransactionCreateB drops a CreateB once the transaction
+	// C++ processTransactionCreateB drops a CreateB once the transaction
 	// already reached trCreated (xbridgesession.cpp:2424). A post-completion
 	// retransmit must not re-broadcast a second deposit.
 	if s.state >= csCreatedB {
@@ -762,7 +767,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadALockTime}
 			}
-			// CRYPTO-F85: validate the maker's A deposit BEFORE committing ours
+			// Validate the maker's A deposit BEFORE committing ours
 			// (C++ :2495). Wait → no response (hub retransmits); bad → Cancel.
 			dcheck, err := c.checkCounterpartyDeposit(c.theirSecretHash, c.dstAmt)
 			if err != nil {
@@ -857,7 +862,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	if !s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", orderID)
 	}
-	// STATE-F77: C++ processTransactionConfirmA drops a ConfirmA once the transaction
+	// C++ processTransactionConfirmA drops a ConfirmA once the transaction
 	// already reached trCommited (xbridgesession.cpp:2897). A retransmit AFTER
 	// we redeemed must not re-broadcast a second claim payTx.
 	if s.state >= csConfirmedA {
@@ -886,7 +891,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadBLockTime}
 			}
-			// CRYPTO-F85: validate the taker's B deposit before redeeming it
+			// Validate the taker's B deposit before redeeming it
 			// (C++ :2957). Wait → no response (hub retransmits); bad → Cancel.
 			dcheck, err := c.checkCounterpartyDeposit(c.secretHash, c.dstAmt)
 			if err != nil {
@@ -948,7 +953,7 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()); the
-	// validated deposit out-params feed the F90 order record.
+	// validated deposit out-params feed the order record.
 	s.n.store.Update(orderID, func(o *Order) {
 		o.CounterpartyRedeemed = true
 		o.OBinTxVout = out.check.DepositVout
@@ -980,7 +985,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	if s.isMaker {
 		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", orderID)
 	}
-	// STATE-F77: C++ processTransactionConfirmB drops a ConfirmB once the transaction
+	// C++ processTransactionConfirmB drops a ConfirmB once the transaction
 	// already reached trCommited (xbridgesession.cpp:3152). A retransmit AFTER
 	// we redeemed must not re-broadcast a second claim payTx.
 	if s.state >= csConfirmedB {
@@ -1096,7 +1101,7 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 // paths, matching C++ force-refund semantics). Returns ("", nil) when the
 // refund is not yet due — the sweep retries on the next tick. Runs on a worker
 // goroutine; self-contained (all inputs captured by value, including the
-// connector captured at enqueue time — CONC-F94). cur names the coin for error
+// connector captured at enqueue time). cur names the coin for error
 // context only.
 func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32, checkLock bool) (string, error) {
 	if conn == nil {
@@ -1122,7 +1127,7 @@ func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32
 // and clears the guard so that sweep can re-enqueue it.
 func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, checkLock bool, done func(txid string, err error)) bool {
 	// Capture the connector at enqueue time (engine side) so a mid-task reload
-	// cannot swap which wallet broadcasts the refund (CONC-F94).
+	// cannot swap which wallet broadcasts the refund.
 	conn := n.cfg().Connectors[cur]
 	task := workTask{
 		orderID: orderID,
@@ -1319,7 +1324,7 @@ func (n *Node) checkRefunds() {
 // done before returning.
 func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) {
 	if s := n.sessions[orderID]; s != nil && s.refundHex != "" {
-		// CONC-F102: take the pendingRefunds guard so a concurrent sweep
+		// Take the pendingRefunds guard so a concurrent sweep
 		// (scanRefunds) cannot enqueue a second broadcast of the same refund
 		// hex while this force-refund is in flight. postRefundTask's apply
 		// clears the guard on success AND error, so the sweep safety net still
@@ -1454,7 +1459,7 @@ func (c *swapCtx) computeLockTime(isMaker bool) uint32 {
 
 // buildDeposit builds the local participant's HTLC deposit, funds it from the
 // wallet connector, signs the funding inputs via the wallet, pre-builds the CLTV
-// refund, and only then broadcasts (CRYPTO-F86 — C++ builds deposit → refund →
+// refund, and only then broadcasts (C++ builds deposit → refund →
 // broadcast). It returns the broadcast deposit txid + lockTime and the
 // pre-signed refund hex as a depositOutcome. Runs on a worker in the two-phase
 // handshake; it reads only this snapshot and lock-guarded config, and performs
@@ -1471,7 +1476,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !ok {
 		return depositOutcome{}, fmt.Errorf("api: unknown coin %s", cur)
 	}
-	// CRYPTO-F87: spend the recorded make/take-time selection (Order.UsedCoins,
+	// Spend the recorded make/take-time selection (Order.UsedCoins,
 	// C++ xtx->usedCoins), never a fresh ListUnspent.
 	funding := c.funding
 	if len(funding) == 0 {
@@ -1487,7 +1492,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	} else {
 		copy(change[:], a.Hash)
 	}
-	// CRYPTO-F78: the deposit network fee uses minTxFee1(nIn, 3) — C++ computes
+	// The deposit network fee uses minTxFee1(nIn, 3) — C++ computes
 	// fee1 over the deposit with three outputs (p2sh + change + dust safety),
 	// xbridgesession.cpp:1994 (maker) / :2526 (taker).
 	fee := estimateFee(cc, len(funding), 3)
@@ -1504,7 +1509,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !isMaker {
 		hash = c.theirSecretHash
 	}
-	// W0 (CRYPTO-F90 prerequisite): the on-chain deposit locks NATIVE base units.
+	// The on-chain deposit locks NATIVE base units.
 	// c.srcAmt is XBridge 1e6 base; convert at this boundary so the swap
 	// package (BuildDepositTx output = Amount+fee2, change = total−Amount−fee−fee2)
 	// never mixes scales. C++ converts outAmount = fromAmount/COIN(XBridge) to
@@ -1526,7 +1531,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 		return depositOutcome{}, err
 	}
 	// The P2SH HTLC is always output 0; record its exact value so buildRefundTx
-	// can commit it to the forkid digest without recomputing fee2 (CRYPTO-F77).
+	// can commit it to the forkid digest without recomputing fee2.
 	if len(tx.Outputs) == 0 {
 		return depositOutcome{}, fmt.Errorf("api: deposit tx has no outputs for %s", cur)
 	}
@@ -1544,7 +1549,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if !complete {
 		return depositOutcome{}, fmt.Errorf("api: deposit signing incomplete for %s", cur)
 	}
-	// CRYPTO-F86: derive the deposit txid LOCALLY (C++ binTxId comes from
+	// Derive the deposit txid LOCALLY (C++ binTxId comes from
 	// createDepositTransaction, xbridgewalletconnectorbtc.cpp:2410) and
 	// pre-build the CLTV refund BEFORE broadcasting. C++ builds deposit →
 	// refund → then broadcasts (processTransactionCreateA/B); the old order
@@ -1586,7 +1591,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 	if err != nil {
 		return "", err
 	}
-	// CRYPTO-F77: for forkid coins the digest commits the spent output's exact
+	// For forkid coins the digest commits the spent output's exact
 	// value. The refund spends our deposit's P2SH output (outAmount+fee2,
 	// xbridgesession.cpp:2135), whose value was recorded at build time as
 	// c.ourDepositP2SH (never recomputed, so a conf hot-reload can't skew it).
@@ -1611,7 +1616,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 		PrevOut:  coins.OutPoint{Hash: h, Index: 0},
 		Sequence: 0xfffffffe, // enable CLTV
 	})
-	// CRYPTO-F90: the refund pays the FULL nominal amount — C++ refund output is
+	// The refund pays the FULL nominal amount — C++ refund output is
 	// outAmount (xbridgesession.cpp:2149), spending the deposit's outAmount+fee2
 	// output, so fee2 is the refund's implicit miner fee. Was spec.Amount - fee
 	// (a second fee2 deduction).
@@ -1657,8 +1662,8 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		return "", "", err
 	}
 	fee := estimateFee(c.conf(depositCur), 1, 1)
-	// CRYPTO-F90: spend the VALIDATED counterparty deposit (C++ oBinTxVout /
-	// oBinTxP2SHAmount, recorded by the F85 check) instead of the hardcoded
+	// Spend the VALIDATED counterparty deposit (C++ oBinTxVout /
+	// oBinTxP2SHAmount, recorded by the deposit check) instead of the hardcoded
 	// vout 0 / nominal amount. The claim pays the exact deposit value − fee2;
 	// the excess over the nominal dstAmt (+fee2) is what the redeemer keeps
 	// (C++ output = outAmount + oOverpayment = depositP2SH − fee2,
@@ -1693,7 +1698,7 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: p2shNative - fee, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
-	// CRYPTO-F77: for forkid coins the digest commits the exact spent value —
+	// For forkid coins the digest commits the exact spent value —
 	// the validated deposit P2SH amount (C++ oBinTxP2SHAmount,
 	// xbridgesession.cpp:3967) — not the nominal order amount.
 	sig, err := coins.SignTxInputForCoin(tx, 0, inner, p2shNative, c.privKey[:], depositCoin)
@@ -1729,7 +1734,7 @@ func (c *swapCtx) connector(t string) (wallet.Connector, error) {
 	return conn, nil
 }
 
-// conf returns the per-coin conf from this task's snapshot (CONC-F94), so a
+// conf returns the per-coin conf from this task's snapshot, so a
 // mid-task reload cannot change the minConf/txVersion/blockTime a deposit or
 // claim is built with.
 func (c *swapCtx) conf(cur string) *config.CoinConf {
@@ -1739,7 +1744,7 @@ func (c *swapCtx) conf(cur string) *config.CoinConf {
 	return nil
 }
 
-// coin returns the coin value for cur from this task's snapshot (CONC-F94), so
+// coin returns the coin value for cur from this task's snapshot, so
 // a mid-task reload cannot change the decimals/prefix/codec a deposit, refund,
 // or claim is built with — the C++ session holds the coin parameters it
 // captured at task start. The snapshot covers the session's own two currencies
@@ -1777,7 +1782,7 @@ func (c *swapCtx) minConf(cc *config.CoinConf) int {
 // payTx, verifying it against the expected secretHash hx (the deposit's
 // HashedSecret). C++ does the same in getSecretFromPaymentTransaction
 // (xbridgewalletconnectorbtc.cpp:2241-2276), which scans every vin's scriptSig
-// and only adopts a push whose getKeyId(push) equals hx. CRYPTO-F92: scan ALL
+// and only adopts a push whose getKeyId(push) equals hx. Scan ALL
 // inputs, not just input 0 — the deposit-spending input is not guaranteed to be
 // the first, and the hash check makes a wrong-input match impossible.
 func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) {
@@ -1847,7 +1852,7 @@ func secretFromScriptSig(script []byte, hx [20]byte) ([33]byte, bool) {
 
 // decodePub33 decodes a 33-byte compressed pubkey hex into a fixed array,
 // returning the zero value when the string is empty, malformed, or the wrong
-// length. It is used to materialize a session's trusted hub key (STATE-F78).
+// length. It is used to materialize a session's trusted hub key.
 func decodePub33(s string) [33]byte {
 	var out [33]byte
 	if s == "" {

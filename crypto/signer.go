@@ -137,7 +137,7 @@ func (BtcSigner) VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error) 
 // this for the per-order HTLC secret keypair (xPubKey/xPrivKey), generated
 // at order-creation time (C++ xbridgeapp.cpp:2001). It uses the full 256-bit
 // range with retry until the scalar is in [1, N-1] (N = curve group order),
-// mirroring C++ m_cp.makeNewKey (CRYPTO-F82): the pre-fix code cleared the top
+// mirroring C++ m_cp.makeNewKey: the pre-fix code cleared the top
 // bit, discarding one bit of entropy. Keys are local (no interop impact), but
 // the generated space should match C++.
 func NewPrivateKey() ([]byte, error) {

@@ -71,7 +71,7 @@ BlockTime=60
 Confirmations=2
 `
 
-// TestReloadMidSwapTaskKeepsConnectorSnapshot — CONC-F94 proof. A
+// TestReloadMidSwapTaskKeepsConnectorSnapshot. A
 // dxLoadXBridgeConf mid-swap-task must not swap which connector a two-phase
 // deposit task builds against: the worker captured its connectors at enqueue
 // time (the C++ session holds the connector pointer it captured, so a reload
@@ -100,7 +100,7 @@ func TestReloadMidSwapTaskKeepsConnectorSnapshot(t *testing.T) {
 
 	// Park all engineWorkers with refund broadcasts on the gated BTC connector,
 	// so the deposit task posted below waits in the queue. Each refund task
-	// captures the connector at enqueue (CONC-F94), so the parked tasks also
+	// captures the connector at enqueue, so the parked tasks also
 	// resume against gated after the reload.
 	for i := 0; i < engineWorkers; i++ {
 		var id [32]byte
@@ -153,7 +153,7 @@ func TestReloadMidSwapTaskKeepsConnectorSnapshot(t *testing.T) {
 	}
 }
 
-// TestReloadMidSwapTaskKeepsCoinSnapshot — CONC-F94 closure. The worker
+// TestReloadMidSwapTaskKeepsCoinSnapshot closure. The worker
 // captured the session's coin values at enqueue (swapCtx.coinsMap), so a
 // dxLoadXBridgeConf mid-task that CHANGES a coin's P2PKH byte must not change
 // what the in-flight deposit build decodes addresses with. If the worker

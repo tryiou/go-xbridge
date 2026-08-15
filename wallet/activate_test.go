@@ -43,8 +43,8 @@ func mockEndpoint(c *config.CoinConf, rawURL string) {
 	}
 }
 
-// TestActivateExchangeWalletsOnly locks CFG-F87: exactly the ExchangeWallets
-// currencies are connected — a conf coin not listed is never activated.
+// TestActivateExchangeWalletsOnly locks the ExchangeWallets keying: exactly the
+// currencies listed are connected — a conf coin not listed is never activated.
 func TestActivateExchangeWalletsOnly(t *testing.T) {
 	confs := map[string]*config.CoinConf{
 		"BTC":  admitConf("BTC", "BTC"),
@@ -64,7 +64,7 @@ func TestActivateExchangeWalletsOnly(t *testing.T) {
 	}
 }
 
-// TestActivateGateDrops locks CFG-F85 wiring: an ExchangeWallets coin failing
+// TestActivateGateDrops locks the gate wiring: an ExchangeWallets coin failing
 // the static gates is dropped with the gate reason.
 func TestActivateGateDrops(t *testing.T) {
 	confs := map[string]*config.CoinConf{
@@ -95,7 +95,7 @@ func TestActivateMissingConf(t *testing.T) {
 	}
 }
 
-// TestActivateProbe locks CFG-F87's reachability probe: a wallet answering
+// TestActivateProbe locks the reachability probe: a wallet answering
 // getblockcount connects; an unreachable endpoint is dropped and marked bad.
 func TestActivateProbe(t *testing.T) {
 	srv := mockRPC(t)

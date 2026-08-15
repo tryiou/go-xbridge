@@ -239,7 +239,7 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	s := n.sessions[hexEncode(orderID[:])]
 	// Seed the counterparty deposit knowledge ConfirmB needs (normally learned
 	// via CreateB); the secret itself is deliberately NOT set. The validated
-	// deposit out-params (CRYPTO-F90) feed the claim: vout 0, 2.5 BTC.
+	// deposit out-params feed the claim: vout 0, 2.5 BTC.
 	s.theirSecretHash = secretHash
 	s.theirDepositTxID = strings.Repeat("cc", 32) // the maker's BTC deposit
 	s.theirLockTime = 1030
@@ -285,7 +285,7 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	}
 }
 
-// TestCreateAStateGuardDropsPostCompletionRetransmitE2E proves the STATE-F77 state
+// TestCreateAStateGuardDropsPostCompletionRetransmitE2E proves the state
 // guard end-to-end: after the deposit task COMPLETES (await cleared, state ==
 // csCreatedA), a duplicate CreateA from the hub must be dropped by the handler
 // — not processSwap's in-flight guard — so exactly one deposit is ever

@@ -7,8 +7,8 @@ import (
 	"go-xbridge/wallet"
 )
 
-// TestStoreReserveForTake verifies the atomic take-input reservation (B2
-// Finding 1): only one order can claim a "txid:vout" key, the reservation is
+// TestStoreReserveForTake verifies the atomic take-input reservation:
+// only one order can claim a "txid:vout" key, the reservation is
 // immediately visible through LockedUtxoInfo alongside committed order inputs,
 // a second in-flight take of the SAME order is refused (C++ state gate
 // xbridgeapp.cpp:2122), terminal orders release their locks, and ReleaseReserve
@@ -434,7 +434,7 @@ func TestLockedUtxoInfoFor(t *testing.T) {
 	}
 }
 
-// TestPruneUnconnected locks CFG-F87's clearNonLocalOrders port: non-local
+// TestPruneUnconnected locks the clearNonLocalOrders port: non-local
 // orders whose from/to currency has no connector are removed; local orders are
 // always kept (C++ App::clearNonLocalOrders, xbridgeapp.cpp:3811-3821).
 func TestPruneUnconnected(t *testing.T) {

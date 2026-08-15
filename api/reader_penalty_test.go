@@ -58,7 +58,7 @@ func wrapXBridgePkt(pkt []byte) []byte {
 // (net_processing.cpp:2874-2878).
 var undersizedEnvelope = []byte{0x00}
 
-// TestReaderLoopHubBan locks in STATE-F75 for the direct hub connection: ten
+// TestReaderLoopHubBan locks in the hub ban for the direct hub connection: ten
 // undersized xbridge envelopes accumulate +10 each (C++ Misbehaving +10,
 // net_processing.cpp:2874-2878) and the reader loop drops the connection at the
 // 100-point ban threshold.

@@ -252,9 +252,8 @@ func TestCashAddrMultiSize(t *testing.T) {
 }
 
 // TestDGBCoinConf confirms Digibyte chainparams: it is a BTC-family UTXO chain
-// with native segwit (HRP "dgb"), matching C++'s DGB connector. Resolves the
-// [VERIFY] flag on DGB chainparams in the audit — these values mirror
-// xbridgewalletconnectordgb.cpp.
+// with native segwit (HRP "dgb"), matching C++'s DGB connector — these values
+// mirror xbridgewalletconnectordgb.cpp.
 func TestDGBCoinConf(t *testing.T) {
 	c, err := FromConf(&config.CoinConf{
 		Ticker: "DGB", Title: "Digibyte", CreateTxMethod: "DGB",

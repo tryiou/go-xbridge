@@ -9,7 +9,7 @@ import (
 	"go-xbridge/proto"
 )
 
-// TestEngineWriteDoesNotBlockOnSlowPeer — CONC-F92 proof at the engine level.
+// TestEngineWriteDoesNotBlockOnSlowPeer at the engine level.
 // A hub peer that stops reading must not stall the engine's outbound path: the
 // engine enqueues frames (the p2p writer goroutine does the blocking socket
 // write) and keeps processing commands. Mirrors TestEngineLivenessSlowWallet
