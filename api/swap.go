@@ -250,7 +250,7 @@ func (c *swapCtx) counterpartyDepositScriptHex(hash [20]byte) string {
 // returned DepositCheck with IsGood=false is a definitively bad deposit (the
 // caller must wire-Cancel, crBadADepositTx/crBadBDepositTx).
 func (c *swapCtx) checkCounterpartyDeposit(hash [20]byte, expectedAmount uint64) (wallet.DepositCheck, error) {
-	conn := c.n.cfg().Connectors[c.dstCur]
+	conn := c.connectors[c.dstCur]
 	if conn == nil {
 		return wallet.DepositCheck{}, fmt.Errorf("api: no connector for %s", c.dstCur)
 	}
@@ -267,9 +267,9 @@ func counterpartyCoin(s *SwapSession) coins.Coin {
 
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
 // stage-1 enqueue time. The two-phase handshake workers run the wallet-I/O
-// builders against THIS value (plus the node's lock-guarded config via c.n) and
-// never touch a live session, which the engine owns exclusively — a worker
-// reading a session field would race the engine's resume writes.
+// builders against THIS value and never touch a live session, which the engine
+// owns exclusively — a worker reading a session field would race the engine's
+// resume writes.
 type swapCtx struct {
 	n             *Node
 	id            [32]byte
@@ -297,6 +297,19 @@ type swapCtx struct {
 	ourLockTime      uint32
 	refundHex        string
 
+	// connectors / confs are shallow snapshots of the live config taken at
+	// enqueue time (CONC-F94). A dxLoadXBridgeConf or the 30s wallet sweep
+	// swaps n.config with NEW connector/confs objects; the worker task must
+	// build against the set that was current when the swap started — the C++
+	// session holds the connector pointer it captured, so a mid-task reload
+	// cannot swap which wallet a deposit/claim is built against. Interfaces and
+	// config pointers are immutable references, so holding them is race-free.
+	// (The coin registry is resolved at build time via the atomic
+	// coins.Get(cur); a reload that drops a coin mid-task would fail that
+	// build with a clean "unknown coin" error rather than redirect it.)
+	connectors map[string]wallet.Connector
+	confs      map[string]*config.CoinConf
+
 	// ourDepositP2SH is the exact value of OUR deposit's P2SH output as built by
 	// BuildDepositTx (Amount+fee2, output 0). buildRefundTx commits it to the
 	// forkid digest (CRYPTO-F77), so the committed value is structural rather
@@ -310,9 +323,23 @@ type swapCtx struct {
 	funding []wallet.Utxo
 }
 
-// snapshot copies the session's fields a worker task needs. It runs on the
-// engine goroutine (stage 1), so reading live session state here is safe.
+// snapshot copies the session's fields a worker task needs, plus shallow
+// snapshots of the live connector/confs sets (CONC-F94). It runs on the engine
+// goroutine (stage 1), so reading live session state and the cfg-guarded config
+// here is safe.
 func (s *SwapSession) snapshot() swapCtx {
+	var connectors map[string]wallet.Connector
+	var confs map[string]*config.CoinConf
+	if cfg := s.n.cfg(); cfg != nil {
+		connectors = make(map[string]wallet.Connector, len(cfg.Connectors))
+		for t, c := range cfg.Connectors {
+			connectors[t] = c
+		}
+		confs = make(map[string]*config.CoinConf, len(cfg.Confs))
+		for t, c := range cfg.Confs {
+			confs[t] = c
+		}
+	}
 	return swapCtx{
 		n:                s.n,
 		id:               s.id,
@@ -338,6 +365,8 @@ func (s *SwapSession) snapshot() swapCtx {
 		ourDepositTxID:   s.ourDepositTxID,
 		ourLockTime:      s.ourLockTime,
 		refundHex:        s.refundHex,
+		connectors:       connectors,
+		confs:            confs,
 		funding:          s.n.orderFunding(s.id),
 	}
 }
@@ -863,7 +892,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 				return nil, err
 			}
 			xlog.Debug("ConfirmA: claim tx built", "order", orderID, "cur", cur)
-			conn, e := s.n.connector(cur)
+			conn, e := c.connector(cur)
 			if e != nil {
 				return nil, e
 			}
@@ -952,7 +981,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		orderID: orderID,
 		run: func() (any, error) {
 			// Recover the 33-byte secret preimage from the maker's payTx.
-			conn := s.n.cfg().Connectors[c.srcCur]
+			conn := c.connectors[c.srcCur]
 			if conn == nil {
 				return nil, fmt.Errorf("api: no connector for %s", c.srcCur)
 			}
@@ -980,7 +1009,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 				return nil, err
 			}
 			xlog.Debug("ConfirmB: claim tx built", "order", orderID, "cur", cur)
-			conn2, e := s.n.connector(cur)
+			conn2, e := c.connector(cur)
 			if e != nil {
 				return nil, e
 			}
@@ -1050,14 +1079,15 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 	return 0, nil, nil
 }
 
-// runRefundTask executes a refund broadcast for cur/refundHex. When checkLock
+// runRefundTask executes a refund broadcast for conn/refundHex. When checkLock
 // is set it only broadcasts once the chain is at/above lockTime (the sweep
 // path); otherwise it broadcasts immediately (the cancel/rollback/escape-hatch
 // paths, matching C++ force-refund semantics). Returns ("", nil) when the
 // refund is not yet due — the sweep retries on the next tick. Runs on a worker
-// goroutine; self-contained (all inputs captured by value).
-func (n *Node) runRefundTask(cur, refundHex string, lockTime uint32, checkLock bool) (string, error) {
-	conn := n.cfg().Connectors[cur]
+// goroutine; self-contained (all inputs captured by value, including the
+// connector captured at enqueue time — CONC-F94). cur names the coin for error
+// context only.
+func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32, checkLock bool) (string, error) {
 	if conn == nil {
 		return "", fmt.Errorf("api: no connector for %s", cur)
 	}
@@ -1080,10 +1110,13 @@ func (n *Node) runRefundTask(cur, refundHex string, lockTime uint32, checkLock b
 // queue drops the task (the broadcast is idempotent and the next sweep retries)
 // and clears the guard so that sweep can re-enqueue it.
 func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, checkLock bool, done func(txid string, err error)) bool {
+	// Capture the connector at enqueue time (engine side) so a mid-task reload
+	// cannot swap which wallet broadcasts the refund (CONC-F94).
+	conn := n.cfg().Connectors[cur]
 	task := workTask{
 		orderID: orderID,
 		run: func() (any, error) {
-			return n.runRefundTask(cur, refundHex, lockTime, checkLock)
+			return runRefundTask(conn, cur, refundHex, lockTime, checkLock)
 		},
 		apply: func(v any, err error) {
 			delete(n.pendingRefunds, orderID)
@@ -1373,7 +1406,7 @@ func (s *SwapSession) computeLockTime(isMaker bool) uint32 {
 // can validate it via acceptableLockTimeDrift. Runs on a worker in the two-phase
 // handshake, so it reads config/connectors only — never live session state.
 func (c swapCtx) computeLockTimeFor(cur string, isMaker bool) uint32 {
-	conn := c.n.cfg().Connectors[cur]
+	conn := c.connectors[cur]
 	cc := c.conf(cur)
 	if conn == nil {
 		return 0
@@ -1418,7 +1451,7 @@ func (c *swapCtx) computeLockTime(isMaker bool) uint32 {
 func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	cur := c.srcCur
 	amt := c.srcAmt
-	conn := c.n.cfg().Connectors[cur]
+	conn := c.connectors[cur]
 	cc := c.conf(cur)
 	if conn == nil {
 		return depositOutcome{}, fmt.Errorf("api: no connector for %s", cur)
@@ -1677,9 +1710,20 @@ func (c *swapCtx) destScript(cur, addrStr string) ([]byte, error) {
 	return coins.BuildP2PKHScript(h), nil
 }
 
+func (c *swapCtx) connector(t string) (wallet.Connector, error) {
+	conn := c.connectors[t]
+	if conn == nil {
+		return nil, fmt.Errorf("dx: no wallet configured for %s", t)
+	}
+	return conn, nil
+}
+
+// conf returns the per-coin conf from this task's snapshot (CONC-F94), so a
+// mid-task reload cannot change the minConf/txVersion/blockTime a deposit or
+// claim is built with.
 func (c *swapCtx) conf(cur string) *config.CoinConf {
-	if c.n.cfg().Confs != nil {
-		return c.n.cfg().Confs[cur]
+	if c.confs != nil {
+		return c.confs[cur]
 	}
 	return nil
 }
