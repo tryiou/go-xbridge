@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -97,12 +98,15 @@ func (n *Node) start() {
 	n.tasks = make(chan workTask, 16)
 	n.results = make(chan workResult, engineWorkers)
 	n.pendingRefunds = map[string]bool{}
-	n.wg.Add(5) // reader, engine, blockLoop, statusLoop, wallet sweep
+	n.persistSignal = make(chan struct{}, 1)
+	n.wg.Add(6) // reader, engine, blockLoop, statusLoop, wallet sweep, persist
 	go n.readerLoop()
 	go n.engineLoop()
 	go n.blockLoop()
 	go n.statusLoop()
 	go n.sweepLoop()
+	n.persistUp.Store(true)
+	go n.persistLoop()
 	n.startWorkers()
 	n.engineRunning.Store(true)
 }
@@ -240,6 +244,42 @@ func (n *Node) statusLoop() {
 	}
 }
 
+// persistLoop writes the newest swap snapshot to disk in the background, so
+// the engine goroutine never blocks on fsync (C++ saveOrders runs on the
+// timer/worker threads, never the message thread, xbridgeapp.cpp:3744).
+// Coalescing: each pass drains the latest slot, so a burst of engine persists
+// collapses into the newest snapshot. On n.stop it flushes whatever is queued;
+// Node.Close additionally flushes the latest slot after every goroutine has
+// joined, so the last state is durable before Close returns even when a final
+// engine command raced the stop.
+func (n *Node) persistLoop() {
+	defer n.wg.Done()
+	for {
+		select {
+		case <-n.persistSignal:
+			n.writeLatestPersist()
+		case <-n.stop:
+			n.writeLatestPersist()
+			return
+		}
+	}
+}
+
+// writeLatestPersist durably writes the newest queued swap snapshot, if any,
+// logging a failure without taking the engine down.
+func (n *Node) writeLatestPersist() {
+	n.persistMu.Lock()
+	job := n.persistLatest
+	n.persistLatest = nil
+	n.persistMu.Unlock()
+	if job == nil {
+		return
+	}
+	if err := writeSwaps(job.path, job.data); err != nil {
+		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
+	}
+}
+
 // safeRun executes fn, logging (and swallowing) any panic so a single bad
 // packet or command can never kill the engine goroutine (which would silently
 // stop all state processing).
@@ -309,5 +349,9 @@ func (n *Node) Close() error {
 		cerr = n.conn.Close()
 	}
 	n.wg.Wait()
+	// The engine may have published one final persist from a command that raced
+	// the stop-drain, so flush the latest slot once more after every goroutine
+	// has exited (no further publishes can race this drain).
+	n.writeLatestPersist()
 	return cerr
 }

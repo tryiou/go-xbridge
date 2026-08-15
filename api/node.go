@@ -195,9 +195,21 @@ type Node struct {
 	tasks   chan workTask
 	results chan workResult
 
-	// wg tracks the engine, reader, workers, blockLoop, and statusLoop so Close
-	// can join them all before returning.
+	// wg tracks the engine, reader, workers, blockLoop, statusLoop, sweepLoop,
+	// and persistLoop so Close can join them all before returning.
 	wg sync.WaitGroup
+
+	// persistMu guards persistLatest, the newest swap-file write job awaiting
+	// the background persistLoop (CONC-F92b). persistSignal is a buffered(1)
+	// wake for persistLoop; publishLatest coalesces by overwriting the slot, so
+	// a burst of engine persists collapses into the newest snapshot and an
+	// in-flight write is never duplicated.
+	persistMu     sync.Mutex
+	persistLatest *persistJob
+	persistSignal chan struct{}
+	// persistUp is true once start() has launched persistLoop. persist() writes
+	// synchronously when it is false (inline/test mode, no loop to hand to).
+	persistUp atomic.Bool
 
 	// pendingRefunds is the engine-owned guard against double-enqueueing a
 	// refund broadcast for an order whose sweep task is already in flight.

@@ -112,17 +112,17 @@ func swapStatePath(dir string) string {
 	return filepath.Join(dir, "xbridged-swaps.json")
 }
 
-// saveSwaps writes all local (Mine) swaps atomically. It mirrors C++ saveOrders,
+// snapshotSwaps marshals the swap-file envelope (live local swaps AND local
+// history) into the blob writeSwaps durably stores. It mirrors C++ saveOrders,
 // which serializes the live local transactions AND the local history: live
 // orders are persisted with their session state (so an in-flight trade can be
 // rebuilt post-restart, including its per-trade M keypair), while terminal
 // orders that moved to Store.history are persisted as historical records so
-// finished/cancelled trades remain visible after restart. It then marshals +
-// sha256s the blob and performs an atomic temp-write / fsync / rename (C++
-// SerializeFileDB is atomic; this mirrors that). The caller must be the engine
-// goroutine (or a single-threaded test): it reads n.sessions, which the engine
-// alone owns.
-func saveSwaps(path string, n *Node) error {
+// finished/cancelled trades remain visible after restart. The marshal (CPU,
+// consistent snapshot) runs on the engine goroutine — it reads n.sessions,
+// which the engine alone owns — while the disk write runs on the background
+// persistLoop goroutine (CONC-F92b), so the engine never blocks on fsync.
+func snapshotSwaps(n *Node) ([]byte, error) {
 	ps := make([]persistedSwap, 0, len(n.sessions))
 	for _, o := range n.store.List() {
 		if !o.Mine {
@@ -147,15 +147,23 @@ func saveSwaps(path string, n *Node) error {
 
 	blob, err := json.Marshal(ps)
 	if err != nil {
-		return fmt.Errorf("api: marshal swaps: %w", err)
+		return nil, fmt.Errorf("api: marshal swaps: %w", err)
 	}
 	sum := sha256.Sum256(blob)
 	env := swapFile{Sum: hex.EncodeToString(sum[:]), Swaps: ps}
 	data, err := json.Marshal(env)
 	if err != nil {
-		return fmt.Errorf("api: marshal swap file: %w", err)
+		return nil, fmt.Errorf("api: marshal swap file: %w", err)
 	}
+	return data, nil
+}
 
+// writeSwaps durably writes a marshaled swap-file blob via temp-write, fsync
+// and atomic rename (C++ SerializeFileDB is atomic; this mirrors that). Runs on
+// the background persistLoop goroutine, or synchronously in inline/test mode.
+// A var so tests can instrument the disk-write boundary (count/block) without
+// touching the engine snapshot path.
+var writeSwaps = func(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("api: mkdir swap dir: %w", err)
 	}
@@ -208,16 +216,53 @@ func loadSwaps(path string) ([]persistedSwap, error) {
 	return env.Swaps, nil
 }
 
-// persist flushes local swap state to disk (no-op when DataDir is unset, the
-// previous behaviour). Runs on the engine goroutine only in production (tests
-// call it single-threaded), so no lock is needed: n.sessions is engine-owned
-// and the snapshot is consistent by construction.
+// persistJob is one background swap-file write: the on-disk path plus the
+// already-marshaled swapFile blob (the snapshot is built on the engine
+// goroutine, where n.sessions is owned; only the disk I/O is backgrounded).
+type persistJob struct {
+	path string
+	data []byte
+}
+
+// persist flushes local swap state to disk without blocking the engine on
+// fsync (CONC-F92b). The snapshot (marshal of the swapFile env, reading the
+// engine-owned n.sessions) is built on the engine goroutine; the actual
+// temp-write/fsync/rename runs on the background persistLoop goroutine, so a
+// slow disk never stalls packet processing — C++ saveOrders likewise runs on
+// the timer/worker threads, never the message thread (xbridgeapp.cpp:3744).
+// Coalescing: publishLatest overwrites the slot, so a burst of engine persists
+// collapses into the newest snapshot. When the engine is not started (tests,
+// inline mode) the write runs synchronously, preserving the single-threaded
+// behaviour the test suite relies on.
 func (n *Node) persist() {
-	if n.cfg() == nil || n.cfg().DataDir == "" {
+	cfg := n.cfg()
+	if cfg == nil || cfg.DataDir == "" {
 		return
 	}
-	if err := saveSwaps(swapStatePath(n.cfg().DataDir), n); err != nil {
-		xlog.Error("swap persist failed", "dir", n.cfg().DataDir, "err", err)
+	path := swapStatePath(cfg.DataDir)
+	data, err := snapshotSwaps(n)
+	if err != nil {
+		xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
+		return
+	}
+	if !n.persistUp.Load() {
+		if err := writeSwaps(path, data); err != nil {
+			xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
+		}
+		return
+	}
+	n.publishLatest(&persistJob{path: path, data: data})
+}
+
+// publishLatest records the newest swap-file write job and wakes the background
+// persistLoop (non-blocking; a pending signal already covers it).
+func (n *Node) publishLatest(job *persistJob) {
+	n.persistMu.Lock()
+	n.persistLatest = job
+	n.persistMu.Unlock()
+	select {
+	case n.persistSignal <- struct{}{}:
+	default:
 	}
 }
 
