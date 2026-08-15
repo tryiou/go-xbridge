@@ -91,6 +91,14 @@ the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
 - **`proto.Unmarshal` requires an exact-length body** — trailing bytes after the
   declared body are an error, matching `XBridgePacket::copyFrom`
   (`xbridgepacket.h:489-493`).
+- **Inbound protocol-version gate** — a packet whose header `version` differs
+  from `XBRIDGE_PROTOCOL_VERSION` (55) is rejected before its body is parsed or
+  its signature verified, mirroring C++ `Session::checkXBridgePacketVersion`
+  (`xbridgesession.cpp:343-368`), called at the top of
+  `App::onMessageReceived` / `App::onBroadcastReceived`
+  (`xbridgeapp.cpp:648,737`). The drop is silent (no misbehaviour penalty) and
+  applies to every inbound path, since all wire bytes reach the engine through
+  `proto.Unmarshal`.
 
 Implemented in `p2p/message.go` (`Message`, `Checksum`, `Marshal`,
 `UnmarshalMessage`), `p2p/envelope.go` (`readVarInt`), and `proto/packet.go`.

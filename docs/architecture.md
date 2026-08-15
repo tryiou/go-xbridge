@@ -313,7 +313,10 @@ so the swap handshake and the refund sweep can never race each other.
 - **`readerLoop`** is the read half of the former `feed()`: it blocks on the
   socket, decodes + signature-verifies bodies, and forwards raw packets to the
   engine. A slow peer can no longer stall state processing, and malformed/forged
-  packets are dropped before they reach the engine.
+  packets are dropped before they reach the engine. Inbound packets whose header
+  protocol version differs from 55 are rejected at decode (`proto.Unmarshal`,
+  matching C++ `xbridgesession.cpp:343-368`, `xbridgeapp.cpp:648,737`) before
+  the body is parsed or the signature checked.
 - **Worker pool** (`engineWorkers=4`): a `workTask` carries a self-contained
   `run` closure (all wallet RPC/`SendRawTransaction` I/O, capturing values by
   value) and an `apply` closure that runs on the engine. Results flow back over
