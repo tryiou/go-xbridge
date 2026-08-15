@@ -3,9 +3,7 @@
 This file gives coding agents (and contributors) the rules for working in this
 repository. End users should read [`README.md`](README.md); the full contributor
 guide (package-by-package architecture, build/test/verify, conventions) is
-[`docs/architecture.md`](docs/architecture.md); the C++↔Go audit home is
-[`docs/audit/`](docs/audit/README.md) — canonical register in
-[`docs/audit/register.md`](docs/audit/register.md).
+[`docs/architecture.md`](docs/architecture.md).
 
 ## What this is
 

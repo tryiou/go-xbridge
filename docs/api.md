@@ -6,7 +6,7 @@ API works as a drop-in replacement for blocknetd's XBridge RPC.
 
 All 24 methods are documented below: 23 `dx*` commands plus `getnetworkinfo`.
 The C++ `gettradingdata` command is not exposed — only `dxGetTradingData` is.
-This is a deliberate removal (RPC-F37): the lowercase command is a
+This is a deliberate removal: the lowercase command is a
 blocknetd-internal registration (`rpcxbridge.cpp:3520`) with a different schema
 and a duplicated `to` key; `xbridged` is a thin client and only surfaces the
 `dxGetTradingData` variant. Calling `gettradingdata` against `xbridged` returns
@@ -26,20 +26,19 @@ curl -s http://127.0.0.1:41414 \
 - Response: `{"result":…,"error":null,"id":<echo>}` (no `jsonrpc` field).
 - **Auth:** HTTP Basic auth is enforced whenever **any** credential is
   configured — `-rpcuser`/`-rpcpassword` or one or more `-rpcauth`
-  `user:salt$hash` entries (HMAC-SHA256). A request without valid credentials
+  `user:salt$hash` entries (HMAC-SHA256, the same credential path C++ offers).
+  A request without valid credentials
   answers `401` with an **empty body** and `WWW-Authenticate:
   Basic realm="jsonrpc"` (no JSON envelope). A presented bad credential waits
   250 ms before the 401 (C++ brute-force deterrence `MilliSleep(250)`,
   `httprpc.cpp:168-171`; a missing header fails immediately). With **no**
   credentials configured the daemon is default-open on its loopback bind — a
-  documented divergence (Go never auto-creates a cookie file; C++ always
-  authenticates via `~/.cookie`). See [Transport](#transport).
+  documented divergence: go-xbridge has no cookie auth, unlike C++ which
+  falls back to one when no credentials are set.
 
 ## Transport
 
-The HTTP transport matches the C++ `httprpc.cpp` conventions (audit branch B4
-`fix/http-hardening`; details in
-[`audit/remediation/B4-http.md`](audit/remediation/B4-http.md)).
+The HTTP transport matches the C++ `httprpc.cpp` conventions.
 
 - **POST only.** `GET` and other verbs answer `405 Method Not Allowed` (C++ is
   POST-only).
@@ -78,9 +77,9 @@ The HTTP transport matches the C++ `httprpc.cpp` conventions (audit branch B4
 
 - **Amounts** are fixed **6-decimal strings** (XBridge scale `TransactionDescr::COIN` = 1e6),
   truncating: `"1.500000"`. (Exceptions: `dxGetUtxos` amounts are fixed to the
-  coin's `COIN` decimals — `"1.00000000"` for BTC (RPC-F44); `dxGetLockedUtxos`
-  uses C++ default-double rendering (RPC-F31); `dxGetTokenBalances` renders
-  fixed-6 — see [audit/register.md](audit/register.md).)
+  coin's `COIN` decimals — `"1.00000000"` for BTC; `dxGetLockedUtxos`
+  uses C++ default-double rendering; `dxGetTokenBalances` renders
+  fixed-6.)
 - **Timestamps** are ISO-8601 strings with millisecond precision:
   `"2026-08-07T12:00:00.000Z"`.
 - **Order ids** are 64-hex strings in display order.
@@ -300,7 +299,7 @@ defaulted or trailing parameter.
 - `params`: none.
 - `result`: object mapping each configured exchange-wallet ticker to its
   spendable balance (6-decimal string, locked UTXOs subtracted). No `"Wallet"`
-  key is synthesized (documented divergence RPC-F23/F24): the BLOCK fee
+  key is synthesized (documented divergence): the BLOCK fee
   balance is exposed under the `BLOCK` ticker, and C++'s key order is
   race-dependent thread-completion order anyway. Empty object when no wallet
   loads.
@@ -352,7 +351,7 @@ defaulted or trailing parameter.
 - `result`: array of 8-field records `{timestamp, fee_txid, nodepubkey, id,
   taker, taker_size, maker, maker_size}`. Session-local fills only — see
   Tier 3. `fee_txid`/`nodepubkey` are always `""`: they come from the on-chain
-  BLOCK scan (RPC-F38/F39) that a thin client cannot replay. `blocks`/`errors`
+  BLOCK scan that a thin client cannot replay. `blocks`/`errors`
   are accepted for contract compatibility but cannot bound a BLOCK block scan.
 
 **`dxLoadXBridgeConf`**
@@ -377,8 +376,7 @@ view, so three families of commands are bounded by what this node has observed:
 - **`dxGetOrderHistory` / `dxGetTradingData`** aggregate from **session-local
   fills** only (fills this node saw on its P2P feed); they cannot replay
   historical chain data. `dxGetTradingData` accordingly reports
-  `fee_txid`/`nodepubkey` as `""` (they require the on-chain BLOCK scan,
-  RPC-F38/F39).
+  `fee_txid`/`nodepubkey` as `""` (they require the on-chain BLOCK scan).
 - **`dxGetNetworkTokens`** is bounded by the servicenodes this node is currently
   connected to (their advertised wallet services), not the whole network.
 - **Locked-UTXO accounting** (`dxGetUtxos`, `dxGetLockedUtxos`,
@@ -387,8 +385,8 @@ view, so three families of commands are bounded by what this node has observed:
 
 ## Divergences from blocknetd
 
-The full C++↔Go fidelity register — including the known response-shape
-differences (order-book detail-4 nesting, `dxGetMyPartialOrderChain` unknown-id
-behavior, `dxSplitInputs` utxo schema, per-command amount formats) — is tracked
-in [`audit/register.md`](audit/register.md). This document is the stable
-contract for the port as built.
+The known response-shape differences — order-book detail-4 nesting,
+`dxGetMyPartialOrderChain` unknown-id behavior, `dxSplitInputs` utxo schema,
+per-command amount formats — are described inline at each command above, and
+the wire contract they derive from is [`docs/protocol.md`](protocol.md). This
+document is the stable contract for the port as built.

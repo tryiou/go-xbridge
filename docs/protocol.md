@@ -75,7 +75,7 @@ own 4-byte `timestamp`, §2.1, is **seconds**.)
 envelope via `encodeXBridgePayload`; on receive, `DecodeXBridgePayload` strips
 the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
 
-**Transport hardening (B5):**
+**Transport hardening:**
 - **Frame cap 4,000,000 bytes** — the declared `length` is rejected above
   `MaxPayloadSize` (C++ `MAX_PROTOCOL_MESSAGE_LENGTH`, `net.h:55`), disconnecting
   the peer like C++ (`net.cpp:583-585`).
@@ -134,7 +134,7 @@ Field values (`p2p/version.go`):
 - `fxrouter` = `false` (thin client is not an XRouter hub). Sent explicitly so
   address gossip/discovery works against stock service nodes.
 
-**Version gate (B5):** the peer's advertised `version` must be at least
+**Version gate:** the peer's advertised `version` must be at least
 `MinPeerProtoVersion` (70712, `src/version.h:27`); a lower version or a
 duplicate `version` message disconnects the peer (C++
 `net_processing.cpp:1617-1626,1574-1582`).
@@ -221,7 +221,7 @@ intentional — historical.)
 | Value | Name | Direction / purpose |
 |-------|------|---------------------|
 | 0  | `xbcInvalid`            | — |
-| 2  | `xbcXChatMessage`       | relay envelope (no C++ writer; body type removed on B5) |
+| 2  | `xbcXChatMessage`       | relay envelope (no C++ writer; body type removed) |
 | 3  | `xbcTransaction`        | make / broadcast an order |
 | 4  | `xbcPendingTransaction` | list of open orders broadcast |
 | 5  | `xbcTransactionAccepting` | accept an open order |
@@ -240,11 +240,11 @@ intentional — historical.)
 | 22 | `xbcTransactionCancel`  | cancel (uint256 id, uint32 reason) |
 | 24 | `xbcTransactionFinished`| finished |
 | 26 | `xbcTransactionReject`  | reject (uint256 id, uint32 reason) |
-| 50 | `xbcServicesPing`       | supported-services ping (no C++ writer; body type removed on B5 — `DecodeBody` rejects) |
+| 50 | `xbcServicesPing`       | supported-services ping (no C++ writer; body type removed — `DecodeBody` rejects) |
 
 Implemented in `proto/command.go`. Commands 2 (`xbcXChatMessage`) and 50 have
-no C++ writer on either side; their speculative body types were removed on B5
-(WIRE-F67/F68) and `DecodeBody` returns an unsupported-command error for them.
+no C++ writer on either side; their speculative body types were removed and
+`DecodeBody` returns an unsupported-command error for them.
 
 ---
 

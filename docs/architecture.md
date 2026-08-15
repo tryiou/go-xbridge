@@ -83,6 +83,11 @@ IPs, `getaddr`/`addr` gossip, an outbound peer pool, relayed behind the
 wallet learns the network token set. `WalletServices()` returns the union of
 SPV-tier wallet tokens (`^[^:]+$`, excluding `xr`/`xrs`) from servicenodes
 pinged within the 5-minute running window. Feeds `dxGetNetworkTokens`.
+`registrationValid` applies the thin-client-enforceable subset of C++
+`ServiceNode::isValid` (`servicenode.h:398-484`): the on-chain checks a full
+chain index requires — block ancestry and collateral-utxo
+existence/amount/ownership (`servicenode.h:401,447-478`) — cannot be made by a
+thin client and are skipped (a thin-client limitation).
 
 ### `crypto/` — signing
 
