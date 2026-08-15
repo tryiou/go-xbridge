@@ -7,6 +7,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -31,8 +32,9 @@ type Signer interface {
 	// Verify checks p's signature against p.Pubkey.
 	Verify(p *proto.Packet) (bool, error)
 	// VerifyAgainst checks p's signature against an explicit 33-byte hex
-	// pubkey (C++ packet->verify(pubkey) with a non-header key, e.g. the
-	// order's mPubKey/oPubKey/sPubKey rather than pkt.Pubkey).
+	// pubkey (C++ packet->verify(pubkey), xbridgepacket.cpp:154-162). As in
+	// C++, the header pubkey field must equal the given key first (the order's
+	// mPubKey/oPubKey/sPubKey) before the signature is verified against it.
 	VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error)
 }
 
@@ -110,14 +112,22 @@ func (BtcSigner) Verify(p *proto.Packet) (bool, error) {
 
 // VerifyAgainst returns true iff p.Signature is a valid compact ECDSA signature
 // over the packet digest, produced by the holder of the given 33-byte hex
-// compressed pubkey. It mirrors C++ packet->verify(pubkey), which checks
-// against an arbitrary key rather than the packet header's pubkey. A malformed
-// or wrong-length hex yields (false, err); callers that wish to treat an
-// absent key as "not verified" should ignore the error.
+// compressed pubkey. It mirrors C++ packet->verify(pubkey)
+// (xbridgepacket.cpp:154-162): the packet header's pubkey field must equal the
+// given key first (memcmp), and only then is the signature verified against
+// that key. A header pubkey that differs from the given key yields (false,
+// nil) — C++ returns false there; a malformed or wrong-length hex yields
+// (false, err). Callers that wish to treat an absent key as "not verified"
+// should ignore the error.
 func (BtcSigner) VerifyAgainst(p *proto.Packet, pubkeyHex string) (bool, error) {
 	raw, err := hex.DecodeString(pubkeyHex)
 	if err != nil || len(raw) != 33 {
 		return false, fmt.Errorf("crypto: bad pubkey hex %q", pubkeyHex)
+	}
+	if !bytes.Equal(p.Pubkey[:], raw) {
+		// C++ xbridgepacket.cpp:154-162: verify(pubkey) requires the header
+		// pubkey field to equal the given key before it verifies the signature.
+		return false, nil
 	}
 	pub, err := btcec.ParsePubKey(raw)
 	if err != nil {

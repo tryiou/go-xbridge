@@ -1,10 +1,12 @@
 package crypto
 
 import (
+	"encoding/hex"
 	"math/big"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"go-xbridge/proto"
 )
@@ -144,6 +146,50 @@ func TestSignWrongKeyLength(t *testing.T) {
 	if err := signer.Sign(p, []byte("tooshort")); err == nil {
 		t.Fatal("expected error for non-32-byte key")
 	}
+}
+
+// TestVerifyAgainstRejectsMismatchedHeaderPubkey locks in C++
+// packet->verify(pubkey) semantics (xbridgepacket.cpp:154-162): the header
+// pubkey field must equal the given key BEFORE the signature is verified. A
+// packet whose header claims pubkey X but is signed by key Y must be rejected
+// by VerifyAgainst(pkt, Y) — the naive behavior (verify the signature against
+// Y without checking the header) would accept it.
+func TestVerifyAgainstRejectsMismatchedHeaderPubkey(t *testing.T) {
+	signer := NewBtcSigner()
+
+	// Two independent keypairs.
+	privY, _ := btcec.NewPrivateKey()
+	privX, _ := btcec.NewPrivateKey()
+	pubY := privY.PubKey().SerializeCompressed()
+	pubX := privX.PubKey().SerializeCompressed()
+
+	// Build a packet whose header claims pubkey X, but whose signature was made
+	// with key Y over the digest (which includes header pubkey X).
+	p := proto.NewPacket(proto.XbcTransactionCancel, []byte("mismatch"))
+	copy(p.Pubkey[:], pubX)
+	d := p.Digest()
+	sig := ecdsa.Sign(privY, d[:])
+	compact := compactSerialize(sig)
+	copy(p.Signature[:], compact[:])
+
+	if ok, err := signer.VerifyAgainst(p, hexPubkey(pubY)); ok || err != nil {
+		t.Fatalf("VerifyAgainst(mismatched header) = %v/%v, want false/nil (header pubkey %x != supplied %x)",
+			ok, err, pubX, pubY)
+	}
+
+	// Positive control: a packet whose header pubkey matches the supplied key
+	// still verifies.
+	if err := signer.Sign(p, privY.Serialize()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if ok, err := signer.VerifyAgainst(p, hexPubkey(pubY)); !ok || err != nil {
+		t.Fatalf("VerifyAgainst(matching header) = %v/%v, want true/nil", ok, err)
+	}
+}
+
+// hexPubkey hex-encodes a 33-byte compressed pubkey for VerifyAgainst.
+func hexPubkey(pub []byte) string {
+	return hex.EncodeToString(pub)
 }
 
 // TestSignDeterministicKAT pins the signing output for a known key + digest.
