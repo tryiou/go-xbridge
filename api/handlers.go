@@ -34,7 +34,7 @@ func (f xfloat) MarshalJSON() ([]byte, error) {
 // xfloat8 renders a double as a JSON number with 8 fixed decimals, matching
 // C++ json_spirit write_string's precision_of_doubles=8 (std::fixed +
 // setprecision(8), json_spirit_writer_template.h:195). Used for the
-// dxGetOrderHistory OHLCV row (RPC-F17).
+// dxGetOrderHistory OHLCV row.
 type xfloat8 float64
 
 func (f xfloat8) MarshalJSON() ([]byte, error) {
@@ -43,8 +43,7 @@ func (f xfloat8) MarshalJSON() ([]byte, error) {
 
 // quantizePrice mirrors ccy::Asset::Price (currency.h:108-123): the to/from
 // ratio is rounded half-up onto the currency-basis grid. XBridge queries use
-// TransactionDescr::COIN = 1e6 as the basis, so prices land on the 1e-6 grid
-// (RPC-F17).
+// TransactionDescr::COIN = 1e6 as the basis, so prices land on the 1e-6 grid.
 func quantizePrice(price float64) float64 {
 	return math.Round(price*1e6) / 1e6
 }
@@ -216,8 +215,8 @@ func (h *HandlerCtx) dxGetOrder(params []json.RawMessage) (interface{}, *rpcErro
 func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *rpcError) {
 	// C++ returns the loaded wallet connectors (availableCurrencies(),
 	// xbridgeapp.cpp:808-821) — the connector map, so never unconnected or
-	// duplicated (RPC-F53). The config's ExchangeWallets may list tickers that
-	// failed to load.
+	// duplicated. The config's ExchangeWallets may list tickers that failed to
+	// load.
 	if h.Node == nil || h.Node.cfg() == nil || h.Node.cfg().Connectors == nil {
 		return []string{}, nil
 	}
@@ -232,7 +231,7 @@ func (h *HandlerCtx) dxGetLocalTokens(params []json.RawMessage) (interface{}, *r
 func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, *rpcError) {
 	// C++ returns the pure union of tokens running servicenodes advertise
 	// (walletServices(), xbridgeapp.cpp:2758; rpcxbridge.cpp:319-326) — no
-	// config fallback (RPC-F54). Empty when no servicenodes are connected.
+	// config fallback. Empty when no servicenodes are connected.
 	if h.Node == nil {
 		return []string{}, nil
 	}
@@ -242,7 +241,7 @@ func (h *HandlerCtx) dxGetNetworkTokens(params []json.RawMessage) (interface{}, 
 // connector returns the wallet connector configured for ticker, or a no-session
 // business error (mirroring C++ when no wallet is loaded for that coin). method
 // is the calling handler's name — C++ passes __FUNCTION__ at every NO_SESSION
-// site (RPC-F02).
+// site.
 func (h *HandlerCtx) connector(ticker, method string) (wallet.Connector, *rpcError) {
 	if h.Node == nil || h.Node.cfg() == nil || h.Node.cfg().Connectors == nil {
 		return nil, makeError(errNoSession, method, ticker)
@@ -265,7 +264,7 @@ func (h *HandlerCtx) dxLoadXBridgeConf(params []json.RawMessage) (interface{}, *
 	if err := h.Node.reloadConf(); err != nil {
 		// C++ returns uret(success) with success=false when loadSettings()
 		// fails (rpcxbridge.cpp:229-234) — the envelope succeeds with a false
-		// result, it is NOT a business error (RPC-F56).
+		// result, it is NOT a business error.
 		return false, nil
 	}
 	return true, nil
@@ -297,7 +296,7 @@ func (h *HandlerCtx) dxGetNewTokenAddress(params []json.RawMessage) (interface{}
 	if err != nil {
 		// C++ getNewTokenAddress() returns an empty string on failure, leaving
 		// the result array empty (rpcxbridge.cpp:186-190) — not a business
-		// error (RPC-F55).
+		// error.
 		return []string{}, nil
 	}
 	return []string{addr}, nil
@@ -550,7 +549,7 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	// (rpcxbridge.cpp:1364-1385). The from-currency connector is gated INSIDE
 	// CancelOrder (missing from -> NO_SESSION, no cancel); a missing TO
 	// connector only fails the result build here — the cancel side effect
-	// already happened (RPC-F07).
+	// already happened.
 	res, e := h.Node.CancelOrder(CancelOrderParams{ID: key})
 	if e != nil {
 		return nil, e
@@ -566,9 +565,19 @@ func (h *HandlerCtx) dxCancelOrder(params []json.RawMessage) (interface{}, *rpcE
 	return res.toCancelResult(), nil
 }
 
+// defaultOrderHistoryMaxBuckets is the hard cap on the number of OHLCV buckets
+// dxGetOrderHistory may build when the caller omits interval_limit. C++'s
+// IntervalLimit default is INT_MAX (util/xseries.h:42), so an absent-limit
+// request spanning the whole 2018→now window at the 60 s granularity would
+// allocate ~4.3M buckets and an equally large result slice — a remote-OOM
+// vector. Go caps the default so the unbounded path is bounded; an explicit
+// interval_limit still mirrors C++ exactly (cap + tail window).
+const defaultOrderHistoryMaxBuckets = 100_000
+
 // ---------------------------------------------------------------------------
-// dxGetOrderHistory — OHLC volume series (requires historical blockchain data;
-// the thin client returns an empty series).
+// dxGetOrderHistory — OHLC volume series aggregated from the fills this node
+// has actually seen (session-local fills only; no network-wide XSeries block
+// index is available to the thin client — see docs/api.md Tier 3).
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *rpcError) {
@@ -652,10 +661,18 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	numBuckets := (alignedEnd - alignedStart) / granularity
 	// C++ getChainXAggregateSeries caps the bucket count at interval_limit and
 	// shifts the window to the most-recent tail: period = [period.end -
-	// num_intervals*granularity, period.end] (xseries.cpp:106-112). The default
-	// limit is INT_MAX, so the cap only bites for an explicit small limit.
-	if len(params) > 7 && int64(limit) < numBuckets {
-		numBuckets = int64(limit)
+	// num_intervals*granularity, period.end] (xseries.cpp:106-112). An explicit
+	// interval_limit mirrors C++ exactly. C++'s DEFAULT limit is INT_MAX
+	// (util/xseries.h:42), which is the remote-OOM vector closed here:
+	// without an explicit limit the bucket count is hard-capped at
+	// defaultOrderHistoryMaxBuckets and the window shifts to the tail, so a
+	// 2018→now request allocates ≤100k buckets, not ~4.3M.
+	effectiveLimit := defaultOrderHistoryMaxBuckets
+	if len(params) > 7 {
+		effectiveLimit = limit
+	}
+	if numBuckets > int64(effectiveLimit) {
+		numBuckets = int64(effectiveLimit)
 		alignedStart = alignedEnd - numBuckets*granularity
 	}
 
@@ -667,10 +684,10 @@ func (h *HandlerCtx) dxGetOrderHistory(params []json.RawMessage) (interface{}, *
 	type bucket struct {
 		fills []*fillEntry
 	}
+	// Lazy per-bucket allocation: buckets[i].fills is nil until a fill lands
+	// in it (append to a nil slice allocates on demand), so a sparse window
+	// over a mostly-empty fills store allocates only for observed buckets.
 	buckets := make([]bucket, numBuckets)
-	for i := range buckets {
-		buckets[i].fills = make([]*fillEntry, 0)
-	}
 	allFills := h.Store.Fills()
 	for i := range allFills {
 		f := &allFills[i]
@@ -812,8 +829,8 @@ func idsAtPrice(list []obEntry, best obEntry) []string {
 
 // bestOf returns the side's best entry (lowest-price ask / highest-price bid);
 // ties are broken by the smallest raw id (orderIDLess, LSB-first), mirroring
-// C++ std::min_element / std::max_element over the id-sorted TransactionMap
-// (RPC-F21). list must be non-empty.
+// C++ std::min_element / std::max_element over the id-sorted TransactionMap.
+// list must be non-empty.
 func bestOf(list []obEntry, highest bool) obEntry {
 	best := list[0]
 	for _, e := range list[1:] {
@@ -868,7 +885,7 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 		if strings.EqualFold(o.FromCurrency, maker) && strings.EqualFold(o.ToCurrency, taker) {
 			// ask: from=maker (sold), to=taker; C++ price =
 			// xBridgeValueFromAmount(to) / xBridgeValueFromAmount(from) — the
-			// +1/::COIN bump on each amount (xutil.cpp:293-302, RPC-F20).
+			// +1/::COIN bump on each amount (xutil.cpp:293-302).
 			p := xBridgeValueFromAmount(o.ToAmount) / xBridgeValueFromAmount(o.FromAmount)
 			asks = append(asks, obEntry{price: p, priceStr: formatXPrice(p), amount: o.FromAmount, id: orderIDString(o.ID), rawID: o.ID})
 		}
@@ -883,7 +900,7 @@ func (h *HandlerCtx) dxGetOrderBook(params []json.RawMessage) (interface{}, *rpc
 
 	// Sort both sides descending by price; equal prices are ordered by the
 	// smallest raw id (orderIDLess, LSB-first). For detail 1/4 this mirrors C++'
-	// min/max_element over the id-sorted TransactionMap exactly (RPC-F21); for
+	// min/max_element over the id-sorted TransactionMap exactly; for
 	// detail 2/3 C++ std::sort leaves the within-price-group order unspecified,
 	// so the ascending-id tie-break is a deterministic superset guarantee.
 	sort.Slice(asks, func(i, j int) bool {
@@ -1026,11 +1043,11 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			out[ticker] = formatBalanceNative(c, avail)
 		}
 	}
-	// DOCUMENTED divergence (RPC-F23/F24): C++ always emits a "Wallet" key (the
+	// DOCUMENTED divergence: C++ always emits a "Wallet" key (the
 	// native BLOCK available balance). go-xbridge deliberately does NOT
 	// synthesize one — the thin client pays service-node fees from the BLOCK
 	// connector balance, which is already exposed under its ticker, and the
-	// C++ ticker ordering is race-dependent anyway. See register.md F23/F24.
+	// C++ ticker ordering is race-dependent anyway.
 	return out, nil
 }
 
@@ -1041,7 +1058,7 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 func (h *HandlerCtx) dxGetMyOrders(params []json.RawMessage) (interface{}, *rpcError) {
 	// C++ builds a combined live+history vector, sorts by txtime, then renders
 	// with a `seen` dedup (rpcxbridge.cpp:2103-2138). Sort on the raw µs value,
-	// not the ISO-rendered string, so microsecond ordering is exact (RPC-F26).
+	// not the ISO-rendered string, so microsecond ordering is exact.
 	orders := []*Order{}
 	seen := map[string]bool{}
 	for _, o := range h.Store.Mine() {
@@ -1126,8 +1143,8 @@ func (h *HandlerCtx) dxGetMyPartialOrderChain(params []json.RawMessage) (interfa
 //     descendant down via parent links. (The C++ child-walk only scans orders
 //     with fewer utxos than the queried id and never descends to grandchildren
 //     — xbridgeapp.cpp:3958-3967 — but that is sort-order dependent and is a
-//     latent C++ bug; the parity oracle and the audit intent model the full
-//     lineage, so the port is deterministic here.)
+//     latent C++ bug; the port models the full lineage so it is deterministic
+//     here.)
 //  3. The final chain is sorted ascending by created time so the oldest order
 //     is first (xbridgeapp.cpp:3985-3988).
 func (h *HandlerCtx) partialOrderChain(id string) []*Order {
@@ -1245,7 +1262,7 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 		orderIDs = append(orderIDs, orderIDString(t.ID))
 		// C++ pushes ONE entry per chain order — the deposit txids or an empty
 		// string — so callers can index p2sh_deposits against `orders` by
-		// position (rpcxbridge.cpp:2456-2457; RPC-F28).
+		// position (rpcxbridge.cpp:2456-2457).
 		deposits = append(deposits, t.BinTxId)
 		counter = append(counter, t.OBinTxId)
 	}
@@ -1302,7 +1319,7 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		// No id -> all locked utxos across the configured exchange wallets,
 		// rendered as C++ Exchange::getUtxoItems "txid:vout:amount:address"
 		// strings with the native amount streamed as a default-float double
-		// (RPC-F31, xbridgewalletconnector.cpp:25-30).
+		// (xbridgewalletconnector.cpp:25-30).
 		all := make([]string, 0)
 		for _, ticker := range h.Node.cfg().ExchangeWallets {
 			conn, e := h.connector(ticker, "dxGetLockedUtxos")
@@ -1323,14 +1340,14 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 		}
 		return map[string]interface{}{"all_locked_utxo": all}, nil
 	}
-	// RPC-F34: the echoed id is the C++ display-hex (GetHex) of the parsed
+	// The echoed id is the C++ display-hex (GetHex) of the parsed
 	// value, never the raw param (rpcxbridge.cpp:2672; error text 2641,2666).
 	idNorm := orderIDString(raw)
 	o := h.Store.Get(orderIDKey(id))
 	if o == nil {
 		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", idNorm)
 	}
-	// RPC-F32: C++ errors 1021 TRANSACTION_NOT_FOUND when the id has NO locked
+	// C++ errors 1021 TRANSACTION_NOT_FOUND when the id has NO locked
 	// utxos reserved (Exchange::getUtxoItems -> m_utxoTxMap miss, rpcxbridge.cpp:
 	// 2637, xbridgeexchange.cpp:294-303) or the transaction is in neither the
 	// pending nor the accepted map (rpcxbridge.cpp:2660-2670). A live order with
@@ -1360,7 +1377,7 @@ func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *r
 	// an accepted transaction a_currency_and_b_currency. Membership is not the
 	// raw state ordinal — a maker's own order lives in the accepted map from
 	// creation (xbridgeapp.cpp:2034), so o.Mine counts as accepted even while
-	// still pending/open (RPC-F33).
+	// still pending/open.
 	entries := make([]string, 0)
 	key := o.FromCurrency
 	if o.Mine || st >= int(swap.DescrAccepting) {
@@ -1432,7 +1449,7 @@ func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface
 			UseCount: f.UseCount,
 		})
 	}
-	// RPC-F36: keys emitted in C++ pushKV order (rpcxbridge.cpp:1474-1489).
+	// Keys emitted in C++ pushKV order (rpcxbridge.cpp:1474-1489).
 	return flushCancelledResult{
 		AgeMillis:        int64(ageMillis),
 		Now:              iso8601(now),
@@ -1579,11 +1596,11 @@ func (h *HandlerCtx) dxSplitInputs(params []json.RawMessage) (interface{}, *rpcE
 //   - each split output sends `splitAmount` (+feesPerUtxo when include_fees) to address;
 //   - the real tx fee is deducted from change, clawed back from the last split
 //     output when the change is dust;
-//   - change goes to the REQUESTED address (RPC-F42), not a fresh one;
+//   - change goes to the REQUESTED address, not a fresh one;
 //   - the result echoes C++'s 8-field object in pushKV order.
 //
 // Fee math is done in XBridge 1e6 units exactly as C++ (minTxFee1/minTxFee2
-// whole-coin + xBridgeIntFromReal, RPC-F41); raw tx values are converted to the
+// whole-coin + xBridgeIntFromReal); raw tx values are converted to the
 // coin's native scale at build time. txid is the double-SHA256 of the signed
 // transaction, byte-reversed — always computed, even when submit=false.
 func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees, showRawTx, submit bool, utxos []wallet.Utxo, method string) (interface{}, *rpcError) {
@@ -1607,7 +1624,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}
 	// C++ validates the address (and wallet membership) BEFORE listing utxos
 	// (xbridgewalletconnectorbtc.cpp:2639-2642): BAD_REQUEST named after the
-	// method (RPC-F43). Native-segwit destinations are also rejected here (the
+	// method. Native-segwit destinations are also rejected here (the
 	// split builder only emits legacy scripts).
 	if a, derr := c.DecodeAddress(address); derr != nil || (a.Kind != coins.P2PKH && a.Kind != coins.P2SH) {
 		return nil, makeError(errBadRequest, method, "address is invalid or not in the wallet for token "+ticker)
@@ -1655,7 +1672,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	} else {
 		// Explicit path (dxSplitInputs): C++ needs only txid+vout (COutPoint,
 		// rpcxbridge.cpp:3362-3367); resolve the entries against the wallet's
-		// unspent list and reject any that are not available (RPC-F40). The
+		// unspent list and reject any that are not available. The
 		// wallet's data wins, and the vins follow the WALLET's order (C++
 		// builds newUnspent by scanning getUnspent, :2648-2662).
 		want := map[string]bool{}
@@ -1713,7 +1730,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	// Change (or claw-back) — C++ xbridgewalletconnectorbtc.cpp:2707-2734.
 	change := int64(remainderXB) - int64(txFeesXB)
 	if change > 0 && !isDustNative(xBridgeValueFromAmount(uint64(change)), cc, relayFee, coinNativeScale(c)) {
-		// Change goes to the REQUESTED address (RPC-F42).
+		// Change goes to the REQUESTED address.
 		outs = append(outs, uint64(change))
 	} else {
 		feesLeft := txFeesXB
@@ -1777,7 +1794,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}
 	if submit {
 		if _, err := conn.SendRawTransaction(signedHex); err != nil {
-			// RPC-F43: submit failure is 1004 BAD_REQUEST, named after the
+			// Submit failure is 1004 BAD_REQUEST, named after the
 			// actual method (rpcxbridge.cpp:3278/3392).
 			return nil, makeError(errBadRequest, method, err.Error())
 		}
@@ -1999,7 +2016,7 @@ func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {
 // parseUtxoParam parses the explicit-utxos array argument of dxSplitInputs.
 // C++ needs only txid+vout per entry (COutPoint, rpcxbridge.cpp:3362-3367);
 // amount/scriptPubKey/address are optional and, when absent, resolved from the
-// wallet's unspent list by splitTx (RPC-F40).
+// wallet's unspent list by splitTx.
 func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError) {
 	var arr []struct {
 		TxID         string `json:"txid"`
@@ -2092,8 +2109,7 @@ func (h *HandlerCtx) dxGetUtxos(params []json.RawMessage) (interface{}, *rpcErro
 // to the wallet. We advertise a Blocknet version/subversion (configurable via
 // -walletversion/-walletversionstr, defaulting to 4.4.1) and the live peer
 // count so the dapp reports the wallet as connected. The remaining fields
-// mirror real blocknetd's getnetworkinfo (net.cpp:495-527) for compatibility
-// (RPC-F46).
+// mirror real blocknetd's getnetworkinfo (rpc/net.cpp:495-527) for compatibility.
 // ---------------------------------------------------------------------------
 
 func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpcError) {
@@ -2121,7 +2137,7 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 	return map[string]interface{}{
 		"version":    ver,
 		"subversion": sub,
-		// F46 alignment with real blocknetd (rpc/net.cpp:495-527): protocol
+		// Alignment with real blocknetd (rpc/net.cpp:495-527): protocol
 		// version 70713 (version.h), XBridge 55 / XRouter 50 (xbridge,xrouter
 		// version.h), 8-decimal ValueFromAmount fee strings, networks entries
 		// carrying proxy_randomize_credentials.

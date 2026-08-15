@@ -212,8 +212,9 @@ defaulted or trailing parameter.
 **`dxGetOrderHistory`**
 - `params`: `maker`, `taker` (strings), `start`, `end`, `granularity` (unix
   seconds), `order_ids` (bool, default `false`), `with_inverse` (bool, default
-  `false`), `limit` (int) [optional — accepted but not applied by the thin
-  client].
+  `false`), `limit` (int) [optional — the max number of returned buckets; the
+  window is shifted to the most-recent tail. Without an explicit `limit` the
+  bucket count is hard-capped at 100k].
 - `result`: array of OHLCV rows `[time, low, high, open, close, volume]`
   (plus an order-ids array when `order_ids`). The thin client aggregates from
   session-local fills only — see Tier 3.
