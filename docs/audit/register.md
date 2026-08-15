@@ -176,9 +176,9 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
-| CONC-F92 | S2 | Engine goroutine can block on socket write / fsync, stalling packet processing + RPC | OPEN | B11 |
-| CONC-F93 | S3 | Discovery peer goroutines never joined; Dedupe sweeper leaks without Flush | OPEN | B11 |
-| CONC-F94 | S3 | Conf reload mid-swap-task hazard (untested) | OPEN | B11 |
+| CONC-F92 | S2 | Engine goroutine can block on socket write / fsync, stalling packet processing + RPC | FIXED | B11 `fix/concurrency`: bounded buffered outbound writer in `p2p.Conn` (growing queue drained by a writer goroutine — the engine never blocks on a peer; 1 MB cap disconnects the peer like C++ `PushMessage`/`nSendBufferMaxSize`, net.cpp:2705-2730 — no silent frame drops) + background persist (`snapshotSwaps`/`writeSwaps`/`persistLoop`, coalesced latest-slot + final flush on Close, C++ `saveOrders` off-msghand); `TestConnWriteSlowPeerNonBlocking`, `TestConnWriteDeliversInOrderConcurrent`, `TestEngineWriteDoesNotBlockOnSlowPeer`, `TestPersistDoesNotBlockEngine`, `TestPersistCoalescesBurst`, `TestPersistFlushedOnClose` |
+| CONC-F93 | S3 | Discovery peer goroutines never joined; Dedupe sweeper leaks without Flush | FIXED | B11 `fix/concurrency`: PeerManager `wg`-joins maintain/connectOne/readLoop on Close (C++ `join_all`, xbridgeapp.cpp:530-544) + ctx-cancellable dials (`DialContext`); `Dedupe.startSweepLocked` re-registers so a restarted sweeper is still stopped by `FlushAll`; `Node.Close` calls `xlog.FlushAll()`; `TestPeerManagerCloseAbortsInflightDialAndJoins`, `TestDedupe_RestartReRegisters`, `TestNodeCloseFlushesDedupeSweepers` |
+| CONC-F94 | S3 | Conf reload mid-swap-task hazard (untested) | FIXED | B11 `fix/concurrency`: `swapCtx` snapshots `Connectors`/`Confs` at enqueue (C++ session holds the captured connector pointer; reload replaces the pool under `m_connectorsLock`); every worker-path read uses the snapshot (`checkCounterpartyDeposit`, claim broadcasts, `buildDeposit`, `computeLockTimeFor`, `conf()`); `postRefundTask` captures the connector at enqueue; `TestReloadMidSwapTaskKeepsConnectorSnapshot` (fails if reverted to live-config reads) |
 | CONC-F95 | S3 | Go hides C++'s transient "accepting" window | DOCUMENTED | Go-stricter; `findings.md` |
 | CONC-F96 | S4 | Go runs swap wallet I/O + RPC concurrently where C++ serializes | DOCUMENTED | model note; `findings.md` |
 | CONC-F97 | S2 | `SwapSession` fields single-owner, engine-only | FIXED | race tests |
@@ -193,7 +193,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
 | INV-F97 | S4 | Unported C++ internal helpers (not dApp-facing) | DOCUMENTED | gap list in `evidence/inventory.md` |
-| INV-F98 | S4 | `docs/protocol.md` says order `Created` is unix seconds; wire carries µs | OPEN | doc fix |
+| INV-F98 | S4 | `docs/protocol.md` says order `Created` is unix seconds; wire carries µs | FIXED | B11 `fix/concurrency` (doc): protocol.md §4.2 notes now state µs (`total_microseconds()`, xutil.cpp:280; Go passes the u64 through); stale `findings.md:366` ref corrected |
 | INV-F99 | S4 | Stale C++ header-comment enums (commands 11/12/13/18/20/24) | DOCUMENTED | C++ side; writers authoritative |
 | INV-F100 | S4 | Vestigial `Server.verify`, `coins.MustGet`, unreferenced `swap`, LocalConnector sign/verify | FIXED | documented |
 
@@ -227,7 +227,7 @@ namespace is the Current register above.
 | F11–F14 | INV-F100 | vestigial helpers — FIXED |
 | F15 | CONC-F101 | live `*Order` race — FIXED |
 | F16 | STATE-F77 | post-completion retransmit — FIXED |
-| F17 | CONC-F92 | blocking I/O on engine goroutine — OPEN |
+| F17 | CONC-F92 | blocking I/O on engine goroutine — FIXED (B11) |
 | F18 | CONC-F102 | force-refund double-broadcast — FIXED |
 | F19 | CRYPTO-F84 | AcceptingBody empty fee/utxos — FIXED (B2) |
 | F20 | WIRE-F71 | registration integrity — FIXED (B1) |
@@ -272,6 +272,10 @@ namespace is the Current register above.
 | S3-P | STATE-F74 | `trRollbackFailed` unset — FIXED (B8: `rollbackGate` on refund-broadcast failure) |
 | S3-Q | STATE-F75 | no peer penalty — FIXED (B8: misbehaviour score + ban, pool + hub) |
 | S3-R | SEC-F02 | inbound UTXO proofs unverified — FIXED (B8: `verifyOrderUtxos` before booking) |
+| S2-S | CONC-F92 | blocking I/O on engine goroutine — FIXED (B11: buffered outbound writer + background persist) |
+| S3-S | CONC-F93 | goroutine joins / Dedupe sweeper leak — FIXED (B11: WaitGroup + ctx dial + Close `FlushAll`) |
+| S3-T | CONC-F94 | reload mid-swap-task — FIXED (B11: `swapCtx` connector/confs snapshot) |
+| S4-D | INV-F98 | `Created` doc µs — FIXED (B11 doc) |
 | S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 
 ---

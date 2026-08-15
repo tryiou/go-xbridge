@@ -54,7 +54,7 @@ here can lag the code.
 | B8 | `fix/state-machinery` | **STATE-F72–F75, STATE-F79, SEC-F02** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `api/swap.go`, `api/cancel_reason.go`, `api/order.go`, `wallet/connector.go`, `wallet/rpc.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `swap/transaction.go` | B3 |
 | B9 | `fix/crypto-connectors` | **CRYPTO-F77 (S1), F82, F83, F88, F89, F91, F92** (F98/F99 DOCUMENTED residual: PART/BCD non-portable) | `coins/tx.go`, `coins/coin.go`, `coins/cashaddr.go`, `coins/base58check.go`, `crypto/signer.go`, `api/swap.go`, `api/handlers.go`, `api/utxo_select.go`, `wallet/rpc.go`, `swap/deposit.go` | B3 |
 | B10 | `fix/config-parity` | **CFG-F84–F91** (F86 DOCUMENTED; F80 folded) | `config/conf.go`, `config/admit.go`, `cmd/xbridged/main.go`, `coins/coin.go`, `wallet/conf.go`, `wallet/activate.go`, `api/node.go`, `api/store.go`, `api/handlers.go`, `api/utxo_select.go`, `api/engine.go` | B4 |
-| B11 | `fix/concurrency` | **CONC-F92–F94** | `api/node.go`, `api/engine.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/persist.go` | B5 |
+| B11 | `fix/concurrency` | **CONC-F92–F94** (INV-F98 doc) | `p2p/conn.go`, `api/persist.go`, `api/engine.go`, `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/swap.go`, `api/node.go`, `docs/protocol.md` | B8 |
 
 \* SEC-F03 (taker-trust) has no standalone code — the HTLC composition is sound
 (`coins/htlc.go:45-54` matches C++). It is closed by **B3** as composite
@@ -92,7 +92,11 @@ clearing; CFG-F86 documented never-creates). **B8 merged** (state-machinery:
 STATE-F72–F75, STATE-F79, SEC-F02 — 15 s expiry prune + 60 s persist,
 `TxCancelReason` enum/text incl. C++ bugs, `trRollbackFailed` on refund
 failure, peer misbehaviour score + ban, `tryJoinMatches` guard confirmation,
-inbound UTXO proof verification). B11 pending.
+inbound UTXO proof verification). **B11 merged** (concurrency: CONC-F92–F94,
+INV-F98 — buffered outbound writer + background persist so the engine never
+blocks on a peer/fsync, WaitGroup-joined discovery goroutines + ctx-cancellable
+dials, Dedupe re-registration + `Node.Close` FlushAll, `swapCtx` connector/confs
+snapshot for reload-mid-task safety, `Created` µs doc). Register: fully green.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -309,7 +313,13 @@ doc: `B10-config.md`.
 
 Bounded async socket writes / background persist so the engine never blocks on
 a peer or fsync; join discovery goroutines + stop Dedupe on Close; snapshot
-connectors at task start (reload-mid-task race test).
+connectors at task start (reload-mid-task race test). **DONE** — merged to
+`main`; register rows CONC-F92/F93/F94 + INV-F98 → `FIXED` (B11); branch doc
+`B11-concurrency.md`. Residuals documented: `p2p.Conn` write errors surface on
+the next send (C++ surfacing on the socket-handler thread); a handshake-stall
+peer can hold discovery `Close` up to `handshakeTimeout`; the coin registry is
+still resolved at build time via the atomic `coins.Get` (a reload dropping a
+coin fails a mid-task build cleanly rather than redirecting it).
 
 ## Register + audit.md hygiene
 

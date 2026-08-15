@@ -600,19 +600,19 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: C++ `PushMessage` and `saveOrders` never block the packet-processing path.
 - CAND: `api/node.go:802-814` → `p2p/conn.go:140-145` (synchronous socket write) and `persist.go:154-176` (fsync) run on the engine goroutine — a slow peer or slow disk stalls every packet and every awaiting RPC.
 - IMPACT: head-of-line blocking / perceived daemon stall.
-- FIX: bounded async/buffered writes; non-blocking persist (background writer).
+- FIX (B11): `p2p.Conn` grows an outbound queue drained by a writer goroutine (lazy-started, so read-only/handshake-failed conns spawn nothing; `maxSendBufferSize` 1 MB cap disconnects the peer like C++ `PushMessage`/`nSendBufferMaxSize`, net.cpp:2705-2730 — frames are never dropped, avoiding the CreatedA-retransmit double-deposit hazard; write errors surface on the next send + tear the conn down in both directions). Persist splits into `snapshotSwaps` (engine) + `writeSwaps` (background `persistLoop`, coalesced latest-slot, final flush after `Close` joins). Tests: `p2p/conn_write_test.go` + `api/slow_peer_test.go` + `api/persist_async_test.go`.
 
 ### CONC-F93 · S3 · CONC · Discovery peer goroutines never joined; Dedupe sweeper leaks without Flush
 - REF: C++ joins all threads on shutdown (`xbridgeapp.cpp:530-544`).
 - CAND: `p2p/discovery/peer_manager.go:128,201,270,433-448` — signalled via `m.done` but never joined (no WaitGroup); `log/dedup.go:137-148` sweeper stops only on Flush (mitigated by `main.go:263` FlushAll on graceful shutdown).
 - IMPACT: goroutine leaks on library-level Close; less severe under the daemon.
-- FIX: WaitGroup-join discovery goroutines; stop Dedupe on Close.
+- FIX (B11): PeerManager tracks maintain/connectOne/readLoop with a `WaitGroup` joined by `Close`, drives an internal lifecycle context so in-flight dials abort immediately (`p2p.DialContext`, `net.Dialer.DialContext`; a handshake-stall can hold the join up to `handshakeTimeout` 60 s, bounded + documented); `Dedupe.startSweepLocked` re-registers so a restarted sweeper is stopped by a later `FlushAll`; `Node.Close` calls `xlog.FlushAll()`. Tests: `TestPeerManagerCloseAbortsInflightDialAndJoins`, `TestDedupe_RestartReRegisters`, `TestNodeCloseFlushesDedupeSweepers`.
 
 ### CONC-F94 · S3 · CONC · Conf reload mid-swap-task hazard (untested)
 - REF: C++ wallet list is stable during a session task.
 - CAND: `reloadConf` (`api/node.go:287-334`) can swap the connector a deposit task builds against mid-task; not covered by `-race` tests.
 - IMPACT: torn connector state across a reload boundary.
-- FIX: snapshot/version connectors at task start; add a reload-mid-task race test.
+- FIX (B11): `swapCtx` snapshots `Connectors`/`Confs` at enqueue (shallow copies under `cfg()`); all worker-path connector/confs reads go through the snapshot, and `postRefundTask` captures the connector at enqueue — a mid-task reload can no longer redirect a deposit/claim/refund build (C++ session holds the captured connector pointer; reload replaces the pool under `m_connectorsLock`). The coin registry is still resolved at build time via the atomic `coins.Get` (documented residual: a reload dropping a coin fails the build with a clean error, never redirects it). Test: `TestReloadMidSwapTaskKeepsConnectorSnapshot` (real `reloadConf` mid-task; verified to fail when `buildDeposit` is reverted to live-config reads).
 
 ### CONC-F95 · S3 · CONC · Go hides C++'s transient "accepting" window
 - REF: `xbridgeapp.cpp:2126-2135` — a transient `trAccepting` + modified-sizes state is observable during an in-flight take.
@@ -640,7 +640,7 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: `total_microseconds()` (`xutil.cpp:280`) — µs in the wire body and envelope timestamp.
 - CAND: `docs/protocol.md:395` (§4.2 notes) — said seconds; Go code correctly passes through µs (`store.go:517-519`).
 - IMPACT: documentation-only; a reader would build a wrong encoder.
-- FIX: correct the doc.
+- FIX (B11): protocol.md §4.2 note corrected — order `Created` is µs since epoch (the 8-byte envelope timestamp is also µs; only the packet-header timestamp is seconds, §2.1).
 
 ### INV-F99 · S4 · DOC · Stale C++ header-comment enums
 - REF: header comments for commands 11/12/13/18/20/24 and locktime threshold prose in `xbridgepacket.h` / `xbridgesession.h` are stale; the writers are authoritative.
