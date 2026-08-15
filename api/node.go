@@ -242,7 +242,7 @@ type Node struct {
 	// does, so it defaults false; the cancel handler's exchange branch is
 	// therefore dead in production but ported verbatim for fidelity (and
 	// exercisable in tests via SetExchangeStarted). Atomic so a test flip
-	// cannot race the feed goroutine reading it in onRemoteCancel.
+	// cannot race the feed goroutine reading it in handleRemoteCancel.
 	exchangeStarted atomic.Bool
 }
 
@@ -790,7 +790,7 @@ func (n *Node) blockLoop() {
 // handlePacket routes a decoded, signature-verified packet to its handler on
 // the engine goroutine. It is the engine-side half of the former feed(): the
 // reader loop does the socket read + decode/verify, and the engine applies the
-// body type-switch here (onRemoteCancel also needs the raw pkt for
+// body type-switch here (handleRemoteCancel also needs the raw pkt for
 // VerifyAgainst).
 func (n *Node) handlePacket(in inboundPacket) {
 	body, err := proto.DecodeBody(in.pkt.Command, in.pkt.Body)
@@ -1034,22 +1034,14 @@ type responseBody interface {
 	Marshal() []byte
 }
 
-// dispatchSwap routes a hub-originated handshake packet to the local session for
-// the given order id and runs the session handler, submitting the work to the
-// engine goroutine (which owns sessions). Packets for order ids we are not a
+// processSwap dispatches a hub-originated handshake packet to the local session
+// for the given order id and runs the session handler. handlePacket (node.go:795)
+// calls it on the engine goroutine (which owns sessions); off-engine callers
+// marshal it onto the engine with submit. Packets for order ids we are not a
 // party to are ignored. The `hub` parameter (the address the packet embeds) is
 // intentionally ignored: the response destination is the hub pinned at session
 // creation, never learned from the packet. When the engine is not started
 // (tests) the work runs inline on the caller.
-func (n *Node) dispatchSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
-	n.submit(func() { n.processSwap(pkt, id, hub, cmdName, fn) }, false)
-}
-
-// processSwap is the engine-side body of dispatchSwap: it looks up the session
-// for the order id, re-verifies the packet against the session's trusted hub
-// key, runs the session handler, and (if it produced a response) signs and
-// sends it addressed to the session's pinned hub. Runs on the engine goroutine
-// (or inline when the engine is not started).
 //
 // Hub-key auth: every handshake packet is re-verified against the
 // session's TRUSTED hub key before dispatch — mirroring C++
@@ -2275,16 +2267,11 @@ func (n *Node) markStale(o *Order) {
 func (n *Node) onUnlockCoins(o *Order)    {}
 func (n *Node) onUnlockFeeUtxos(o *Order) {}
 
-// onRemoteCancel is the public entry point for a hub-originated cancel; it
-// submits the work to the engine goroutine (which owns the session and book
-// maps). handlePacket calls handleRemoteCancel directly.
-func (n *Node) onRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
-	n.submit(func() { n.handleRemoteCancel(pkt, b) }, false)
-}
-
 // handleRemoteCancel ports C++ Session::Impl::processTransactionCancel
 // (xbridgesession.cpp:3288-3429) verbatim, including the Exchange branch and
-// the state-machine switch. Runs on the engine goroutine.
+// the state-machine switch. handlePacket calls it on the engine goroutine
+// (which owns the session and book maps); off-engine callers marshal it onto
+// the engine with submit.
 func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	idHex := hexEncode(b.ID[:])
 	o := n.store.Get(idHex)
@@ -2401,16 +2388,11 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	n.persist()
 }
 
-// onRemoteReject is the public entry point for a hub-originated reject; it
-// submits the work to the engine goroutine. handlePacket calls
-// handleRemoteReject directly.
-func (n *Node) onRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
-	n.submit(func() { n.handleRemoteReject(pkt, b) }, false)
-}
-
 // handleRemoteReject ports C++ Session::Impl::processTransactionReject
 // (xbridgesession.cpp:3432-3485) verbatim. It restores the order to pending
-// (trPending / "open") and NEVER cancels it. Runs on the engine goroutine.
+// (trPending / "open") and NEVER cancels it. handlePacket calls it on the
+// engine goroutine (which owns the session and book maps); off-engine callers
+// marshal it onto the engine with submit.
 func (n *Node) handleRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
 	idHex := hexEncode(b.ID[:])
 	o := n.store.Get(idHex)

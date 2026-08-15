@@ -61,8 +61,7 @@ func httpStatusForCode(code int) int {
 
 // Server is the JSON-RPC 1.0 HTTP server exposing the dx* surface.
 type Server struct {
-	ctx    *HandlerCtx
-	verify bool // when true, signatures are verified before storing orders
+	ctx *HandlerCtx
 
 	// user/pass are the HTTP Basic credentials RPC callers must present
 	// (-rpcuser/-rpcpassword).

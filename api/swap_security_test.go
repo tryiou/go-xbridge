@@ -77,7 +77,7 @@ func TestNodeConnectorMissing(t *testing.T) {
 }
 
 // TestDispatchSwapRecoversFromPanic ensures a panicking swap handler cannot
-// crash the process: dispatchSwap must recover and return. The session is a
+// crash the process: processSwap must recover and return. The session is a
 // pinned maker so the packet passes the hub-key auth gate and reaches the
 // handler (which is what panics).
 func TestDispatchSwapRecoversFromPanic(t *testing.T) {
@@ -106,7 +106,7 @@ func TestDispatchSwapRecoversFromPanic(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		node.dispatchSwap(pkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+		node.processSwap(pkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 			panic("boom")
 		})
 		close(done)
@@ -114,7 +114,7 @@ func TestDispatchSwapRecoversFromPanic(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("dispatchSwap did not return after panic (process may have crashed)")
+		t.Fatal("processSwap did not return after panic (process may have crashed)")
 	}
 }
 
@@ -167,7 +167,7 @@ func TestDispatchSwapDropsForgedFinished(t *testing.T) {
 	}
 
 	// Forged Finished from the attacker's key: dropped, session state untouched.
-	node.dispatchSwap(signed(attackerPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(signed(attackerPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		return s.OnFinished(&proto.FinishedBody{ID: id})
 	})
 	if s.state == csFinished {
@@ -175,7 +175,7 @@ func TestDispatchSwapDropsForgedFinished(t *testing.T) {
 	}
 
 	// Honest Finished from the pinned hub key: still processed.
-	node.dispatchSwap(signed(hubPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(signed(hubPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		return s.OnFinished(&proto.FinishedBody{ID: id})
 	})
 	if s.state != csFinished {
@@ -223,7 +223,7 @@ func TestDispatchSwapMakerRejectsNonPinnedHub(t *testing.T) {
 
 	// The trusted hub's Hold dispatches.
 	dispatched := false
-	node.dispatchSwap(mk(hubPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(mk(hubPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		dispatched = true
 		return 0, nil, nil
 	})
@@ -235,7 +235,7 @@ func TestDispatchSwapMakerRejectsNonPinnedHub(t *testing.T) {
 	}
 
 	// A forger's Hold is dropped and does NOT repin.
-	node.dispatchSwap(mk(forgerPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(mk(forgerPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		t.Fatal("forger Hold reached handler")
 		return 0, nil, nil
 	})
@@ -244,7 +244,7 @@ func TestDispatchSwapMakerRejectsNonPinnedHub(t *testing.T) {
 	}
 
 	// A forged Finished from the forger is rejected (hubKey stays pinned).
-	node.dispatchSwap(mk(forgerPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(mk(forgerPriv), id, [20]byte{}, "Finished", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		t.Fatal("forged Finished after pin reached handler")
 		return 0, nil, nil
 	})
@@ -274,7 +274,7 @@ func TestDispatchSwapMakerUnpinnedDropsAll(t *testing.T) {
 	}
 
 	// Even a validly-signed Hold must not pin an unpinned maker.
-	node.dispatchSwap(mk(hubPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(mk(hubPriv), id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		t.Fatal("unpinned maker packet reached handler")
 		return 0, nil, nil
 	})
@@ -302,7 +302,7 @@ func TestDispatchSwapTakerRejectsUnpinnedHub(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	node.dispatchSwap(pkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+	node.processSwap(pkt, id, [20]byte{}, "Hold", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
 		t.Fatal("unpinned taker packet reached handler")
 		return 0, nil, nil
 	})

@@ -33,8 +33,6 @@ type Dedupe struct {
 	// permanently disables later Events — dedup keeps summarizing after a
 	// shutdown-triggered flush.
 	stopCh chan struct{}
-	// sweepOnce guards lazy start of the sweep goroutine.
-	sweepOnce sync.Once
 	// sweepStarted reports whether the sweep goroutine is live (under mu).
 	sweepStarted bool
 }

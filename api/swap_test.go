@@ -1649,19 +1649,19 @@ func TestComputeLockTime(t *testing.T) {
 	n.sessions["x"] = s
 
 	// blockTime 60: maker 7200/60=120 → 1120; taker 1800/60=30 → 1030.
-	if got := s.computeLockTime(true); got != 1120 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, true); got != 1120 {
 		t.Errorf("maker lockTime (bt60) = %d, want 1120", got)
 	}
-	if got := s.computeLockTime(false); got != 1030 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, false); got != 1030 {
 		t.Errorf("taker lockTime (bt60) = %d, want 1030", got)
 	}
 
 	// blockTime 100 (no clamp): maker 7200/100=72 → 1072; taker 1800/100=18 → 1018.
 	confs["BTC"].BlockTime = 100
-	if got := s.computeLockTime(true); got != 1072 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, true); got != 1072 {
 		t.Errorf("maker lockTime (bt100) = %d, want 1072", got)
 	}
-	if got := s.computeLockTime(false); got != 1018 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, false); got != 1018 {
 		t.Errorf("taker lockTime (bt100) = %d, want 1018", got)
 	}
 
@@ -1669,17 +1669,17 @@ func TestComputeLockTime(t *testing.T) {
 	// XMIN_LOCKTIME_BLOCKS=6 → 1006. (The XSLOW_TAKER branch is also applied for
 	// bt>=600 but the 6-block clamp dominates the result, matching C++.)
 	confs["BTC"].BlockTime = 7200
-	if got := s.computeLockTime(true); got != 1006 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, true); got != 1006 {
 		t.Errorf("maker lockTime (clamped) = %d, want 1006", got)
 	}
-	if got := s.computeLockTime(false); got != 1006 {
+	if got := s.snapshot().computeLockTimeFor(s.srcCur, false); got != 1006 {
 		t.Errorf("taker lockTime (clamped) = %d, want 1006", got)
 	}
 }
 
 // TestRefundWatcher drives the fund-safety safety net: before the deposit's
 // lockTime the watcher must not broadcast; once the chain advances past the
-// lockTime, checkRefunds must auto-broadcast the pre-signed refund exactly once
+// lockTime, scanRefunds must auto-broadcast the pre-signed refund exactly once
 // (guarded by refundDone).
 func TestRefundWatcher(t *testing.T) {
 	n, s, conn := setupSwapPair(t)
@@ -1692,13 +1692,13 @@ func TestRefundWatcher(t *testing.T) {
 	// Maker lockTime = 1000 (blockHeight) + 7200/60 = 1120. Before expiry, the
 	// watcher must leave the deposit untouched.
 	before := len(conn.broadcasts)
-	n.checkRefunds()
+	n.scanRefunds()
 	if len(conn.broadcasts) != before {
 		t.Errorf("refund broadcast before lockTime expiry (broadcasts %d)", len(conn.broadcasts))
 	}
 	// Advance the chain past the deposit lockTime and re-run the check.
 	conn.blockHeight = 1200
-	n.checkRefunds()
+	n.scanRefunds()
 	if len(conn.broadcasts) != before+1 {
 		t.Fatalf("refund not auto-broadcast at lockTime (broadcasts %d, want %d)", len(conn.broadcasts), before+1)
 	}
@@ -1707,7 +1707,7 @@ func TestRefundWatcher(t *testing.T) {
 	}
 	// A second pass must NOT double-broadcast.
 	after := len(conn.broadcasts)
-	n.checkRefunds()
+	n.scanRefunds()
 	if len(conn.broadcasts) != after {
 		t.Errorf("refund auto-broadcast twice (broadcasts %d, want %d)", len(conn.broadcasts), after)
 	}

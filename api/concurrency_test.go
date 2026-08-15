@@ -94,7 +94,7 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				n.checkRefunds()
+				n.submit(func() { n.scanRefunds() }, false)
 			}
 		}()
 	}
@@ -122,7 +122,7 @@ func TestConcurrentRefundSweepAndDepositTask(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := gated.fakeConnector.broadcastSnapshot(); len(got) != 1 {
+	if got := gated.broadcastSnapshot(); len(got) != 1 {
 		t.Fatalf("deposit broadcast %d times, want 1", len(got))
 	}
 	if got := readOnEngine(t, n, func() string { return n.sessions[hexEncode(aID[:])].ourDepositTxID }); got != createdA.ADepositTxID {
@@ -648,7 +648,7 @@ func TestCloseDrainsInFlightRefundTask(t *testing.T) {
 	}, true)
 
 	// The sweep posts the refund task; wait until it is parked in the wallet.
-	n.checkRefunds()
+	n.submit(func() { n.scanRefunds() }, false)
 	deadline := time.Now().Add(5 * time.Second)
 	for gated.callCount() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -715,7 +715,8 @@ func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
 	}
 
 	// Session B (maker, LTC): CreateA delivered as a live hub-signed packet via
-	// dispatchSwap → processSwap (hub-key re-verify + registry check).
+	// processSwap (hub-key re-verify + registry check), marshaled onto the
+	// engine goroutine like an inbound packet would be.
 	_, bPub := newKey(t)
 	var bID [32]byte
 	copy(bID[:], []byte("liveness-dispatch-b-order-00000"))
@@ -727,9 +728,11 @@ func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
 	createA := hubSignedPkt(t, hubPriv, proto.XbcTransactionCreateA, &proto.CreateABody{
 		HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub),
 	})
-	n.dispatchSwap(createA, bID, [20]byte{}, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
-		return s.OnCreateA(&proto.CreateABody{HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub)})
-	})
+	n.submit(func() {
+		n.processSwap(createA, bID, [20]byte{}, "CreateA", func(s *SwapSession) (proto.XBridgeCommand, responseBody, error) {
+			return s.OnCreateA(&proto.CreateABody{HubAddress: coins.KeyID(hubPub[:]), ID: bID, BPubKey: to33(bPub)})
+		})
+	}, false)
 
 	// B's CreatedA arrives (A's is deferred behind the parked wallet).
 	waitForPacket(t, cc, proto.XbcTransactionCreatedA, 5*time.Second)
