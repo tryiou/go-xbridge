@@ -353,5 +353,9 @@ func (n *Node) Close() error {
 	// the stop-drain, so flush the latest slot once more after every goroutine
 	// has exited (no further publishes can race this drain).
 	n.writeLatestPersist()
+	// Stop every Dedupe sweeper so a library-level Close leaks no goroutine
+	// (the daemon's main.go FlushAll becomes a no-op here). A later Event on a
+	// reused node restarts its own sweeper on demand.
+	xlog.FlushAll()
 	return cerr
 }

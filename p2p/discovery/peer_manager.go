@@ -37,8 +37,9 @@ type Options struct {
 	// (C++ default -bantime).
 	BanDuration time.Duration
 	// Dialer optionally overrides the connect function (used by tests). The
-	// default is p2p.Dial.
-	Dialer func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
+	// default is p2p.DialContext, which aborts an in-flight dial when its
+	// context is cancelled (Close), so PeerManager.Close stays bounded.
+	Dialer func(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
 }
 
 // PeerManager maintains N outbound Blocknet peers and exposes a single
@@ -50,12 +51,20 @@ type PeerManager struct {
 	network string
 	opts    Options
 	target  int
-	dial    func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
+	dial    func(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error)
 
 	addrMan   *AddrMan
 	xbridgeCh chan peerPacket
 	done      chan struct{}
 	once      sync.Once
+	// ctx is the manager's own lifecycle context, cancelled by Close so an
+	// in-flight dial aborts immediately (dial is ctx-aware via DialContext).
+	ctx    context.Context
+	cancel context.CancelFunc
+	// wg tracks the maintain, connectOne, and per-peer readLoop goroutines so
+	// Close joins them all before returning (C++ joins every xbridge thread on
+	// shutdown, xbridgeapp.cpp:530-544).
+	wg sync.WaitGroup
 
 	// seeds is the resolved bootstrap address list for the network, populated
 	// once on first use so we do not re-run a blocking DNS lookup every tick.
@@ -108,7 +117,7 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 	}
 	dial := opts.Dialer
 	if dial == nil {
-		dial = p2p.Dial
+		dial = p2p.DialContext
 	}
 	explicit := opts.ExplicitAddrs
 	if len(opts.SeedOverride) > 0 {
@@ -131,12 +140,15 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 	if banDuration <= 0 {
 		banDuration = 24 * time.Hour
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &PeerManager{
 		magic:         magic,
 		network:       network,
 		opts:          opts,
 		target:        target,
 		dial:          dial,
+		ctx:           ctx,
+		cancel:        cancel,
 		explicit:      explicit,
 		explicitSet:   explicitSet,
 		explicitTried: make(map[string]time.Time),
@@ -162,7 +174,11 @@ func (m *PeerManager) Start(ctx context.Context) {
 	// a candidate set even before any peer advertises addresses.
 	m.seedAddrMan()
 	m.connectUpTo(ctx, m.target)
-	go m.maintain(ctx)
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.maintain(ctx)
+	}()
 }
 
 // bootstrapAddrs is the seed source; overridable in tests to keep them
@@ -250,7 +266,11 @@ func (m *PeerManager) connectUpTo(ctx context.Context, want int) {
 		m.mu.Lock()
 		m.peers[cand] = nil // reserve; set to the real conn on success
 		m.mu.Unlock()
-		go m.connectOne(ctx, cand)
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.connectOne(cand)
+		}()
 	}
 }
 
@@ -300,15 +320,19 @@ func (m *PeerManager) candidates() []string {
 }
 
 // connectOne dials a single candidate, registers the live conn, and starts its
-// read loop. On failure it frees the reservation so the address can be retried.
-func (m *PeerManager) connectOne(ctx context.Context, addr string) {
+// read loop. The dial uses the manager's own context (m.ctx), so Close cancels
+// an in-flight dial immediately; on failure it frees the reservation so the
+// address can be retried.
+func (m *PeerManager) connectOne(addr string) {
 	m.mu.Lock()
 	if m.explicitSet[addr] {
 		m.explicitTried[addr] = now()
 	}
 	m.mu.Unlock()
 	m.addrMan.MarkTried(addr)
-	conn, err := m.dial(addr, m.magic, 30*time.Second)
+	// Dial with the manager's own context so Close cancels an in-flight dial
+	// immediately instead of waiting out the timeout.
+	conn, err := m.dial(m.ctx, addr, m.magic, 30*time.Second)
 	if err != nil {
 		m.mu.Lock()
 		delete(m.peers, addr)
@@ -328,7 +352,11 @@ func (m *PeerManager) connectOne(ctx context.Context, addr string) {
 
 	// Start reading from the peer first so its addr/XBridge traffic is consumed
 	// even if the getaddr write below is slow to be read by the peer.
-	go m.readLoop(addr, conn)
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.readLoop(addr, conn)
+	}()
 
 	// Ask the peer for its known addresses (enables further discovery).
 	if err := conn.SendCommand(p2p.CmdGetAddr, nil); err != nil {
@@ -566,10 +594,17 @@ func (m *PeerManager) liveCount() int {
 	return n
 }
 
-// Close stops maintenance, closes all peer connections, and tears down the
-// manager. It is safe to call multiple times.
+// Close stops maintenance, cancels in-flight dials, closes all peer
+// connections, and joins every goroutine (maintain, connectOne, per-peer
+// readLoop) before returning, mirroring C++'s join_all on shutdown
+// (xbridgeapp.cpp:530-544). The dial phase is cancelled immediately via the
+// manager context; a peer that accepts TCP but stalls the version handshake can
+// hold the join up to handshakeTimeout (60s, bounded and non-additive — peers
+// proceed concurrently). Safe to call multiple times. Start must not be called
+// concurrently with Close.
 func (m *PeerManager) Close() error {
 	m.once.Do(func() {
+		m.cancel()
 		close(m.done)
 		m.mu.Lock()
 		for _, c := range m.peers {
@@ -581,6 +616,7 @@ func (m *PeerManager) Close() error {
 		// Note: xbridgeCh is intentionally left open — a blocked send in
 		// readLoop selects against m.done and returns rather than sending to a
 		// closed channel, so we avoid a send-on-closed-channel panic.
+		m.wg.Wait()
 	})
 	return nil
 }

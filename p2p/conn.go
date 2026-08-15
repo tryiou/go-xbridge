@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -100,6 +101,22 @@ func Dial(addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
 		// Dedupe.Event is internally synchronized and atomically reports the
 		// first occurrence, so concurrent Dial failures for the same address
 		// produce exactly one diagnostic log line.
+		if first := dialDedup.Event(addr); first {
+			xlog.Debug("dial failed", "addr", addr, "err", err)
+		}
+		return nil, err
+	}
+	return NewConn(nc, magic)
+}
+
+// DialContext is the context-aware dial used by the discovery PeerManager: the
+// dial aborts the moment ctx is cancelled (Close), so an in-flight connect is
+// interrupted immediately instead of running out its timeout. The handshake
+// itself is bounded by handshakeTimeout inside NewConn.
+func DialContext(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	nc, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
 		if first := dialDedup.Event(addr); first {
 			xlog.Debug("dial failed", "addr", addr, "err", err)
 		}

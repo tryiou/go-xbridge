@@ -161,7 +161,7 @@ func TestPeerManagerFakePeer(t *testing.T) {
 	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
-		Dialer: func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			client, server := net.Pipe()
 			go fakePeer(server, magic)
 			return p2p.NewConn(client, magic)
@@ -220,18 +220,16 @@ func TestPeerManagerExplicitCooldown(t *testing.T) {
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"hostname.example:41412"},
 		DialCooldown:  2 * time.Minute,
-		Dialer: func(addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, addr string, magic [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			return nil, errors.New("dial failed")
 		},
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 
 	const addr = "hostname.example:41412"
 	if got := pm.nextCandidate(); got != addr {
 		t.Fatalf("fresh explicit addr should be a candidate, got %q", got)
 	}
-	pm.connectOne(ctx, addr)
+	pm.connectOne(addr)
 
 	// Within the cooldown window the explicit addr must not be re-candidated.
 	if got := pm.nextCandidate(); got != "" {
@@ -303,7 +301,7 @@ func TestPeerManagerIgnoresGetaddr(t *testing.T) {
 	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
-		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			client, server := net.Pipe()
 			go func() {
 				defer close(done)
@@ -344,7 +342,7 @@ func TestPeerManagerSNListEcho(t *testing.T) {
 	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
-		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			client, server := net.Pipe()
 			go func() {
 				defer close(done)
@@ -393,7 +391,7 @@ func TestPeerManagerAddrCapDropped(t *testing.T) {
 	pm := New(magic, "regtest", Options{
 		TargetPeers:   1,
 		ExplicitAddrs: []string{"fake:1"},
-		Dialer: func(addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, addr string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			client, server := net.Pipe()
 			go func() {
 				readMsg(tDummy{}, server)

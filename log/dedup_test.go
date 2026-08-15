@@ -241,3 +241,45 @@ func TestFlushAll(t *testing.T) {
 		t.Fatalf("registry size = %d, want 0 after FlushAll", n)
 	}
 }
+
+// TestDedupe_RestartReRegisters — a later Event after Flush restarts the sweep
+// goroutine AND re-registers it, so a subsequent FlushAll still sees and stops
+// it. Without the re-registration a restarted sweeper would be invisible to
+// FlushAll and leak forever (the CONC-F93 gap the daemon's shutdown FlushAll
+// used to miss).
+func TestDedupe_RestartReRegisters(t *testing.T) {
+	cap1 := &captureSummaries{}
+	d := NewDedupe(time.Hour, cap1.add)
+
+	d.Event("a")
+	regMu.Lock()
+	_, registered := registry[d]
+	regMu.Unlock()
+	if !registered {
+		t.Fatal("first Event must register the sweeper")
+	}
+
+	d.Flush() // shutdown-style flush: deregisters and stops the sweeper
+	regMu.Lock()
+	_, registered = registry[d]
+	regMu.Unlock()
+	if registered {
+		t.Fatal("Flush must deregister the sweeper")
+	}
+
+	d.Event("a") // reuse after flush: restarts the sweeper
+	regMu.Lock()
+	_, registered = registry[d]
+	regMu.Unlock()
+	if !registered {
+		t.Fatal("restarted sweeper must re-register so FlushAll can stop it")
+	}
+
+	FlushAll() // must stop the restarted sweeper, or the goroutine leaks
+	regMu.Lock()
+	_, registered = registry[d]
+	regMu.Unlock()
+	if registered {
+		t.Fatal("FlushAll must deregister the restarted sweeper")
+	}
+}

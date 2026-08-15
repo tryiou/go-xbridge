@@ -29,7 +29,7 @@ func pmWithFakePeer(t *testing.T, opts Options, msgs func(server net.Conn, magic
 		ExplicitAddrs: []string{addr},
 		BanThreshold:  opts.BanThreshold,
 		BanDuration:   opts.BanDuration,
-		Dialer: func(a string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
+		Dialer: func(ctx context.Context, a string, m [4]byte, timeout time.Duration) (*p2p.Conn, error) {
 			client, server := net.Pipe()
 			go func() {
 				readMsg(tDummy{}, server)

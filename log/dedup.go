@@ -119,11 +119,17 @@ func (d *Dedupe) Event(key string) (first bool) {
 }
 
 // startSweepLocked lazily starts the sweep goroutine. Caller must hold d.mu.
+// It re-registers d in the global registry: Flush deletes the entry, so a
+// restarted sweeper (a later Event after a shutdown-triggered flush) must be
+// re-registered or a subsequent FlushAll would miss it and leak the goroutine.
 func (d *Dedupe) startSweepLocked() {
 	if d.sweepStarted {
 		return
 	}
 	d.sweepStarted = true
+	regMu.Lock()
+	registry[d] = struct{}{}
+	regMu.Unlock()
 	interval := d.quietFor / 2
 	if interval <= 0 {
 		interval = time.Second
