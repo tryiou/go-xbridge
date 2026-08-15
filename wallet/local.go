@@ -32,15 +32,23 @@ type Broadcaster func(txHex string) (txid string, err error)
 // Address/UTXO/fee queries have no local source, so those methods return an
 // error; the deposit flow supplies inputs and prevTxs explicitly instead.
 type LocalConnector struct {
-	ticker    string
-	signer    LocalSigner
-	broadcast Broadcaster
+	ticker       string
+	signer       LocalSigner
+	broadcast    Broadcaster
+	hasTimeField bool
 }
 
 // NewLocalConnector builds a local-signing connector. broadcast may be nil for
 // sign-only use.
 func NewLocalConnector(ticker string, signer LocalSigner, broadcast Broadcaster) *LocalConnector {
-	return &LocalConnector{ticker: ticker, signer: signer, broadcast: broadcast}
+	c := &LocalConnector{ticker: ticker, signer: signer, broadcast: broadcast}
+	// Bind the coin's serializeWithTimeField quirk at construction (the
+	// connector captures its conf; a reload rebuilds connectors), so a
+	// mid-task registry change cannot re-interpret an in-flight txHex.
+	if coin, ok := coins.Get(ticker); ok {
+		c.hasTimeField = coin.TxWithTimeField
+	}
+	return c
 }
 
 func (l *LocalConnector) Ticker() string { return l.ticker }
@@ -68,11 +76,9 @@ func (l *LocalConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (str
 	// Deserialize honoring the coin's serializeWithTimeField quirk: if the
 	// stored txHex carries the 4-byte nTime field (deposit/refund/claim for a
 	// TxWithTimeField coin), we must read it so the witness/script layout lines
-	// up and the re-emitted hex is byte-identical.
-	hasTime := false
-	if c, ok := coins.Get(l.ticker); ok {
-		hasTime = c.TxWithTimeField
-	}
+	// up and the re-emitted hex is byte-identical. The flag is captured at
+	// construction, matching the connector's conf-bound behavior.
+	hasTime := l.hasTimeField
 	tx, err := coins.DeserializeWithTime(raw, hasTime)
 	if err != nil {
 		return "", false, err

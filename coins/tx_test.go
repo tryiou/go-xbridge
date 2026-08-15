@@ -153,9 +153,9 @@ func TestKeyID(t *testing.T) {
 }
 
 func TestBuildDepositUnlockScript(t *testing.T) {
-	myPub, _ := hex.DecodeString("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-	otherPub, _ := hex.DecodeString("02f9308a019258c31049344f85f619bcf79a3b296b825f9cc0d5c7d3a0b5c8e8e")
-	secret, _ := hex.DecodeString("0123456789abcdef0123456789abcdef01234567")
+	myPub := mustDecode(t, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+	otherPub := mustDecode(t, "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+	secret := mustDecode(t, "0123456789abcdef0123456789abcdef01234567")
 	lockTime := uint32(600)
 
 	s := BuildDepositUnlockScript(myPub, otherPub, secret, lockTime)

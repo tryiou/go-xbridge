@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"go-xbridge/coins"
+	"go-xbridge/config"
 )
 
 // testHTLCSigner signs the refund (IF) branch of an XBridge HTLC deposit,
@@ -22,13 +23,25 @@ func (s *testHTLCSigner) SignInput(tx *coins.Tx, idx int, prev PrevTx) ([]byte, 
 	return coins.BuildRefundScriptSig(sig, s.myPub, s.inner), nil
 }
 
-func TestLocalConnectorSignHTLC(t *testing.T) {
+// testHTLCFixture is the shared HTLC deposit/signer fixture for the
+// LocalConnector signing tests: a 1-input/1-output deposit paying a P2SH HTLC
+// redeem script, its prevout, and the local signer holding the maker key.
+type testHTLCFixture struct {
+	signer     *testHTLCSigner
+	depositHex string
+	prev       PrevTx
+	myPub      []byte
+	inner      []byte
+}
+
+func newTestHTLCFixture(t *testing.T) testHTLCFixture {
+	t.Helper()
 	// secp256k1 generator private key (32 bytes, last byte 0x01).
 	myPriv := make([]byte, 32)
 	myPriv[31] = 0x01
-	myPub, _ := hex.DecodeString("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-	otherPub, _ := hex.DecodeString("02f9308a019258c31049344f85f619bcf79a3b296b825f9cc0d5c7d3a0b5c8e8e")
-	secretHash, _ := hex.DecodeString("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	myPub := mustHex(t, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+	otherPub := mustHex(t, "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+	secretHash := mustHex(t, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 
 	// Build the HTLC inner redeem script and its P2SH scriptPubKey.
 	inner := coins.BuildDepositUnlockScript(myPub, otherPub, secretHash, 600)
@@ -46,16 +59,24 @@ func TestLocalConnectorSignHTLC(t *testing.T) {
 			ScriptPubKey: p2sh,
 		}},
 	}
-	depositHex := hex.EncodeToString(deposit.Serialize())
 
-	prev := PrevTx{
-		TxID:         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		Vout:         0,
-		ScriptPubKey: hex.EncodeToString(p2sh),
-		Amount:       1_000_000,
+	return testHTLCFixture{
+		signer:     &testHTLCSigner{myPriv: myPriv, myPub: myPub, otherPub: otherPub, inner: inner},
+		depositHex: hex.EncodeToString(deposit.Serialize()),
+		prev: PrevTx{
+			TxID:         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			Vout:         0,
+			ScriptPubKey: hex.EncodeToString(p2sh),
+			Amount:       1_000_000,
+		},
+		myPub: myPub,
+		inner: inner,
 	}
+}
 
-	signer := &testHTLCSigner{myPriv: myPriv, myPub: myPub, otherPub: otherPub, inner: inner}
+func TestLocalConnectorSignHTLC(t *testing.T) {
+	f := newTestHTLCFixture(t)
+	signer, depositHex, prev, myPub, inner := f.signer, f.depositHex, f.prev, f.myPub, f.inner
 	c := NewLocalConnector("BTC", signer, nil)
 
 	signedHex, complete, err := c.SignRawTransaction(depositHex, []PrevTx{prev})
@@ -121,4 +142,51 @@ func mustSign(t *testing.T, tx *coins.Tx, idx int) []byte {
 		t.Fatalf("bad push length %d", n)
 	}
 	return ss[1 : 1+n]
+}
+
+// TestLocalConnectorSignAfterRegistryFlip — CONC-F94 closure. LocalConnector
+// must bind its coin's serializeWithTimeField flag at construction: a reload
+// that flips the live registry mid-run must not re-interpret the txHex a
+// signer is re-serializing. The connector is built while the registry is empty
+// (captured flag false); after the registry flips BTC to TxWithTimeField=true,
+// signing the same no-time-field deposit must still succeed and produce a
+// byte-identical scriptSig (a live read would shift the layout and fail the
+// parse).
+func TestLocalConnectorSignAfterRegistryFlip(t *testing.T) {
+	// Make the test self-contained: the connector must capture hasTimeField
+	// from an empty registry (false), regardless of what earlier tests left in
+	// the global registry. The defer below restores the same empty state.
+	if err := coins.InitFromConf(map[string]*config.CoinConf{}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = coins.InitFromConf(map[string]*config.CoinConf{}) }()
+	f := newTestHTLCFixture(t)
+	c := NewLocalConnector("BTC", f.signer, nil)
+
+	sign := func() string {
+		t.Helper()
+		signedHex, complete, err := c.SignRawTransaction(f.depositHex, []PrevTx{f.prev})
+		if err != nil {
+			t.Fatalf("SignRawTransaction: %v", err)
+		}
+		if !complete {
+			t.Fatal("expected complete=true")
+		}
+		signed, err := coins.Deserialize(mustHex(t, signedHex))
+		if err != nil {
+			t.Fatalf("deserialize signed: %v", err)
+		}
+		return hex.EncodeToString(signed.Inputs[0].ScriptSig)
+	}
+	golden := sign()
+
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxWithTimeField: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sign(); got != golden {
+		t.Fatalf("scriptSig changed after registry flip:\n got %s\nwant %s", got, golden)
+	}
 }
