@@ -122,14 +122,14 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
 | STATE-F71 | S2 | OnHold/OnInit skip the C++ amount/identity/price verification | FIXED | B3 `fix/deposit-path`: `verifyHold` (C++ `processTransactionHold` :1404-1471) + `verifyInit` with the intended-OR order-detail check + state gate; `TestHoldInitVerification` |
-| STATE-F72 | S2 | Expiry pruning never wired in Go (IsExpired has no production caller) | OPEN | B8 |
-| STATE-F73 | S3 | TxCancelReason enum + text table not ported (incl. C++ bugs) | OPEN | B8 |
-| STATE-F74 | S3 | `trRollbackFailed` never set (refund broadcast failure) | OPEN | B8 |
-| STATE-F75 | S3 | No peer penalty/Misbehaving analogue | OPEN | B8 |
+| STATE-F72 | S2 | Expiry pruning never wired in Go (IsExpired has no production caller) | FIXED | B8 `fix/state-machinery`: `Store.PruneExpired` (open book `"created"`/`"open"`; strict `>` TTLs, block-height + time, `PrepTx` pending-partial guard, erase-without-history) on the 15 s `expirySweepInterval` ticker; `Order.BlockNumber` stamp at ingest/make; persist aligned 240 s → 60 s (C++ `checkAndEraseExpiredTransactions`/`saveOrders`, xbridgeapp.cpp:3573-3654/:3744); maker in-swap protection via the session `inSwap` guard; `TestPruneExpired*` |
+| STATE-F73 | S3 | TxCancelReason enum + text table not ported (incl. C++ bugs) | FIXED | B8 `fix/state-machinery`: full enum (xbridgepacket.h:21-48) + `TxCancelReasonText` incl. the two C++ bugs (`crBadSettings`→`"crUnknown"`, `crUnknown`/default→`"crNone"`, xbridgeapp.cpp:4052-4107); `selfCancelErr`/`sendSelfCancel` retyped; `cancel_reason` log field wired; `TestTxCancelReason*` |
+| STATE-F74 | S3 | `trRollbackFailed` never set (refund broadcast failure) | FIXED | B8 `fix/state-machinery`: `postRefundTask` apply writes `"rollback failed"` on broadcast failure for orders at session `csCreatedA+` (`rollbackGate`, C++ `redeemOrderDeposit` xbridgesession.cpp:3852-3908) and restores `"rolled back"` on a later success (:3911); never clobbers terminal/canceled; `TestRollbackFailed*`/`TestRefundFailureStateGate` |
+| STATE-F75 | S3 | No peer penalty/Misbehaving analogue | FIXED | B8 `fix/state-machinery`: per-peer misbehaviour score (+10 undersized xbridge envelope, +20 rejected addr, ban at 100 = C++ `-banscore`) with disconnect + re-candidating exclusion, per-connection reset and ban pruning; direct-hub score gated on the new `p2p.ErrMalformedXBridge` sentinel; `TestPeerManagerMisbehave*`/`TestReaderLoopHub*` |
 | STATE-F76 | S4 | Live handshake uses separate `clientState`, not ported `swap.State` | DOCUMENTED | internal choice (`findings.md`) |
 | STATE-F77 | S2 | Post-completion handshake retransmit re-broadcasts deposit/claim | FIXED | state guards (`swap_guard_test.go`) |
 | STATE-F78 | S2 | Handshake inbound packets re-verified against pinned hub key, no TOFU | FIXED | hub-key pinning (`swap.go`) |
-| STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | OPEN | B8 |
+| STATE-F79 | S3 | `tryJoinMatches` partial-order min-size guards unconfirmed | FIXED | B8 `fix/state-machinery`: confirmed 1:1 with C++ `Transaction::tryJoin` (xbridgetransaction.cpp:527 `other->m_destAmount < m_minPartialAmount`, strict `<`); `TestTryJoinPartialMinSizeGuard` |
 
 ### CRYPTO axis (`CRYPTO-F77`–`CRYPTO-F97`) — evidence: `evidence/crypto.md`
 
@@ -202,7 +202,7 @@ Detail for every Current finding lives in [`findings.md`](findings.md)
 | ID | Sev | Finding (one line) | Status | Owner |
 |---|---|---|---|---|
 | SEC-F01 | S2 | RPC binds to loopback by default (auth only when both creds set) | FIXED | loopback bind |
-| SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | OPEN | B8 |
+| SEC-F02 | S3 | Inbound order UTXO ownership proofs never verified before booking | FIXED | B8 `fix/state-machinery`: `wallet.Connector.GetTxOut` (gettxout) + `verifyAndBook`/`verifyOrderUtxos` verify each maker UTXO before booking (C++ snode `processTransaction`, xbridgesession.cpp:535-577: getTxOut existence + BIP137 verifyMessage vs the chain amount, skip bad entries, reject when no survivor covers fromAmount); wallet I/O offloaded so the engine never blocks; cmd-4 broadcasts carry no utxos so the gate fires for any utxo-bearing order body; `TestVerifyOrderUtxos*`/`TestVerifyAndBook*` |
 | SEC-F03 | S2 | HTLC ELSE branch + CreateB-derived taker deposit composition sound; no standalone code | FIXED | B3 `fix/deposit-path` (composite): validated-deposit refusal kills the theft end-to-end — `TestSecF03CompositeRefusal` (taker refuses a bad A-deposit → Cancel + no B deposit; maker refuses a bad B-deposit at ConfirmA → Cancel + refund rollback). Attacker model corrected: the hostile outcome is **theft**, not recoverable lockup. |
 | SEC-F04 | S2 | Plaintext secrets + debug-log leakage | FIXED | B6 `fix/secrets-hygiene`: `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`. |
 
@@ -221,7 +221,7 @@ namespace is the Current register above.
 | F4 | CONC-F98 | coin registry atomic reload — FIXED |
 | F5/F9 | CONC-F99 | bounded growth — FIXED |
 | F6 | CONC-F100 | no wallet I/O under lock — FIXED |
-| F7 | SEC-F02 | inbound UTXO proofs unverified — OPEN |
+| F7 | SEC-F02 | inbound UTXO proofs unverified — FIXED (B8) |
 | F8 | CRYPTO-F88 | segwit dead code — FIXED (B9) |
 | F10 | RPC-F49 | 4 MiB body cap — FIXED (B4 `fix/http-hardening`: 32 MiB `rpcMaxBodyBytes`, non-envelope 413) |
 | F11–F14 | INV-F100 | vestigial helpers — FIXED |
@@ -245,7 +245,7 @@ namespace is the Current register above.
 | S2-A | RPC-F57 | order-book detail-4 nesting — FIXED (B7) |
 | S2-B | RPC-F59 | partial-chain unknown/malformed id — FIXED |
 | S2-C | RPC-F40 | `dxSplitInputs` utxo schema — FIXED (B7) |
-| S2-D | STATE-F72 | expiry sweep unwired — OPEN (B8) |
+| S2-D | STATE-F72 | expiry sweep unwired — FIXED (B8: 15 s prune, persist 60 s, BlockNumber stamp) |
 | S2-E | STATE-F78 | hub-key pinning, no TOFU — FIXED |
 | S2-H | CRYPTO-F81 | base58check strictness — DOCUMENTED |
 | S2-I | CRYPTO-F77 | BCH forkid sighash — FIXED (B9, fork value 0xffdead) |
@@ -263,11 +263,15 @@ namespace is the Current register above.
 | S3-G | CRYPTO-F90 | payout model (fee2 margin) — FIXED (B3 `fix/deposit-path`) |
 | S3-H | CRYPTO-F91 | `signrawtransaction` payload — FIXED (B9) |
 | S3-I | CRYPTO-F92 | secret-from-payTx input scan — FIXED (B9) |
-| S3-J | STATE-F79 | `tryJoinMatches` min-size guards — OPEN (B8) |
+| S3-J | STATE-F79 | `tryJoinMatches` min-size guards — FIXED (B8: confirmed vs C++ `tryJoin`) |
 | S3-K | CFG-F88 | `ExchangeWallets` parsing — FIXED (B10) |
 | S3-L | CFG-F89 | case-insensitive keys — FIXED (B10: exact-case) |
 | S3-M | CFG-F90 | CLI flags — FIXED (B10: `-dxnowallets`/`-enableexchange`; version case done B7) |
 | S3-N | CFG-F91 | conf-key set alignment — FIXED (B10: Title, MinimumAmount, CashAddrPrefix, CreateTxMethod) |
+| S3-O | STATE-F73 | cancel-reason enum/text — FIXED (B8: `TxCancelReasonText` incl. C++ bugs) |
+| S3-P | STATE-F74 | `trRollbackFailed` unset — FIXED (B8: `rollbackGate` on refund-broadcast failure) |
+| S3-Q | STATE-F75 | no peer penalty — FIXED (B8: misbehaviour score + ban, pool + hub) |
+| S3-R | SEC-F02 | inbound UTXO proofs unverified — FIXED (B8: `verifyOrderUtxos` before booking) |
 | S4 | RPC-F24/F30/F36, WIRE-F57 | key order, +1/COIN, help text, 64 MiB cap — DOCUMENTED (RPC-F52 leniency FIXED on B4) |
 
 ---

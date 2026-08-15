@@ -51,7 +51,7 @@ here can lag the code.
 | B5 | `fix/wire-hardening` | **WIRE-F57–F64, F67–F70** (F65/F66 DOCUMENTED; F71 on B1) | `p2p/addr.go`, `p2p/envelope.go`, `p2p/conn.go`, `p2p/message.go`, `p2p/params.go`, `p2p/version.go`, `p2p/seeds.go`, `p2p/discovery/peer_manager.go`, `proto/packet.go`, `proto/body_types.go`, `p2p/servicenode/servicenode.go`, `cmd/xbridged/main.go` | — |
 | B6 | `fix/secrets-hygiene` | **SEC-F04** | `api/persist.go`, `wallet/rpc.go`, `api/swap.go` (log lines only) | — |
 | B7 | `fix/rpc-surface` | **RPC-F03–F59** (+ re-decide F37) | `api/handlers.go`, `api/response.go`, `api/order.go`, `api/utxo_select.go`, `api/store.go`, `coins/amount.go`, `api/node.go` | B3, B4 |
-| B8 | `fix/state-machinery` | **STATE-F72–F75** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `swap/transaction.go` | B3 |
+| B8 | `fix/state-machinery` | **STATE-F72–F75, STATE-F79, SEC-F02** | `api/engine.go`, `api/store.go`, `api/response.go`, `api/node.go`, `api/swap.go`, `api/cancel_reason.go`, `api/order.go`, `wallet/connector.go`, `wallet/rpc.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `swap/transaction.go` | B3 |
 | B9 | `fix/crypto-connectors` | **CRYPTO-F77 (S1), F82, F83, F88, F89, F91, F92** (F98/F99 DOCUMENTED residual: PART/BCD non-portable) | `coins/tx.go`, `coins/coin.go`, `coins/cashaddr.go`, `coins/base58check.go`, `crypto/signer.go`, `api/swap.go`, `api/handlers.go`, `api/utxo_select.go`, `wallet/rpc.go`, `swap/deposit.go` | B3 |
 | B10 | `fix/config-parity` | **CFG-F84–F91** (F86 DOCUMENTED; F80 folded) | `config/conf.go`, `config/admit.go`, `cmd/xbridged/main.go`, `coins/coin.go`, `wallet/conf.go`, `wallet/activate.go`, `api/node.go`, `api/store.go`, `api/handlers.go`, `api/utxo_select.go`, `api/engine.go` | B4 |
 | B11 | `fix/concurrency` | **CONC-F92–F94** | `api/node.go`, `api/engine.go`, `p2p/conn.go`, `p2p/discovery/peer_manager.go`, `log/dedup.go`, `api/persist.go` | B5 |
@@ -88,7 +88,11 @@ documented non-portable). **B10 merged** (config-parity: CFG-F84–F91 — `[Rpc
 whitelist, admission gates `config.Admit`, `ExchangeWallets` parsing, exact-case
 keys, CLI flags, `MinimumAmount`/`CashAddrPrefix`/`CreateTxMethod` alignment,
 ExchangeWallets-keyed activation + reachability probe + 30 s sweep + order
-clearing; CFG-F86 documented never-creates). B8, B11 pending.
+clearing; CFG-F86 documented never-creates). **B8 merged** (state-machinery:
+STATE-F72–F75, STATE-F79, SEC-F02 — 15 s expiry prune + 60 s persist,
+`TxCancelReason` enum/text incl. C++ bugs, `trRollbackFailed` on refund
+failure, peer misbehaviour score + ban, `tryJoinMatches` guard confirmation,
+inbound UTXO proof verification). B11 pending.
 
 **Order:** `B1 → B2 → B3` sequential (real data dependencies). `B4 ∥ B5 ∥ B6`
 anytime, but **B6 must merge before B3** (both touch `api/swap.go`). B2/B3 also
@@ -250,12 +254,21 @@ flush-cancelled (RPC-F35/F36), trading-data (RPC-F38/F39), split
 tokens (RPC-F53/F54), new-address (RPC-F55), loadconf (RPC-F56), order-book
 nesting (RPC-F57). Full per-finding detail: `register.md` + `findings.md`.
 
-### B8 — `fix/state-machinery` — STATE-F72–F75
+### B8 — `fix/state-machinery` — STATE-F72–F75, STATE-F79, SEC-F02 — **DONE, merged to `main`**
 
-Wire the expiry sweep (`IsExpired`/`IsExpiredByBlockNumber`, `swap/
-transaction.go:219-255`); port `TxCancelReason` enum + `TxCancelReasonText`
-incl. the C++ rendering bugs; set `trRollbackFailed` on refund-broadcast
-failure; add a peer penalty/ban analogue.
+Wire the order-book expiry sweep (`Store.PruneExpired`, open book only, time +
+block-height TTLs, `PrepTx` pending-partial guard, 15 s `expirySweepInterval`
+ticker, persist aligned to 60 s, `Order.BlockNumber` stamp, maker in-swap
+`inSwap` session guard); port `TxCancelReason` enum + `TxCancelReasonText` incl.
+the two C++ rendering bugs (`crBadSettings`→`"crUnknown"`,
+`crUnknown`/default→`"crNone"`); set `trRollbackFailed` on refund-broadcast
+failure (`rollbackGate` keyed on session `csCreatedA+`, restore `"rolled back"`
+on a later success); add a peer penalty/ban analogue (misbehaviour score +10
+undersized xbridge envelope / +20 rejected addr, ban at 100, for the discovery
+pool AND the direct hub via the `p2p.ErrMalformedXBridge` sentinel); confirm the
+`tryJoinMatches` partial min-size guards against C++ `tryJoin`; verify inbound
+maker UTXO proofs before booking (`wallet.Connector.GetTxOut` +
+`verifyOrderUtxos`, C++ snode gate). Branch doc: `B8-state.md`.
 
 ### B9 — `fix/crypto-connectors` — CRYPTO-F77, F82, F83, F88, F89, F91, F92 — **DONE, merged to `main`**
 

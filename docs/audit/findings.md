@@ -465,24 +465,28 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - CAND: `swap/transaction.go:219,241` `IsExpired`/`IsExpiredByBlockNumber` have no non-test caller; the 60 s/240 s tickers never prune the Store.
 - IMPACT: expired orders persist in Go indefinitely (hidden from dxGetOrders but still present).
 - FIX: wire a periodic prune using the existing predicates; align cadence (15 s / 60 s).
+- FIX (B8): `Store.PruneExpired` (open book `"created"`/`"open"` only; strict `>` time + block-height TTLs, `PrepTx` pending-partial guard, erase-without-history, deterministic ids) driven by the new 15 s `expirySweepInterval` engine ticker; `Order.BlockNumber` stamped at ingest/make from the cached BLOCK tip; persist aligned to every 60 s tick (C++ `saveOrders` every 4th 15 s tick); maker in-swap orders protected via the session `inSwap` guard (C++ advances the descriptor to trHold). Tests: `api/store_expiry_test.go` (`TestPruneExpired*`, `TestNodePruneExpired`).
 
 ### STATE-F73 · S3 · STATE · TxCancelReason enum + text table not ported
 - REF: `xbridgepacket.h:21-48` (0–24) + `xbridgeapp.cpp:4052-4107` `TxCancelReasonText`, including the C++ bugs (`crBadSettings` → `"crUnknown"`, default → `"crNone"`).
 - CAND: reason kept as raw uint32; no text table.
 - IMPACT: cancel-reason strings/logs differ; on-wire value is a bare int on the Go side.
 - FIX: port the enum + exact text table (including the C++ bugs for parity).
+- FIX (B8): `api/cancel_reason.go` — full `TxCancelReason` enum (0–24) + `TxCancelReasonText` reproducing both C++ bugs byte-for-byte; `selfCancelErr`/`sendSelfCancel` retyped to the enum (wire boundary converts back to uint32); the `cancel_reason` order-log field wired at the cancel/reject sites (C++ xbridgesession.cpp:3312,3536). Tests: `TestTxCancelReasonEnumOrdinals`, `TestTxCancelReasonText`.
 
 ### STATE-F74 · S3 · STATE · `trRollbackFailed` never set
 - REF: `xbridgesession.cpp:3908` — sets `trRollbackFailed=11` on refund-broadcast failure.
 - CAND: `api/response.go:450-451` maps the string but `api/node.go:1917-1929` only ever sets "rolled back".
 - IMPACT: rollback-failed orders report a different status.
 - FIX: set the rollback-failed descriptor state on refund failure.
+- FIX (B8): `postRefundTask`'s apply — on a failed refund broadcast, `rollbackGate` (session state ≥ `csCreatedA` = C++ state ≥ trCreated, with a `RefundTx` fallback for session-less orders) writes `"rollback failed"` (never clobbering a terminal/canceled order); a later successful broadcast restores `"rolled back"` (C++ trRollbackFailed → trRollback, :3911). Tests: `TestRollbackFailedStatusOnRefundBroadcastFailure`, `TestRefundFailureStateGate`.
 
 ### STATE-F75 · S3 · STATE · No peer penalty/Misbehaving analogue
 - REF: `net_processing.cpp:2877,2904-2907` — Misbehaving-scores xbridge peers.
 - CAND: no penalty/ban mechanism (only per-packet drop / connection error).
 - IMPACT: misbehaving peers accumulate no penalty in Go.
 - FIX: add a misbehavior score/ban.
+- FIX (B8): per-peer misbehaviour score in `discovery.PeerManager` (+10 undersized xbridge envelope, +20 rejected addr, ban at 100 = C++ `-banscore`; disconnect + exclude from re-candidating, per-connection reset, expired bans pruned). Direct hub: the reader loop scores +10 per envelope-decode failure via the new `p2p.ErrMalformedXBridge` sentinel and drops the connection at 100; sized-but-malformed bodies are dropped unscored (C++ DoS 0). Tests: `TestPeerManagerMisbehave*`, `TestReaderLoopHub*`.
 
 ### STATE-F76 · S4 · STATE · Go live handshake uses a separate `clientState`, not the ported `swap.State`
 - REF: C++ drives the live session through `Transaction::State` (`xbridgesession.cpp` process* handlers call `increaseStateCounter`).
@@ -676,7 +680,7 @@ appendix maps every old ID to its canonical home.
   registry membership; forged `Finished` dropped before `OnFinished`. FIXED.
 
 ### STATE-F79 · S3 · tryJoinMatches partial-order min-size guards
-- Partial-order minimum-size guards unconfirmed against C++. OPEN (B7).
+- Partial-order minimum-size guards unconfirmed against C++. FIXED (B8): `Transaction::tryJoin` (xbridgetransaction.cpp:527 `other->m_destAmount < m_minPartialAmount`, strict `<`) is confirmed 1:1 with the Go `tryJoinMatches` (`swap/transaction.go:106`), including the drift → bounds → min-guard ordering; `TestTryJoinPartialMinSizeGuard` isolates the guard with a 2:1-price fixture (exactly-the-minimum joins, one below rejected).
 
 ### CRYPTO-F84 · S2 · AcceptingBody empty fee/utxos
 - `TakeOrder` emitted `AcceptingBody` with empty fee/utxos (156 B < 188 B).
@@ -784,7 +788,7 @@ appendix maps every old ID to its canonical home.
 - RPC binds loopback by default; Basic auth when both creds set. FIXED.
 
 ### SEC-F02 · S3 · Inbound UTXO ownership proofs unverified
-- Order UTXO proofs never verified before booking. OPEN (B7).
+- Order UTXO proofs never verified before booking. FIXED (B8): `wallet.Connector.GetTxOut` (gettxout) + `verifyAndBook`/`verifyOrderUtxos` verify each maker UTXO before booking, mirroring the C++ snode gate (`processTransaction`, xbridgesession.cpp:535-577: getTxOut existence + BIP137 verifyMessage against the chain amount, per-entry skip, reject when no survivor covers fromAmount); wallet I/O offloaded so the engine never blocks. cmd-4 broadcasts carry no UTXO entries on the trader wire (C++ `processPendingTransaction` parses none), so the gate fires for any utxo-bearing order body. Tests: `api/verify_inbound_test.go`.
 
 ### SEC-F03 · S2 · Taker-trust composite
 - HTLC ELSE branch + CreateB-derived taker deposit; composition sound, no
