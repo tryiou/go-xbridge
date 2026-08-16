@@ -193,12 +193,17 @@ func (n *Node) readerLoop() {
 		}
 		in := inboundPacket{pkt: pkt, peer: peer, snode: hexEncode(pkt.Pubkey[:])}
 		xlog.Debug("packet received", "command", pkt.Command.String(), "snode", in.snode, "peer", peer)
+		// Backpressure, not drop: a full packets channel parks the reader
+		// until the engine drains, matching C++'s synchronous net thread
+		// (onMessageReceived/onBroadcastReceived process in place,
+		// xbridgeapp.cpp:645-723,763) and the discovery readLoop
+		// (peer_manager.go:405-409). The only loss is the in-flight packet at
+		// shutdown, counted by packetsDropped.
 		select {
 		case n.packets <- in:
 		case <-n.stop:
+			n.packetsDropped.Add(1)
 			return
-		default:
-			xlog.Debug("packet dropped, engine busy", "command", pkt.Command.String())
 		}
 	}
 }
