@@ -162,6 +162,9 @@ type Node struct {
 	store  *Store
 	signer crypto.Signer
 	stop   chan struct{}
+	// stopOnce guards close(stop): concurrent Close calls must not panic. It is
+	// per-instance, not per start() — a Node is created once and never restarted.
+	stopOnce sync.Once
 
 	// activator builds the active connector set (admission + reachability
 	// probe, C++ bad-wallet retry). It is set from Config.Activator (or a fresh

@@ -363,11 +363,7 @@ func safeTaskRun(t workTask) (v any, err error) {
 // HTTP handlers (httpSrv.Shutdown) before calling this, so no handler races
 // the teardown.
 func (n *Node) Close() error {
-	select {
-	case <-n.stop:
-	default:
-		close(n.stop)
-	}
+	n.stopOnce.Do(func() { close(n.stop) })
 	n.engineRunning.Store(false)
 	var cerr error
 	if n.conn != nil {
