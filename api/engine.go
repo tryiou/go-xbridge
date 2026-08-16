@@ -270,8 +270,8 @@ func (n *Node) statusLoop() {
 }
 
 // persistLoop writes the newest swap snapshot to disk in the background, so
-// the engine goroutine never blocks on fsync (C++ saveOrders runs on the
-// timer/worker threads, never the message thread, xbridgeapp.cpp:3744).
+// the engine goroutine never blocks on marshal or fsync (C++ saveOrders runs
+// on the timer/worker threads, never the message thread, xbridgeapp.cpp:3744).
 // Coalescing: each pass drains the latest slot, so a burst of engine persists
 // collapses into the newest snapshot. On n.stop it flushes whatever is queued;
 // Node.Close additionally flushes the latest slot after every goroutine has
@@ -291,8 +291,12 @@ func (n *Node) persistLoop() {
 }
 
 // writeLatestPersist durably writes the newest queued swap snapshot, if any,
-// logging a failure without taking the engine down.
+// logging a failure without taking the engine down. The marshal + checksum and
+// the disk write both run on the persistLoop goroutine (or the Close caller),
+// never the engine.
 func (n *Node) writeLatestPersist() {
+	// The lock covers only the slot swap: the marshal below runs unlocked, so
+	// the engine can keep publishing while a large book is being serialized.
 	n.persistMu.Lock()
 	job := n.persistLatest
 	n.persistLatest = nil
@@ -300,7 +304,12 @@ func (n *Node) writeLatestPersist() {
 	if job == nil {
 		return
 	}
-	if err := writeSwaps(job.path, job.data); err != nil {
+	data, err := marshalSwapFile(job.swaps)
+	if err != nil {
+		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
+		return
+	}
+	if err := writeSwaps(job.path, data); err != nil {
 		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
 	}
 }
