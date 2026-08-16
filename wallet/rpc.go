@@ -392,11 +392,7 @@ func (c *RPCConnector) GetRelayFee() (float64, error) {
 // GetBlockCount returns the best block height of the coin's chain via the
 // wallet's getblockcount RPC.
 func (c *RPCConnector) GetBlockCount() (int64, error) {
-	var h int64
-	if err := c.cli.Call("getblockcount", nil, &h); err != nil {
-		return 0, c.wrapErr("getblockcount", err)
-	}
-	return h, nil
+	return c.GetBlockCountContext(context.Background())
 }
 
 // GetBlockCountContext is the context-cancellable variant of GetBlockCount used
