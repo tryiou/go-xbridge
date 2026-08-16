@@ -1263,6 +1263,14 @@ func (n *Node) send(dest [20]byte, cmd proto.XBridgeCommand, body responseBody, 
 	if err := n.signer.Sign(pkt, priv); err != nil {
 		return err
 	}
+	// Durable-write the current swap state BEFORE sending the response, so a
+	// crash after the send can never leave the hub knowing state the local
+	// durable copy lacks (which would strand a restarted swap — fund loss).
+	// C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes on a timer with no
+	// before-send guarantee; this port makes the durable write precede the send.
+	if err := n.persistNow(); err != nil {
+		return err
+	}
 	return n.conn.WritePacket(pkt, dest)
 }
 

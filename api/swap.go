@@ -203,6 +203,15 @@ func (s *SwapSession) sendSelfCancel(reason TxCancelReason) {
 	xlog.Warn("selfCancel: counterparty deposit rejected", "order", orderID, "reason", reason, "reasonText", TxCancelReasonText(uint32(reason)))
 	// Local rollback first (C++ processTransactionCancel(reply)), then broadcast.
 	s.n.handleRemoteCancel(pkt, body)
+	// Durable-write the rolled-back state BEFORE broadcasting the cancel, so a
+	// crash after the send normally cannot leave a locally-cancelled swap on
+	// disk as still-live (which a counterparty could act on — fund loss). On a
+	// persist failure we still broadcast the cancel (preventing counterparty
+	// fund-lock) and surface the error; the rare stale-disk case is then
+	// reconciled by the next persist.
+	if err := s.n.persistNow(); err != nil {
+		xlog.Error("selfCancel: persist failed", "order", orderID, "err", err)
+	}
 	if err := s.n.conn.WritePacket(pkt, [20]byte{}); err != nil {
 		xlog.Error("selfCancel: broadcast failed", "order", orderID, "err", err)
 	}
