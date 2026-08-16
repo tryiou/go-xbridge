@@ -749,3 +749,66 @@ func TestEngineLivenessDispatchSwapSlowWallet(t *testing.T) {
 		t.Error("A await cleared while its deposit is still parked")
 	}
 }
+
+// TestRefundTaskDropInvokesDone proves a full worker queue cannot strand a
+// refund caller: when postRefundTask's drop branch fires (all workers busy and
+// the task buffer full), it must still invoke the done callback so
+// BroadcastRefund returns an error instead of blocking forever on the out
+// channel. The stored-order path (tryStoredRefund chaining candidates through
+// the callback) hangs pre-fix, because the drop branch never called done.
+func TestRefundTaskDropInvokesDone(t *testing.T) {
+	n, _, gated, _ := setupTwoCoinNode(t)
+	defer gated.open() // runs before t.Cleanup's Close, so shutdown can always drain
+
+	// Park every worker in SendRawTransaction (gate held shut), then fill the
+	// 16-slot task buffer with due refunds so the next postRefundTask must drop.
+	for i := 0; i < engineWorkers+cap(n.tasks); i++ {
+		var rID [32]byte
+		copy(rID[:], fmt.Sprintf("refund-drop-%03d-00000000000000", i))
+		rtx := &coins.Tx{Version: 1}
+		rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("ef", 32)), Index: 0}, Sequence: 0xfffffffe}}
+		rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+		n.submit(func() {
+			n.sessions[hexEncode(rID[:])] = &SwapSession{
+				n: n, id: rID, isMaker: false, srcCur: "BTC", dstCur: "LTC",
+				refundHex: hex.EncodeToString(rtx.Serialize()), refundDone: false,
+				ourLockTime: 1, state: csCreatedA,
+			}
+		}, true)
+	}
+
+	// The sweep enqueues a refund task for each session; exactly engineWorkers
+	// tasks park in SendRawTransaction and the rest fill the buffer.
+	n.submit(func() { n.scanRefunds() }, false)
+	deadline := time.Now().Add(5 * time.Second)
+	for gated.callCount() < engineWorkers && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gated.callCount() < engineWorkers {
+		t.Fatalf("expected %d parked refund tasks, got %d", engineWorkers, gated.callCount())
+	}
+
+	// A stored order with no live session: BroadcastRefund routes through
+	// tryStoredRefund, whose chained postRefundTask hits the full queue and
+	// drops. The done callback must still fire so the caller unblocks.
+	var sID [32]byte
+	copy(sID[:], []byte("refund-drop-stored-order-0000"))
+	storedID := hexEncode(sID[:])
+	rtx := &coins.Tx{Version: 1}
+	rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("f0", 32)), Index: 0}, Sequence: 0xfffffffe}}
+	rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+	n.store.Add(&Order{ID: sID, FromCurrency: "BTC", ToCurrency: "LTC", RefundTx: hex.EncodeToString(rtx.Serialize())})
+
+	done := make(chan error, 1)
+	go func() { _, err := n.BroadcastRefund(storedID); done <- err }()
+	select {
+	case err := <-done:
+		// The chain exhausts (both candidates dropped), so the caller sees the
+		// tryStoredRefund exhaustion error, not a success.
+		if err == nil || !strings.Contains(err.Error(), "stored refund") {
+			t.Fatalf("BroadcastRefund err = %v, want stored-refund exhaustion error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BroadcastRefund blocked forever on a dropped refund task")
+	}
+}

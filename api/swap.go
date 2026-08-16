@@ -1123,8 +1123,11 @@ func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32
 // synchronously in inline mode, when the engine is not started). The apply runs
 // on the engine: it clears the in-flight guard, invokes the optional done
 // callback, marks the session refundDone on success, and persists. A full task
-// queue drops the task (the broadcast is idempotent and the next sweep retries)
-// and clears the guard so that sweep can re-enqueue it.
+// queue drops the task (the broadcast is idempotent and a later retry — the
+// sweep for live sessions, a manual call for stored orders — re-enqueues it),
+// clears the guard so that retry can re-enqueue it, and still invokes done with
+// an error so a caller awaiting the outcome (tryStoredRefund's chained
+// candidates, BroadcastRefund) never blocks forever on the drop.
 func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, checkLock bool, done func(txid string, err error)) bool {
 	// Capture the connector at enqueue time (engine side) so a mid-task reload
 	// cannot swap which wallet broadcasts the refund.
@@ -1198,6 +1201,12 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 	default:
 		delete(n.pendingRefunds, orderID)
 		xlog.Warn("refund task dropped, engine busy", "order", orderID)
+		// The task never ran, so done must still fire: a caller awaiting its
+		// outcome (tryStoredRefund's chained candidates, BroadcastRefund) would
+		// otherwise block forever. A later retry re-enqueues.
+		if done != nil {
+			done("", errors.New("api: refund task dropped, engine busy"))
+		}
 		return false
 	}
 }
