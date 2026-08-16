@@ -91,27 +91,18 @@ func marshalNetAddr(a NetAddr) []byte {
 // P2P payloads (e.g. servicenode tests/builders).
 func MarshalVarStr(s string) []byte { return marshalVarStr(s) }
 
-// marshalVarStr serializes a length-prefixed string using a Bitcoin VarInt.
-// User agents are short, so only the single-byte and 0xFD (uint16) encodings
-// are needed here.
+// marshalVarStr serializes a length-prefixed string using a Bitcoin CompactSize
+// varint, mirroring C++ WriteCompactSize (serialize.h:255-273): 0xFD+uint16 for
+// lengths in [0xFD, 0xFFFF], 0xFE+uint32 for [0x10000, 0xFFFFFFFF], 0xFF+uint64
+// beyond that (the length prefix is written via writeVarInt, envelope.go). The
+// read side already accepts all four encodings (unmarshalVarStr below;
+// readVarInt in envelope.go), so the writer must emit the full range — a string
+// longer than 0xFFFF previously wrapped the length in the 0xFD form (uint16
+// truncation), producing a corrupt prefix that the reader would misparse.
 func marshalVarStr(s string) []byte {
-	b := []byte(s)
 	buf := new(bytes.Buffer)
-	switch {
-	case len(b) < 0xFD:
-		buf.WriteByte(byte(len(b)))
-	case len(b) <= 0xFFFF:
-		buf.WriteByte(0xFD)
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(b)))
-		buf.Write(l[:])
-	default:
-		buf.WriteByte(0xFD)
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(b)))
-		buf.Write(l[:])
-	}
-	buf.Write(b)
+	buf.Write(writeVarInt(len(s)))
+	buf.WriteString(s)
 	return buf.Bytes()
 }
 
