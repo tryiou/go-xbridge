@@ -777,8 +777,8 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 		}, true)
 	}
 
-	// The sweep enqueues a refund task for each session; the first
-	// engineWorkers park in SendRawTransaction, the rest fill the buffer.
+	// The sweep enqueues a refund task for each session; exactly engineWorkers
+	// tasks park in SendRawTransaction and the rest fill the buffer.
 	n.submit(func() { n.scanRefunds() }, false)
 	deadline := time.Now().Add(5 * time.Second)
 	for gated.callCount() < engineWorkers && time.Now().Before(deadline) {
@@ -803,8 +803,10 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 	go func() { _, err := n.BroadcastRefund(storedID); done <- err }()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("BroadcastRefund succeeded despite a dropped refund task")
+		// The chain exhausts (both candidates dropped), so the caller sees the
+		// tryStoredRefund exhaustion error, not a success.
+		if err == nil || !strings.Contains(err.Error(), "stored refund") {
+			t.Fatalf("BroadcastRefund err = %v, want stored-refund exhaustion error", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("BroadcastRefund blocked forever on a dropped refund task")
