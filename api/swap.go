@@ -676,6 +676,13 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 		xlog.Info("CreateA ignored: swap already past deposit", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
 	}
+	// A retransmit arriving WHILE the deposit worker is in flight (await set)
+	// must not re-post a second deposit task — that would double-broadcast our
+	// deposit. The in-flight worker will complete and send CreatedA.
+	if s.await {
+		xlog.Info("CreateA ignored: deposit worker in flight", "order", orderID)
+		return 0, nil, nil
+	}
 	if b.BPubKey == [33]byte{} {
 		return 0, nil, fmt.Errorf("api: CreateA missing B pubkey")
 	}
@@ -768,6 +775,13 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	// retransmit must not re-broadcast a second deposit.
 	if s.state >= csCreatedB {
 		xlog.Info("CreateB ignored: swap already past deposit", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	// A retransmit arriving WHILE the deposit worker is in flight (await set)
+	// must not re-post a second deposit task — that would double-broadcast our
+	// deposit. The in-flight worker will complete and send CreatedB.
+	if s.await {
+		xlog.Info("CreateB ignored: deposit worker in flight", "order", orderID)
 		return 0, nil, nil
 	}
 	if b.APubKey == [33]byte{} {
@@ -905,6 +919,13 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		xlog.Info("ConfirmA ignored: swap already past claim", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
 	}
+	// A retransmit arriving WHILE the claim worker is in flight (await set)
+	// must not re-post a second redeem task — that would double-broadcast the
+	// claim payTx. The in-flight worker will complete and send ConfirmedA.
+	if s.await {
+		xlog.Info("ConfirmA ignored: claim worker in flight", "order", orderID)
+		return 0, nil, nil
+	}
 	s.theirDepositTxID = b.BDepositTxID
 	s.theirLockTime = b.BLockTime
 	// Record the counterparty (taker) deposit txid on the order so
@@ -1026,6 +1047,13 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	// we redeemed must not re-broadcast a second claim payTx.
 	if s.state >= csConfirmedB {
 		xlog.Info("ConfirmB ignored: swap already past claim", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	// A retransmit arriving WHILE the claim worker is in flight (await set)
+	// must not re-post a second redeem task — that would double-broadcast the
+	// claim payTx. The in-flight worker will complete and send ConfirmedB.
+	if s.await {
+		xlog.Info("ConfirmB ignored: claim worker in flight", "order", orderID)
 		return 0, nil, nil
 	}
 	c := s.snapshot()
