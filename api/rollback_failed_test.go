@@ -115,7 +115,9 @@ func TestRefundFailureStateGate(t *testing.T) {
 	n.sessions[makerKey] = &SwapSession{n: n, id: maker, isMaker: true, srcCur: "LTC", dstCur: "LTC",
 		refundHex: refundHexFixture(), state: csCreatedA}
 
-	// Taker: store order stays "accepting", session at csCreatedB.
+	// Taker: in live code the stored status now advances hold/initialized/created
+	// like the maker's (api/swap.go setOrderStatus); this fixture pins it to
+	// "accepting" to exercise the session-state gate (csCreatedB) in isolation.
 	var taker [32]byte
 	copy(taker[:], []byte("refund-fail-taker-0000000"))
 	takerKey := hexEncode(taker[:])

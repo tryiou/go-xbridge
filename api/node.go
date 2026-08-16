@@ -753,21 +753,31 @@ func (n *Node) cachedBlockHeight() uint32 {
 // book. Engine-owned: it mutates n.store, so it always runs on the engine
 // goroutine (ticker + tests).
 func (n *Node) pruneExpired() {
-	// Protect orders whose handshake has started: the maker's store order stays
-	// "created" for the whole swap, so only the session state can tell an
-	// in-swap order from an unmatched one (C++ advances the descriptor to
-	// trHold, xbridgesession.cpp:1529; an unmatched maker order keeps its
-	// session at the initial state). Takers need no guard: their order is
-	// "accepting" for the whole swap (already excluded by status), and after a
-	// hub Reject the order is restored to "open" but the session stays past
-	// csTaker — guarding it here would leak the rejected order into the book
-	// forever (the session is never pruned), whereas C++ restores trPending and
-	// lets the app-side sweep erase it after an hour idle (xbridgeapp.cpp:3624).
+	// Protect orders whose handshake has started. A maker's order advances
+	// through hold/initialized/created as the swap drives it (api/swap.go
+	// setOrderStatus, mirroring C++ xbridgesession.cpp:1529/1762/2174). A taker's
+	// order is "accepting" for most of the handshake, then reaches "created" at
+	// its deposit broadcast (applyCreatedB, swap.go:858) and is restored to
+	// "open" on a hub Reject — the "created"/"open" states ARE in the
+	// PruneExpired sweep set, so the session-state guard below is what keeps an
+	// in-swap order out of the sweep. A maker is in-swap once its session passes
+	// csMaker (an unmatched maker is still at csMaker); a taker is in-swap once
+	// its session passes csMaker AND its order has actually advanced past "open"
+	// (a hub-Rejected taker's order is restored to "open" with its session still
+	// past csTaker — protecting it here would leak the rejected order into the
+	// book forever, since the session is never pruned; C++ restores trPending and
+	// lets the app-side sweep erase it after an hour idle, xbridgeapp.cpp:3624).
 	inSwap := map[string]bool{}
 	for id, s := range n.sessions {
-		if s.isMaker && s.state > csMaker {
-			inSwap[id] = true
+		if s.state <= csMaker {
+			continue
 		}
+		if !s.isMaker {
+			if o := n.store.Get(id); o == nil || o.Status == "open" {
+				continue
+			}
+		}
+		inSwap[id] = true
 	}
 	// Non-blocking height read: the blockLoop keeps the cache fresh; a stale
 	// cache just skips the block-height predicate for this pass.

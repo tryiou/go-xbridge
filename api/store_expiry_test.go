@@ -209,13 +209,50 @@ func TestNodePruneExpired(t *testing.T) {
 	}
 }
 
+// TestNodePruneExpiredTakerInSwap verifies the taker half of the inSwap guard:
+// a taker whose session has advanced past csMaker AND whose order has progressed
+// past "open" (e.g. "created" at its deposit broadcast, swap.go applyCreatedB)
+// must survive the sweep, while a hub-Rejected taker whose order is restored to
+// "open" (session still past csTaker) must be pruned — otherwise the rejected
+// order would leak into the book forever.
+func TestNodePruneExpiredTakerInSwap(t *testing.T) {
+	ctx := newWalletTestCtx()
+	now := time.Now()
+	nowSec := uint64(now.Unix())
+
+	// In-swap TAKER: order advanced to "created", session past csMaker. The
+	// stale Updated (TTL+1) would expire it on the activity predicate alone, so
+	// survival proves the guard covers takers too.
+	inSwap := expiryTestOrder(4, "created", nowSec, 0, swap.TTL+1)
+	inSwapKey := hexEncode(inSwap.ID[:])
+	ctx.Store.Add(inSwap)
+	ctx.Node.sessions = map[string]*SwapSession{
+		inSwapKey: {n: ctx.Node, id: inSwap.ID, isMaker: false, state: csCreatedB},
+	}
+	ctx.Node.pruneExpired()
+	if ctx.Store.Get(inSwapKey) == nil {
+		t.Fatal("in-swap taker order must survive node.pruneExpired (session past csMaker, status created)")
+	}
+
+	// Rejected TAKER: order restored to "open" (session still past csMaker) must
+	// NOT be protected — it must be pruned, not leaked into the book.
+	rejected := expiryTestOrder(5, "open", nowSec, 0, swap.TTL+1)
+	rejectedKey := hexEncode(rejected.ID[:])
+	ctx.Store.Add(rejected)
+	ctx.Node.sessions[rejectedKey] = &SwapSession{n: ctx.Node, id: rejected.ID, isMaker: false, state: csCreatedB}
+	ctx.Node.pruneExpired()
+	if ctx.Store.Get(rejectedKey) != nil {
+		t.Fatal("rejected taker order (status open) must be pruned, not leaked by the guard")
+	}
+}
+
 // TestPruneExpiredInSwapGuard proves the inSwap guard at the store level: an id
 // in the inSwap set is never swept, regardless of status/age.
 func TestPruneExpiredInSwapGuard(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
 	nowSec := uint64(now.Unix())
-	o := expiryTestOrder(1, "created", nowSec, swap.DeadlineTTL+100, swap.TTL+100)
+	o := expiryTestOrder(1, "open", nowSec, swap.DeadlineTTL+100, swap.TTL+100)
 	s.Add(o)
 	key := hexEncode(o.ID[:])
 	if got := s.PruneExpired(now, 1_000_000, map[string]bool{key: true}); len(got) != 0 {
