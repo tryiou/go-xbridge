@@ -66,10 +66,13 @@ func TestPruneExpiredCreatedTrNew(t *testing.T) {
 }
 
 // TestPruneExpiredOpenTrPending verifies the trPending ("open") rules: last-
-// activity age > TTL or created-age > DeadlineTTL (C++ isExpired for
-// state > trNew plus the descriptor deadline erase xbridgeapp.cpp:3630-3634).
-// Block-height expiry NEVER applies past trNew (C++ :295-296 short-circuit),
-// even when BlockNumber is very old and the tip is far ahead.
+// activity age > PendingTTL or created-age > DeadlineTTL. C++ flips trPending
+// to trExpired once inactive for pendingTTL (6 min) (xbridgeapp.cpp:3611-3616)
+// and the order book only surfaces trPending (rpcxbridge.cpp:1591), so an
+// inactive order leaves the book at the 6 min mark; the deadline erase is
+// xbridgeapp.cpp:3630-3634. Block-height expiry NEVER applies past trNew
+// (C++ :295-296 short-circuit), even when BlockNumber is very old and the tip
+// is far ahead.
 func TestPruneExpiredOpenTrPending(t *testing.T) {
 	now := time.Now()
 	nowSec := uint64(now.Unix())
@@ -83,8 +86,8 @@ func TestPruneExpiredOpenTrPending(t *testing.T) {
 		want     bool
 	}{
 		{"fresh", 0, 0, tip - 5, false},
-		{"TTL boundary exact not expired", 0, swap.TTL, tip - 5, false},
-		{"TTL +1 expired", 0, swap.TTL + 1, tip - 5, true},
+		{"pendingTTL boundary exact not expired", 0, swap.PendingTTL, tip - 5, false},
+		{"pendingTTL +1 expired", 0, swap.PendingTTL + 1, tip - 5, true},
 		{"deadline +1 expired", swap.DeadlineTTL + 1, 0, tip - 5, true},
 		{"block never applies past trNew", 0, 0, 1, false},
 	}
@@ -99,6 +102,25 @@ func TestPruneExpiredOpenTrPending(t *testing.T) {
 				t.Fatalf("PruneExpired = %v, want expired=%v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPruneExpiredOpenInactiveWindow is the order-book divergence regression:
+// an open order idle for ~20 min — past core's 6 min pendingTTL cutoff but
+// inside go's old 1 h TTL window — must be pruned, matching the C++ app-side
+// trPending → trExpired flip (xbridgeapp.cpp:3611-3616).
+func TestPruneExpiredOpenInactiveWindow(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	nowSec := uint64(now.Unix())
+	o := expiryTestOrder(1, "open", nowSec, 0, 20*60)
+	s.Add(o)
+	key := hexEncode(o.ID[:])
+	if got := s.PruneExpired(now, 0, nil); len(got) != 1 || got[0] != key {
+		t.Fatalf("PruneExpired = %v, want the ~20 min idle order pruned", got)
+	}
+	if s.Get(key) != nil {
+		t.Fatal("idle open order must leave the live book")
 	}
 }
 
@@ -149,7 +171,7 @@ func TestNodePruneExpired(t *testing.T) {
 	now := time.Now()
 	nowSec := uint64(now.Unix())
 
-	expired := expiryTestOrder(1, "open", nowSec, 0, swap.TTL+1)
+	expired := expiryTestOrder(1, "open", nowSec, 0, swap.PendingTTL+1)
 	ctx.Store.Add(expired)
 	key := hexEncode(expired.ID[:])
 

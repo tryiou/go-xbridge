@@ -357,13 +357,19 @@ func (s *Store) PruneUnconnected(kept map[string]bool) {
 //
 // Predicates (strict `>`; an order exactly at a TTL is not expired). The time
 // rules blend the C++ APP-side inactivity sweep that governs a trader's own
-// orders (xbridgeapp.cpp:3604-3634: erase once no activity for TTL (1 h)) with
-// the exchange-side block/deadline predicates (xbridgetransaction.cpp:268-311,
-// xbridgeexchange.cpp:712-747):
+// orders (xbridgeapp.cpp:3604-3634) with the exchange-side block/deadline
+// predicates (xbridgetransaction.cpp:268-311, xbridgeexchange.cpp:712-747):
 //   - "created" (trNew): block-expired (tip − BlockNumber > BlocksTTL), or
-//     created-age > DeadlineTTL, or last-activity age > TTL.
-//   - "open" (trPending): last-activity age > TTL, or created-age > DeadlineTTL.
-//     Block-height expiry never applies past trNew (C++ :295-296 short-circuit).
+//     created-age > DeadlineTTL, or last-activity age > TTL. C++ flips trNew to
+//     trOffline at pendingTTL but keeps trOffline visible in dxGetOrders until
+//     the 1 h erase (xbridgeapp.cpp:3604-3610, :3624-3628), which the TTL rule
+//     mirrors.
+//   - "open" (trPending): last-activity age > PendingTTL, or created-age >
+//     DeadlineTTL. C++ flips trPending to trExpired once inactive for pendingTTL
+//     (6 min) (xbridgeapp.cpp:3611-3616) and the order book only surfaces
+//     trPending (rpcxbridge.cpp:1591,1606), so an inactive order leaves the book
+//     at the 6 min mark. Block-height expiry never applies past trNew (C++
+//     :295-296 short-circuit).
 //
 // The created-age > DeadlineTTL for trNew is the exchange-side isExpired rule
 // (C++ app-side never applies the 7-day deadline to trNew directly); Go keeps
@@ -402,7 +408,7 @@ func (s *Store) PruneExpired(now time.Time, currentBlock uint32, inSwap map[stri
 				currentBlock > o.BlockNumber && currentBlock-o.BlockNumber > swap.BlocksTTL
 			expired = blockExpired || created > swap.DeadlineTTL || updated > swap.TTL
 		case "open": // C++ trPending
-			expired = updated > swap.TTL || created > swap.DeadlineTTL
+			expired = updated > swap.PendingTTL || created > swap.DeadlineTTL
 		}
 		if expired {
 			delete(s.orders, key)
