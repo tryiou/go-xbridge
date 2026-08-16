@@ -334,18 +334,22 @@ func (s *Store) PruneUnconnected(kept map[string]bool) {
 // PruneExpired removes open-book orders that have exceeded their TTL, mirroring
 // C++ App::Impl::checkAndEraseExpiredTransactions (xbridgeapp.cpp:3573-3654) —
 // the periodic sweep driven by the 15 s timer. It applies the expiry predicates
-// to the OPEN book: status "created" (the store's unmatched local-order status,
-// written only by MakeOrder for a not-yet-taken order — NOT the trCreated
-// descriptor state) and status "open" (trPending). In-swap and terminal orders
-// are never swept here — they leave the book via their own lifecycle paths.
+// to the OPEN book: status "open" (trPending, written by MakeOrder for a
+// not-yet-taken local order and kept alive by the 240 s rebroadcast heartbeat,
+// api/node.go rebroadcastOpenOrders) and status "created" (trCreated, the
+// in-swap state — protected from this sweep by the inSwap guard below). In-swap
+// and terminal orders are never swept here — they leave the book via their own
+// lifecycle paths.
 //
 // inSwap is the set of order ids whose client-side handshake has STARTED (the
-// node's live sessions past their initial pre-swap state). The maker's store
-// order stays "created" until the swap finishes — the handshake never advances
-// its Status — so without this guard the sweep would prune an in-swap maker
-// order and release its deposit's utxo locks mid-swap (C++ protects it by
-// advancing the descriptor to trHold, xbridgesession.cpp:1529). Unmatched maker
-// orders (session still at its initial state) remain sweepable.
+// node's live sessions past their initial pre-swap state, api/swap.go
+// setOrderStatus advancing the order to hold/initialized/created as the swap
+// drives it — xbridgesession.cpp:1529/1762/2174). The session-state guard is
+// what tells an in-swap maker from an in-swap taker (both advance their Status)
+// and keeps the sweep from pruning a maker mid-swap and releasing its deposit's
+// utxo locks (C++ protects it by advancing the descriptor to trHold,
+// xbridgesession.cpp:1529). Unmatched maker orders (session still at its initial
+// state) remain sweepable.
 //
 // Expired orders are REMOVED without a history entry, matching C++
 // eraseExpiredTransactions (xbridgeexchange.cpp:712-747, erases from
@@ -359,11 +363,11 @@ func (s *Store) PruneUnconnected(kept map[string]bool) {
 // rules blend the C++ APP-side inactivity sweep that governs a trader's own
 // orders (xbridgeapp.cpp:3604-3634) with the exchange-side block/deadline
 // predicates (xbridgetransaction.cpp:268-311, xbridgeexchange.cpp:712-747):
-//   - "created" (trNew): block-expired (tip − BlockNumber > BlocksTTL), or
-//     created-age > DeadlineTTL, or last-activity age > TTL. C++ flips trNew to
-//     trOffline at pendingTTL but keeps trOffline visible in dxGetOrders until
-//     the 1 h erase (xbridgeapp.cpp:3604-3610, :3624-3628), which the TTL rule
-//     mirrors.
+//   - "created" (trCreated=6, the in-swap state): block-expired (tip −
+//     BlockNumber > BlocksTTL), or created-age > DeadlineTTL, or last-activity
+//     age > TTL. A live in-swap "created" order is protected from this sweep by
+//     the node-level inSwap session guard (api/node.go pruneExpired); these
+//     bounds fire only for an orphaned in-swap order with no live session.
 //   - "open" (trPending): last-activity age > PendingTTL, or created-age >
 //     DeadlineTTL. C++ flips trPending to trExpired once inactive for pendingTTL
 //     (6 min) (xbridgeapp.cpp:3611-3616) and the order book only surfaces
@@ -403,7 +407,7 @@ func (s *Store) PruneExpired(now time.Time, currentBlock uint32, inSwap map[stri
 		updated := ageSec(nowUs, o.Updated)
 		expired := false
 		switch o.Status {
-		case "created": // C++ trNew
+		case "created": // C++ trCreated=6 (in-swap; node-level sweep protects it via the inSwap session guard)
 			blockExpired := o.BlockNumber != 0 && currentBlock != 0 &&
 				currentBlock > o.BlockNumber && currentBlock-o.BlockNumber > swap.BlocksTTL
 			expired = blockExpired || created > swap.DeadlineTTL || updated > swap.TTL

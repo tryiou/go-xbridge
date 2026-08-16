@@ -112,7 +112,9 @@ Command-specific additions:
 - `dxGetMyOrders`, `dxGetMyPartialOrderChain` add `maker_address` and
   `taker_address`.
 - `dxMakeOrder`, `dxMakePartialOrder` add `maker_address`, `taker_address` and
-  `block_id`; status is `"created"`.
+  `block_id`; status is `"open"` (trPending — the live state of a freshly made,
+  un-taken maker order, xbridgesession.cpp:764). The `dxMakeOrder` *response*
+  string is cosmetic; the stored live status is `"open"`.
 - `dxTakeOrder` returns the order with `maker`/`taker` swapped (the taker's view
   of the trade).
 - `dxCancelOrder` returns a **distinct shape** with no `partial_*`/`order_type`
@@ -229,7 +231,7 @@ defaulted or trailing parameter.
   `taker` (ticker), `taker_size` (string), `taker_address` (string), `type`
   (must be `"exact"`), `use_all_funds` (bool, default `true`) [optional],
   `dryrun` (literal `"dryrun"`) [optional — only when exactly 9 params].
-- `result`: order object (status `"created"`, `order_type` `"exact"`, plus
+- `result`: order object (status `"open"` (trPending), `order_type` `"exact"`, plus
   `maker_address`, `taker_address`, `block_id`).
 - `errors`: 1025 (missing params, non-`exact` type, invalid `use_all_funds`,
   misspelled/extra `dryrun`).
@@ -239,7 +241,7 @@ defaulted or trailing parameter.
   `taker_address`, `minimum_size` (string), `repost` (bool, default `true`),
   `use_all_funds` (bool, default `true`), `auto_split` (bool, default `true`),
   `dryrun` (literal) [optional — only when exactly 11 params].
-- `result`: order object (status `"created"`, `order_type` `"partial"`).
+- `result`: order object (status `"open"` (trPending), `order_type` `"partial"`).
 - `errors`: 1025 (same rules as `dxMakeOrder`).
 
 **`dxTakeOrder`**

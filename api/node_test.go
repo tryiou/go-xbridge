@@ -393,14 +393,18 @@ func TestRemoteCancelAlreadyCanceled(t *testing.T) {
 	}
 }
 
-// TestRemoteCancelCreatedNoDeposit cancels a created order whose deposit was
-// never sent.
-func TestRemoteCancelCreatedNoDeposit(t *testing.T) {
+// TestRemoteCancelOpenNoDeposit verifies that a remote cancel on an un-taken
+// (open / trPending) maker order is NOT cancelled but marked stale so it is
+// re-broadcast on another servicenode (C++ xbridgeapp.cpp:3379-3383). "open" is
+// the live state of a freshly made, un-taken maker order (xbridgesession.cpp:764);
+// the old port treated it as "created" (trCreated, in-swap) and wrongly cancelled
+// it here.
+func TestRemoteCancelOpenNoDeposit(t *testing.T) {
 	snodePriv := make([]byte, 32)
 	snodePriv[0] = 0x55
 	_, idHex := mustID(t)
 	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
-		Status: "created", DepositSent: false, SNodePubkey: hexPub(t, snodePriv)}
+		Mine: true, Status: "open", DepositSent: false, SNodePubkey: hexPub(t, snodePriv)}
 	o.ID = decodeID(t, idHex)
 
 	n := newCancelTestNode(nil)
@@ -410,8 +414,16 @@ func TestRemoteCancelCreatedNoDeposit(t *testing.T) {
 	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
 
 	got := n.store.Get(idHex)
-	if got == nil || got.Status != "canceled" {
-		t.Fatal("created+no-deposit order must become 'canceled' in the live store")
+	if got == nil {
+		t.Fatal("un-taken open order must remain in the live store after a remote cancel")
+	}
+	if got.Status != "open" {
+		t.Fatalf("un-taken open order status = %q, want open (re-broadcast, not canceled)", got.Status)
+	}
+	// markStale pushes Updated 241s into the past so the order is re-offered on
+	// another servicenode rather than cancelled (C++ :3379-3383).
+	if NowMicro()-got.Updated < 240_000_000 {
+		t.Fatalf("un-taken open order not marked stale: now-Updated = %dus, want >= 240_000_000", NowMicro()-got.Updated)
 	}
 }
 
@@ -648,4 +660,161 @@ func hexPub(t *testing.T, priv []byte) string {
 	t.Helper()
 	pub := mustPub(t, priv)
 	return hexEncode(pub[:])
+}
+
+// TestRebroadcastOpenOrders exercises the 240s heartbeat that keeps an un-taken
+// local maker order alive in the book (mirrors C++ checkAndRelayPendingOrders,
+// xbridgeapp.cpp:3241). It asserts the re-posted packet is wire-faithful to the
+// original MakeOrder: same command, order id, header pubkey and a signature
+// that verifies with the per-trade M key, sent to the order's hub address, and
+// that the order's Updated is bumped so it is not re-posted within the interval.
+func TestRebroadcastOpenOrders(t *testing.T) {
+	var mPriv [32]byte
+	mPriv[0], mPriv[31] = 1, 2
+	mPub := mustPub(t, mPriv[:])
+	hubAddr := [20]byte{0xaa}
+
+	conn := &captureXConn{}
+	n := &Node{
+		config:   &Config{Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}}},
+		signer:   crypto.NewBtcSigner(),
+		stop:     make(chan struct{}),
+		store:    NewStore(),
+		sessions: map[string]*SwapSession{},
+		conn:     conn,
+	}
+
+	var id [32]byte
+	copy(id[:], []byte("rebroadcast-test-order-0000000"))
+	o := &Order{
+		ID:           id,
+		FromCurrency: "BTC",
+		ToCurrency:   "LTC",
+		FromAmount:   1e6,
+		ToAmount:     2e6,
+		Created:      NowMicro(),
+		Mine:         true,
+		Status:       "open",
+		HubAddress:   hubAddr,
+		Utxos:        []proto.UtxoEntry{{Vout: 0}},
+	}
+	// Age the order past the rebroadcast interval so the cadence gate opens.
+	o.Updated = NowMicro() - uint64((rebroadcastInterval+10*time.Second)/time.Microsecond)
+	n.store.Add(o)
+	n.sessions[hexEncode(id[:])] = &SwapSession{n: n, id: id, isMaker: true, state: csMaker, privKey: mPriv, hub: hubAddr}
+
+	n.rebroadcastOpenOrders()
+
+	pkts := conn.snapshot()
+	if len(pkts) != 1 {
+		t.Fatalf("rebroadcast wrote %d packets, want 1", len(pkts))
+	}
+	pkt := pkts[0]
+	if pkt.Command != proto.XbcTransaction {
+		t.Fatalf("rebroadcast command = %v, want XbcTransaction", pkt.Command)
+	}
+	var body proto.OrderBody
+	if err := body.Unmarshal(pkt.Body); err != nil {
+		t.Fatalf("decode rebroadcast body: %v", err)
+	}
+	if body.ID != id {
+		t.Fatalf("rebroadcast order id = %x, want %x", body.ID, id)
+	}
+	if pkt.Pubkey != mPub {
+		t.Fatalf("rebroadcast header pubkey = %x, want maker %x", pkt.Pubkey, mPub)
+	}
+	ok, err := n.signer.VerifyAgainst(pkt, hexEncode(mPub[:]))
+	if err != nil || !ok {
+		t.Fatalf("rebroadcast signature verify ok=%v err=%v", ok, err)
+	}
+	if d := conn.snapshotDests(); d[0] != hubAddr {
+		t.Fatalf("rebroadcast dest = %x, want hub %x", d[0], hubAddr)
+	}
+	got := n.store.Get(hexEncode(id[:]))
+	if got == nil {
+		t.Fatal("rebroadcasted order missing from store")
+	}
+	// Updated must have been bumped to ~now; if it is still older than the
+	// rebroadcast interval the heartbeat did not refresh it (would re-post every
+	// tick).
+	if age := NowMicro() - got.Updated; age >= uint64(rebroadcastInterval/time.Microsecond) {
+		t.Fatalf("rebroadcast did not bump Updated: now-Updated=%dus (>= interval %dus)", age, uint64(rebroadcastInterval/time.Microsecond))
+	}
+}
+
+// TestRebroadcastOpenOrdersSkips asserts the heartbeat only re-posts a fresh,
+// locally-made, un-taken maker order: it skips recent re-posts (cadence gate),
+// non-local orders, pending-partial splits, non-open status, taken (in-swap)
+// sessions, and taker sessions.
+func TestRebroadcastOpenOrdersSkips(t *testing.T) {
+	var mPriv [32]byte
+	mPriv[0] = 7
+	hubAddr := [20]byte{0xbb}
+	var id [32]byte
+	copy(id[:], []byte("rebroadcast-skip-order-00000000"))
+
+	baseOrder := func() *Order {
+		o := &Order{
+			ID:           id,
+			FromCurrency: "BTC",
+			ToCurrency:   "LTC",
+			FromAmount:   1e6,
+			ToAmount:     2e6,
+			Created:      NowMicro(),
+			Mine:         true,
+			Status:       "open",
+			HubAddress:   hubAddr,
+			Utxos:        []proto.UtxoEntry{{Vout: 0}},
+		}
+		o.Updated = NowMicro() - uint64((rebroadcastInterval+10*time.Second)/time.Microsecond)
+		return o
+	}
+
+	cases := []struct {
+		name string
+		mut  func(n *Node, o *Order, s *SwapSession)
+	}{
+		{"recent repost", func(n *Node, o *Order, s *SwapSession) {
+			o.Updated = NowMicro() // within the 240s gap
+		}},
+		{"not mine", func(n *Node, o *Order, s *SwapSession) {
+			o.Mine = false
+		}},
+		{"pending partial", func(n *Node, o *Order, s *SwapSession) {
+			o.PrepTx = "somepreptxid"
+		}},
+		{"non-open status", func(n *Node, o *Order, s *SwapSession) {
+			o.Status = "created"
+		}},
+		{"taken session", func(n *Node, o *Order, s *SwapSession) {
+			s.state = csHoldApplied
+		}},
+		{"taker session", func(n *Node, o *Order, s *SwapSession) {
+			s.isMaker = false
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &captureXConn{}
+			n := &Node{
+				config:   &Config{Connectors: map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}}},
+				signer:   crypto.NewBtcSigner(),
+				stop:     make(chan struct{}),
+				store:    NewStore(),
+				sessions: map[string]*SwapSession{},
+				conn:     conn,
+			}
+			o := baseOrder()
+			s := &SwapSession{n: n, id: id, isMaker: true, state: csMaker, privKey: mPriv, hub: hubAddr}
+			tc.mut(n, o, s)
+			n.store.Add(o)
+			n.sessions[hexEncode(id[:])] = s
+
+			n.rebroadcastOpenOrders()
+
+			if got := conn.snapshot(); len(got) != 0 {
+				t.Fatalf("case %q: rebroadcast wrote %d packets, want 0", tc.name, len(got))
+			}
+		})
+	}
 }

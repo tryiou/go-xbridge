@@ -90,9 +90,10 @@ func TestRollbackFailedStatusOnRefundBroadcastFailure(t *testing.T) {
 // "rollback failed" only when the order's session has broadcast a deposit
 // (csCreatedA+ — the state >= trCreated analog, and the exact predicate
 // scanRefunds uses). The gate keys off the SESSION state, not the store order
-// ordinal: the taker's order stays "accepting" (ordinal 3) for its whole swap,
-// so an ordinal gate would never fire for taker refunds (C++ writes
-// trRollbackFailed for takers too). A pre-deposit session (state < csCreatedA)
+// ordinal: the taker's stored status now advances hold/initialized/created
+// like the maker's, so a status/ordinal-keyed gate would be unreliable across
+// roles (C++ writes trRollbackFailed for takers too). A pre-deposit session
+// (state < csCreatedA)
 // is left untouched.
 func TestRefundFailureStateGate(t *testing.T) {
 	ltc := &fakeConnector{ticker: "LTC", blockHeight: 1000, rawTx: map[string]string{}}
@@ -114,7 +115,9 @@ func TestRefundFailureStateGate(t *testing.T) {
 	n.sessions[makerKey] = &SwapSession{n: n, id: maker, isMaker: true, srcCur: "LTC", dstCur: "LTC",
 		refundHex: refundHexFixture(), state: csCreatedA}
 
-	// Taker: store order stays "accepting", session at csCreatedB.
+	// Taker: in live code the stored status now advances hold/initialized/created
+	// like the maker's (api/swap.go setOrderStatus); this fixture pins it to
+	// "accepting" to exercise the session-state gate (csCreatedB) in isolation.
 	var taker [32]byte
 	copy(taker[:], []byte("refund-fail-taker-0000000"))
 	takerKey := hexEncode(taker[:])

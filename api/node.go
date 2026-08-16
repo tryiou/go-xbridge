@@ -753,21 +753,31 @@ func (n *Node) cachedBlockHeight() uint32 {
 // book. Engine-owned: it mutates n.store, so it always runs on the engine
 // goroutine (ticker + tests).
 func (n *Node) pruneExpired() {
-	// Protect orders whose handshake has started: the maker's store order stays
-	// "created" for the whole swap, so only the session state can tell an
-	// in-swap order from an unmatched one (C++ advances the descriptor to
-	// trHold, xbridgesession.cpp:1529; an unmatched maker order keeps its
-	// session at the initial state). Takers need no guard: their order is
-	// "accepting" for the whole swap (already excluded by status), and after a
-	// hub Reject the order is restored to "open" but the session stays past
-	// csTaker — guarding it here would leak the rejected order into the book
-	// forever (the session is never pruned), whereas C++ restores trPending and
-	// lets the app-side sweep erase it after an hour idle (xbridgeapp.cpp:3624).
+	// Protect orders whose handshake has started. A maker's order advances
+	// through hold/initialized/created as the swap drives it (api/swap.go
+	// setOrderStatus, mirroring C++ xbridgesession.cpp:1529/1762/2174). A taker's
+	// order is "accepting" for most of the handshake, then reaches "created" at
+	// its deposit broadcast (applyCreatedB, swap.go:858) and is restored to
+	// "open" on a hub Reject — the "created"/"open" states ARE in the
+	// PruneExpired sweep set, so the session-state guard below is what keeps an
+	// in-swap order out of the sweep. A maker is in-swap once its session passes
+	// csMaker (an unmatched maker is still at csMaker); a taker is in-swap once
+	// its session passes csMaker AND its order has actually advanced past "open"
+	// (a hub-Rejected taker's order is restored to "open" with its session still
+	// past csTaker — protecting it here would leak the rejected order into the
+	// book forever, since the session is never pruned; C++ restores trPending and
+	// lets the app-side sweep erase it after an hour idle, xbridgeapp.cpp:3624).
 	inSwap := map[string]bool{}
 	for id, s := range n.sessions {
-		if s.isMaker && s.state > csMaker {
-			inSwap[id] = true
+		if s.state <= csMaker {
+			continue
 		}
+		if !s.isMaker {
+			if o := n.store.Get(id); o == nil || o.Status == "open" {
+				continue
+			}
+		}
+		inSwap[id] = true
 	}
 	// Non-blocking height read: the blockLoop keeps the cache fresh; a stale
 	// cache just skips the block-height predicate for this pass.
@@ -778,6 +788,84 @@ func (n *Node) pruneExpired() {
 	if len(removed) > 0 {
 		xlog.Info("expiry sweep", "removed", len(removed))
 	}
+}
+
+// rebroadcastInterval is how often an open (trPending) maker order is re-posted
+// to keep it alive in the book. C++ uses pendingOrderShouldRebroadcast
+// (xbridgeapp.cpp:3299): a trPending order is re-broadcast every 240 s. Open
+// orders expire after PendingTTL (6 min, store.go:411), so without this
+// heartbeat an un-taken maker order would silently leave the book; C++ keeps
+// them alive by re-posting.
+const rebroadcastInterval = 240 * time.Second
+
+// rebroadcastOpenOrders re-posts every locally-made (Mine) open maker order
+// that is not yet taken and not a pending-partial split, keeping it alive in
+// the order book. It mirrors C++ App::Impl::checkAndRelayPendingOrders
+// (xbridgeapp.cpp:3241), which re-sends trPending orders every ~240 s. Orders
+// whose handshake has started (session past csMaker) are excluded — they are
+// either in-swap (the swap drives them) or finished. The re-post reconstructs
+// the original xbcPendingTransaction from the stored Order and re-signs it with
+// the per-trade M key held by the maker session, so the hub re-relays it as the
+// same order (same id/body/header-pubkey/signature); the packet header
+// timestamp is refreshed on each re-post, which the hub ignores for ordering.
+func (n *Node) rebroadcastOpenOrders() {
+	now := NowMicro()
+	gap := uint64(rebroadcastInterval / time.Microsecond)
+	for id, s := range n.sessions {
+		if !s.isMaker || s.state != csMaker {
+			continue
+		}
+		o := n.store.Get(id)
+		if o == nil || !o.Mine || o.PrepTx != "" || o.Status != "open" {
+			continue
+		}
+		// C++ rebroadcast cadence gate: skip if re-posted recently.
+		if now-o.Updated < gap {
+			continue
+		}
+		hubAddr := o.HubAddress
+		if hubAddr == [20]byte{} {
+			hubAddr = s.hub
+		}
+		pkt, err := n.buildOrderPacket(o, s.privKey)
+		if err != nil {
+			xlog.Error("rebroadcast: build failed", "order", id, "err", err)
+			continue
+		}
+		if err := n.conn.WritePacket(pkt, hubAddr); err != nil {
+			xlog.Error("rebroadcast: send failed", "order", id, "err", err)
+			continue
+		}
+		n.store.Update(id, func(ord *Order) { ord.Updated = now })
+		xlog.Debug("order rebroadcast", "order", id)
+	}
+}
+
+// buildOrderPacket reconstructs the xbcPendingTransaction packet for a stored
+// order so it can be re-broadcast. It mirrors the original MakeOrder wire bytes
+// (node.go:1636-1649): the same OrderBody fields, re-signed with the per-trade
+// M key. The hub treats the re-post as the same order (same id and created
+// time) and re-relays it.
+func (n *Node) buildOrderPacket(o *Order, priv [32]byte) (*proto.Packet, error) {
+	body := &proto.OrderBody{
+		ID:             o.ID,
+		From:           o.From,
+		FromCurrency:   o.FromCurrency,
+		FromAmount:     o.FromAmount,
+		To:             o.To,
+		ToCurrency:     o.ToCurrency,
+		ToAmount:       o.ToAmount,
+		Created:        o.Created,
+		BlockHash:      o.BlockHash,
+		PartialAllowed: o.PartialAllowed,
+		MinFromAmount:  o.MinFromAmount,
+		Utxos:          o.Utxos,
+	}
+	pkt := proto.NewPacket(proto.XbcTransaction, body.Marshal())
+	if err := n.signer.Sign(pkt, priv[:]); err != nil {
+		return nil, err
+	}
+	return pkt, nil
 }
 
 // blockLoop keeps the cached block hash fresh.
@@ -1605,11 +1693,19 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			o.Status = "open"
 			o.PrepTx = prepTxID
 		} else {
-			// Exact-match and non-autoSplit partials list immediately.
-			o.Status = "created"
+			// Exact-match and non-autoSplit partials list immediately as an
+			// open (trPending) order, exactly like a non-partial make below.
+			o.Status = "open"
 		}
 	} else {
-		o.Status = "created"
+		// C++ freshly-made maker order: the live descriptor is trPending
+		// ("open", xbridgesession.cpp:764) the moment it is broadcast. The
+		// dxMakeOrder *response* literal "created" (rpcxbridge.cpp:1066) is a
+		// cosmetic verb decoupled from the live state; it is rendered by
+		// makeOrderResponse and must NOT be the stored status. "created"
+		// (trCreated=6) is the TAKER-side state after a take — using it here
+		// made an un-taken maker order report as in-swap to dxGetOrders/BLOCKDX.
+		o.Status = "open"
 	}
 	if !p.DryRun {
 		// C++ OrderDescr: sPubKey/hubAddress are the chosen servicenode, NOT
