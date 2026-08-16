@@ -209,8 +209,10 @@ func (n *Node) readerLoop() {
 }
 
 // engineLoop owns all mutable state (sessions, refund state, persist cadence)
-// and processes, in order: handler commands, decoded packets, worker results,
-// and the refund/persist ticker. It is the single writer of n.sessions and the
+// and processes handler commands, decoded packets, worker results, and the
+// refund/persist ticker. A worker result ready at the start of an iteration is
+// applied before commands/packets, so a session's await guard clears before a
+// same-session packet is judged. It is the single writer of n.sessions and the
 // persist path.
 func (n *Node) engineLoop() {
 	defer n.wg.Done()
@@ -220,6 +222,20 @@ func (n *Node) engineLoop() {
 	te := time.NewTicker(expirySweepInterval)
 	defer te.Stop()
 	for {
+		// Priority: a worker result already queued at iteration start is applied
+		// before any packet or ticker is judged, so a session's await guard is
+		// cleared and its response sent before the next hub packet for that
+		// session is handled — C++ processes synchronously in place, so a
+		// completed deposit/claim lands first (xbridgeapp.cpp:645-723;
+		// xbridgesession.cpp:1893 builds the deposit inline). A result that
+		// arrives while the engine is blocked in the main select below is served
+		// by its n.results case, so nothing waits on a full results buffer.
+		select {
+		case r := <-n.results:
+			n.safeRun(func() { r.task.apply(r.value, r.err) })
+			continue
+		default:
+		}
 		select {
 		case cmd := <-n.cmds:
 			n.safeRun(func() { cmd.run() })
