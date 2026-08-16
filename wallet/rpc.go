@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -78,6 +79,18 @@ func NewRPCClient(url, user, pass, jsonVersion, contentType string, omitJSONVers
 
 // Call invokes method with params and unmarshals the result into out.
 func (c *RPCClient) Call(method string, params []interface{}, out interface{}) error {
+	return c.call(context.Background(), method, params, out)
+}
+
+// CallContext invokes method with params under ctx, unmarshaling the result
+// into out. A caller that cancels ctx (or whose deadline fires) aborts the
+// in-flight HTTP request, so a hung wallet cannot outlive the caller. Used by
+// the wallet reachability probe so a timed-out probe is joined promptly.
+func (c *RPCClient) CallContext(ctx context.Context, method string, params []interface{}, out interface{}) error {
+	return c.call(ctx, method, params, out)
+}
+
+func (c *RPCClient) call(ctx context.Context, method string, params []interface{}, out interface{}) error {
 	id := fmt.Sprintf("xbg-%d", c.nextID.Add(1)-1)
 	xlog.Debug("rpc call", "coin", c.ticker, "method", method, "url", c.url)
 	// Wallet RPCs (XLite, Bitcoin Core) require "params" to be an array; a nil
@@ -99,7 +112,7 @@ func (c *RPCClient) Call(method string, params []interface{}, out interface{}) e
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -379,8 +392,16 @@ func (c *RPCConnector) GetRelayFee() (float64, error) {
 // GetBlockCount returns the best block height of the coin's chain via the
 // wallet's getblockcount RPC.
 func (c *RPCConnector) GetBlockCount() (int64, error) {
+	return c.GetBlockCountContext(context.Background())
+}
+
+// GetBlockCountContext is the context-cancellable variant of GetBlockCount used
+// by the wallet reachability probe: cancelling ctx (or its deadline firing)
+// aborts the in-flight getblockcount request, so a hung wallet cannot hold the
+// probe goroutine past its own bound.
+func (c *RPCConnector) GetBlockCountContext(ctx context.Context) (int64, error) {
 	var h int64
-	if err := c.cli.Call("getblockcount", nil, &h); err != nil {
+	if err := c.cli.CallContext(ctx, "getblockcount", nil, &h); err != nil {
 		return 0, c.wrapErr("getblockcount", err)
 	}
 	return h, nil
