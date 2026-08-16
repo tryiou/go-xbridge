@@ -77,7 +77,7 @@ jobs:
           go-version: "1.25.x"
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           # Pin the toolchain version whose baseline produced the green gate
           # (v2.11.4, built with go1.26.1). Upgrade deliberately, not by drift.
