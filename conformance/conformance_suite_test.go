@@ -834,80 +834,89 @@ func TestWireSignKnownAnswer(t *testing.T) {
 	}
 }
 
-// TestWireCommandBodies encodes every XBridgeCommand body hex vector
-// (commands 2,3,4,5,6,7,8,9,10,11,12,13,18,19,20,
-// 21,22,24,26,50) and asserts decode + the expected decoded fields.
+// wireBodyVector is one decode/marshal vector: a C++-writer-derived hex body
+// for the command, and an optional skip reason. The table is shared by the
+// decode test (TestWireCommandBodies) and the marshal round-trip KAT
+// (TestWireMarshalRoundTrip) so the vectors stay in one place.
+type wireBodyVector struct {
+	name    string
+	cmd     proto.XBridgeCommand
+	hexBody string
+	skip    string // non-empty => t.Skip with this reason
+}
+
+// wireBodyVectors encodes every XBridgeCommand body hex vector
+// (commands 3,4,5,6,7,8,9,10,11,12,13,18,19,20,21,22,24,26 — 2 and 50 have no
+// C++ writer on either side and no body type) as a C++-writer-derived hex body.
+var wireBodyVectors = []wireBodyVector{
+	{name: "xbcTransaction", cmd: proto.XbcTransaction, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "6274630000000000" + "2100000000000000" +
+		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000" +
+		"566a8b1700000000" + "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
+		"0100" + "0500000000000000" + "01000000" +
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
+		"00010203" + "404142434445464748494a4b4c4d4e4f50515253" +
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"},
+	{name: "xbcPendingTransaction", cmd: proto.XbcPendingTransaction, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"6274630000000000" + "2100000000000000" + "7872000000000000" + "3400000000000000" +
+		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "566a8b1700000000" +
+		"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
+		"0100" + "0500000000000000"},
+	{name: "xbcTransactionAccepting", cmd: proto.XbcTransactionAccepting, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"03000000" + "aabbcc" + "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" +
+		"6274630000000000" + "2100000000000000" + "05060000" + "1112131415161718" +
+		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000" +
+		"08090000" + "2122232425262728" + "01000000" +
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
+		"00010203" + "404142434445464748494a4b4c4d4e4f50515253" +
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"},
+	{name: "xbcTransactionHold", cmd: proto.XbcTransactionHold, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"2100000000000000" + "3400000000000000"},
+	{name: "xbcTransactionHoldApply", cmd: proto.XbcTransactionHoldApply, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
+	{name: "xbcTransactionInit", cmd: proto.XbcTransactionInit, hexBody: "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" +
+		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "6274630000000000" + "2100000000000000" +
+		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000"},
+	{name: "xbcTransactionInitialized", cmd: proto.XbcTransactionInitialized, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
+	{name: "xbcTransactionCreateA", cmd: proto.XbcTransactionCreateA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0"},
+	{name: "xbcTransactionCreatedA", cmd: proto.XbcTransactionCreatedA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"6465616462656566" + "00" + "333435363738393a3b3c3d3e3f40414243444546" + "04030201" +
+		"336131623263" + "00" + "3061316232633364" + "00"},
+	{name: "xbcTransactionCreateB", cmd: proto.XbcTransactionCreateB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
+		"6465616462656566" + "00" + "333435363738393a3b3c3d3e3f40414243444546" + "04030201"},
+	{name: "xbcTransactionCreatedB", cmd: proto.XbcTransactionCreatedB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"6361666562616265" + "00" + "08070605" + "336131623263" + "00" + "3061316232633364" + "00"},
+	{name: "xbcTransactionConfirmA", cmd: proto.XbcTransactionConfirmA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"6361666562616265" + "00" + "08070605"},
+	{name: "xbcTransactionConfirmedA", cmd: proto.XbcTransactionConfirmedA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"3132333435363738" + "00"},
+	{name: "xbcTransactionConfirmB", cmd: proto.XbcTransactionConfirmB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"3132333435363738" + "00"},
+	{name: "xbcTransactionConfirmedB", cmd: proto.XbcTransactionConfirmedB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
+		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
+		"3961626364656630" + "00"},
+	{name: "xbcTransactionCancel", cmd: proto.XbcTransactionCancel, hexBody: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20" + "efbeedfe"},
+	{name: "xbcTransactionFinished", cmd: proto.XbcTransactionFinished, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
+	{name: "xbcTransactionReject", cmd: proto.XbcTransactionReject, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" + "dec0ad0b"},
+}
+
+// TestWireCommandBodies decodes every wireBodyVectors entry and asserts the
+// expected decoded fields.
 func TestWireCommandBodies(t *testing.T) {
-	cases := []struct {
-		name    string
-		cmd     proto.XBridgeCommand
-		hexBody string
-		skip    string // non-empty => t.Skip with this reason
-	}{
-		{name: "xbcTransaction", cmd: proto.XbcTransaction, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "6274630000000000" + "2100000000000000" +
-			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000" +
-			"566a8b1700000000" + "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
-			"0100" + "0500000000000000" + "01000000" +
-			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
-			"00010203" + "404142434445464748494a4b4c4d4e4f50515253" +
-			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"},
-		{name: "xbcPendingTransaction", cmd: proto.XbcPendingTransaction, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"6274630000000000" + "2100000000000000" + "7872000000000000" + "3400000000000000" +
-			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "566a8b1700000000" +
-			"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
-			"0100" + "0500000000000000"},
-		{name: "xbcTransactionAccepting", cmd: proto.XbcTransactionAccepting, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"03000000" + "aabbcc" + "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" +
-			"6274630000000000" + "2100000000000000" + "05060000" + "1112131415161718" +
-			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000" +
-			"08090000" + "2122232425262728" + "01000000" +
-			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
-			"00010203" + "404142434445464748494a4b4c4d4e4f50515253" +
-			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"},
-		{name: "xbcTransactionHold", cmd: proto.XbcTransactionHold, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"2100000000000000" + "3400000000000000"},
-		{name: "xbcTransactionHoldApply", cmd: proto.XbcTransactionHoldApply, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
-		{name: "xbcTransactionInit", cmd: proto.XbcTransactionInit, hexBody: "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" +
-			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "6274630000000000" + "2100000000000000" +
-			"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" + "7872000000000000" + "3400000000000000"},
-		{name: "xbcTransactionInitialized", cmd: proto.XbcTransactionInitialized, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" + "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
-		{name: "xbcTransactionCreateA", cmd: proto.XbcTransactionCreateA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0"},
-		{name: "xbcTransactionCreatedA", cmd: proto.XbcTransactionCreatedA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"6465616462656566" + "00" + "333435363738393a3b3c3d3e3f40414243444546" + "04030201" +
-			"336131623263" + "00" + "3061316232633364" + "00"},
-		{name: "xbcTransactionCreateB", cmd: proto.XbcTransactionCreateB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
-			"6465616462656566" + "00" + "333435363738393a3b3c3d3e3f40414243444546" + "04030201"},
-		{name: "xbcTransactionCreatedB", cmd: proto.XbcTransactionCreatedB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"6361666562616265" + "00" + "08070605" + "336131623263" + "00" + "3061316232633364" + "00"},
-		{name: "xbcTransactionConfirmA", cmd: proto.XbcTransactionConfirmA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"6361666562616265" + "00" + "08070605"},
-		{name: "xbcTransactionConfirmedA", cmd: proto.XbcTransactionConfirmedA, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"3132333435363738" + "00"},
-		{name: "xbcTransactionConfirmB", cmd: proto.XbcTransactionConfirmB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"3132333435363738" + "00"},
-		{name: "xbcTransactionConfirmedB", cmd: proto.XbcTransactionConfirmedB, hexBody: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3" +
-			"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-			"3961626364656630" + "00"},
-		{name: "xbcTransactionCancel", cmd: proto.XbcTransactionCancel, hexBody: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20" + "efbeedfe"},
-		{name: "xbcTransactionFinished", cmd: proto.XbcTransactionFinished, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"},
-		{name: "xbcTransactionReject", cmd: proto.XbcTransactionReject, hexBody: "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" + "dec0ad0b"},
-	}
-	for _, c := range cases {
+	for _, c := range wireBodyVectors {
 		// Each command is a subtest so a skip does not abort the remaining
 		// body vectors. (cmd 2 xbcXChatMessage and cmd 50 xbcServicesPing have
 		// no C++ writer and their body types were removed.)
@@ -1026,6 +1035,125 @@ func checkBodyFields(t *testing.T, name string, cmd proto.XBridgeCommand, v inte
 		}
 	default:
 		t.Errorf("%s: unhandled body type %T", name, v)
+	}
+}
+
+// TestWireExactLengths asserts the C++ exact-length contracts for the bodies
+// whose writers fix the byte count:
+//
+//   - xbcPendingTransaction must be exactly 134 bytes (xbridgesession.cpp:694)
+//     — the C++ broadcast writer emits a 126-byte form (no minFromAmount,
+//     xbridgesession.cpp:3626-3651) that C++ itself would reject, so go-xbridge
+//     deliberately tolerates the 126-byte variant for interop with that dead
+//     writer; a truncated 133-byte body is a malformed packet either way.
+//   - xbcTransactionCancel / xbcTransactionReject must be exactly 36 bytes
+//     (xbridgesession.cpp:3293,3437) — trailing bytes are rejected.
+func TestWireExactLengths(t *testing.T) {
+	// The 134-byte pending vector from the shared table (xbridgesession.cpp:3666
+	// writer: id/from/to amounts/hub/created/blockhash/partial/minFromAmount).
+	var pending134 []byte
+	for _, v := range wireBodyVectors {
+		if v.name == "xbcPendingTransaction" {
+			pending134 = hx(v.hexBody)
+		}
+	}
+	if len(pending134) != 134 {
+		t.Fatalf("pending vector is %d bytes, want 134 (test table drift)", len(pending134))
+	}
+	// 126-byte broadcast-writer form: strip the trailing 8-byte minFromAmount.
+	pending126 := pending134[:126]
+
+	// Cancel/reject vector bodies from the shared table are exactly 36 bytes.
+	var cancel36, reject36 []byte
+	for _, v := range wireBodyVectors {
+		switch v.name {
+		case "xbcTransactionCancel":
+			cancel36 = hx(v.hexBody)
+		case "xbcTransactionReject":
+			reject36 = hx(v.hexBody)
+		}
+	}
+	if len(cancel36) != 36 || len(reject36) != 36 {
+		t.Fatalf("cancel/reject vectors: got %d/%d bytes, want 36/36", len(cancel36), len(reject36))
+	}
+
+	t.Run("pending", func(t *testing.T) {
+		if _, err := proto.DecodeBody(proto.XbcPendingTransaction, pending134); err != nil {
+			t.Errorf("134-byte pending rejected: %v", err)
+		}
+		// Deliberate tolerance of C++'s own 126-byte broadcast writer
+		// (xbridgesession.cpp:3626-3651): the decode must accept it, leaving
+		// MinFromAmount unset. The asymmetry (tolerate 126 on read, always
+		// Marshal the 134-byte form) is the point of the divergence note.
+		var p proto.PendingTransactionBody
+		if err := p.Unmarshal(pending126); err != nil {
+			t.Fatalf("unmarshal 126-byte pending: %v", err)
+		}
+		if p.MinFromAmount != 0 {
+			t.Errorf("126-byte pending MinFromAmount = %d, want 0", p.MinFromAmount)
+		}
+		if _, err := proto.DecodeBody(proto.XbcPendingTransaction, pending134[:133]); err == nil {
+			t.Errorf("133-byte pending accepted; want malformed-packet error")
+		}
+	})
+	t.Run("cancel", func(t *testing.T) {
+		if _, err := proto.DecodeBody(proto.XbcTransactionCancel, cancel36); err != nil {
+			t.Errorf("36-byte cancel rejected: %v", err)
+		}
+		if _, err := proto.DecodeBody(proto.XbcTransactionCancel, cancel36[:35]); err == nil {
+			t.Errorf("35-byte cancel accepted; want error")
+		}
+		if _, err := proto.DecodeBody(proto.XbcTransactionCancel, append(append([]byte{}, cancel36...), 0xff)); err == nil {
+			t.Errorf("37-byte cancel accepted; want trailing-bytes error")
+		}
+	})
+	t.Run("reject", func(t *testing.T) {
+		if _, err := proto.DecodeBody(proto.XbcTransactionReject, reject36); err != nil {
+			t.Errorf("36-byte reject rejected: %v", err)
+		}
+		if _, err := proto.DecodeBody(proto.XbcTransactionReject, reject36[:35]); err == nil {
+			t.Errorf("35-byte reject accepted; want error")
+		}
+		if _, err := proto.DecodeBody(proto.XbcTransactionReject, append(append([]byte{}, reject36...), 0xff)); err == nil {
+			t.Errorf("37-byte reject accepted; want trailing-bytes error")
+		}
+	})
+}
+
+// TestWireMarshalRoundTrip is the per-command marshal golden KAT: each vector
+// body is C++-writer-derived bytes; decode it, re-marshal through the Go body
+// writer, and require the bytes come back identical. Because every Marshal
+// mirrors the C++ writer field-for-field, a round-trip reproducing the C++
+// bytes is a byte-exact outbound golden — not just a self-consistency check.
+// (xbcPendingTransaction is the one asymmetric reader/writer pair: the reader
+// tolerates the 126-byte broadcast form while Marshal always emits the
+// 134-byte live-writer form, so only the 134-byte vector is tabled — a
+// 126-byte vector would correctly fail this KAT.)
+func TestWireMarshalRoundTrip(t *testing.T) {
+	for _, c := range wireBodyVectors {
+		t.Run(c.name, func(t *testing.T) {
+			if c.skip != "" {
+				t.Skipf("%s: %s", c.name, c.skip)
+			}
+			want := hx(c.hexBody)
+			v, err := proto.DecodeBody(c.cmd, want)
+			if err != nil {
+				t.Fatalf("DecodeBody(%s): %v", c.cmd, err)
+			}
+			m, ok := v.(interface{ Marshal() []byte })
+			if !ok {
+				t.Fatalf("DecodeBody(%s) returned %T without Marshal()", c.cmd, v)
+			}
+			got := m.Marshal()
+			if len(got) != len(want) {
+				t.Fatalf("marshal length %d != vector %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("byte %d: marshal %02x != vector %02x", i, got[i], want[i])
+				}
+			}
+		})
 	}
 }
 
