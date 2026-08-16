@@ -327,12 +327,38 @@ func (n *Node) writeLatestPersist() {
 	data, err := marshalSwapFile(job.swaps)
 	if err != nil {
 		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
+		n.persistFailures.Add(1)
 		return
 	}
-	if err := writeSwaps(job.path, data); err != nil {
-		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
+	// Retry a transient disk failure with bounded backoff before giving up, so a
+	// brief write error does not silently drop the only durable copy of in-flight
+	// swap state (a restart would then be unable to refund/claim — fund loss).
+	// C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes the orders DB via
+	// xdb.Write with no retry; this port adds bounded retry so a transient EIO is
+	// survived rather than silently losing the only durable copy.
+	var lastErr error
+	for attempt := 0; attempt < persistWriteMaxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(persistWriteBackoff << (attempt - 1))
+		}
+		if err := writeSwaps(job.path, data); err != nil {
+			lastErr = err
+			continue
+		}
+		return
 	}
+	xlog.Error("swap persist failed after retries", "dir", filepath.Dir(job.path), "err", lastErr)
+	n.persistFailures.Add(1)
 }
+
+// persistWrite* bound the retry of a durable swap-state write. Three attempts
+// with exponential backoff (25ms, then 50ms) cover a transient disk stall
+// without materially delaying the background flush; the final attempt has no
+// leading sleep, so total backoff is at most 75ms.
+const (
+	persistWriteMaxAttempts = 3
+	persistWriteBackoff     = 25 * time.Millisecond
+)
 
 // safeRun executes fn, logging (and swallowing) any panic so a single bad
 // packet or command can never kill the engine goroutine (which would silently

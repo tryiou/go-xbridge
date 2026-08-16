@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
@@ -368,5 +369,71 @@ func TestCorruptSwapFileContinuesLikeCpp(t *testing.T) {
 	}
 	if len(n.store.List()) != 0 || len(n.store.History()) != 0 {
 		t.Fatalf("corrupt file must restore nothing; live=%d history=%d", len(n.store.List()), len(n.store.History()))
+	}
+}
+
+// TestPersistWriteFailurePropagated proves a durable swap-state write that
+// ultimately fails is NOT silently dropped: persistFailures is incremented and
+// surfaced, so an operator can see that on-disk state may lag in-memory state
+// (a restart could otherwise be unable to refund/claim an in-flight swap).
+func TestPersistWriteFailurePropagated(t *testing.T) {
+	dir := t.TempDir()
+	n := newPersistNode(t, dir)
+
+	mPriv := make([]byte, 32)
+	mPriv[31] = 3
+	mPub, err := crypto.CompressedPubKey(mPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id [32]byte
+	copy(id[:], []byte("persist-fail-prop-order-id0000"))
+	o := &Order{ID: id, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e8, ToAmount: 2e8, Mine: true}
+	n.store.Add(o)
+	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
+
+	orig := writeSwaps
+	writeSwaps = func(path string, data []byte) error { return errors.New("disk full") }
+	t.Cleanup(func() { writeSwaps = orig })
+
+	n.persist() // inline path (node not started)
+
+	if got := n.persistFailures.Load(); got != 1 {
+		t.Fatalf("persistFailures = %d, want 1 (failure must be counted, not dropped)", got)
+	}
+	if _, err := os.Stat(swapStatePath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("swap file should not exist after a failed write; stat err = %v", err)
+	}
+}
+
+// TestPersistWriteRetrySucceeds proves a transient disk failure does not lose the
+// durable copy: writeLatestPersist retries with bounded backoff and the swap
+// file is written once a write succeeds, with no persistFailure recorded.
+func TestPersistWriteRetrySucceeds(t *testing.T) {
+	dir := t.TempDir()
+	n := newPersistNode(t, dir)
+
+	var attempts int
+	orig := writeSwaps
+	writeSwaps = func(path string, data []byte) error {
+		attempts++
+		if attempts < persistWriteMaxAttempts {
+			return errors.New("transient EIO")
+		}
+		return orig(path, data)
+	}
+	t.Cleanup(func() { writeSwaps = orig })
+
+	n.persistLatest = &persistJob{path: swapStatePath(dir), swaps: []persistedSwap{}}
+	n.writeLatestPersist()
+
+	if attempts != persistWriteMaxAttempts {
+		t.Fatalf("write attempts = %d, want %d (retried to the last attempt)", attempts, persistWriteMaxAttempts)
+	}
+	if got := n.persistFailures.Load(); got != 0 {
+		t.Fatalf("persistFailures = %d, want 0 (transient failure must not be counted)", got)
+	}
+	if _, err := os.Stat(swapStatePath(dir)); err != nil {
+		t.Fatalf("swap file must exist after retry succeeds; stat err = %v", err)
 	}
 }

@@ -219,6 +219,14 @@ type Node struct {
 	// persistUp is true once start() has launched persistLoop. persist() writes
 	// synchronously when it is false (inline/test mode, no loop to hand to).
 	persistUp atomic.Bool
+	// persistFailures counts durable swap-state persist operations (marshal or
+	// disk write) that failed. A non-zero value means the on-disk state may be
+	// behind the in-memory state, so a restart could be unable to refund/claim
+	// an in-flight swap. C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes
+	// via xdb.Write with no retry; this port adds bounded retry + this counter
+	// so a transient failure is visible rather than silently lost. Surfaced in
+	// the 60s status log for operator visibility.
+	persistFailures atomic.Int64
 
 	// pendingRefunds is the engine-owned guard against double-enqueueing a
 	// refund broadcast for an order whose sweep task is already in flight.
@@ -1106,6 +1114,7 @@ func (n *Node) logNetworkStatus() {
 		"addrs", addrs,
 		"servicenodes", snodes,
 		"packets_dropped", n.packetsDropped.Load(),
+		"persist_failures", n.persistFailures.Load(),
 		"tokens", strings.Join(n.NetworkTokens(), ","))
 }
 

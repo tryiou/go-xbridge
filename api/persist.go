@@ -255,10 +255,12 @@ func (n *Node) persist() {
 		data, err := marshalSwapFile(swaps)
 		if err != nil {
 			xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
+			n.persistFailures.Add(1)
 			return
 		}
 		if err := writeSwaps(path, data); err != nil {
 			xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
+			n.persistFailures.Add(1)
 		}
 		return
 	}
