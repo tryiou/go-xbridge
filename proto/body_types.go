@@ -253,12 +253,21 @@ func (b *PendingTransactionBody) Unmarshal(data []byte) error {
 	}
 	b.PartialAllowed = pf != 0
 	// Optional trailing field: only present in writers that advertise a
-	// minimum partial amount. Tolerated for compatibility with the broadcast
-	// writer, which omits it.
-	if r.remaining() >= 8 {
+	// minimum partial amount. The live writer emits 134 bytes with it
+	// (xbridgesession.cpp:3666-3692, minFromAmount at :3687); the C++ broadcast
+	// writer omits it, emitting a 126-byte body that C++'s own exact-134 receive
+	// check would reject (xbridgesession.cpp:694,3626-3651) — go-xbridge
+	// tolerates that dead-writer form for interop, but a partial 8-byte tail
+	// (127-133 bytes) is a malformed packet, not a third variant.
+	switch r.remaining() {
+	case 0:
+		// 126-byte broadcast-writer form (minFromAmount absent).
+	case 8:
 		if b.MinFromAmount, err = r.Uint64(); err != nil {
 			return err
 		}
+	default:
+		return errors.New("xbridge: malformed xbcPendingTransaction body length")
 	}
 	return nil
 }
@@ -856,6 +865,11 @@ func (b *CancelBody) Unmarshal(data []byte) error {
 	if b.Reason, err = r.Uint32(); err != nil {
 		return err
 	}
+	// C++ requires the body to be exactly 32+4 bytes (xbridgesession.cpp:3293);
+	// trailing bytes are a malformed packet, not an extension.
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionCancel body")
+	}
 	return nil
 }
 
@@ -879,6 +893,11 @@ func (b *RejectBody) Unmarshal(data []byte) error {
 	}
 	if b.Reason, err = r.Uint32(); err != nil {
 		return err
+	}
+	// C++ requires the body to be exactly 32+4 bytes (xbridgesession.cpp:3437);
+	// trailing bytes are a malformed packet, not an extension.
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionReject body")
 	}
 	return nil
 }

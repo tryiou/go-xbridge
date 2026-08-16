@@ -126,6 +126,46 @@ func TestPendingTransactionBodyRoundTrip(t *testing.T) {
 	)
 }
 
+// TestPendingExactLengths asserts the wire contract for xbcPendingTransaction:
+// exactly 134 bytes (live writer, xbridgesession.cpp:3666) or the 126-byte
+// broadcast-writer form C++ itself would reject (xbridgesession.cpp:3626-3651,
+// which go-xbridge tolerates for interop). Any partial 8-byte tail (127-133)
+// is malformed.
+func TestPendingExactLengths(t *testing.T) {
+	full := (&PendingTransactionBody{
+		ID: [32]byte{1}, FromCurrency: "BTC", FromAmount: 100,
+		ToCurrency: "DGB", ToAmount: 200, HubAddress: [20]byte{2},
+		Created: 42, PartialAllowed: true, MinFromAmount: 50,
+	}).Marshal()
+	if len(full) != 134 {
+		t.Fatalf("full pending body = %d bytes, want 134", len(full))
+	}
+	if _, err := DecodeBody(XbcPendingTransaction, full); err != nil {
+		t.Fatalf("134-byte pending rejected: %v", err)
+	}
+	if _, err := DecodeBody(XbcPendingTransaction, full[:126]); err != nil {
+		t.Fatalf("126-byte broadcast-writer pending rejected: %v", err)
+	}
+	// The 126-byte form omits MinFromAmount; the decoder must leave it unset
+	// (the asymmetric decode contract: tolerate the absent tail on read, always
+	// emit the 134-byte form on Marshal).
+	var b PendingTransactionBody
+	if err := b.Unmarshal(full[:126]); err != nil {
+		t.Fatalf("unmarshal 126-byte pending: %v", err)
+	}
+	if b.MinFromAmount != 0 {
+		t.Errorf("126-byte pending MinFromAmount = %d, want 0", b.MinFromAmount)
+	}
+	for _, n := range []int{127, 128, 130, 133} {
+		if _, err := DecodeBody(XbcPendingTransaction, full[:n]); err == nil {
+			t.Errorf("%d-byte pending accepted; want malformed-length error", n)
+		}
+	}
+	if _, err := DecodeBody(XbcPendingTransaction, full[:125]); err == nil {
+		t.Errorf("125-byte pending accepted; want field-read error")
+	}
+}
+
 func TestAcceptingBodyRoundTrip(t *testing.T) {
 	b := &AcceptingBody{
 		HubAddress:       [20]byte{1},
@@ -300,6 +340,35 @@ func TestDecodeBodyRejectsUnwriterCommands(t *testing.T) {
 		if v, err := DecodeBody(cmd, []byte{0x01}); err == nil {
 			t.Fatalf("DecodeBody(%s) = %v, nil; want unsupported-command error", cmd, v)
 		}
+	}
+}
+
+// TestCancelRejectExact36 asserts the wire contract for xbcTransactionCancel /
+// xbcTransactionReject bodies: exactly 32-byte id + 4-byte reason (36 total),
+// matching C++ Session::Impl::processTransactionCancel / processTransactionReject
+// (xbridgesession.cpp:3293,3437), which reject any other size. Trailing bytes
+// are a malformed packet, not an extension.
+func TestCancelRejectExact36(t *testing.T) {
+	body36 := append(make([]byte, 32), []byte{0x0a, 0x00, 0x00, 0x00}...) // reason 10 (crRpcRequest)
+	for _, c := range []struct {
+		name string
+		cmd  XBridgeCommand
+	}{
+		{name: "xbcTransactionCancel", cmd: XbcTransactionCancel},
+		{name: "xbcTransactionReject", cmd: XbcTransactionReject},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := DecodeBody(c.cmd, body36); err != nil {
+				t.Fatalf("DecodeBody(%s, 36B) error: %v", c.cmd, err)
+			}
+			if _, err := DecodeBody(c.cmd, body36[:35]); err == nil {
+				t.Errorf("DecodeBody(%s, 35B): expected error, got nil", c.cmd)
+			}
+			extra := append(append([]byte{}, body36...), 0xff)
+			if _, err := DecodeBody(c.cmd, extra); err == nil {
+				t.Errorf("DecodeBody(%s, 37B): expected trailing-bytes error, got nil", c.cmd)
+			}
+		})
 	}
 }
 
