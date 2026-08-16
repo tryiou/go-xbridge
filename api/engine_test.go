@@ -2,12 +2,50 @@ package api
 
 import (
 	"io"
+	"sync"
 	"testing"
 	"time"
 
 	"go-xbridge/crypto"
 	"go-xbridge/proto"
 )
+
+// TestConcurrentDoubleCloseNoPanic proves Close is idempotent under concurrent
+// callers: two goroutines closing the same node at once must both return nil
+// without a double-close(n.stop) panic. The once-guard is sync.Once, not a
+// check-then-close select, so the race window is closed. The loop of fresh
+// unstarted nodes reliably trips the old bug under `go test -race` (the gate):
+// with a check-then-close guard two goroutines can clear the select in the same
+// scheduling window and the second close panics, so enough iterations hit it;
+// with sync.Once the guard is atomic and no iteration can panic. A plain
+// `go test` without -race may not interleave the goroutines inside the window,
+// so this test's signal is tied to the race-enabled run.
+func TestConcurrentDoubleCloseNoPanic(t *testing.T) {
+	for iter := 0; iter < 300; iter++ {
+		n := newEngineNode()
+		start := make(chan struct{})
+		errs := make([]error, 2)
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("iter %d: Close panicked: %v", iter, r)
+					}
+				}()
+				<-start
+				errs[i] = n.Close()
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("iter %d: concurrent Close returned %v and %v, want nil, nil", iter, errs[0], errs[1])
+		}
+	}
+}
 
 // blockConn is a test XConn whose ReadPacket blocks until the node's stop
 // channel closes (so the reader loop parks instead of spinning on io.EOF) and
