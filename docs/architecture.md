@@ -222,9 +222,13 @@ driver is `api.SwapSession`/`clientState` (see "Client driver" below). Contents:
   cannot drift.
 - **TTL constants** (`state.go`) — `LockTime` 600 s, `PendingTTL` 360 s,
   `TTL` 3600 s, `DeadlineTTL` 604800 s, `BlocksTTL` 10080 blocks.
-  `TTL`/`DeadlineTTL`/`BlocksTTL` drive the store expiry logic
-  (`api/store.go`); `LockTime`/`PendingTTL` are asserted in the conformance
-  suite (and `PendingTTL` in a store-expiry boundary test).
+  `PendingTTL`/`TTL`/`DeadlineTTL`/`BlocksTTL` drive the store expiry logic
+  (`api/store.go`): an `open` (trPending) order leaves the book once inactive
+  for `PendingTTL` (6 min), mirroring the C++ app-side `trPending → trExpired`
+  flip (`xbridgeapp.cpp:3611-3616`); `TTL` remains the `created` inactivity
+  erase and `DeadlineTTL` the deadline erase for both. `LockTime`/`PendingTTL`
+  are asserted in the conformance suite (and `PendingTTL` in a store-expiry
+  boundary test).
 
 The `DescrState`/TTL values are asserted against C++ in the conformance suite
 (`TestStateEnumVectors`, `TestTTLConstants`); the strict-`>` expiry boundary
