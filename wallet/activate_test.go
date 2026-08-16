@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"strings"
@@ -180,5 +181,86 @@ func TestActivateClearBad(t *testing.T) {
 	}
 	if probes.Load() != 2 {
 		t.Fatalf("probes = %d, want 2 (ClearBad forced a re-probe)", probes.Load())
+	}
+}
+
+// hangingProbeConnector is a Connector stub whose reachability probe never
+// returns: GetBlockCount blocks forever (the plain, non-cancellable call) and
+// GetBlockCountContext blocks until its context is cancelled. returned is
+// closed when the underlying call exits, so a test can observe whether the probe
+// goroutine was joined after a timeout.
+type hangingProbeConnector struct {
+	block    chan struct{} // never closed: a plain GetBlockCount parks forever
+	returned chan struct{}
+}
+
+func (c *hangingProbeConnector) Ticker() string                  { return "HANG" }
+func (c *hangingProbeConnector) GetBalance() (uint64, error)     { return 0, errors.New("unused") }
+func (c *hangingProbeConnector) GetNewAddress() (string, error)  { return "", errors.New("unused") }
+func (c *hangingProbeConnector) ListUnspent(int) ([]Utxo, error) { return nil, errors.New("unused") }
+func (c *hangingProbeConnector) SignRawTransaction(string, []PrevTx) (string, bool, error) {
+	return "", false, errors.New("unused")
+}
+func (c *hangingProbeConnector) SendRawTransaction(string) (string, error) {
+	return "", errors.New("unused")
+}
+func (c *hangingProbeConnector) GetRelayFee() (float64, error) { return 0, errors.New("unused") }
+func (c *hangingProbeConnector) GetBlockCount() (int64, error) {
+	<-c.block
+	close(c.returned)
+	return 0, nil
+}
+func (c *hangingProbeConnector) GetBlockHash(int64) ([32]byte, error) {
+	return [32]byte{}, errors.New("unused")
+}
+func (c *hangingProbeConnector) GetRawTransaction(string) (string, error) {
+	return "", errors.New("unused")
+}
+func (c *hangingProbeConnector) CheckDepositTransaction(string, string, uint64, int) (DepositCheck, error) {
+	return DepositCheck{}, errors.New("unused")
+}
+func (c *hangingProbeConnector) SignMessage(string, string) ([]byte, error) {
+	return nil, errors.New("unused")
+}
+func (c *hangingProbeConnector) VerifyMessage(string, []byte, string) (bool, error) {
+	return false, errors.New("unused")
+}
+func (c *hangingProbeConnector) GetTxOut(string, uint32) (Utxo, bool, error) {
+	return Utxo{}, false, errors.New("unused")
+}
+
+// GetBlockCountContext blocks until ctx is done, then reports the context's
+// error and signals that the call exited.
+func (c *hangingProbeConnector) GetBlockCountContext(ctx context.Context) (int64, error) {
+	<-ctx.Done()
+	close(c.returned)
+	return 0, ctx.Err()
+}
+
+// TestProbeGoroutineJoinedOnTimeout proves a timed-out reachability probe does
+// not leak its goroutine: probeReachable runs the ctx-aware connector under a
+// cancellable context, aborts the in-flight RPC on timeout, and joins the probe
+// goroutine before returning. Without the ctx-aware path the goroutine would
+// park in GetBlockCount and outlive the probe by the wallet RPC timeout.
+func TestProbeGoroutineJoinedOnTimeout(t *testing.T) {
+	orig := probeTimeout
+	probeTimeout = 50 * time.Millisecond
+	defer func() { probeTimeout = orig }()
+
+	c := &hangingProbeConnector{block: make(chan struct{}), returned: make(chan struct{})}
+	start := time.Now()
+	err := probeReachable(c)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("probe err = %v, want timeout", err)
+	}
+	// The probe goroutine must have exited by the time probeReachable returns:
+	// the context cancelled the in-flight RPC and the goroutine was joined.
+	select {
+	case <-c.returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe goroutine not joined after timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*probeTimeout {
+		t.Fatalf("probe took %v, want ~%v", elapsed, probeTimeout)
 	}
 }
