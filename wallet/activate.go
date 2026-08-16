@@ -131,25 +131,28 @@ func (a *Activator) Activate(confs map[string]*config.CoinConf, exchangeWallets 
 	return connectors, drops
 }
 
-// ctxBlockCounter is the optional context-aware reachability surface: a
+// contextBlockCounter is the optional context-aware reachability surface: a
 // Connector may implement GetBlockCountContext so a timed-out probe cancels the
 // in-flight RPC instead of leaving the probe goroutine blocked until the wallet
-// RPC timeout.
-type ctxBlockCounter interface {
+// RPC timeout. Contract: the implementation must return as soon as ctx is done —
+// probeReachable waits for the probe goroutine on timeout, and that wait is
+// bounded so even a non-conforming implementation cannot hang the probe.
+type contextBlockCounter interface {
 	GetBlockCountContext(context.Context) (int64, error)
 }
 
 // probeReachable is the default reachability probe: a getblockcount round-trip
-// bounded by probeTimeout (the thin-client analog of C++ conn->init()). When the
-// connector supports GetBlockCountContext, the probe runs under a cancellable
-// context: on timeout the in-flight RPC is aborted and the probe goroutine is
-// joined before probeReachable returns, so a hung wallet cannot leave a
-// goroutine alive up to the wallet RPC timeout. Connectors without the
-// ctx-aware method (LocalConnector, test stubs) fall back to the bounded select.
+// bounded by probeTimeout (the thin-client analog of C++ conn->init(),
+// xbridgewalletconnectorbtc.cpp:1513-1525). When the connector supports
+// GetBlockCountContext, the probe runs under a cancellable context: on timeout
+// the in-flight RPC is aborted and the probe goroutine is waited for (bounded)
+// before probeReachable returns, so a hung wallet cannot leave a goroutine alive
+// up to the wallet RPC timeout. Connectors without the ctx-aware method
+// (LocalConnector, test stubs) fall back to the bounded select.
 func probeReachable(c Connector) error {
 	type result struct{ err error }
 	done := make(chan result, 1)
-	if bc, ok := c.(ctxBlockCounter); ok {
+	if bc, ok := c.(contextBlockCounter); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 		defer cancel()
 		go func() {
@@ -160,9 +163,15 @@ func probeReachable(c Connector) error {
 		case r := <-done:
 			return r.err
 		case <-ctx.Done():
-			// The context aborts the in-flight RPC; wait for the goroutine to
-			// exit so nothing outlives the probe.
-			<-done
+			// The context aborts the in-flight RPC; give the goroutine a bounded
+			// window to exit so nothing outlives the probe (a non-conforming
+			// implementer that ignores ctx cannot hang the caller).
+			joinTimer := time.NewTimer(probeTimeout)
+			select {
+			case <-done:
+				joinTimer.Stop()
+			case <-joinTimer.C:
+			}
 			return fmt.Errorf("probe timed out after %s", probeTimeout)
 		}
 	}
