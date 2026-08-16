@@ -812,3 +812,81 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 		t.Fatal("BroadcastRefund blocked forever on a dropped refund task")
 	}
 }
+
+// TestEngineAppliesResultBeforeNextPacket proves the engine drains a ready
+// worker result before judging an inbound packet for the same session: with a
+// session in the await state and both a completed-deposit result and a next-step
+// CreateA packet queued, the result apply must clear await first so the packet
+// is processed (deposit task posted → SendRawTransaction). If the packet is
+// judged first, processSwap drops it as a retransmit and no deposit is built.
+func TestEngineAppliesResultBeforeNextPacket(t *testing.T) {
+	n, _, gated, _ := setupTwoCoinNode(t)
+	defer gated.open() // runs before t.Cleanup's Close, so shutdown can always drain
+
+	// A maker session pinned to a registered hub so the CreateA packet passes
+	// verifyHubPacket, with funding so processing the packet posts a deposit.
+	mPriv, mPub := newKey(t)
+	_, tkPub := newKey(t)
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 2
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerHub(t, n, hubPriv)
+
+	var orderID [32]byte
+	copy(orderID[:], []byte("order-id-order-id-order-id-0"))
+	mkAddr := addrFor(0, "maker-btc-dest")
+	o := &Order{
+		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	}
+	n.newMakerSession(withUsedCoins(t, n, o, []wallet.Utxo{gated.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: mkAddr}, arr32(mPriv), toArr33(mPub))
+	n.submit(func() {
+		s := n.sessions[hexEncode(orderID[:])]
+		s.await = true // a deposit/claim task is "in flight"
+	}, true)
+
+	// Park the engine so both the result and the packet are queued before it
+	// returns to its select: with the flat select the packet could be picked
+	// while await is still set and dropped; with the priority select the result
+	// is always drained first.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unpark := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unpark() // safety net: a failing test must not hang Close on the parked engine
+	n.submit(func() { close(started); <-release }, false)
+	<-started
+
+	// The completed-deposit result (clears await) and the next-step CreateA.
+	n.results <- workResult{
+		task: workTask{
+			orderID: hexEncode(orderID[:]),
+			apply: func(v any, terr error) {
+				s := n.sessions[hexEncode(orderID[:])]
+				if s != nil {
+					s.await = false
+				}
+			},
+		},
+	}
+	n.packets <- inboundPacket{
+		pkt: hubSignedPkt(t, hubPriv, proto.XbcTransactionCreateA, &proto.CreateABody{
+			HubAddress: coins.KeyID(hubPub[:]), ID: orderID, BPubKey: to33(tkPub),
+		}),
+		snode: hex.EncodeToString(hubPub[:]),
+	}
+	unpark() // release the parked engine; the defer is a no-op safety net now
+
+	// The packet must be processed (deposit task reaches the wallet), proving the
+	// result apply ran before the packet was judged.
+	deadline := time.Now().Add(5 * time.Second)
+	for gated.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if c := gated.callCount(); c == 0 {
+		t.Fatalf("next-step packet dropped as a retransmit: result not applied before the packet (calls=%d)", c)
+	}
+}

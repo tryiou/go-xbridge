@@ -272,11 +272,12 @@ The engine is a **single owner**: one goroutine (`engineLoop`) owns all mutable
 state — `n.sessions`, the live book writes, refund state, and the persist path —
 so the swap handshake and the refund sweep can never race each other.
 
-- **`engineLoop`** selects over five inputs in priority order: handler commands
-  (`n.cmds`, from `submit`), decoded packets (`n.packets`, from the reader),
-  worker results (`n.results`), the 60 s refund/persist ticker, and `n.stop`.
-  Every handler runs inside `safeRun`, so a single bad packet can never kill the
-  engine.
+- **`engineLoop`** applies a worker result ready at the start of an iteration
+  first (so a session's await guard clears before a same-session packet is
+  judged), then selects among handler commands (`n.cmds`, from `submit`),
+  decoded packets (`n.packets`, from the reader), worker results (`n.results`),
+  the 60 s refund/persist ticker, and `n.stop`. Every handler runs inside
+  `safeRun`, so a single bad packet can never kill the engine.
 - **`readerLoop`** is the read half of the former `feed()`: it blocks on the
   socket, decodes + signature-verifies bodies, and forwards raw packets to the
   engine. A slow peer can no longer stall state processing, and malformed/forged
