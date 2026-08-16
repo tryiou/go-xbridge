@@ -262,6 +262,10 @@ func (n *Node) engineLoop() {
 			// Order-book expiry sweep (C++ checkAndEraseExpiredTransactions on
 			// the 15 s timer): prune open orders past their TTL/deadline.
 			n.safeRun(func() { n.pruneExpired() })
+			// Keep open maker orders alive: re-post them to the hub so they
+			// survive the 6-min PendingTTL (C++ checkAndRelayPendingOrders,
+			// xbridgeapp.cpp:3241, every 240 s).
+			n.safeRun(func() { n.rebroadcastOpenOrders() })
 		case <-n.stop:
 			return
 		}

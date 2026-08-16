@@ -43,8 +43,8 @@ func TestMakeOrderDeterministicID(t *testing.T) {
 	if o.ID != wantID {
 		t.Fatalf("order id = %x, want deterministic %x", o.ID, wantID)
 	}
-	if o.Status != "created" {
-		t.Fatalf("status = %q, want created", o.Status)
+	if o.Status != "open" {
+		t.Fatalf("status = %q, want open (trPending)", o.Status)
 	}
 	if len(o.Utxos) != 1 || o.Utxos[0].RawAddress != fromID {
 		t.Fatalf("utxos = %+v, want the single funded utxo at the maker address", o.Utxos)
@@ -148,8 +148,8 @@ func TestMakeOrderExactMatchPartial(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("MakeOrder(exact partial): %v", rerr)
 	}
-	if o.Status != "created" {
-		t.Fatalf("status = %q, want created (exact match)", o.Status)
+	if o.Status != "open" {
+		t.Fatalf("status = %q, want open (exact match, trPending)", o.Status)
 	}
 	if o.PrepTx != "" {
 		t.Fatalf("prep txid = %q, want empty for an exact match", o.PrepTx)

@@ -501,6 +501,8 @@ func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseB
 	src := [20]byte{}
 	copy(src[:], a.Hash)
 	s.state = csHoldApplied
+	// C++ maker/taker order both advance to trHold here (xbridgesession.cpp:1529).
+	s.setOrderStatus("hold")
 	xlog.Info("hold applied", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionHoldApply, &proto.HoldApplyBody{
 		HubAddress: s.hub, ClientAddress: src, ID: s.id,
@@ -568,6 +570,8 @@ func (s *SwapSession) OnInit(b *proto.InitBody) (proto.XBridgeCommand, responseB
 		return 0, nil, nil
 	}
 	s.state = csInitialized
+	// C++ maker/taker order both advance to trInitialized here (xbridgesession.cpp:1762).
+	s.setOrderStatus("initialized")
 	xlog.Info("initialized", "order", orderID, "state", s.state.String())
 	return proto.XbcTransactionInitialized, &proto.InitializedBody{
 		HubAddress: s.hub, ClientAddress: b.ClientAddress, ID: s.id,
@@ -608,6 +612,25 @@ func (s *SwapSession) order() *Order {
 		return nil
 	}
 	return s.n.store.Get(hexEncode(s.id[:]))
+}
+
+// setOrderStatus advances the order's client-descriptor Status to mirror the
+// C++ TransactionDescr::State progression the swap is driving
+// (xbridgesession.cpp:1529 trHold, :1762 trInitialized, :2174 trCreated). The
+// authoritative swap progress lives in s.state; this keeps the order's Status
+// field (what dxGetOrders/BLOCKDX surface) in lock-step so an in-swap order is
+// reported as hold/initialized/created rather than as a still-open order. This
+// is the inverse of the old "frozen Status" divergence, where a maker order
+// stayed at the initial status for the whole swap and the session state was the
+// only thing distinguishing in-swap from unmatched.
+func (s *SwapSession) setOrderStatus(status string) {
+	if s.n == nil || s.n.store == nil {
+		return
+	}
+	idHex := hexEncode(s.id[:])
+	s.n.store.Update(idHex, func(o *Order) {
+		o.Status = status
+	})
 }
 
 // decodeAddrHash decodes addrStr on cur into its 20-byte HASH160 (zero on an
@@ -701,6 +724,8 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 		o.RefundTx = out.refundHex
 	})
 	s.state = csCreatedA
+	// C++ maker order advances to trCreated here (xbridgesession.cpp:2174).
+	s.setOrderStatus("created")
 	xlog.Info("deposit A broadcast", "order", orderID, "txid", out.txid,
 		"lockTime", out.lockTime, "secretHash", hexEncode(s.secretHash[:]))
 	xlog.Debug("deposit A refund pre-signed", "order", orderID)
@@ -833,6 +858,8 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 		o.OOverpayment = out.check.Excess
 	})
 	s.state = csCreatedB
+	// C++ taker order advances to trCreated here (xbridgesession.cpp:2702).
+	s.setOrderStatus("created")
 	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
 		"lockTime", out.out.lockTime, "makerDeposit", s.theirDepositTxID)
 	xlog.Debug("deposit B refund pre-signed", "order", orderID)
@@ -1217,7 +1244,7 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 // and scanRefunds only sweeps sessions past it (swap.go:1205); the store order
 // is the fallback for the stored-order escape hatch, where no live session
 // exists, keyed on RefundTx (set exactly when the deposit was built, C++
-// trCreated — covering the taker too, whose stored status stays "accepting").
+// trCreated — covering the taker too, whose stored status now advances hold/initialized/created like the maker's, so the fallback keys on RefundTx rather than a status string).
 // Engine-owned (reads n.sessions); call from the engine or inline tests.
 func (n *Node) rollbackGate(orderID string) bool {
 	if s := n.sessions[orderID]; s != nil {

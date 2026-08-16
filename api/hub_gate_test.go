@@ -276,7 +276,7 @@ func TestMakeOrderReturnsStoreCopy(t *testing.T) {
 	if got.Updated != liveUpdated {
 		t.Fatalf("returned order aliases the live record: mutating it changed store Updated (%d -> %d)", liveUpdated, got.Updated)
 	}
-	if got.Status != "created" {
+	if got.Status != "open" {
 		t.Fatalf("returned order aliases the live record: mutating it changed store Status to %q", got.Status)
 	}
 

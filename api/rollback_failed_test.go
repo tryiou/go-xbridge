@@ -90,9 +90,10 @@ func TestRollbackFailedStatusOnRefundBroadcastFailure(t *testing.T) {
 // "rollback failed" only when the order's session has broadcast a deposit
 // (csCreatedA+ — the state >= trCreated analog, and the exact predicate
 // scanRefunds uses). The gate keys off the SESSION state, not the store order
-// ordinal: the taker's order stays "accepting" (ordinal 3) for its whole swap,
-// so an ordinal gate would never fire for taker refunds (C++ writes
-// trRollbackFailed for takers too). A pre-deposit session (state < csCreatedA)
+// ordinal: the taker's stored status now advances hold/initialized/created
+// like the maker's, so a status/ordinal-keyed gate would be unreliable across
+// roles (C++ writes trRollbackFailed for takers too). A pre-deposit session
+// (state < csCreatedA)
 // is left untouched.
 func TestRefundFailureStateGate(t *testing.T) {
 	ltc := &fakeConnector{ticker: "LTC", blockHeight: 1000, rawTx: map[string]string{}}

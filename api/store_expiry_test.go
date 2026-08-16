@@ -18,14 +18,15 @@ func expiryTestOrder(seed byte, status string, nowSec uint64, createdAgo, update
 	return o
 }
 
-// TestPruneExpiredCreatedTrNew verifies the trNew ("created") expiry rules:
-// created-age > DeadlineTTL, last-activity age > TTL, or block-height elapsed >
-// BlocksTTL. The inactivity TTL is 1 h, not the 6-min pendingTTL: the C++ APP
-// side (which governs a trader's own orders, xbridgeapp.cpp:3604-3634) only
-// transitions trNew to trOffline at pendingTTL and erases it after an hour of
-// no activity — the 6-min/block predicates come from the exchange-book sweep
-// (xbridgetransaction.cpp:268-311, xbridgeexchange.cpp:712-747). All
-// comparisons are strict >.
+// TestPruneExpiredCreatedTrNew exercises the store-level age rules for a
+// "created" order. In go-xbridge "created" is the in-swap trCreated state
+// (xbridgesession.cpp:2174); the node-level sweep keeps live in-swap orders out
+// of the prune set via the inSwap session guard (api/node.go pruneExpired), so
+// this branch only ever fires for an orphaned "created" order. The bounds
+// mirror the C++ APP-side ownership sweep (xbridgeapp.cpp:3604-3634): created
+// is treated with the trNew-style bounds — created-age > DeadlineTTL,
+// last-activity age > TTL (1 h, not the 6-min pendingTTL), or block-height
+// elapsed > BlocksTTL. All comparisons are strict >.
 func TestPruneExpiredCreatedTrNew(t *testing.T) {
 	now := time.Now()
 	nowSec := uint64(now.Unix())
@@ -175,13 +176,13 @@ func TestNodePruneExpired(t *testing.T) {
 	ctx.Store.Add(expired)
 	key := hexEncode(expired.ID[:])
 
-	// In-swap MAKER: the store order stays "created" for the whole swap and the
-	// handshake never advances its Status, so the session state is what tells
-	// the sweep an in-swap order from an unmatched one (C++ advances the
-	// descriptor to trHold, xbridgesession.cpp:1529). A maker session past its
-	// initial state must protect the order; an unmatched maker session (initial
-	// state) must not.
-	inSwap := expiryTestOrder(2, "created", nowSec, 0, swap.TTL+1)
+	// In-swap MAKER: the order now starts at "open" (trPending) and advances to
+	// hold/initialized/created as the swap drives it (api/swap.go setOrderStatus,
+	// mirroring C++ xbridgesession.cpp:1529/1762/2174). The inSwap guard below
+	// keys off the session state (past csMaker), which agrees with the order's
+	// Status: any session past the initial csMaker is in-swap or finished and
+	// must survive; an unmatched maker (still at csMaker) is sweepable.
+	inSwap := expiryTestOrder(2, "open", nowSec, 0, swap.TTL+1)
 	inSwapKey := hexEncode(inSwap.ID[:])
 	ctx.Store.Add(inSwap)
 	ctx.Node.sessions = map[string]*SwapSession{
@@ -198,7 +199,7 @@ func TestNodePruneExpired(t *testing.T) {
 	}
 
 	// Unmatched maker (session still at the initial csMaker state): sweepable.
-	unmatched := expiryTestOrder(3, "created", nowSec, 0, swap.TTL+1)
+	unmatched := expiryTestOrder(3, "open", nowSec, 0, swap.TTL+1)
 	unmatchedKey := hexEncode(unmatched.ID[:])
 	ctx.Store.Add(unmatched)
 	ctx.Node.sessions[unmatchedKey] = &SwapSession{n: ctx.Node, id: unmatched.ID, isMaker: true, state: csMaker}
