@@ -14,11 +14,15 @@ import (
 // the build-tagged re-exports in go-xbridge/api/export_conformance.go (which
 // exists only under `-tags conformance`).
 //
-// fxErrorName / fxResponseKeys are NOT wired: they require a live api.Handler
-// with a fixture store + connectors to drive business-error paths and render
-// response objects. Until such a fixture harness exists, the tests that use
-// them (TestRPCMethodNameField, TestRPCResponseShape) t.Skip — the reference
-// vectors they encode remain complete in this file.
+// fxErrorName / fxResponseKeys are wired to a live fixture HandlerCtx in
+// package api: directly-constructed Nodes (no engine/dial) with seeded stores
+// and stub connectors, so the suite drives the REAL dispatch/handler paths.
+// The write-command response rows (dxMakeOrder / dxMakePartialOrder /
+// dxTakeOrder / dxCancelOrder) need a full hub + stub XConn + funded
+// connectors to reach a SUCCESS shape; the suite does not drive those from the
+// fixture (their refKeys are documented known-gap skips — the shapes are
+// already covered by the api KAT tests), so the fixture covers the read-only
+// methods.
 
 func init() {
 	fxXbridgeErrorText = api.XbridgeErrorText
@@ -29,4 +33,6 @@ func init() {
 	fxParseXAmount = api.ParseXAmount
 	fxLocktimeConstants = api.LocktimeConstants
 	fxOrderBookResultJSON = api.OrderBookResultJSON
+	fxErrorName = api.ConformanceErrorName
+	fxResponseKeys = api.ConformanceResponseKeys
 }
