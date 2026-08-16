@@ -182,18 +182,24 @@ type Node struct {
 	// suite relies on.
 	engineRunning atomic.Bool
 
-	// Engine channels: packets carries reader→engine traffic, cmds carries
-	// handler→engine commands, tasks carries engine→worker wallet RPCs, and
-	// results carries worker→engine outcomes. Buffers: packets drop-on-full
-	// (a busy engine drops inbound broadcasts, like C++ under load), cmds
-	// backpressure (never drop — a lost make/take/cancel is worse than a slow
-	// handler), tasks drop-on-full (fund-safe: the refund guard is cleared so
-	// the next sweep retries), results == engineWorkers (a result send can
-	// never block once the engine is gone).
+	// Engine channels: packets carries reader→engine traffic and
+	// backpressures (a full channel parks the reader until the engine drains,
+	// matching C++'s synchronous net thread xbridgeapp.cpp:645-723,763 and the
+	// discovery readLoop peer_manager.go:405-409), cmds backpressures (never
+	// drop — a lost make/take/cancel is worse than a slow handler), tasks
+	// drop-on-full (fund-safe: the refund guard is cleared so the next sweep
+	// retries), results == engineWorkers (a result send can never block once
+	// the engine is gone).
 	packets chan inboundPacket
 	cmds    chan engineCmd
 	tasks   chan workTask
 	results chan workResult
+
+	// packetsDropped counts inbound packets lost at reader shutdown (the
+	// engine stopped before a parked send completed). After the blocking-send
+	// reader this is the ONLY loss path, so a nonzero live-engine count means
+	// a drop-on-full regression. Surfaced in logNetworkStatus.
+	packetsDropped atomic.Uint64
 
 	// wg tracks the engine, reader, workers, blockLoop, statusLoop, sweepLoop,
 	// and persistLoop so Close can join them all before returning.
@@ -1008,6 +1014,7 @@ func (n *Node) logNetworkStatus() {
 		"peers", peers,
 		"addrs", addrs,
 		"servicenodes", snodes,
+		"packets_dropped", n.packetsDropped.Load(),
 		"tokens", strings.Join(n.NetworkTokens(), ","))
 }
 
