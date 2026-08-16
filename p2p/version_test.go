@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -169,5 +170,98 @@ func TestNetAddrRoundTrip(t *testing.T) {
 	}
 	if _, _, err := unmarshalNetAddr(b[:25]); err == nil {
 		t.Error("unmarshalNetAddr(<26 bytes) should error")
+	}
+}
+
+// TestMarshalVarStrFullCompactSize verifies marshalVarStr emits the complete
+// CompactSize range, mirroring C++ WriteCompactSize (serialize.h:255-273). The
+// old writer only handled the single-byte and 0xFD (uint16) forms; a string
+// longer than 0xFFFF wrapped its length in uint16, so a 0x10000-byte string
+// produced a 0xFD-prefixed zero-length header (corrupt). Each boundary must
+// round-trip through unmarshalVarStr and carry the correct prefix byte.
+func TestMarshalVarStrFullCompactSize(t *testing.T) {
+	cases := []struct {
+		name string
+		n    int
+	}{
+		{"single-byte-max", 0xFC},                 // 1-byte prefix (len < 0xFD)
+		{"uint16-min", 0xFD},                      // 0xFD + uint16 lower bound
+		{"uint16-max", 0xFFFF},                    // 0xFD + uint16 upper bound
+		{"uint32-min", 0x10000},                   // 0xFE + uint32 lower bound (old code wrapped to zero length)
+		{"uint32-mid", 0x10001},                   // just past the wrap point
+		{"uint32-large", 0x01000000},              // 16 MiB, well into the 0xFE range
+		{"uint32-max", 0xFFFFFFFF},                // 0xFE + uint32 upper bound (prefix-only, 4 GiB payload)
+		{"uint64-min-representable", 0x100000000}, // 0xFF + uint64 (4 GiB — no payload copy)
+	}
+	// allocatablePayload is the largest varstr payload a test allocates for a
+	// real round-trip; larger cases assert the header via writeVarInt only.
+	const allocatablePayload = 16 << 20 // 16 MiB
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var b []byte
+			if c.n <= allocatablePayload {
+				// Real payload for the affordable cases.
+				s := make([]byte, c.n)
+				for i := range s {
+					s[i] = byte(i)
+				}
+				b = marshalVarStr(string(s))
+				got, n, err := unmarshalVarStr(b)
+				if err != nil {
+					t.Fatalf("unmarshalVarStr: %v", err)
+				}
+				if n != len(b) {
+					t.Errorf("consumed = %d, want %d (no trailing bytes)", n, len(b))
+				}
+				if len(got) != c.n {
+					t.Errorf("round-trip length = %d, want %d", len(got), c.n)
+				}
+				if !bytes.Equal([]byte(got), s) {
+					t.Error("round-trip content differs from the payload")
+				}
+			} else {
+				// 4 GiB+ payloads are not allocatable; assert the 0xFE/0xFF
+				// headers via writeVarInt directly (0xFE + uint32 LE,
+				// 0xFF + uint64 LE).
+				got := writeVarInt(c.n)
+				wantFirst := byte(0xFE)
+				var wantLen uint64
+				if c.n > 0xFFFFFFFF {
+					wantFirst = 0xFF
+					wantLen = uint64(c.n)
+				} else {
+					wantLen = uint64(c.n)
+				}
+				if got[0] != wantFirst {
+					t.Errorf("prefix byte = 0x%02x, want 0x%02x", got[0], wantFirst)
+				}
+				if c.n <= 0xFFFFFFFF {
+					if l := binary.LittleEndian.Uint32(got[1:5]); uint64(l) != wantLen {
+						t.Errorf("0xFE length field = %d, want %d", l, wantLen)
+					}
+				} else if l := binary.LittleEndian.Uint64(got[1:9]); l != wantLen {
+					t.Errorf("0xFF length field = %d, want %d", l, wantLen)
+				}
+			}
+		})
+	}
+}
+
+// TestMarshalVarStrPrefixBytes locks in the exact prefix byte per CompactSize
+// range, so a regression to the 0xFD-only writer is caught directly (the
+// uint32-min case previously emitted 0xFD + a wrapped uint16).
+func TestMarshalVarStrPrefixBytes(t *testing.T) {
+	prefixFor := func(n int) byte {
+		b := marshalVarStr(string(make([]byte, n)))
+		return b[0]
+	}
+	if got := prefixFor(0x10); got != 0x10 {
+		t.Errorf("len 0x10 prefix = 0x%02x, want single-byte", got)
+	}
+	if got := prefixFor(0xFD); got != 0xFD {
+		t.Errorf("len 0xFD prefix = 0x%02x, want 0xFD", got)
+	}
+	if got := prefixFor(0x10000); got != 0xFE {
+		t.Errorf("len 0x10000 prefix = 0x%02x, want 0xFE (was 0xFD + wrapped length)", got)
 	}
 }
