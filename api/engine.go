@@ -330,25 +330,41 @@ func (n *Node) writeLatestPersist() {
 		n.persistFailures.Add(1)
 		return
 	}
-	// Retry a transient disk failure with bounded backoff before giving up, so a
-	// brief write error does not silently drop the only durable copy of in-flight
-	// swap state (a restart would then be unable to refund/claim — fund loss).
-	// C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes the orders DB via
-	// xdb.Write with no retry; this port adds bounded retry so a transient EIO is
-	// survived rather than silently losing the only durable copy.
+	// Serialize the actual disk write with persistNow so a blocking durable
+	// write at the make-order send boundary can never race or be clobbered by
+	// this loop's stale queued snapshot.
+	n.persistWriteMu.Lock()
+	defer n.persistWriteMu.Unlock()
+	// Retry a transient error with bounded backoff before giving up; on final
+	// failure count it. A brief write error must not silently drop the only
+	// durable copy of in-flight swap state (a restart would then be unable to
+	// refund/claim — fund loss). C++ App::saveOrders (xbridgeapp.cpp:3868-3898)
+	// writes the orders DB via xdb.Write with no retry; this port adds bounded
+	// retry so a transient EIO is survived rather than silently lost.
+	if err := writeSwapsWithRetry(job.path, data); err != nil {
+		xlog.Error("swap persist failed after retries", "dir", filepath.Dir(job.path), "err", err)
+		n.persistFailures.Add(1)
+	}
+}
+
+// writeSwapsWithRetry attempts the durable swap-file write with bounded
+// exponential backoff (persistWriteMaxAttempts attempts, persistWriteBackoff
+// step) so a transient disk error (EIO/ENOSPC stall) is survived rather than
+// silently dropping the only durable copy of in-flight swap state. It returns
+// the last error if every attempt fails.
+func writeSwapsWithRetry(path string, data []byte) error {
 	var lastErr error
 	for attempt := 0; attempt < persistWriteMaxAttempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(persistWriteBackoff << (attempt - 1))
 		}
-		if err := writeSwaps(job.path, data); err != nil {
+		if err := writeSwaps(path, data); err != nil {
 			lastErr = err
 			continue
 		}
-		return
+		return nil
 	}
-	xlog.Error("swap persist failed after retries", "dir", filepath.Dir(job.path), "err", lastErr)
-	n.persistFailures.Add(1)
+	return lastErr
 }
 
 // persistWrite* bound the retry of a durable swap-state write. Three attempts

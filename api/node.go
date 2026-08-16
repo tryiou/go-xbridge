@@ -215,7 +215,15 @@ type Node struct {
 	// in-flight write is never duplicated.
 	persistMu     sync.Mutex
 	persistLatest *persistJob
-	persistSignal chan struct{}
+	// persistWriteMu serializes the actual disk write so the blocking
+	// persistNow (called at the make-order send boundary) and the background
+	// persistLoop never race on the same swap-state file, nor can a stale
+	// queued snapshot clobber a newer durable write. Both writers take
+	// persistMu, release it, then take persistWriteMu (persistNow also clears
+	// persistLatest under persistMu first) — never nested — so there is no
+	// lock-order cycle.
+	persistWriteMu sync.Mutex
+	persistSignal  chan struct{}
 	// persistUp is true once start() has launched persistLoop. persist() writes
 	// synchronously when it is false (inline/test mode, no loop to hand to).
 	persistUp atomic.Bool
@@ -1744,17 +1752,32 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 				stored = n.store.Get(hexEncode(o.ID[:]))
 				return
 			}
+			// Register the client-side session (per-trade M keypair) first, then
+			// durably persist BEFORE sending, so a crash after the send can never
+			// leave the hub knowing an order the local state hasn't recorded
+			// (which would strand a take on restart — fund loss). On a persist or
+			// send failure, roll back the store entry + session so no locally
+			// live / hub-unknown orphan remains.
+			n.newMakerSession(o, p, mPrivArr, mPub)
+			if err := n.persistNow(); err != nil {
+				delete(n.sessions, hexEncode(o.ID[:]))
+				n.store.Remove(hexEncode(o.ID[:]))
+				rerr = makeError(errUnknown, "dxMakeOrder", err.Error())
+				return
+			}
 			// SEND is addressed to the chosen hub's envelope address (C++
 			// onSend(ptr->hubAddress, ...), xbridgeapp.cpp:2100). The hub relays
 			// it to counterparties as an xbcPendingTransaction broadcast.
 			if err := n.conn.WritePacket(pkt, hubAddr); err != nil {
+				// Roll back both the in-memory session/order AND the durable
+				// copy we just wrote (best-effort flush), so no locally-live /
+				// hub-unknown orphan remains on disk either.
+				delete(n.sessions, hexEncode(o.ID[:]))
+				n.store.Remove(hexEncode(o.ID[:]))
+				_ = n.persistNow()
 				rerr = makeError(errUnknown, "dxMakeOrder", err.Error())
 				return
 			}
-			// Begin driving the client-side deposit handshake for this order.
-			n.newMakerSession(o, p, mPrivArr, mPub)
-			// Persist the new local swap (incl. its per-trade M keypair) to disk.
-			n.persist()
 			stored = n.store.Get(hexEncode(o.ID[:]))
 		}, true)
 		if rerr != nil {

@@ -234,6 +234,45 @@ type persistJob struct {
 	swaps []persistedSwap
 }
 
+// persistNow durably writes the current swap snapshot to disk synchronously
+// (marshal + fsync + atomic rename), blocking the caller. It is used at the
+// critical boundary immediately before sending an outbound swap/make-order
+// response, so a crash after the send can never leave the hub knowing state the
+// local durable copy lacks (which would strand a restarted swap — fund loss).
+// C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes on a timer with no
+// before-send guarantee; this port makes the durable write precede the send.
+// Runs on the engine goroutine (snapshotSwaps reads the engine-owned session
+// map), never from a test/HTTP goroutine on a started node.
+func (n *Node) persistNow() error {
+	cfg := n.cfg()
+	if cfg == nil || cfg.DataDir == "" {
+		return nil
+	}
+	path := swapStatePath(cfg.DataDir)
+	// Invalidate any queued async snapshot BEFORE writing, so the background
+	// persistLoop cannot later flush a stale snapshot (taken before this one)
+	// over the just-written state. Lock order matches writeLatestPersist
+	// (persistMu then persistWriteMu) to avoid a deadlock.
+	n.persistMu.Lock()
+	n.persistLatest = nil
+	n.persistMu.Unlock()
+	n.persistWriteMu.Lock()
+	defer n.persistWriteMu.Unlock()
+	swaps := snapshotSwaps(n)
+	data, err := marshalSwapFile(swaps)
+	if err != nil {
+		xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
+		n.persistFailures.Add(1)
+		return err
+	}
+	if err := writeSwapsWithRetry(path, data); err != nil {
+		xlog.Error("swap persist failed after retries", "dir", cfg.DataDir, "err", err)
+		n.persistFailures.Add(1)
+		return err
+	}
+	return nil
+}
+
 // persist flushes local swap state to disk without blocking the engine on
 // marshal or fsync. The snapshot flatten (reading the engine-owned n.sessions)
 // runs on the engine goroutine; the marshal + checksum + temp-write/fsync/rename
