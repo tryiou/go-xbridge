@@ -260,7 +260,9 @@ is. Contracts, response shapes and error codes are in [`api.md`](api.md).
   (wallet I/O on workers) and the engine-scheduled refund sweep.
 - `engine.go` — the single-owner engine goroutine + worker pool (below).
 - `persist.go` — per-trade state + keypair persistence to
-  `<datadir>/xbridged-swaps.json`, written on the engine goroutine.
+  `<datadir>/xbridged-swaps.json`, flattened on the engine goroutine; the
+  JSON marshal + checksum and the disk write run on the background `persistLoop`
+  (when the engine is not started, they run synchronously).
 - `locktime.go` — `acceptableLockTimeDrift`/`computeLockTimeFor` validating the
   counterparty deposit lockTime before our deposit/redeem.
 

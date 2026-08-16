@@ -64,6 +64,43 @@ func TestPersistDoesNotBlockEngine(t *testing.T) {
 	unblock()
 }
 
+// TestPersistMarshalOffEngine — a parked marshal must not stall the engine:
+// persist() flattens on the engine and publishes non-blocking, the persistLoop
+// does the JSON marshal + fsync, and the engine keeps processing awaited
+// commands while the marshal is blocked.
+func TestPersistMarshalOffEngine(t *testing.T) {
+	n := persistNode(t)
+
+	marshalParked := make(chan struct{})
+	release := make(chan struct{})
+	var parkOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	orig := marshalSwapFile
+	marshalSwapFile = func(swaps []persistedSwap) ([]byte, error) {
+		parkOnce.Do(func() { close(marshalParked) })
+		<-release
+		return orig(swaps)
+	}
+	// Cleanup order matters: this runs BEFORE persistNode's Close cleanup (LIFO),
+	// so the parked marshal is released before Close joins the persistLoop.
+	t.Cleanup(func() { marshalSwapFile = orig; unblock() })
+
+	// Engine-side persist whose marshal parks on the gate.
+	addLocalOrder(n, 1)
+	n.submit(func() { n.persist() }, true)
+	<-marshalParked // the marshal is now in flight on the persistLoop
+
+	// The engine must still process an awaited command promptly.
+	done := make(chan struct{})
+	n.submit(func() { close(done) }, true)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine blocked on a background persist marshal")
+	}
+	unblock()
+}
+
 // TestPersistCoalescesBurst — a burst of engine persists must collapse into the
 // newest snapshot: with the first disk write parked, two more publishes leave
 // one pending signal + one latest slot, so exactly two writes happen (A then
