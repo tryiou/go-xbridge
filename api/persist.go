@@ -10,6 +10,7 @@ import (
 
 	xlog "go-xbridge/log"
 	"go-xbridge/proto"
+	"go-xbridge/wallet"
 )
 
 // persistedSwap is the on-disk record of one local (Mine) swap, merging the
@@ -53,6 +54,12 @@ type persistedSwap struct {
 	Status           string            `json:"status"`
 	Utxos            []proto.UtxoEntry `json:"utxos"`
 	UtxoCurrency     string            `json:"utxoCurrency"`
+
+	// UsedCoins is the recorded funding UTXO selection (C++ xtx->usedCoins,
+	// xbridgetransactiondescr.h:136 READWRITE(usedCoins)). C++ persists it and
+	// rebuilds the deposit from it after a restart; mirror that so a pre-deposit
+	// crash can resume the maker/taker deposit instead of stalling.
+	UsedCoins []wallet.Utxo `json:"usedCoins"`
 
 	SNodePubkey          string   `json:"sNodePubkey"`
 	HubAddress           [20]byte `json:"hubAddress"`
@@ -353,6 +360,7 @@ func orderFields(o *Order) persistedSwap {
 		Status:           o.Status,
 		Utxos:            o.Utxos,
 		UtxoCurrency:     o.UtxoCurrency,
+		UsedCoins:        o.UsedCoins,
 
 		SNodePubkey:          o.SNodePubkey,
 		HubAddress:           o.HubAddress,
@@ -519,6 +527,7 @@ func buildOrder(ps persistedSwap) *Order {
 		Status:           ps.Status,
 		Utxos:            ps.Utxos,
 		UtxoCurrency:     ps.UtxoCurrency,
+		UsedCoins:        ps.UsedCoins,
 		Mine:             true,
 
 		SNodePubkey:          ps.SNodePubkey,
