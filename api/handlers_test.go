@@ -1049,58 +1049,71 @@ func TestGetNetworkInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getNetworkInfo: %v", err)
 	}
-	m, ok := res.(map[string]interface{})
+	n, ok := res.(networkInfoResult)
 	if !ok {
-		t.Fatalf("getNetworkInfo result = %T", res)
+		t.Fatalf("getNetworkInfo result = %T, want networkInfoResult", res)
 	}
-	if m["version"] != 4040100 {
-		t.Errorf("version = %v, want 4040100", m["version"])
+	if n.Version != 4040100 {
+		t.Errorf("version = %v, want 4040100", n.Version)
 	}
-	if m["subversion"] != "/Blocknet:4.4.1/" {
-		t.Errorf("subversion = %v, want /Blocknet:4.4.1/", m["subversion"])
+	if n.Subversion != "/Blocknet:4.4.1/" {
+		t.Errorf("subversion = %v, want /Blocknet:4.4.1/", n.Subversion)
 	}
 	// Alignment with real blocknetd (rpc/net.cpp:495-527, version.h).
-	if m["protocolversion"] != 70713 {
-		t.Errorf("protocolversion = %v, want 70713", m["protocolversion"])
+	if n.ProtocolVersion != 70713 {
+		t.Errorf("protocolversion = %v, want 70713", n.ProtocolVersion)
 	}
-	if m["xbridgeprotocolversion"] != 55 {
-		t.Errorf("xbridgeprotocolversion = %v, want 55", m["xbridgeprotocolversion"])
+	if n.XBridgeProtocolVersion != 55 {
+		t.Errorf("xbridgeprotocolversion = %v, want 55", n.XBridgeProtocolVersion)
 	}
-	if m["xrouterprotocolversion"] != 50 {
-		t.Errorf("xrouterprotocolversion = %v, want 50", m["xrouterprotocolversion"])
+	if n.XRouterProtocolVersion != 50 {
+		t.Errorf("xrouterprotocolversion = %v, want 50", n.XRouterProtocolVersion)
 	}
-	if m["relayfee"] != "0.00010000" {
-		t.Errorf("relayfee = %v, want \"0.00010000\"", m["relayfee"])
+	// Fees render as JSON numbers with 8 decimals (ValueFromAmount), exactly
+	// as blocknetd — not strings.
+	if n.RelayFee != json.Number("0.00010000") {
+		t.Errorf("relayfee = %v, want 0.00010000 (number)", n.RelayFee)
 	}
-	if m["incrementalfee"] != "0.00001000" {
-		t.Errorf("incrementalfee = %v, want \"0.00001000\"", m["incrementalfee"])
+	if n.IncrementalFee != json.Number("0.00001000") {
+		t.Errorf("incrementalfee = %v, want 0.00001000 (number)", n.IncrementalFee)
 	}
-	nets, ok := m["networks"].([]map[string]interface{})
-	if !ok || len(nets) != 3 {
-		t.Fatalf("networks = %v (%T), want 3 entries", m["networks"], m["networks"])
+	if len(n.Networks) != 3 {
+		t.Fatalf("networks = %v, want 3 entries", n.Networks)
 	}
-	for _, n := range nets {
-		if n["proxy_randomize_credentials"] != false {
-			t.Errorf("networks[].proxy_randomize_credentials = %v, want false", n["proxy_randomize_credentials"])
+	for _, e := range n.Networks {
+		if e.ProxyRandomizeCredentials != false {
+			t.Errorf("networks[].proxy_randomize_credentials = %v, want false", e.ProxyRandomizeCredentials)
 		}
 	}
-	// Key set must be the 15 C++ getnetworkinfo fields (order is sorted-map).
-	wantKeys := []string{
+	// Raw key order must match blocknetd's struct order (rpc/net.cpp:495-527),
+	// top level and inside networks entries.
+	raw, merr := json.Marshal(res)
+	if merr != nil {
+		t.Fatalf("marshal getnetworkinfo: %v", merr)
+	}
+	wantOrder := []string{
 		"version", "subversion", "protocolversion", "xbridgeprotocolversion",
 		"xrouterprotocolversion", "localservices", "localrelay", "timeoffset",
 		"networkactive", "connections", "networks", "relayfee", "incrementalfee",
 		"localaddresses", "warnings",
 	}
-	if len(m) != len(wantKeys) {
-		t.Errorf("field count = %d, want %d", len(m), len(wantKeys))
-	}
-	for _, k := range wantKeys {
-		if _, ok := m[k]; !ok {
+	last := -1
+	for _, k := range wantOrder {
+		i := strings.Index(string(raw), `"`+k+`":`)
+		if i < 0 {
 			t.Errorf("missing getnetworkinfo field %q", k)
+			continue
 		}
+		if i < last {
+			t.Errorf("getnetworkinfo field %q out of C++ order", k)
+		}
+		last = i
 	}
-	if m["connections"] != 0 {
-		t.Errorf("connections = %v, want 0 (no live conn)", m["connections"])
+	if !strings.Contains(string(raw), `"relayfee":0.00010000`) {
+		t.Errorf("relayfee not rendered as bare 0.00010000: %s", raw)
+	}
+	if n.Connections != 0 {
+		t.Errorf("connections = %v, want 0 (no live conn)", n.Connections)
 	}
 	// Rejects params.
 	if _, err := ctx.getNetworkInfo([]json.RawMessage{jstr("x")}); err == nil {
@@ -1110,9 +1123,9 @@ func TestGetNetworkInfo(t *testing.T) {
 	// Explicit Config overrides the defaults.
 	ctx2 := &HandlerCtx{Store: NewStore(), Node: &Node{config: &Config{WalletVersion: 4120000, WalletVersionStr: "/blocknet:4.12.0/"}}}
 	res2, _ := ctx2.getNetworkInfo(nil)
-	m2 := res2.(map[string]interface{})
-	if m2["version"] != 4120000 || m2["subversion"] != "/blocknet:4.12.0/" {
-		t.Errorf("override = %v / %v", m2["version"], m2["subversion"])
+	n2 := res2.(networkInfoResult)
+	if n2.Version != 4120000 || n2.Subversion != "/blocknet:4.12.0/" {
+		t.Errorf("override = %v / %v", n2.Version, n2.Subversion)
 	}
 }
 

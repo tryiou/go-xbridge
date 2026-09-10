@@ -457,10 +457,11 @@ func TestRPCResponseShape(t *testing.T) {
 		// (dxGetUtxos/key-order).
 		{method: "dxGetUtxos", mode: "set", div: true, id: "dxGetUtxos/key-order", refKeys: []string{
 			"txid", "vout", "amount", "address", "scriptPubKey", "confirmations", "orderid"}},
-		// getnetworkinfo: 15 C++ fields (net.cpp:495-527). All 15 now emitted;
-		// the remaining divergence is CAND map -> sorted key order
-		// (handlers.go:2082-2128). DIVERGENT (getnetworkinfo/fields).
-		{method: "getnetworkinfo", mode: "set", div: true, id: "getnetworkinfo/fields", refKeys: []string{
+		// getnetworkinfo: 15 C++ fields in C++ order (net.cpp:495-527).
+		// CONFORMANT (ordered struct). The remaining live divergence is the
+		// localservices VALUE (thin client reports its own capability bits,
+		// not a full node's) — a value decision, not a shape gap.
+		{method: "getnetworkinfo", mode: "exact", refKeys: []string{
 			"version", "subversion", "protocolversion", "xbridgeprotocolversion",
 			"xrouterprotocolversion", "localservices", "localrelay", "timeoffset",
 			"networkactive", "connections", "networks", "relayfee", "incrementalfee",

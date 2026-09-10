@@ -102,6 +102,43 @@ type partialChainDetailsResult struct {
 	P2SHDepositsCounterparty []string `json:"p2sh_deposits_counterparty"`
 }
 
+// networkInfoEntry is one getnetworkinfo networks element. Field ORDER matches
+// blocknetd (rpc/net.cpp:495-527): name, limited, reachable, proxy,
+// proxy_randomize_credentials.
+type networkInfoEntry struct {
+	Name                      string `json:"name"`
+	Limited                   bool   `json:"limited"`
+	Reachable                 bool   `json:"reachable"`
+	Proxy                     string `json:"proxy"`
+	ProxyRandomizeCredentials bool   `json:"proxy_randomize_credentials"`
+}
+
+// networkInfoResult is the getnetworkinfo success object. Field ORDER matches
+// blocknetd (rpc/net.cpp:495-527): version, subversion, protocolversion,
+// xbridgeprotocolversion, xrouterprotocolversion, localservices, localrelay,
+// timeoffset, networkactive, connections, networks, relayfee, incrementalfee,
+// localaddresses, warnings. Fees render as JSON numbers with 8 decimals
+// (ValueFromAmount), hence json.Number carrying the exact literal — a float64
+// would marshal as 0.0001 and break byte parity. localservices deliberately
+// reports the thin client's own capability bits, not a full node's.
+type networkInfoResult struct {
+	Version                int                `json:"version"`
+	Subversion             string             `json:"subversion"`
+	ProtocolVersion        int                `json:"protocolversion"`
+	XBridgeProtocolVersion int                `json:"xbridgeprotocolversion"`
+	XRouterProtocolVersion int                `json:"xrouterprotocolversion"`
+	LocalServices          string             `json:"localservices"`
+	LocalRelay             bool               `json:"localrelay"`
+	TimeOffset             int                `json:"timeoffset"`
+	NetworkActive          bool               `json:"networkactive"`
+	Connections            int                `json:"connections"`
+	Networks               []networkInfoEntry `json:"networks"`
+	RelayFee               json.Number        `json:"relayfee"`
+	IncrementalFee         json.Number        `json:"incrementalfee"`
+	LocalAddresses         []interface{}      `json:"localaddresses"`
+	Warnings               string             `json:"warnings"`
+}
+
 // flushCancelledResult is the dxFlushCancelledOrders success object. Field ORDER
 // matches the C++ writer (rpcxbridge.cpp:1474-1489): ageMillis, now,
 // durationMicrosec, flushedOrders.

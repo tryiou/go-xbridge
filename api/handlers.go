@@ -2066,29 +2066,31 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 			conns = 1
 		}
 	}
-	return map[string]interface{}{
-		"version":    ver,
-		"subversion": sub,
+	return networkInfoResult{
+		Version:    ver,
+		Subversion: sub,
 		// Alignment with real blocknetd (rpc/net.cpp:495-527): protocol
 		// version 70713 (version.h), XBridge 55 / XRouter 50 (xbridge,xrouter
-		// version.h), 8-decimal ValueFromAmount fee strings, networks entries
-		// carrying proxy_randomize_credentials.
-		"protocolversion":        70713,
-		"xbridgeprotocolversion": 55,
-		"xrouterprotocolversion": 50,
-		"localservices":          "000000000000000d",
-		"localrelay":             true,
-		"timeoffset":             0,
-		"networkactive":          true,
-		"connections":            conns,
-		"networks": []map[string]interface{}{
-			{"name": "ipv4", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
-			{"name": "ipv6", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
-			{"name": "onion", "limited": true, "reachable": false, "proxy": "", "proxy_randomize_credentials": false},
+		// version.h), networks entries carrying proxy_randomize_credentials.
+		// Fees are JSON numbers with 8 decimals (ValueFromAmount), not
+		// strings. localservices reports the thin client's own capability
+		// bits — deliberately not a full node's bits.
+		ProtocolVersion:        70713,
+		XBridgeProtocolVersion: 55,
+		XRouterProtocolVersion: 50,
+		LocalServices:          "000000000000000d",
+		LocalRelay:             true,
+		TimeOffset:             0,
+		NetworkActive:          true,
+		Connections:            conns,
+		Networks: []networkInfoEntry{
+			{Name: "ipv4", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "ipv6", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "onion", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
 		},
-		"relayfee":       "0.00010000",
-		"incrementalfee": "0.00001000",
-		"localaddresses": []interface{}{},
-		"warnings":       "",
+		RelayFee:       json.Number("0.00010000"),
+		IncrementalFee: json.Number("0.00001000"),
+		LocalAddresses: []interface{}{},
+		Warnings:       "",
 	}, nil
 }
