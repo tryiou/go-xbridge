@@ -456,6 +456,90 @@ func TestDxSplitChangeToRequestedAddress(t *testing.T) {
 	}
 }
 
+// TestDxSplitOutputsCarryOneSatBump locks in C++ output-value parity: C++
+// createTransaction builds CTxOut(out.second * COIN)
+// (xbridgewalletconnectorbtc.cpp:2451) where out.second already carries the
+// +1sat nudge from xBridgeValueFromAmount (xutil.cpp:276-280). A clean 0.5
+// split output is therefore 50000001 sats, not 50000000 — verified against a
+// live Core template (split-show baseline: 57 outputs at 50000001 on Core vs
+// 50000000 on go-xbridge).
+func TestDxSplitOutputsCarryOneSatBump(t *testing.T) {
+	ctx := newWalletTestCtx()
+	res, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("true"), json.RawMessage("false"),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitAddress: %v", err)
+	}
+	m := mustJSONMap(t, res)
+	wire, derr := hex.DecodeString(m["rawtx"].(string))
+	if derr != nil {
+		t.Fatalf("decode rawtx: %v", derr)
+	}
+	tx, derr := coins.Deserialize(wire)
+	if derr != nil {
+		t.Fatalf("deserialize rawtx: %v", derr)
+	}
+	if len(tx.Outputs) == 0 {
+		t.Fatal("no outputs in split tx")
+	}
+	// The first output is always a full split (fee claw-back hits the last).
+	if tx.Outputs[0].Value != 50000001 {
+		t.Errorf("split output = %d sats, want 50000001 (C++ +1sat bump)", tx.Outputs[0].Value)
+	}
+}
+
+// TestDxSplitSkipsNonP2PKH locks in the C++ getUnspent filter: only P2PKH
+// outputs (25-byte 76a914{20}88ac) are eligible for splitting, for both the
+// auto and the explicit path (xbridgewalletconnectorbtc.cpp:1617-1636). A
+// P2SH utxo sent to the split address must not contribute to the split.
+func TestDxSplitSkipsNonP2PKH(t *testing.T) {
+	ctx := newWalletTestCtx()
+	stub := ctx.Node.config.Connectors["BTC"].(*stubConn)
+	stub.utxos = append(stub.utxos, wallet.Utxo{
+		// 0.7 on purpose: a 0.5 P2SH utxo would be dropped by the
+		// already-split-size rule instead, hiding the script filter.
+		TxID: "1111111111111111111111111111111111111111111111111111111111111111", Vout: 1,
+		Amount: 70000000, Value: 0.7,
+		ScriptPubKey: "a914000000000000000000000000000000000000000087", Address: btcAddr,
+	})
+	res, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("false"),
+	})
+	if err != nil {
+		t.Fatalf("dxSplitAddress: %v", err)
+	}
+	if m := mustJSONMap(t, res); m["split_total"] != "1.000000" {
+		t.Errorf("split_total = %v, want 1.000000 (P2SH utxo excluded)", m["split_total"])
+	}
+}
+
+// TestDxSplitInputsRejectsNonP2PKH locks in the explicit path of the C++
+// getUnspent filter (xbridgewalletconnectorbtc.cpp:1617-1636, applied at
+// splitUtxos entry before user-utxo matching at :2650-2665): user-specified
+// utxos resolve against the P2PKH-filtered unspent list, so a P2SH utxo
+// reports "not found or not available" (1004), exactly as C++.
+func TestDxSplitInputsRejectsNonP2PKH(t *testing.T) {
+	ctx := newWalletTestCtx()
+	stub := ctx.Node.config.Connectors["BTC"].(*stubConn)
+	p2shTxid := "2222222222222222222222222222222222222222222222222222222222222222"
+	stub.utxos = append(stub.utxos, wallet.Utxo{
+		TxID: p2shTxid, Vout: 0,
+		Amount: 70000000, Value: 0.7,
+		ScriptPubKey: "a914000000000000000000000000000000000000000087", Address: btcAddr,
+	})
+	_, err := ctx.dxSplitInputs([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("false"),
+		json.RawMessage(`[{"txid":"` + p2shTxid + `","vout":0}]`),
+	})
+	if err == nil || err.Code != errBadRequest || err.Name != "dxSplitInputs" {
+		t.Fatalf("dxSplitInputs(P2SH utxo) = %v, want 1004 dxSplitInputs not-found", err)
+	}
+}
+
 // TestDxSplitSubmitFailure locks in the failure shape: a submit failure is 1004
 // BAD_REQUEST named after the actual method (rpcxbridge.cpp:3278/3392).
 func TestDxSplitSubmitFailure(t *testing.T) {

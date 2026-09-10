@@ -1640,6 +1640,19 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if err != nil {
 		return nil, makeError(errBadRequest, method, err.Error())
 	}
+	// C++ getUnspent keeps only P2PKH outputs and re-derives the entry
+	// address from the script (fromXAddr), for both the auto and the
+	// explicit path (xbridgewalletconnectorbtc.cpp:1617-1636). Filter here
+	// so a user-specified non-P2PKH utxo also resolves as "not found or not
+	// available", exactly as C++. For P2PKH the derived address equals the
+	// wallet-reported one, so no re-derivation is needed.
+	filtered := make([]wallet.Utxo, 0, len(walletUtxos))
+	for _, u := range walletUtxos {
+		if isP2PKHScript(u.ScriptPubKey) {
+			filtered = append(filtered, u)
+		}
+	}
+	walletUtxos = filtered
 	lockedKeys, _ := h.Store.LockedUtxoInfo()
 	if len(utxos) == 0 {
 		// Auto path (dxSplitAddress): split the spendable (non-locked) utxos,
@@ -1757,7 +1770,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		})
 	}
 	for _, v := range outs {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: fromXBridgeAmt(c, v), ScriptPubKey: destScript})
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: splitNativeValue(c, v), ScriptPubKey: destScript})
 	}
 
 	unsigned := hex.EncodeToString(tx.Serialize())
@@ -1986,6 +1999,31 @@ func coinNativeScale(c coins.Coin) uint64 {
 		nc *= 10
 	}
 	return nc
+}
+
+// isP2PKHScript reports whether the hex scriptPubKey is a P2PKH script
+// (25 bytes: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG), the only
+// script type C++ getUnspent keeps for splitting
+// (xbridgewalletconnectorbtc.cpp:1622-1632).
+func isP2PKHScript(scriptHex string) bool {
+	script, err := hex.DecodeString(scriptHex)
+	if err != nil || len(script) != 25 {
+		return false
+	}
+	return script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 &&
+		script[23] == 0x88 && script[24] == 0xac
+}
+
+// splitNativeValue converts an XBridge 1e6-scale split output into the coin's
+// native base units exactly as C++ createTransaction
+// (xbridgewalletconnectorbtc.cpp:2451): CTxOut(out.second * COIN) truncates the
+// +1sat-nudged double from xBridgeValueFromAmount (xutil.cpp:276-280). The
+// float operations run in the same order as C++, so the truncation lands on
+// the same satoshi. This is intentionally separate from fromXBridgeAmt (used
+// by the swap paths): the swap-side conversions are out of scope for the
+// split parity item.
+func splitNativeValue(c coins.Coin, xb uint64) uint64 {
+	return uint64(xBridgeValueFromAmount(xb) * float64(coinNativeScale(c)))
 }
 
 // fromXBridgeAmt converts an XBridge 1e6-scale amount into the coin's native
