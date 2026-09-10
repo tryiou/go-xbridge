@@ -266,7 +266,13 @@ is. Contracts, response shapes and error codes are in [`api.md`](api.md).
 - `persist.go` — per-trade state + keypair persistence to
   `<datadir>/xbridged-swaps.json`, flattened on the engine goroutine; the
   JSON marshal + checksum and the disk write run on the background `persistLoop`
-  (when the engine is not started, they run synchronously).
+  (when the engine is not started, they run synchronously). On startup the
+  strict checksum path loads valid files unchanged; a corrupt file is
+  quarantined to `xbridged-swaps.json.bad.<unixnano>` and every
+  individually-valid record is salvaged (unparseable and zero-ID records
+  dropped with counts logged), so corruption can never silently strand
+  in-flight refund material — stale quarantine files accumulate for operator
+  cleanup.
 - `locktime.go` — `acceptableLockTimeDrift`/`computeLockTimeFor` validating the
   counterparty deposit lockTime before our deposit/redeem.
 

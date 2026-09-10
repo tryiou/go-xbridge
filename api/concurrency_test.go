@@ -765,26 +765,29 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 	n, _, gated, _ := setupTwoCoinNode(t)
 	defer gated.open() // runs before t.Cleanup's Close, so shutdown can always drain
 
-	// Park every worker in SendRawTransaction (gate held shut), then fill the
-	// 16-slot task buffer with due refunds so the next postRefundTask must drop.
-	for i := 0; i < engineWorkers+cap(n.tasks); i++ {
-		var rID [32]byte
-		copy(rID[:], fmt.Sprintf("refund-drop-%03d-00000000000000", i))
-		rtx := &coins.Tx{Version: 1}
-		rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("ef", 32)), Index: 0}, Sequence: 0xfffffffe}}
-		rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
-		n.submit(func() {
-			n.sessions[hexEncode(rID[:])] = &SwapSession{
-				n: n, id: rID, isMaker: false, srcCur: "BTC", dstCur: "LTC",
-				refundHex: hex.EncodeToString(rtx.Serialize()), refundDone: false,
-				ourLockTime: 1, state: csCreatedA,
+	// Deterministic fill: post on-engine until engineWorkers+cap(n.tasks)
+	// are ACCEPTED. Nothing completes while the gate is shut, so 20
+	// accepted == 4 parked + 16 buffered == provably full. Drops (the
+	// post-vs-pickup race) retry with a fresh id, so each attempt is
+	// independent. Counting acceptances is what makes fullness certain.
+	rtxFill := &coins.Tx{Version: 1}
+	rtxFill.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("ef", 32)), Index: 0}, Sequence: 0xfffffffe}}
+	rtxFill.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+	fillHex := hex.EncodeToString(rtxFill.Serialize())
+	filled := make(chan struct{})
+	n.submit(func() {
+		for seq, accepted := 0, 0; accepted < engineWorkers+cap(n.tasks); seq++ {
+			if n.postRefundTask(fmt.Sprintf("refund-drop-fill-%04d", seq), "BTC", fillHex, 1, true, nil) {
+				accepted++
 			}
-		}, true)
+		}
+		close(filled)
+	}, false)
+	select {
+	case <-filled:
+	case <-time.After(30 * time.Second):
+		t.Fatal("queue fill never reached full")
 	}
-
-	// The sweep enqueues a refund task for each session; exactly engineWorkers
-	// tasks park in SendRawTransaction and the rest fill the buffer.
-	n.submit(func() { n.scanRefunds() }, false)
 	// Generous wall-clock bound: the property is parking, not speed.
 	deadline := time.Now().Add(30 * time.Second)
 	for gated.callCount() < engineWorkers && time.Now().Before(deadline) {

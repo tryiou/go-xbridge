@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -334,27 +335,70 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 	return n, nil
 }
 
-// restoreLocalSwaps loads and re-registers swap state persisted in dataDir,
-// mirroring C++ App::loadOrders (xbridgeapp.cpp:3828). A missing file is a
-// no-op; a corrupt file logs at Error and is skipped — C++ logs "Failed to
-// load existing orders database" at erro level and continues with an empty
-// set, it never refuses to start.
+// restoreLocalSwaps loads swap state persisted in dataDir (C++ App::loadOrders,
+// xbridgeapp.cpp:3828) — except a corrupt file is quarantined and salvaged
+// where C++ discards everything. Missing file: no-op. Valid file: strict
+// checksum path, unchanged. Corrupt file: renamed to
+// "xbridged-swaps.json.bad.<unixnano>" with each valid record restored and
+// salvaged/dropped counts logged. Never refuses to start: an unlistable
+// envelope, or a failed quarantine, still starts fresh and loud.
 func (n *Node) restoreLocalSwaps(dataDir string) {
-	ps, err := loadSwaps(swapStatePath(dataDir))
-	if err != nil {
-		xlog.Error("could not load persisted swaps; starting fresh", "dir", dataDir, "err", err)
+	path := swapStatePath(dataDir)
+	ps, strictErr := loadSwaps(path)
+	if strictErr == nil {
+		for _, p := range ps {
+			n.restoreSwap(p)
+		}
+		if len(ps) > 0 {
+			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
+		}
+		// Crash-window reconciliation (see reconcileUnconfirmedDeposits): a deposit
+		// broadcast whose confirmation never persisted is ambiguous on disk —
+		// resolve it against the chain before the engine starts, so the refund
+		// sweep owns confirmed deposits immediately.
+		n.reconcileUnconfirmedDeposits()
 		return
 	}
-	for _, p := range ps {
+	// Strict load failed: per-record salvage over the raw bytes.
+	// Corrupt files only — valid ones never reach here.
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		xlog.Error("could not load persisted swaps; starting fresh", "dir", dataDir, "err", rerr)
+		return
+	}
+	good, dropped, lerr := loadSwapsLenient(data)
+	qpath, qerr := quarantineSwapFile(path)
+	if qerr != nil {
+		// Evidence backup failed, but the salvaged records are already in
+		// memory — restore them anyway and start degraded-loud instead of
+		// discarding fund-recovery material over a filesystem error.
+		xlog.Error("could not quarantine corrupt swap file; restoring salvaged records without evidence backup",
+			"dir", dataDir, "path", path, "salvaged", len(good), "err", qerr)
+		for _, p := range good {
+			n.restoreSwap(p)
+		}
+		n.reconcileUnconfirmedDeposits()
+		return
+	}
+	if lerr != nil {
+		xlog.Error("corrupt swap file quarantined, nothing salvageable; starting fresh",
+			"dir", dataDir, "quarantine", qpath, "err", strictErr)
+		return
+	}
+	for _, p := range good {
 		n.restoreSwap(p)
 	}
-	if len(ps) > 0 {
-		xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
+	if len(good) == 0 && dropped == 0 {
+		xlog.Warn("empty corrupt swap file quarantined",
+			"dir", dataDir, "quarantine", qpath, "err", strictErr)
+	} else {
+		xlog.Error("corrupt swap file quarantined, valid records salvaged",
+			"dir", dataDir, "quarantine", qpath,
+			"salvaged", len(good), "dropped", dropped, "err", strictErr)
 	}
-	// Crash-window reconciliation (see reconcileUnconfirmedDeposits): a deposit
-	// broadcast whose confirmation never persisted is ambiguous on disk —
-	// resolve it against the chain before the engine starts, so the refund
-	// sweep owns confirmed deposits immediately.
+	if len(good) > 0 {
+		xlog.Info("restored local swaps from disk", "count", len(good), "dir", dataDir)
+	}
 	n.reconcileUnconfirmedDeposits()
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	xlog "go-xbridge/log"
 	"go-xbridge/proto"
@@ -229,6 +230,71 @@ func loadSwaps(path string) ([]persistedSwap, error) {
 		return nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
 	}
 	return env.Swaps, nil
+}
+
+// errSwapEnvelopeUnusable marks a swap-state file whose envelope cannot even
+// be listed (not JSON, or missing the record array): per-record salvage is
+// impossible, so the caller quarantines the file and starts fresh.
+var errSwapEnvelopeUnusable = fmt.Errorf("api: swap file envelope unusable")
+
+// loadSwapsLenient salvages individually-valid records from a file the strict
+// loadSwaps rejected (one bad record fails a typed slice, dooming every
+// healthy swap). Records decode independently; the good ones return with the
+// count of dropped ones. Checksum-free by necessity: the envelope checksum is
+// whole-blob, so it cannot attest records once the blob fails — salvage is
+// best-effort and the quarantined original stays the evidence. Zero-ID
+// records drop: they restore as a live order under the 64-zeros key and would
+// be re-persisted forever. Pure function over read bytes (no I/O). Fallback
+// only — valid files keep the exact strict path including checksum.
+func loadSwapsLenient(data []byte) (good []persistedSwap, dropped int, err error) {
+	var raw struct {
+		Swaps []json.RawMessage `json:"swaps"`
+	}
+	if uerr := json.Unmarshal(data, &raw); uerr != nil || raw.Swaps == nil {
+		if uerr != nil {
+			err = fmt.Errorf("%w: %v", errSwapEnvelopeUnusable, uerr)
+		} else {
+			err = errSwapEnvelopeUnusable
+		}
+		return nil, 0, err
+	}
+	for _, r := range raw.Swaps {
+		var ps persistedSwap
+		if uerr := json.Unmarshal(r, &ps); uerr != nil {
+			dropped++
+			xlog.Debug("swap salvage: dropping unparseable record", "err", uerr)
+			continue
+		}
+		if ps.ID == ([32]byte{}) {
+			dropped++
+			xlog.Debug("swap salvage: dropping zero-ID record")
+			continue
+		}
+		good = append(good, ps)
+	}
+	return good, dropped, nil
+}
+
+// quarantineSwapFile preserves a corrupt swap-state file as
+// "<path>.bad.<unixnano>": same bytes, same mode, atomic same-dir rename —
+// no copy, no second format. A collision loop covers the same-nanosecond
+// double-corrupt case. Stale files accumulate for operator cleanup; the
+// daemon never deletes evidence itself.
+func quarantineSwapFile(path string) (string, error) {
+	base := fmt.Sprintf("%s.bad.%d", path, time.Now().UnixNano())
+	qpath := base
+	for i := 0; i < 1000; i++ {
+		if _, err := os.Stat(qpath); os.IsNotExist(err) {
+			if rerr := os.Rename(path, qpath); rerr != nil {
+				return "", fmt.Errorf("api: quarantine swap file: %w", rerr)
+			}
+			return qpath, nil
+		} else if err != nil {
+			return "", fmt.Errorf("api: quarantine swap file: %w", err)
+		}
+		qpath = fmt.Sprintf("%s.%d", base, i+1)
+	}
+	return "", fmt.Errorf("api: quarantine swap file: no free evidence name for %s", path)
 }
 
 // persistJob is one background swap-file write: the on-disk path plus the

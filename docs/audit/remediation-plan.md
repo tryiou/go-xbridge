@@ -164,6 +164,17 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   `TestCrashBetweenIntentAndBroadcastRecoversRefund`,
   `TestCrashWithUnbroadcastDepositLeavesNoRefund`,
   `TestClaimIntentDurableBeforeBroadcast`, `TestNoRefundAttemptWithoutBroadcast`.
+  Corrupt-file hardening (2026-09-10): where C++ `loadOrders` discards the
+  whole `orders.dat` on corruption, `restoreLocalSwaps` quarantines the file
+  to `xbridged-swaps.json.bad.<unixnano>` (same bytes, same mode, evidence
+  preserved; stale files accumulate for operator cleanup) and salvages every
+  individually-valid record (`loadSwapsLenient`), dropping only unparseable
+  and zero-ID records with salvaged/dropped counts logged — valid files keep
+  the exact strict checksum path. Tests: `TestCorruptSwapFileSalvagesAndQuarantines`,
+  `TestGarbageSwapFileQuarantinesAndStartsFresh`,
+  `TestValidSwapFileNeverQuarantines`,
+  `TestQuarantineNameUniqueAcrossRapidRestarts`, `TestLenientLoaderUnitMatrix`,
+  `TestQuarantineFailureStillRestoresSalvaged`, `TestEmptyCorruptFileWarnsNotErrors`.
 - **CRYPTO-F87:** maker `MakeOrder` records `Order.UsedCoins` (incl. autoSplit);
   `buildDeposit` consumes the `swapCtx.funding` snapshot, never `ListUnspent`
   (`TestDepositSpendsUsedCoins`).

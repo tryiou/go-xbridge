@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -339,25 +340,49 @@ func TestPersistSecretsAlwaysOnDisk(t *testing.T) {
 	}
 }
 
-// TestCorruptSwapFileContinuesLikeCpp proves a corrupt swap-state file surfaces
-// as an Error and restores nothing, mirroring C++ App::loadOrders: a failed
-// orders.dat read logs "Failed to load existing orders database" at erro level
-// and continues with an empty set — the node never refuses to start.
-func TestCorruptSwapFileContinuesLikeCpp(t *testing.T) {
+// TestCorruptSwapFileSalvagesAndQuarantines proves a corrupt file no longer
+// discards everything (the old C++ loadOrders behavior, deliberately
+// exceeded): the file is quarantined byte-identical and each valid record is
+// restored, with counts logged. Envelope: checksum mismatch, 2 good records
+// (live session + historical), 1 type-broken, 1 zero-ID.
+func TestCorruptSwapFileSalvagesAndQuarantines(t *testing.T) {
 	dir := t.TempDir()
 
-	// A valid envelope whose checksum does not match the payload.
-	env := swapFile{Sum: strings.Repeat("0", 64), Swaps: nil}
-	data, err := json.Marshal(env)
+	var liveID [32]byte
+	copy(liveID[:], []byte("salvage-live-session-record-00")) // 32 bytes
+	var histID [32]byte
+	copy(histID[:], []byte("salvage-historical-record-000")) // 32 bytes
+	var mkey [32]byte
+	mkey[31] = 9
+	live := persistedSwap{
+		ID: liveID, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "LTC",
+		Status: "open", IsMaker: true, SrcCur: "BTC", DstCur: "LTC",
+		PrivKey: mkey, RefundHex: "01000000salvageme",
+		OurDepositTxID: "depositsalvage", State: csCreatedA,
+	}
+	hist := persistedSwap{
+		ID: histID, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "LTC",
+		Status: "finished", Historical: true, Updated: 42,
+	}
+	g1, err := json.Marshal(live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(swapStatePath(dir), data, 0600); err != nil {
+	g2, err := json.Marshal(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// All-zero checksum guarantees the strict loader rejects the envelope,
+	// routing restore through the salvage fallback.
+	file := `{"sum":"` + strings.Repeat("0", 64) + `","swaps":[` +
+		string(g1) + `,` + string(g2) + `,{"fromAmount":"boom"},{}]}`
+	path := swapStatePath(dir)
+	if err := os.WriteFile(path, []byte(file), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := loadSwaps(swapStatePath(dir)); err == nil {
-		t.Fatal("corrupt swap file: loadSwaps must return an error")
+	if _, err := loadSwaps(path); err == nil {
+		t.Fatal("corrupt swap file: strict loadSwaps must return an error")
 	}
 
 	old := xlog.L()
@@ -368,12 +393,268 @@ func TestCorruptSwapFileContinuesLikeCpp(t *testing.T) {
 	n := newPersistNode(t, dir)
 	n.restoreLocalSwaps(dir)
 
-	if got := buf.String(); !strings.Contains(got, "level=ERROR") ||
-		!strings.Contains(got, "could not load persisted swaps") {
-		t.Errorf("corrupt file must log at Error severity, got:\n%s", got)
+	// The live session record restores with its refund material intact.
+	rs := n.sessions[hexEncode(liveID[:])]
+	if rs == nil {
+		t.Fatal("salvage must restore the live session")
 	}
+	if rs.refundHex != "01000000salvageme" || rs.privKey != mkey {
+		t.Errorf("salvaged session lost refund material: refundHex=%q privKey=%x", rs.refundHex, rs.privKey)
+	}
+	// The historical record restores to history, never the live set.
+	if len(n.store.History()) != 1 {
+		t.Fatalf("salvage must restore the historical record; history=%d", len(n.store.History()))
+	}
+	if got := n.store.Get(hexEncode(histID[:])); got != nil {
+		t.Error("historical record must not leak into the live set")
+	}
+
+	// The corrupt original is quarantined byte-identical at 0600, and the
+	// live path is gone so the next persist starts clean.
+	bads, err := filepath.Glob(path + ".bad.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bads) != 1 {
+		t.Fatalf("want exactly one quarantine file, got %v", bads)
+	}
+	qdata, err := os.ReadFile(bads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(qdata) != file {
+		t.Error("quarantine must preserve the corrupt file byte-identical")
+	}
+	if fi, err := os.Stat(bads[0]); err != nil || fi.Mode().Perm() != 0600 {
+		t.Errorf("quarantine must keep mode 0600: %v %v", bads[0], err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("corrupt original must be renamed away from the live path")
+	}
+
+	// Two records dropped (one unparseable, one zero-ID), two salvaged —
+	// all named at Error severity with the quarantine path.
+	got := buf.String()
+	for _, want := range []string{"level=ERROR", "quarantine", "salvaged=2", "dropped=2", bads[0]} {
+		if !strings.Contains(got, want) {
+			t.Errorf("salvage log must contain %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestQuarantineFailureStillRestoresSalvaged proves a filesystem error during
+// quarantine does not discard fund-recovery material: the salvaged records
+// (already in memory) still restore, startup continues degraded-loud, and the
+// corrupt original stays at the live path for a later retry.
+func TestQuarantineFailureStillRestoresSalvaged(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("read-only dir does not block rename for root")
+	}
+	dir := t.TempDir()
+
+	var liveID [32]byte
+	copy(liveID[:], []byte("quarantine-fail-restore-00000")) // 32 bytes
+	live := persistedSwap{
+		ID: liveID, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "LTC",
+		Status: "open", RefundHex: "01000000nodepsloss",
+		OurDepositTxID: "dep-nodepsloss", State: csCreatedA,
+	}
+	g1, err := json.Marshal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := swapStatePath(dir)
+	file := `{"sum":"` + strings.Repeat("0", 64) + `","swaps":[` + string(g1) + `,{"fromAmount":"boom"}]}`
+	if err := os.WriteFile(path, []byte(file), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	old := xlog.L()
+	defer xlog.SetLogger(old)
+	var buf bytes.Buffer
+	xlog.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	n := newPersistNode(t, dir)
+	n.restoreLocalSwaps(dir)
+
+	if rs := n.sessions[hexEncode(liveID[:])]; rs == nil || rs.refundHex != "01000000nodepsloss" {
+		t.Fatal("salvaged session must restore even when quarantine fails")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("corrupt original must stay at the live path, stat: %v", err)
+	}
+	if got := buf.String(); !strings.Contains(got, "without evidence backup") {
+		t.Errorf("must log degraded-loud quarantine failure, got:\n%s", got)
+	}
+}
+
+// TestEmptyCorruptFileWarnsNotErrors proves a checksum-bad envelope with zero
+// records quarantines as evidence but logs at Warn, not Error — no swap
+// material is at stake, so it must not cry wolf.
+func TestEmptyCorruptFileWarnsNotErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := swapStatePath(dir)
+	if err := os.WriteFile(path, []byte(`{"sum":"deadbeef","swaps":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	old := xlog.L()
+	defer xlog.SetLogger(old)
+	var buf bytes.Buffer
+	xlog.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	newPersistNode(t, dir).restoreLocalSwaps(dir)
+
+	bads, err := filepath.Glob(path + ".bad.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bads) != 1 {
+		t.Fatalf("empty corrupt file must still quarantine, got %v", bads)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "empty corrupt") || !strings.Contains(got, "level=WARN") {
+		t.Errorf("want Warn-level empty-corrupt log, got:\n%s", got)
+	}
+	if strings.Contains(got, "level=ERROR") {
+		t.Errorf("zero-record corruption must not log at Error, got:\n%s", got)
+	}
+}
+
+// TestGarbageSwapFileQuarantinesAndStartsFresh proves an unlistable envelope
+// is quarantined as evidence and the node starts fresh — never refuses to
+// start, never silently discards bytes.
+func TestGarbageSwapFileQuarantinesAndStartsFresh(t *testing.T) {
+	dir := t.TempDir()
+	path := swapStatePath(dir)
+	garbage := "\x00\x01not-json{{{"
+	if err := os.WriteFile(path, []byte(garbage), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	old := xlog.L()
+	defer xlog.SetLogger(old)
+	var buf bytes.Buffer
+	xlog.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	n := newPersistNode(t, dir)
+	n.restoreLocalSwaps(dir)
+
 	if len(n.store.List()) != 0 || len(n.store.History()) != 0 {
-		t.Fatalf("corrupt file must restore nothing; live=%d history=%d", len(n.store.List()), len(n.store.History()))
+		t.Fatalf("garbage file must restore nothing; live=%d history=%d", len(n.store.List()), len(n.store.History()))
+	}
+	bads, err := filepath.Glob(path + ".bad.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bads) != 1 {
+		t.Fatalf("garbage file must be quarantined, got %v", bads)
+	}
+	qdata, err := os.ReadFile(bads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(qdata) != garbage {
+		t.Error("quarantine must preserve garbage bytes identical")
+	}
+	if got := buf.String(); !strings.Contains(got, "level=ERROR") ||
+		!strings.Contains(got, "nothing salvageable") {
+		t.Errorf("garbage file must log at Error severity, got:\n%s", got)
+	}
+}
+
+// TestValidSwapFileNeverQuarantines pins the strict-first fast path: a valid
+// file restores exactly like before and leaves no quarantine evidence behind.
+func TestValidSwapFileNeverQuarantines(t *testing.T) {
+	dir := t.TempDir()
+	n := newPersistNode(t, dir)
+
+	var id [32]byte
+	copy(id[:], []byte("no-quarantine-when-valid-0000")) // 32 bytes
+	n.store.Add(&Order{ID: id, FromCurrency: "BTC", ToCurrency: "LTC", Mine: true, Status: "open"})
+	n.persist()
+
+	n2 := newPersistNode(t, dir)
+	n2.restoreLocalSwaps(dir)
+
+	if got := n2.store.Get(hexEncode(id[:])); got == nil {
+		t.Fatal("valid file must restore the order")
+	}
+	bads, err := filepath.Glob(swapStatePath(dir) + ".bad.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bads) != 0 {
+		t.Errorf("valid file must leave no quarantine behind, got %v", bads)
+	}
+}
+
+// TestQuarantineNameUniqueAcrossRapidRestarts proves back-to-back corrupt
+// restarts each preserve their own evidence instead of colliding on one name.
+func TestQuarantineNameUniqueAcrossRapidRestarts(t *testing.T) {
+	dir := t.TempDir()
+	path := swapStatePath(dir)
+	for i := 0; i < 2; i++ {
+		if err := os.WriteFile(path, []byte("{corrupt"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		newPersistNode(t, dir).restoreLocalSwaps(dir)
+	}
+	bads, err := filepath.Glob(path + ".bad.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bads) != 2 || bads[0] == bads[1] {
+		t.Errorf("want two distinct quarantine files, got %v", bads)
+	}
+}
+
+// TestLenientLoaderUnitMatrix pins loadSwapsLenient accounting without I/O.
+func TestLenientLoaderUnitMatrix(t *testing.T) {
+	var goodID [32]byte
+	goodID[0] = 1
+	goodRec, err := json.Marshal(persistedSwap{ID: goodID, Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroRec, err := json.Marshal(persistedSwap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name       string
+		data       string
+		wantGood   int
+		wantDrop   int
+		wantUsable bool
+	}{
+		{"empty array", `{"sum":"x","swaps":[]}`, 0, 0, true},
+		{"garbage", `{{{`, 0, 0, false},
+		{"missing array", `{"sum":"x"}`, 0, 0, false},
+		{"mixed", `{"sum":"x","swaps":[` + string(goodRec) + `,{"fromAmount":"boom"},` + string(zeroRec) + `]}`, 1, 2, true},
+		{"all bad", `{"sum":"x","swaps":[{"fromAmount":"boom"}]}`, 0, 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			good, dropped, err := loadSwapsLenient([]byte(c.data))
+			if c.wantUsable && err != nil {
+				t.Fatalf("usable envelope must not error: %v", err)
+			}
+			if !c.wantUsable && err == nil {
+				t.Fatal("unusable envelope must error")
+			}
+			if len(good) != c.wantGood || dropped != c.wantDrop {
+				t.Errorf("got good=%d dropped=%d, want %d/%d", len(good), dropped, c.wantGood, c.wantDrop)
+			}
+		})
 	}
 }
 
