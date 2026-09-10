@@ -119,13 +119,12 @@ func TestReloadPrunesUnconnectedOrders(t *testing.T) {
 }
 
 // TestReloadPreservesFlagOverrides locks the G2->G3 handoff: the -dxnowallets
-// override, the reachability-probe toggle and PersistSecrets survive a reload
+// override and the reachability-probe toggle survive a reload
 // (the pre-fix fresh Config dropped all three).
 func TestReloadPreservesFlagOverrides(t *testing.T) {
 	ctx := reloadTestCtx(t, ewKeyingConf)
 	ctx.Node.config.ForceShowAllOrders = true
 	ctx.Node.config.CheckReachability = true
-	ctx.Node.config.PersistSecrets = true
 	// Deterministic probe: CheckReachability is on, but a hermetic test must
 	// not round-trip to the fixture's 127.0.0.1:8332 (which may host a real
 	// wallet on the dev box).
@@ -141,9 +140,6 @@ func TestReloadPreservesFlagOverrides(t *testing.T) {
 	}
 	if !c.CheckReachability {
 		t.Error("CheckReachability lost on reload")
-	}
-	if !c.PersistSecrets {
-		t.Error("PersistSecrets lost on reload")
 	}
 }
 

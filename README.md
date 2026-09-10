@@ -185,7 +185,6 @@ magics and default ports are in [`docs/protocol.md`](docs/protocol.md).
 | `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
 | `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
 | `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
-| `-persistsecrets` | `true` | Persist per-trade M keypair / HTLC secret / pre-signed refund in the swap-state file (C++ `orders.dat` parity). `false` keeps the file secret-free; a restarted mid-flight swap then cannot auto-refund or re-sign a cancel. |
 | `-logfile` | `<datadir>/xbridged.log` | Log file path (stderr stays active). |
 | `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
 
@@ -266,9 +265,8 @@ fills only) are documented under "Tier 3" there.
   (mirroring C++'s `isLocal()` filter). Persistence is best-effort: a
   corrupt/missing file is logged and the node starts fresh rather than crashing.
   Each trade's per-trade M keypair, HTLC secret, and pre-signed refund are
-  persisted on by default (C++ `orders.dat` parity). Pass `-persistsecrets=false`
-  to keep the swap-state file free of signing material; a restarted mid-flight
-  swap then cannot auto-refund or re-sign a cancel.
+  always persisted (C++ `orders.dat` parity — there is no opt-out, so a
+  restarted mid-flight swap can always auto-refund and re-sign cancels).
 - `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` require the relevant wallets to
   be connected (they fund/sign/broadcast); without a reachable wallet the call
   returns a "no session" / "unable to connect to wallet" error.

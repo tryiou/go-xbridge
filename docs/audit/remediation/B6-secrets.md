@@ -1,5 +1,13 @@
 # Diff brief — persist + logging secrets hygiene (B6, SEC-F04)
 
+> Amendment (recovery hardening, 2026-09-10): the `-persistsecrets=false`
+> opt-out described below was **removed**. Secrets are now always persisted
+> (strict C++ `orders.dat` parity); `Config.PersistSecrets`, the CLI flag, the
+> write-time zeroing, and `TestPersistSecretsOptOut` are gone, replaced by
+> `TestPersistSecretsAlwaysOnDisk`. The log-hygiene removals (§3 below) stand
+> unchanged; refund/claim hex logging is a separate pending recovery item
+> (Core TXLOG-hatch parity) — privkeys/preimages stay out of logs.
+
 Session-scratch notes for branch `fix/secrets-hygiene`. Source of truth is the
 C++ writers; the register row (`SEC-F04`) carries the canonical status.
 
@@ -23,21 +31,23 @@ plaintext, and debug logs emit refund/claim tx hex and full RPC bodies.
   plaintext; there is **no** log line like Go's refund/claim `refundHex` /
   `payHex` debug output anywhere in `xbridgesession.cpp`.
 
-## Go deltas (this branch)
+## Go deltas (this branch, as merged — historical; the opt-out in §1/§Config
+below was removed 2026-09-10, see header amendment)
 
-1. **`api/persist.go` `persistFromSession`** — when `Config.PersistSecrets` is
-   false, zero `PrivKey`/`Secret`/`RefundHex` at write time. `PubKey`,
-   `SecretHash`, `OurDepositTxID`, `OurLockTime` always survive (hashes /
-   derived, not signing material). Order-only and history records already write
+1. **`api/persist.go` `persistFromSession`** — when `Config.PersistSecrets` was
+   false, zeroed `PrivKey`/`Secret`/`RefundHex` at write time. `PubKey`,
+   `SecretHash`, `OurDepositTxID`, `OurLockTime` always survived (hashes /
+   derived, not signing material). Order-only and history records already wrote
    zero secrets (`persistFromOrder` / `persistFromHistoryEntry`), so only live
-   session records are gated.
-   - **No restore-path change.** `restoreSwap` / `hasSessionData` are untouched:
-     a secret-less restored session is carried by `State > csIdle` and
+   session records were gated.
+   - **No restore-path change.** `restoreSwap` / `hasSessionData` were untouched:
+     a secret-less restored session was carried by `State > csIdle` and
      `OurDepositTxID != ""`, and the existing guards (`swap.go:823` refund
-     sweep skips `refundHex == ""`, `persist.go:325` terminal routing) govern it
-     exactly as they govern order-only / refund-done records today. This is the
-     one **deliberate, write-only** divergence from C++ (SEC-F04 hardening);
-     with the flag on (default) the on-disk output is byte-identical to C++.
+     sweep skipping `refundHex == ""`, `persist.go:325` terminal routing)
+     governed it exactly as they govern order-only / refund-done records. This
+     was the one **deliberate, write-only** divergence from C++ (SEC-F04
+     hardening); with the flag on (default) the on-disk output was
+     byte-identical to C++.
 2. **`api/node.go`** — `NewNode` restore block extracted to
    `restoreLocalSwaps`; a corrupt swap file logs at **Error** (C++ `erro`
    parity; was `Warn`) and continues with an empty set — it never refuses to
@@ -52,28 +62,28 @@ plaintext, and debug logs emit refund/claim tx hex and full RPC bodies.
    - `swap.go:643` (logs txid + secretHash, not the preimage) and
      `swap.go:1142/1269/1274/1278` (params/err/ok only) verified not leaking.
 
-## Config
+## Config (historical — flag and field removed 2026-09-10)
 
-- `api/node.go` `Config.PersistSecrets bool` — default true (C++ parity).
-- `cmd/xbridged/main.go` `-persistsecrets` flag (default true). CLI-flag only;
-  `config/conf.go` conf-key alignment is B10's (`fix/config-parity`) concern —
-  files stay disjoint.
+- `api/node.go` `Config.PersistSecrets bool` — defaulted true (C++ parity).
+- `cmd/xbridged/main.go` `-persistsecrets` flag (defaulted true). CLI-flag only;
+  `config/conf.go` conf-key alignment was B10's (`fix/config-parity`) concern —
+  files stayed disjoint.
 
-## Opt-out consequence (documented, not coded)
+## Opt-out consequence (historical — opt-out removed 2026-09-10; kept here as
+the record of what the merged branch documented)
 
-With `-persistsecrets=false`, a swap that is mid-flight at restart has no M
-keypair / refund, so the engine cannot auto-refund or re-sign a cancel after
+With `-persistsecrets=false`, a swap that was mid-flight at restart had no M
+keypair / refund, so the engine could not auto-refund or re-sign a cancel after
 restart (`coins` signing uses the per-trade privkey, `api/swap.go:1151,1210`).
-This is inherent to the operator's opt-out choice and is documented in the flag
-help, `README.md`, and `register.md` — it is **not** a new runtime branch.
+This was inherent to the operator's opt-out choice and was documented in the
+flag help, `README.md`, and `register.md` — it was **not** a new runtime branch.
 
 ## Tests
 
-- `newPersistNode` sets `PersistSecrets: true` (existing round-trip /
-  cancel-after-restart tests keep their parity meaning).
-- `TestPersistSecretsOptOut` — write with the flag off: `PrivKey`/`Secret`/
-  `RefundHex` zeroed on disk, `PubKey`/`SecretHash`/`OurDepositTxID`/
-  `OurLockTime`/`State` survive; `restoreSwap` re-adds the order and restores
-  the live session with zero signing material.
+- `newPersistNode` set `PersistSecrets: true` (existing round-trip /
+  cancel-after-restart tests kept their parity meaning).
+- `TestPersistSecretsAlwaysOnDisk` (recovery hardening, replaces the removed
+  `TestPersistSecretsOptOut` below) — secrets always on disk, restore keeps the
+  session sign-capable (M pubkey re-derivation).
 - `TestCorruptSwapFileContinuesLikeCpp` — bad-checksum file: `loadSwaps`
   errors, `restoreLocalSwaps` logs at Error and restores nothing.

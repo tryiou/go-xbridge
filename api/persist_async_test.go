@@ -13,7 +13,7 @@ import (
 func persistNode(t *testing.T) *Node {
 	t.Helper()
 	n := newEngineNode()
-	n.config = &Config{DataDir: t.TempDir(), PersistSecrets: true}
+	n.config = &Config{DataDir: t.TempDir()}
 	n.conn = &blockConn{stop: n.stop}
 	n.start()
 	t.Cleanup(func() { _ = n.Close() })

@@ -19,7 +19,7 @@ import (
 func newStartedPersistNode(t *testing.T, dir string, confs map[string]*config.CoinConf, conns map[string]wallet.Connector) (*Node, *captureXConn) {
 	t.Helper()
 	n := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: true, Confs: confs, Connectors: conns},
+		config:   &Config{DataDir: dir, Confs: confs, Connectors: conns},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
 		sessions: map[string]*SwapSession{},
@@ -123,7 +123,7 @@ func TestRestartRecoversCreatedA(t *testing.T) {
 	// Restart from the same DataDir (restore BEFORE start so the empty loop
 	// cannot clobber the recovered file).
 	n2 := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: true, Confs: confs, Connectors: conns},
+		config:   &Config{DataDir: dir, Confs: confs, Connectors: conns},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
 		sessions: map[string]*SwapSession{},
@@ -263,7 +263,7 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 	_ = n.Close()
 
 	n2 := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: true, Confs: confs, Connectors: conns},
+		config:   &Config{DataDir: dir, Confs: confs, Connectors: conns},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
 		sessions: map[string]*SwapSession{},
@@ -361,7 +361,7 @@ func TestRestartRecoversPreDeposit(t *testing.T) {
 
 	// Restart with the same BTC fakeConnector so the replayed deposit can broadcast; cc2 captures only the hub-facing response.
 	n2 := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: true, Confs: confs, Connectors: map[string]wallet.Connector{"BTC": btcConn}},
+		config:   &Config{DataDir: dir, Confs: confs, Connectors: map[string]wallet.Connector{"BTC": btcConn}},
 		store:    NewStore(),
 		signer:   crypto.NewBtcSigner(),
 		sessions: map[string]*SwapSession{},

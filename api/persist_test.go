@@ -21,7 +21,7 @@ import (
 func newPersistNode(t *testing.T, dir string) *Node {
 	t.Helper()
 	return &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: true},
+		config:   &Config{DataDir: dir},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),
@@ -231,16 +231,15 @@ func TestPersistOnlyLocal(t *testing.T) {
 	}
 }
 
-// TestPersistSecretsOptOut proves the -persistsecrets=false gate: the
-// per-trade M keypair, HTLC secret, and pre-signed refund are zeroed at write
-// time, while the non-secret derived fields (pubkey, secretHash, deposit
-// identity) survive. restoreSwap still re-adds the order and restores the live
-// session via its existing signals (State > csIdle / OurDepositTxID), with the
-// signing material left zero so no refund/cancel re-sign is possible.
-func TestPersistSecretsOptOut(t *testing.T) {
+// TestPersistSecretsAlwaysOnDisk locks the C++ orders.dat parity: the per-trade
+// M keypair, HTLC secret, and pre-signed refund are ALWAYS written — there is
+// no opt-out (a restarted mid-flight swap must be able to auto-refund and
+// re-sign cancels). restoreSwap re-adds the order and restores the live
+// session with the signing material intact and functional.
+func TestPersistSecretsAlwaysOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	n := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: false},
+		config:   &Config{DataDir: dir},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),
@@ -254,7 +253,7 @@ func TestPersistSecretsOptOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	var id [32]byte
-	copy(id[:], []byte("optout-secrets-order-id00000"))
+	copy(id[:], []byte("always-secrets-order-id0000"))
 	o := &Order{
 		ID:           id,
 		FromCurrency: "BTC",
@@ -287,17 +286,17 @@ func TestPersistSecretsOptOut(t *testing.T) {
 		t.Fatalf("persisted %d swaps, want 1", len(ps))
 	}
 	got := ps[0]
-	if got.PrivKey != ([32]byte{}) {
-		t.Errorf("PrivKey leaked to disk: %x", got.PrivKey)
+	if got.PrivKey != arr32(mPriv) {
+		t.Errorf("PrivKey not on disk: %x", got.PrivKey)
 	}
-	if got.Secret != ([33]byte{}) {
-		t.Errorf("Secret leaked to disk: %x", got.Secret)
+	if got.Secret != sec {
+		t.Errorf("Secret not on disk: %x", got.Secret)
 	}
-	if got.RefundHex != "" {
-		t.Errorf("RefundHex leaked to disk: %q", got.RefundHex)
+	if got.RefundHex != "01000000deadbeef" {
+		t.Errorf("RefundHex not on disk: %q", got.RefundHex)
 	}
 	if got.PubKey != mPub {
-		t.Errorf("PubKey = %x, want %x (must survive opt-out)", got.PubKey, mPub)
+		t.Errorf("PubKey = %x, want %x", got.PubKey, mPub)
 	}
 	if got.OurDepositTxID != "aabbccdd" || got.OurLockTime != 1234 {
 		t.Errorf("deposit identity lost: txid %q lockTime %d", got.OurDepositTxID, got.OurLockTime)
@@ -307,9 +306,9 @@ func TestPersistSecretsOptOut(t *testing.T) {
 	}
 
 	// restoreSwap must re-add the order and restore the live session with the
-	// signing material zeroed.
+	// signing material intact — the session can still sign (same M pubkey).
 	n2 := &Node{
-		config:   &Config{DataDir: dir, PersistSecrets: false},
+		config:   &Config{DataDir: dir},
 		signer:   crypto.NewBtcSigner(),
 		stop:     make(chan struct{}),
 		store:    NewStore(),
@@ -323,14 +322,20 @@ func TestPersistSecretsOptOut(t *testing.T) {
 	if rs == nil {
 		t.Fatal("live session must be restored")
 	}
-	if rs.privKey != ([32]byte{}) {
-		t.Errorf("restored session privKey = %x, want zero (opt-out)", rs.privKey)
+	if rs.privKey != arr32(mPriv) {
+		t.Errorf("restored session privKey = %x, want persisted key", rs.privKey)
 	}
-	if rs.refundHex != "" {
-		t.Errorf("restored session refundHex = %q, want empty (opt-out)", rs.refundHex)
+	if rs.refundHex != "01000000deadbeef" {
+		t.Errorf("restored session refundHex = %q, want persisted hex", rs.refundHex)
+	}
+	if rs.secret != sec {
+		t.Errorf("restored session secret lost: %x", rs.secret)
 	}
 	if rs.state != csCreatedA {
 		t.Errorf("restored state = %v, want csCreatedA", rs.state)
+	}
+	if rp, err := crypto.CompressedPubKey(rs.privKey[:]); err != nil || rp != mPub {
+		t.Errorf("restored key cannot re-derive the M pubkey (cancel re-sign impossible): %v", err)
 	}
 }
 

@@ -105,7 +105,6 @@ func main() {
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
-	persistSecrets := flag.Bool("persistsecrets", true, "persist per-trade M keypair/secret/pre-signed refund in the swap-state file (default true; C++ orders.dat parity); false keeps the file secret-free, but a restarted mid-flight swap cannot auto-refund or re-sign cancels")
 	rpcServerTimeout := flag.Int("rpcservertimeout", 30, "timeout in seconds for HTTP RPC requests (C++ DEFAULT_HTTP_SERVER_TIMEOUT parity)")
 	// -dxnowallets mirrors C++ gArgs.GetBoolArg("-dxnowallets",
 	// settings().showAllOrders()) (xbridgeapp.cpp:372): show all orders across
@@ -220,7 +219,6 @@ func main() {
 		WalletVersionStr: *walletVersionStr,
 		DataDir:          dataDir,
 		ConfPath:         *confPath,
-		PersistSecrets:   *persistSecrets,
 		// ShowAllOrders follows the conf unless -dxnowallets overrides it
 		// (C++ showAllOrders() / -dxnowallets, xbridgeapp.cpp:372). Pre-fix
 		// the daemon ignored Main.ShowAllOrders entirely until a reload.

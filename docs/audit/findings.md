@@ -566,7 +566,7 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: reload re-applies admission gates, drops wallets leaving ExchangeWallets, clears non-local orders, keeps prior state on failure (`rpcxbridge.cpp:229-233`; `xbridgeapp.cpp:931-948,3811-3826`).
 - CAND: `api/node.go:287-334` — atomic last-good on failure; keys connectors off ALL `[TICKER]` sections (never ExchangeWallets); no gates; never clears non-local orders.
 - IMPACT: post-reload state differs (wallet set, gates, stale orders).
-- FIX (B10): `wallet.Activator` connects exactly `[Main].ExchangeWallets` ∩ gates ∩ reachability probe (`updateActiveWallets` `xbridgeapp.cpp:917-1214`, 300 s bad-wallet retry); reload preserves `ForceShowAllOrders`/`CheckReachability`/`PersistSecrets` and clears non-local orders via `Store.PruneUnconnected` unless ShowAllOrders (`clearNonLocalOrders`, `rpcxbridge.cpp:229-233`); 30 s sweep re-probes in-memory settings (`:3674-3677`), guarded against clobbering a reload; `TestActivateExchangeWalletsOnly`, `TestActivateProbe`, `TestActivateBadWalletRetry`, `TestReloadAppliesEWKeying`, `TestReloadPrunesUnconnectedOrders`, `TestSweepConnectors`, `TestPruneUnconnected`.
+- FIX (B10): `wallet.Activator` connects exactly `[Main].ExchangeWallets` ∩ gates ∩ reachability probe (`updateActiveWallets` `xbridgeapp.cpp:917-1214`, 300 s bad-wallet retry); reload preserves `ForceShowAllOrders`/`CheckReachability` and clears non-local orders via `Store.PruneUnconnected` unless ShowAllOrders (`clearNonLocalOrders`, `rpcxbridge.cpp:229-233`); 30 s sweep re-probes in-memory settings (`:3674-3677`), guarded against clobbering a reload; `TestActivateExchangeWalletsOnly`, `TestActivateProbe`, `TestActivateBadWalletRetry`, `TestReloadAppliesEWKeying`, `TestReloadPrunesUnconnectedOrders`, `TestSweepConnectors`, `TestPruneUnconnected`.
 
 ### CFG-F88 · S3 · CONFIG · ExchangeWallets parsing differs
 - REF: `util/settings.cpp:143-166` — splits on `,` `;` `:` with symbol validation/uppercase.
@@ -795,7 +795,7 @@ appendix maps every old ID to its canonical home.
   standalone code. OPEN (closed by B3).
 
 ### SEC-F04 · S2 · Plaintext secrets + debug-log leakage
-- Secrets logged in plaintext. FIXED (B6): `-persistsecrets` gate (default ON = C++ orders.dat parity; OFF zeroes `PrivKey`/`Secret`/`RefundHex` on write); refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`.
+- Secrets logged in plaintext. FIXED (B6): refund/claim hex + RPC bodies dropped from logs; corrupt swap file logs at Error like C++ `loadOrders`. Tests: `TestCorruptSwapFileContinuesLikeCpp`. (The `-persistsecrets` opt-out from the original B6 was removed 2026-09-10 — secrets now always persist; see `TestPersistSecretsAlwaysOnDisk`.)
 
 ---
 

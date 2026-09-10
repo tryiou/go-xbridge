@@ -71,7 +71,8 @@ is marked `FIXED`/`DOCUMENTED` in `register.md`.
 
 **Status (2026-08-15):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
-log-site removals, corrupt-file severity parity). **B3 merged** (deposit path:
+log-site removals, corrupt-file severity parity — opt-out **removed
+2026-09-10**, secrets now always persisted; see `B6-secrets.md` amendment). **B3 merged** (deposit path:
 CRYPTO-F85/F86/F87/F78/F90/F97, STATE-F71, SEC-F03 — validated-deposit gate,
 native-unit scale, wire-Cancel). **B5 merged** (wire hardening: WIRE-F57–F64,
 F67–F70 — caps, magic/version/checksum gates, canonical varint, snl echo,
@@ -234,17 +235,24 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   F70. See `remediation/B5-wire.md`.
 - **Verify:** as B1; `make parity` + `make canary`.
 
-### B6 — `fix/secrets-hygiene` — SEC-F04 (high) — MERGED
+### B6 — `fix/secrets-hygiene` — SEC-F04 (high) — MERGED (opt-out since removed;
+see amendment below)
 
-Gate `PrivKey`/`Secret`/`RefundHex` behind `-persistsecrets` (default ON = C++
-`orders.dat` parity; OFF zeroes them at write — the sole deliberate
-divergence). Corrupt swap file logs at **Error** like C++ `loadOrders`'s `erro`
-(continue-empty, never refuse to start) — this also satisfies "treat a corrupt
-file as an error". Persist failures already log at Error + continue, matching
-`saveOrders`'s ignored `xdb.Write` return. Dropped refund/claim hex and full
-RPC bodies from debug logs (`api/swap.go:383,485,545,650`,
-`wallet/rpc.go:129,138`). See `remediation/B6-secrets.md`. Tests:
+Gated `PrivKey`/`Secret`/`RefundHex` behind `-persistsecrets` (default ON = C++
+`orders.dat` parity; OFF zeroed them at write — the sole deliberate
+divergence at the time). Corrupt swap file logs at **Error** like C++
+`loadOrders`'s `erro` (continue-empty, never refuse to start) — this also
+satisfies "treat a corrupt file as an error". Persist failures already log at
+Error + continue, matching `saveOrders`'s ignored `xdb.Write` return. Dropped
+refund/claim hex and full RPC bodies from debug logs (`api/swap.go:383,485,
+545,650`, `wallet/rpc.go:129,138`). See `remediation/B6-secrets.md`. Tests:
 `TestPersistSecretsOptOut`, `TestCorruptSwapFileContinuesLikeCpp`.
+
+> Amendment 2026-09-10 (recovery hardening): the `-persistsecrets` opt-out is
+> gone — secrets always persist (strict C++ parity). `TestPersistSecretsOptOut`
+> replaced by `TestPersistSecretsAlwaysOnDisk`. The gate/dropped-hex sentences
+> above describe the branch as merged; refund/claim hex reinstatement is a
+> separate pending recovery item, not part of this change.
 
 ### B7 — `fix/rpc-surface` — RPC-F03–F59 (RPC S2/S3 set) — **DONE, merged to `main`**
 
@@ -304,7 +312,7 @@ value wins over the method table, ETH/unknown `CreateTxMethod` rejected (F91);
 (F90, version-case sub-item already fixed on B7). `wallet.Activator` connects
 exactly `[Main].ExchangeWallets` ∩ gates ∩ a live reachability probe (C++
 `updateActiveWallets`, 300 s bad-wallet retry), reload preserves the daemon
-flags + `PersistSecrets`, clears non-local orders unless ShowAllOrders, and a
+flags, clears non-local orders unless ShowAllOrders, and a
 30 s sweep re-probes in-memory settings (F87). CFG-F86 is DOCUMENTED — the
 never-creates hard rule stands; the daemon requires an existing conf. Branch
 doc: `B10-config.md`.
