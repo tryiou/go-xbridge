@@ -239,6 +239,26 @@ func TestMakeOrderDryRunSkipsHubGate(t *testing.T) {
 	}
 }
 
+// TestMakeOrderExactMinFromAmountZero locks in C++ wire parity for exact
+// orders: C++ sendXBridgeTransaction passes partialMinimum=0
+// (xbridgeapp.cpp:1479) so minFromAmount is 0 on the wire and renders
+// partial_minimum "0.000000" (rpcxbridge.cpp:808). The port defaulted it to
+// the maker size.
+func TestMakeOrderExactMinFromAmountZero(t *testing.T) {
+	n, _ := newHubNode(servicenode.NewRegistry())
+	o, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+		DryRun: true,
+	})
+	if rerr != nil {
+		t.Fatalf("MakeOrder(dry-run) = %v, want success", rerr)
+	}
+	if o.MinFromAmount != 0 {
+		t.Errorf("exact order MinFromAmount = %d, want 0 (C++ partialMinimum=0)", o.MinFromAmount)
+	}
+}
+
 // TestMakeOrderReturnsStoreCopy proves dxMakeOrder returns a snapshot COPY of
 // the stored order, never the store's live record. On the old code the
 // returned *Order WAS the live record: the HTTP handler rendered

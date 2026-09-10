@@ -1412,7 +1412,10 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
 	}
 	partial := false
-	minFrom := fromAmt
+	// C++ passes partialMinimum=0 for exact orders (sendXBridgeTransaction,
+	// xbridgeapp.cpp:1479); the partial branch below overwrites this with the
+	// requested minimum. All other minFrom consumers are partial-gated.
+	minFrom := uint64(0)
 	cc := n.cfg().Confs[p.Maker]
 	nativeCoin := uint64(coinScale)
 	if cc != nil {
