@@ -385,7 +385,12 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 			// a shared key with INSUFFICIENT_FUNDS ("cannot reuse utxo inputs").
 			// A stale locked-set snapshot (node.go:1428) can also route a
 			// same-order loser to the collision path, so accept either code.
-			if rerr.Code != errBadRequest && rerr.Code != errInsufficientFunds {
+			// A loser snapshotting after the winner's commit sees Mine and gets
+			// 1025 "own order" — matching C++ (accept stamps from/to at
+			// xbridgeapp.cpp:2376-2380, so isLocal hits first at
+			// rpcxbridge.cpp:1211). Accept only this exact text.
+			if rerr.Code != errBadRequest && rerr.Code != errInsufficientFunds &&
+				(rerr.Code != errInvalidParameters || !strings.Contains(rerr.Error, "Unable to accept your own order")) {
 				t.Errorf("TakeOrder %d: unexpected error %v", i, rerr)
 			} else {
 				loses++
@@ -780,7 +785,8 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 	// The sweep enqueues a refund task for each session; exactly engineWorkers
 	// tasks park in SendRawTransaction and the rest fill the buffer.
 	n.submit(func() { n.scanRefunds() }, false)
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous wall-clock bound: the property is parking, not speed.
+	deadline := time.Now().Add(30 * time.Second)
 	for gated.callCount() < engineWorkers && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -808,7 +814,7 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "stored refund") {
 			t.Fatalf("BroadcastRefund err = %v, want stored-refund exhaustion error", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("BroadcastRefund blocked forever on a dropped refund task")
 	}
 }

@@ -997,6 +997,23 @@ func TestTakeOrderOwnOrder(t *testing.T) {
 	}
 }
 
+// A committed (accepting) order still reports 1025: the self-trade check
+// precedes the state gate, as in C++ (rpcxbridge.cpp:1211 before :2122).
+func TestTakeOrderCommittedStillOwnOrder(t *testing.T) {
+	reg, pubHex, hubAddr := pinnedHub(t, 0x6b)
+	n, _ := newHubNode(reg)
+	id := [32]byte{0x7c}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "accepting", Mine: true, Role: 'B',
+		SNodePubkey: pubHex, HubAddress: hubAddr,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
+	if rerr == nil || rerr.Code != errInvalidParameters || rerr.Error != "Invalid parameters: Unable to accept your own order." {
+		t.Fatalf("TakeOrder(accepting) = %v, want 1025 'Unable to accept your own order.'", rerr)
+	}
+}
+
 // TestTakeOrderNotFoundBare locks in C++ dxTakeOrder's not-found message:
 // makeError(TRANSACTION_NOT_FOUND, __FUNCTION__) with NO argument — the
 // double-space "Transaction  not found" (rpcxbridge.cpp:1176-1179).
