@@ -140,7 +140,7 @@ type SwapSession struct {
 	hubKey [33]byte
 	state  clientState
 
-	// await is true while a two-phase handshake task (deposit/claim) for this
+	// await is true while a three-phase handshake task (deposit/claim build + broadcast) for this
 	// session is in flight: set by the staged handler's stage 1, cleared by its
 	// resume on success AND error. The hub sends the next packet only after our
 	// response, so any packet arriving during await is a retransmit and is
@@ -148,28 +148,42 @@ type SwapSession struct {
 	await bool
 }
 
-// depositOutcome is the worker-produced result of a deposit build+broadcast
-// (CreateA/CreateB). depositHex is the signed deposit raw hex (for the swap
-// transcript); txid is the locally-derived txid (authoritative, C++ binTxId).
+// depositOutcome is the worker-produced result of a deposit BUILD (CreateA/CreateB).
+// Nothing is broadcast yet: the engine durably persists the intent
+// (refundHex + txid + lockTime) via persistNow BEFORE posting the broadcast
+// task, so a crash can never strand an on-chain deposit with no refund.
+// depositHex is the signed deposit raw hex for the transcript; the same hex
+// is handed to the broadcast task; txid is the locally-derived
+// txid (authoritative, C++ binTxId).
 type depositOutcome struct {
-	txid       string
-	lockTime   uint32
-	refundHex  string
+	txid      string
+	lockTime  uint32
+	refundHex string
+	// depositHex is the signed deposit raw hex: the transcript records it and
+	// the broadcast task sends it (single field, single owner).
 	depositHex string
+	// conn is the snapshot wallet connector the deposit was built against.
+	// The broadcast task must use THIS connector, never a post-reload one:
+	// a dxLoadXBridgeConf landing mid-task must not swap which wallet a
+	// deposit broadcasts through (the snapshot exists for exactly this).
+	conn wallet.Connector
 }
 
-// confirmOutcome is the worker-produced result of a claim (ConfirmA/B). secret
-// is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA). check
-// carries the validated counterparty deposit (ConfirmA's deposit check; zero for
-// ConfirmB, whose check ran at CreateB). payHex is the signed claim raw hex
-// (for the swap transcript); payTxID is the broadcast chain id. cur is the
-// chain the claim spends on.
+// confirmOutcome is the worker-produced result of a claim BUILD (ConfirmA/B):
+// the signed claim hex plus the validated counterparty deposit (ConfirmA) or
+// the recovered secret (ConfirmB). Nothing is broadcast yet: the engine
+// durably persists the intent via persistNow BEFORE posting the broadcast
+// task. payTxID is the locally-derived claim id (authoritative; the wallet's
+// reported id is only ever logged). cur is the chain the claim spends on.
 type confirmOutcome struct {
 	secret  [33]byte
 	payTxID string
 	payHex  string
 	cur     string
 	check   wallet.DepositCheck
+	// conn is the snapshot wallet connector the claim was built against
+	// (same mid-task-reload rule as depositOutcome.conn).
+	conn wallet.Connector
 }
 
 // selfCancelErr marks a worker failure that must broadcast a Cancel packet with
@@ -189,7 +203,7 @@ func (e *selfCancelErr) Error() string {
 // of the counterparty's deposit/locktime and rolls back locally, mirroring C++
 // sendCancelTransaction + processTransactionCancel + sendPacketBroadcast
 // (xbridgesession.cpp:3525-3576). Must run on the engine goroutine (it mutates
-// the store/order): the callers are the two-phase resumes, which execute on the
+// the store/order): the callers are the three-phase resumes, which execute on the
 // engine. The packet is signed with the session's per-trade M key; since
 // Order.MakerKey is OUR M pubkey (order.go:96-99), handleRemoteCancel's
 // iCanceled check accepts it and performs the state transition (cancel if no
@@ -286,7 +300,7 @@ func counterpartyCoin(s *SwapSession) coins.Coin {
 }
 
 // swapCtx is an immutable engine-side snapshot of a SwapSession, taken at
-// stage-1 enqueue time. The two-phase handshake workers run the wallet-I/O
+// stage-1 enqueue time. The three-phase handshake workers run the wallet-I/O
 // builders against THIS value and never touch a live session, which the engine
 // owns exclusively — a worker reading a session field would race the engine's
 // resume writes.
@@ -666,9 +680,10 @@ func decodeAddrHash(cur, addrStr string) [20]byte {
 
 // OnCreateA (hub→maker) → CreatedA (11): build + broadcast our deposit A.
 //
-// Two-phase: stage 1 (engine) validates and records the counterparty key; the
-// worker builds+broadcasts the deposit (all wallet I/O); the resume applies the
-// outcome to the session/order, sends the CreatedA response, and persists.
+// Three-phase: stage 1 (engine) validates and records the counterparty key;
+// the worker builds the deposit (all wallet I/O, no broadcast); the phase-1
+// resume persists the intent and posts the broadcast; the phase-2 resume
+// applies the confirmed broadcast, sends the CreatedA response, and persists.
 func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
 	if !s.isMaker {
@@ -722,15 +737,19 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	return 0, nil, nil // deferred; applyCreatedA sends on worker completion
 }
 
-// applyCreatedA is the engine-side resume for a CreateA deposit task: it applies
-// the outcome to the session and order, persists, and sends the CreatedA
-// response (started mode) or returns the response body (inline mode). It always
-// clears the session's await guard, so an errored task leaves the swap resumable
-// (the hub resends).
+// applyCreatedA is the engine-side resume for a CreateA deposit BUILD task
+// (phase 1): it adopts the built intent (txid/lockTime/refundHex) to the
+// session and order, durably persists it via persistNow, and posts the
+// broadcast task — it never broadcasts itself. The hub response leaves in
+// phase 2 (applyCreatedABroadcast), after the broadcast confirms. await stays
+// set across the broadcast and is cleared by phase 2 (or here on build/persist
+// failure), so a retransmit can neither double-build nor double-broadcast. A
+// persist failure withholds the broadcast (fail closed); the hub retransmits
+// and the deposit is rebuilt.
 func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
 	if terr != nil {
+		s.await = false
 		xlog.Error("CreateA deposit task failed", "order", orderID, "err", terr)
 		return nil
 	}
@@ -740,10 +759,51 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	s.refundHex = out.refundHex
 	s.n.store.Update(orderID, func(o *Order) {
 		o.BinTxId = out.txid
-		o.DepositSent = true
+		o.DepositSent = false
 	})
 	s.n.store.Update(orderID, func(o *Order) {
 		o.RefundTx = out.refundHex
+	})
+	// Durable intent BEFORE broadcast: from here on, a crash recovers the
+	// pre-signed refund from disk (and the sweep owns it post-restart).
+	if err := s.n.persistNow(); err != nil {
+		s.await = false
+		xlog.Error("CreateA intent persist failed, deposit withheld", "order", orderID, "err", err)
+		return nil
+	}
+	// Transcript of the built (not yet broadcast) deposit + refund, so even a
+	// crash before the broadcast leaves the full manual-recovery record.
+	txLogDepositBuilt(s.id, "A", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.lockTime, out.depositHex, out.refundHex)
+	// Nil in started mode (phase 2 sends the response); the phase-2 body in
+	// inline mode (synchronous broadcast).
+	var body responseBody
+	s.n.postBroadcastTask(orderID, out.conn, s.srcCur, out.depositHex, func(sentID string, berr error) {
+		body = s.applyCreatedABroadcast(out, sentID, berr)
+	})
+	return body
+}
+
+// applyCreatedABroadcast is the engine-side resume for a CreateA deposit
+// BROADCAST task (phase 2): it records the confirmed broadcast, advances the
+// order to created, writes the transcript entry, and sends the CreatedA
+// response (started mode) or returns it (inline mode). A broadcast failure
+// leaves the session at its pre-deposit state with the intent durable —
+// resumption comes from hub redelivery (rebuild) or cancel (clean: no deposit
+// exists, and enqueueRefund refuses unbroadcast intents).
+func (s *SwapSession) applyCreatedABroadcast(out depositOutcome, sentID string, terr error) responseBody {
+	orderID := hexEncode(s.id[:])
+	s.await = false
+	if terr != nil {
+		xlog.Error("CreateA deposit broadcast failed", "order", orderID, "err", terr)
+		return nil
+	}
+	// The wallet's reported id is logged (C++ :2187-2191) but never adopted:
+	// C++ keeps binTxId (the locally-derived txid) as authoritative.
+	if sentID != "" && sentID != out.txid {
+		xlog.Warn("CreateA: wallet reported a different sent txid", "order", orderID, "local", out.txid, "sent", sentID)
+	}
+	s.n.store.Update(orderID, func(o *Order) {
+		o.DepositSent = true
 	})
 	s.state = csCreatedA
 	// C++ maker order advances to trCreated here (xbridgesession.cpp:2174).
@@ -751,7 +811,8 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	xlog.Info("deposit A broadcast", "order", orderID, "txid", out.txid,
 		"lockTime", out.lockTime, "secretHash", hexEncode(s.secretHash[:]))
 	xlog.Debug("deposit A refund pre-signed", "order", orderID)
-	// Swap transcript (dedicated log-tx file): the manual-recovery record.
+	// Swap transcript (dedicated log-tx file): only now that the broadcast is
+	// confirmed — the transcript must never claim an unconfirmed broadcast.
 	txLogDeposit(s.id, "A", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.lockTime, out.depositHex, out.refundHex)
 	body := responseBody(&proto.CreatedABody{
 		HubAddress: s.hub, ID: s.id,
@@ -770,9 +831,11 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 
 // OnCreateB (hub→taker) → CreatedB (13): learn maker's deposit + build ours.
 //
-// Two-phase: stage 1 (engine) records the counterparty deposit; the worker
-// drift-checks its lockTime (GetBlockCount) then builds+broadcasts ours; the
-// resume applies the outcome, sends the CreatedB response, and persists.
+// Three-phase: stage 1 (engine) records the counterparty deposit; the worker
+// drift-checks its lockTime (GetBlockCount) then builds ours (no broadcast);
+// the phase-1 resume persists the intent and posts the broadcast; the phase-2
+// resume applies the confirmed broadcast, sends the CreatedB response, and
+// persists.
 func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
 	if s.isMaker {
@@ -857,12 +920,16 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	return 0, nil, nil // deferred; applyCreatedB sends on worker completion
 }
 
-// applyCreatedB is the engine-side resume for a CreateB deposit task (see
-// applyCreatedA for the resume contract).
+// applyCreatedB is the engine-side resume for a CreateB deposit BUILD task
+// (phase 1): it adopts the built intent plus the validated counterparty
+// out-params, durably persists via persistNow, and posts the broadcast task —
+// it never broadcasts itself (see applyCreatedA for the phase contract). A
+// persist failure withholds the broadcast (fail closed); the hub retransmits
+// and the deposit is rebuilt.
 func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
 	if terr != nil {
+		s.await = false
 		if s.failSelfCancel(terr) {
 			return nil
 		}
@@ -878,7 +945,7 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	s.theirOverpayment = out.check.Excess
 	s.n.store.Update(orderID, func(o *Order) {
 		o.BinTxId = out.out.txid
-		o.DepositSent = true
+		o.DepositSent = false
 	})
 	s.n.store.Update(orderID, func(o *Order) {
 		o.RefundTx = out.out.refundHex
@@ -888,13 +955,54 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 		o.OBinTxP2SHAmount = toXBridgeAmt(counterpartyCoin(s), out.check.P2SHNative)
 		o.OOverpayment = out.check.Excess
 	})
+	// Durable intent BEFORE broadcast: from here on, a crash recovers the
+	// pre-signed refund from disk (and the sweep owns it post-restart).
+	if err := s.n.persistNow(); err != nil {
+		s.await = false
+		xlog.Error("CreateB intent persist failed, deposit withheld", "order", orderID, "err", err)
+		return nil
+	}
+	// Transcript of the built (not yet broadcast) deposit + refund.
+	txLogDepositBuilt(s.id, "B", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.out.lockTime, out.out.depositHex, out.out.refundHex)
+	// Nil in started mode (phase 2 sends the response); the phase-2 body in
+	// inline mode (synchronous broadcast).
+	var body responseBody
+	s.n.postBroadcastTask(orderID, out.out.conn, s.srcCur, out.out.depositHex, func(sentID string, berr error) {
+		body = s.applyCreatedBBroadcast(out, sentID, berr)
+	})
+	return body
+}
+
+// applyCreatedBBroadcast is the engine-side resume for a CreateB deposit
+// BROADCAST task (phase 2): it records the confirmed broadcast, advances the
+// order to created, writes the transcript entry, and sends the CreatedB
+// response (started mode) or returns it (inline mode). A broadcast failure
+// leaves the session at its pre-deposit state with the intent durable —
+// resumption comes from hub redelivery (rebuild) or cancel (clean: no deposit
+// exists, and enqueueRefund refuses unbroadcast intents).
+func (s *SwapSession) applyCreatedBBroadcast(out createdBOutcome, sentID string, terr error) responseBody {
+	orderID := hexEncode(s.id[:])
+	s.await = false
+	if terr != nil {
+		xlog.Error("CreateB deposit broadcast failed", "order", orderID, "err", terr)
+		return nil
+	}
+	// The wallet's reported id is logged (C++ :2710-2714) but never adopted:
+	// the locally-derived txid stays authoritative.
+	if sentID != "" && sentID != out.out.txid {
+		xlog.Warn("CreateB: wallet reported a different sent txid", "order", orderID, "local", out.out.txid, "sent", sentID)
+	}
+	s.n.store.Update(orderID, func(o *Order) {
+		o.DepositSent = true
+	})
 	s.state = csCreatedB
 	// C++ taker order advances to trCreated here (xbridgesession.cpp:2702).
 	s.setOrderStatus("created")
 	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
 		"lockTime", out.out.lockTime, "makerDeposit", s.theirDepositTxID)
 	xlog.Debug("deposit B refund pre-signed", "order", orderID)
-	// Swap transcript (dedicated log-tx file): the manual-recovery record.
+	// Swap transcript (dedicated log-tx file): only now that the broadcast is
+	// confirmed — the transcript must never claim an unconfirmed broadcast.
 	txLogDeposit(s.id, "B", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.out.lockTime, out.out.depositHex, out.out.refundHex)
 	body := responseBody(&proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
@@ -914,9 +1022,10 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 // OnConfirmA (hub→maker's dest) → ConfirmedA (19): redeem taker's deposit B by
 // revealing our secret on-chain, then broadcast A's payTx.
 //
-// Two-phase: stage 1 (engine) records the taker deposit; the worker drift-checks
-// its lockTime, builds the claim, and broadcasts the payTx; the resume applies
-// the outcome, sends the ConfirmedA response, and persists.
+// Three-phase: stage 1 (engine) records the taker deposit; the worker
+// drift-checks its lockTime and builds the claim (no broadcast); the phase-1
+// resume persists the intent and posts the broadcast; the phase-2 resume
+// applies the confirmed claim, sends the ConfirmedA response, and persists.
 func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
 	if !s.isMaker {
@@ -975,15 +1084,20 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 				return nil, err
 			}
 			xlog.Debug("ConfirmA: claim tx built", "order", orderID, "cur", cur)
-			conn, e := c.connector(cur)
+			// Fail fast when the spending chain has no connector, but do NOT
+			// broadcast here: the engine persists the claim intent first and
+			// the broadcast runs as a separate gated step. Derive the payTx id
+			// locally (authoritative, like the deposit txid); the wallet's
+			// reported id is only ever logged, never adopted.
+			wconn, e := c.connector(cur)
 			if e != nil {
 				return nil, e
 			}
-			payTxID, err := conn.SendRawTransaction(payHex)
+			localPayID, err := txIDFromHex(payHex)
 			if err != nil {
-				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
+				return nil, err
 			}
-			return confirmOutcome{payTxID: payTxID, payHex: payHex, cur: cur, check: dcheck}, nil
+			return confirmOutcome{payTxID: localPayID, payHex: payHex, cur: cur, check: dcheck, conn: wconn}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedA(v, terr) },
 	}
@@ -1001,12 +1115,16 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 	return 0, nil, nil // deferred; applyConfirmedA sends on worker completion
 }
 
-// applyConfirmedA is the engine-side resume for a ConfirmA claim task (see
-// applyCreatedA for the resume contract).
+// applyConfirmedA is the engine-side resume for a ConfirmA claim BUILD task
+// (phase 1): it adopts the validated counterparty out-params, durably persists
+// the claim intent via persistNow, and posts the broadcast task — it never
+// broadcasts itself (see applyCreatedA for the phase contract). A persist
+// failure withholds the broadcast (fail closed); the hub retransmits and the
+// claim is rebuilt.
 func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
 	if terr != nil {
+		s.await = false
 		if s.failSelfCancel(terr) {
 			return nil
 		}
@@ -1017,10 +1135,52 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	s.theirDepositVout = out.check.DepositVout
 	s.theirP2SHNative = out.check.P2SHNative
 	s.theirOverpayment = out.check.Excess
+	// Durable intent BEFORE broadcast: from here on, a crash restores the
+	// session identity plus the counterparty deposit pointers
+	// (theirDepositTxID/LockTime/SecretHash) from disk, and the claim itself
+	// rebuilds on hub redelivery (the counterparty deposit is still on
+	// chain). Only the deposit path is fully rebroadcastable from disk
+	// (refundHex + txid + lockTime persist); claims re-derive.
+	if err := s.n.persistNow(); err != nil {
+		s.await = false
+		xlog.Error("ConfirmA intent persist failed, claim withheld", "order", orderID, "err", err)
+		return nil
+	}
+	// Transcript of the built (not yet broadcast) claim.
+	txLogClaimBuilt(s.id, "A", out.cur, out.payHex)
+	// Nil in started mode (phase 2 sends the response); the phase-2 body in
+	// inline mode (synchronous broadcast).
+	var body responseBody
+	s.n.postBroadcastTask(orderID, out.conn, out.cur, out.payHex, func(sentID string, berr error) {
+		body = s.applyConfirmedABroadcast(out, sentID, berr)
+	})
+	return body
+}
+
+// applyConfirmedABroadcast is the engine-side resume for a ConfirmA claim
+// BROADCAST task (phase 2): it records the confirmed claim, writes the
+// transcript entry, and sends the ConfirmedA response (started mode) or
+// returns it (inline mode). A broadcast failure leaves the session at its
+// pre-claim state with the intent durable — resumption comes from hub
+// redelivery (rebuild) or cancel (the counterparty deposit is untouched).
+func (s *SwapSession) applyConfirmedABroadcast(out confirmOutcome, sentID string, terr error) responseBody {
+	orderID := hexEncode(s.id[:])
+	s.await = false
+	if terr != nil {
+		xlog.Error("ConfirmA claim broadcast failed", "order", orderID, "err", terr)
+		return nil
+	}
+	// The wallet's reported id is logged but never adopted: the locally
+	// derived payTx id stays authoritative.
+	if sentID != "" && sentID != out.payTxID {
+		xlog.Warn("ConfirmA: wallet reported a different sent txid", "order", orderID, "local", out.payTxID, "sent", sentID)
+	}
+	payTxID := out.payTxID
 	s.state = csConfirmedA
-	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
-	// Swap transcript (dedicated log-tx file): the broadcast claim.
-	txLogClaim(s.id, "A", out.cur, out.payTxID, out.payHex)
+	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", payTxID)
+	// Swap transcript (dedicated log-tx file): only now that the broadcast is
+	// confirmed — the transcript must never claim an unconfirmed broadcast.
+	txLogClaim(s.id, "A", out.cur, payTxID, out.payHex)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()); the
 	// validated deposit out-params feed the order record.
 	s.n.store.Update(orderID, func(o *Order) {
@@ -1030,7 +1190,7 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 		o.OOverpayment = out.check.Excess
 	})
 	body := responseBody(&proto.ConfirmedABody{
-		HubAddress: s.hub, ID: s.id, APayTxID: out.payTxID,
+		HubAddress: s.hub, ID: s.id, APayTxID: payTxID,
 	})
 	if s.n.engineRunning.Load() {
 		s.n.persist()
@@ -1045,10 +1205,11 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 // OnConfirmB (hub→taker's dest) → ConfirmedB (21): recover the secret from A's
 // payTx, then redeem maker's deposit A.
 //
-// Two-phase: stage 1 (engine) is pure; the worker fetches the maker's payTx,
-// recovers the secret, builds the claim, and broadcasts the payTx; the resume
-// applies the outcome (including the recovered secret), sends the ConfirmedB
-// response, and persists.
+// Three-phase: stage 1 (engine) is pure; the worker fetches the maker's payTx,
+// recovers the secret, and builds the claim (no broadcast); the phase-1 resume
+// persists the intent (including the secret) and posts the broadcast; the
+// phase-2 resume applies the confirmed claim, sends the ConfirmedB response,
+// and persists.
 func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
 	if s.isMaker {
@@ -1101,15 +1262,20 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 				return nil, err
 			}
 			xlog.Debug("ConfirmB: claim tx built", "order", orderID, "cur", cur)
-			conn2, e := c.connector(cur)
+			// Fail fast when the spending chain has no connector, but do NOT
+			// broadcast here: the engine persists the claim intent (including
+			// the recovered secret) first and the broadcast runs separately.
+			// Derive the payTx id locally (authoritative); the wallet's
+			// reported id is only ever logged, never adopted.
+			wconn, e := c.connector(cur)
 			if e != nil {
 				return nil, e
 			}
-			payTxID, err := conn2.SendRawTransaction(payHex2)
+			localPayID, err := txIDFromHex(payHex2)
 			if err != nil {
-				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
+				return nil, err
 			}
-			return confirmOutcome{secret: secret, payTxID: payTxID, payHex: payHex2, cur: cur}, nil
+			return confirmOutcome{secret: secret, payTxID: localPayID, payHex: payHex2, cur: cur, conn: wconn}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedB(v, terr) },
 	}
@@ -1127,21 +1293,64 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 	return 0, nil, nil // deferred; applyConfirmedB sends on worker completion
 }
 
-// applyConfirmedB is the engine-side resume for a ConfirmB claim task (see
-// applyCreatedA for the resume contract). It adopts the worker-recovered secret
-// into the session.
+// applyConfirmedB is the engine-side resume for a ConfirmB claim BUILD task
+// (phase 1): it adopts the worker-recovered secret, durably persists the
+// claim intent via persistNow, and posts the broadcast task — it never
+// broadcasts itself (see applyCreatedA for the phase contract). A persist
+// failure withholds the broadcast (fail closed); the hub retransmits and the
+// claim is rebuilt (the secret is re-recoverable from the maker's payTx).
 func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
 	if terr != nil {
+		s.await = false
 		xlog.Error("ConfirmB claim task failed", "order", orderID, "err", terr)
 		return nil
 	}
 	out := v.(confirmOutcome)
 	s.secret = out.secret
+	// Durable intent BEFORE broadcast: from here on, a crash restores the
+	// recovered secret plus the counterparty deposit pointers from disk, and
+	// the claim itself rebuilds on hub redelivery (the secret re-derives from
+	// the maker's on-chain payTx). Only the deposit path is fully
+	// rebroadcastable from disk (refundHex + txid + lockTime persist).
+	if err := s.n.persistNow(); err != nil {
+		s.await = false
+		xlog.Error("ConfirmB intent persist failed, claim withheld", "order", orderID, "err", err)
+		return nil
+	}
+	// Transcript of the built (not yet broadcast) claim.
+	txLogClaimBuilt(s.id, "B", out.cur, out.payHex)
+	// Nil in started mode (phase 2 sends the response); the phase-2 body in
+	// inline mode (synchronous broadcast).
+	var body responseBody
+	s.n.postBroadcastTask(orderID, out.conn, out.cur, out.payHex, func(sentID string, berr error) {
+		body = s.applyConfirmedBBroadcast(out, sentID, berr)
+	})
+	return body
+}
+
+// applyConfirmedBBroadcast is the engine-side resume for a ConfirmB claim
+// BROADCAST task (phase 2): it records the confirmed claim, writes the
+// transcript entry, and sends the ConfirmedB response (started mode) or
+// returns it (inline mode). A broadcast failure leaves the session at its
+// pre-claim state with the intent (and secret) durable — resumption comes
+// from hub redelivery (rebuild) or cancel.
+func (s *SwapSession) applyConfirmedBBroadcast(out confirmOutcome, sentID string, terr error) responseBody {
+	orderID := hexEncode(s.id[:])
+	s.await = false
+	if terr != nil {
+		xlog.Error("ConfirmB claim broadcast failed", "order", orderID, "err", terr)
+		return nil
+	}
+	// The wallet's reported id is logged but never adopted: the locally
+	// derived payTx id stays authoritative.
+	if sentID != "" && sentID != out.payTxID {
+		xlog.Warn("ConfirmB: wallet reported a different sent txid", "order", orderID, "local", out.payTxID, "sent", sentID)
+	}
 	s.state = csConfirmedB
 	xlog.Info("ConfirmB: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
-	// Swap transcript (dedicated log-tx file): the broadcast claim.
+	// Swap transcript (dedicated log-tx file): only now that the broadcast is
+	// confirmed — the transcript must never claim an unconfirmed broadcast.
 	txLogClaim(s.id, "B", out.cur, out.payTxID, out.payHex)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
 	s.n.store.Update(orderID, func(o *Order) {
@@ -1294,6 +1503,15 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 	}
 }
 
+// orderDepositSent reports whether the order's deposit broadcast confirmed
+// (phase 2 recorded DepositSent). Since intent-before-broadcast, a persisted
+// refund intent alone no longer proves an on-chain deposit — this flag is the
+// proof. Engine- or test-side; store.Get is lock-guarded.
+func (n *Node) orderDepositSent(orderID string) bool {
+	o := n.store.Get(orderID)
+	return o != nil && o.DepositSent
+}
+
 // rollbackGate reports whether C++ redeemOrderDeposit's state gate
 // (state >= trCreated, xbridgesession.cpp:3852-3854) holds for orderID. The
 // session state is authoritative — csCreatedA is the deposit-broadcast state,
@@ -1304,15 +1522,21 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 // Engine-owned (reads n.sessions); call from the engine or inline tests.
 func (n *Node) rollbackGate(orderID string) bool {
 	if s := n.sessions[orderID]; s != nil {
-		return s.state >= csCreatedA
+		// The broadcast-confirmed state advances past csCreatedA in phase 2;
+		// a crash-recovered session keeps its pre-created state but carries
+		// a verified DepositSent — both prove an on-chain deposit.
+		return s.state >= csCreatedA || n.orderDepositSent(orderID)
 	}
 	if o := n.store.Get(orderID); o != nil {
-		return o.RefundTx != ""
+		// Session-less fallback: the stored refund alone no longer proves an
+		// on-chain deposit (phase 1 persists it pre-broadcast) — require the
+		// verified DepositSent too.
+		return o.RefundTx != "" && o.DepositSent
 	}
 	return false
 }
 
-// postSwapTask posts a two-phase handshake task (deposit build / claim) to the
+// postSwapTask posts a three-phase handshake task (deposit build / claim) to the
 // worker pool (or runs it synchronously in inline mode, when the engine is not
 // started). The apply runs on the engine: it applies the outcome to the session,
 // sends the hub response, and persists. A full task queue drops the task and
@@ -1336,6 +1560,49 @@ func (n *Node) postSwapTask(orderID string, task workTask) bool {
 	}
 }
 
+// postBroadcastTask posts a raw-hex chain broadcast (deposit / claim) to the
+// worker pool after the engine has durably persisted the intent, so a crash
+// between broadcast and resume can always recover (the refund was persisted
+// first). conn is the snapshot wallet connector the hex was built against —
+// captured by the worker from its build-time snapshot, never re-resolved
+// post-reload — so a dxLoadXBridgeConf landing mid-task cannot swap which
+// wallet broadcasts (the snapshot exists for exactly this). apply runs on the
+// engine with the wallet-reported sent txid. A full task queue drops the
+// broadcast and clears the session's await guard so the hub's retransmit
+// re-stages it (fund-safe: the intent is durable, nothing was broadcast).
+// Inline mode (tests) runs synchronously.
+func (n *Node) postBroadcastTask(orderID string, conn wallet.Connector, cur, hex string, apply func(sentID string, terr error)) bool {
+	task := workTask{
+		orderID: orderID,
+		run: func() (any, error) {
+			if conn == nil {
+				return "", fmt.Errorf("api: no connector for %s", cur)
+			}
+			return conn.SendRawTransaction(hex)
+		},
+		apply: func(v any, terr error) {
+			sentID, _ := v.(string)
+			apply(sentID, terr)
+		},
+	}
+	if !n.engineRunning.Load() {
+		v, err := safeTaskRun(task)
+		sentID, _ := v.(string)
+		apply(sentID, err)
+		return true
+	}
+	select {
+	case n.tasks <- task:
+		return true
+	default:
+		if s := n.sessions[orderID]; s != nil {
+			s.await = false
+		}
+		xlog.Warn("broadcast task dropped, engine busy", "order", orderID)
+		return false
+	}
+}
+
 // scanRefunds sweeps all live sessions and auto-broadcasts any pre-signed
 // refund whose deposit lockTime has passed (the fund-safety safety net). Runs
 // on the engine goroutine; each eligible session posts a worker task guarded by
@@ -1343,7 +1610,16 @@ func (n *Node) postSwapTask(orderID string, task workTask) bool {
 // broadcasts synchronously.
 func (n *Node) scanRefunds() {
 	for id, s := range n.sessions {
-		if s.refundDone || s.refundHex == "" || s.state == csFinished || s.state < csCreatedA {
+		if s.refundDone || s.refundHex == "" || s.state == csFinished {
+			continue
+		}
+		// No on-chain deposit, no refund: an intent persisted pre-broadcast
+		// (or a state still pre-created) means the deposit may never have
+		// broadcast — refunding it would be a harmless wallet reject, but the
+		// correct paths are hub redelivery (rebuild) or cancel. A
+		// crash-recovered session verified on-chain carries DepositSent and
+		// IS swept. The store lookup runs only for pre-created states.
+		if s.state < csCreatedA && !n.orderDepositSent(id) {
 			continue
 		}
 		if n.engineRunning.Load() {
@@ -1371,7 +1647,9 @@ func (n *Node) sessionIsTerminal(id string, s *SwapSession) bool {
 		return true
 	}
 	// A refund may still be owed: never prune while the sweep could broadcast.
-	if s.refundHex != "" && !s.refundDone && s.state >= csCreatedA {
+	// The sweep covers broadcast-confirmed states (csCreatedA+) and
+	// crash-recovered sessions verified on-chain (DepositSent) alike.
+	if s.refundHex != "" && !s.refundDone && (s.state >= csCreatedA || n.orderDepositSent(id)) {
 		return false
 	}
 	// A deposit/claim task is in flight (await stays set until its apply lands
@@ -1408,7 +1686,19 @@ func (n *Node) pruneSessions() {
 // outcome when it lands. Inline mode (tests) runs synchronously and invokes
 // done before returning.
 func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) {
+	// A persisted intent (refundHex present) is not proof of an on-chain
+	// deposit: since intent-before-broadcast, the refund is durable before the
+	// deposit broadcasts. Only attempt the refund when the deposit was
+	// actually sent — either the state machine advanced past the broadcast
+	// (phase 2) or the order carries a verified DepositSent (crash recovery).
+	// (C++ redeemOrderDeposit is a no-op below trCreated.)
 	if s := n.sessions[orderID]; s != nil && s.refundHex != "" {
+		if s.state < csCreatedA && !n.orderDepositSent(orderID) {
+			if done != nil {
+				done("", fmt.Errorf("api: no deposit broadcast for order %s", orderID))
+			}
+			return
+		}
 		// Take the pendingRefunds guard so a concurrent sweep
 		// (scanRefunds) cannot enqueue a second broadcast of the same refund
 		// hex while this force-refund is in flight. postRefundTask's apply
@@ -1423,7 +1713,7 @@ func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) 
 		return
 	}
 	o := n.store.Get(orderID)
-	if o == nil || o.RefundTx == "" {
+	if o == nil || o.RefundTx == "" || !o.DepositSent {
 		if done != nil {
 			done("", fmt.Errorf("api: no refund available for order %s", orderID))
 		}
@@ -1496,7 +1786,7 @@ func (n *Node) BroadcastRefund(orderID string) (string, error) {
 // computeLockTimeFor returns the absolute block height to embed in the deposit
 // HTLC for a given coin (mirrors C++ lockTime(): currentBlock + target/blockTime).
 // It is also used to compute our expectation of the counterparty's lockTime so we
-// can validate it via acceptableLockTimeDrift. Runs on a worker in the two-phase
+// can validate it via acceptableLockTimeDrift. Runs on a worker in the three-phase
 // handshake, so it reads config/connectors only — never live session state.
 func (c swapCtx) computeLockTimeFor(cur string, isMaker bool) uint32 {
 	conn := c.connectors[cur]
@@ -1535,12 +1825,14 @@ func (c *swapCtx) computeLockTime(isMaker bool) uint32 {
 }
 
 // buildDeposit builds the local participant's HTLC deposit, funds it from the
-// wallet connector, signs the funding inputs via the wallet, pre-builds the CLTV
-// refund, and only then broadcasts (C++ builds deposit → refund →
-// broadcast). It returns the broadcast deposit txid + lockTime and the
-// pre-signed refund hex as a depositOutcome. Runs on a worker in the two-phase
-// handshake; it reads only this snapshot and lock-guarded config, and performs
-// no session/order mutation — those happen in the engine-side resume.
+// wallet connector, signs the funding inputs via the wallet, and pre-builds
+// the CLTV refund — but does NOT broadcast (C++ builds deposit → refund →
+// broadcast; the broadcast is a separate engine-gated step so the refund is
+// durable first). It returns the signed hex + locally-derived txid + lockTime
+// and the pre-signed refund hex as a depositOutcome. Runs on a worker in the
+// three-phase handshake; it reads only this snapshot and lock-guarded config,
+// and performs no session/order mutation — those happen in the engine-side
+// resume.
 func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	cur := c.srcCur
 	amt := c.srcAmt
@@ -1644,21 +1936,15 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	}
 	c.refundHex = refundHex
 
-	sentID, err := conn.SendRawTransaction(signed)
-	if err != nil {
-		return depositOutcome{}, err
-	}
-	// The wallet's returned id is logged (C++ :2187-2191) but never adopted:
-	// C++ keeps binTxId (the locally-derived txid) as authoritative.
-	if sentID != "" && sentID != localTxID {
-		xlog.Warn("buildDeposit: wallet reported a different sent txid", "order", c.orderID, "local", localTxID, "sent", sentID)
-	}
-	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex, depositHex: signed}, nil
+	// No broadcast here: the engine persists this intent (refundHex + txid +
+	// lockTime) via persistNow BEFORE the broadcast task runs, so a crash
+	// between build and broadcast loses nothing.
+	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex, depositHex: signed, conn: conn}, nil
 }
 
 // buildRefundTx pre-signs the IF-branch (CLTV) refund that returns the deposit to
 // our source address, spendable only after the deposit's lockTime. Runs on a
-// worker in the two-phase handshake (reads only this snapshot + config).
+// worker in the three-phase handshake (reads only this snapshot + config).
 func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, error) {
 	coin, ok := c.coin(cur)
 	if !ok {
@@ -1712,7 +1998,7 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 // counterparty's deposit, revealing (maker) or using (taker) the secret. We always
 // redeem the counterparty's deposit, which is the currency we receive (dstCur)
 // and the amount we receive (dstAmt): the maker redeems the taker's LTC deposit,
-// the taker redeems the maker's BTC deposit. Runs on a worker in the two-phase
+// the taker redeems the maker's BTC deposit. Runs on a worker in the three-phase
 // handshake (reads only this snapshot + config); ConfirmB sets c.secret to the
 // recovered preimage before calling.
 func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, err error) {

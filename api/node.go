@@ -351,6 +351,46 @@ func (n *Node) restoreLocalSwaps(dataDir string) {
 	if len(ps) > 0 {
 		xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
 	}
+	// Crash-window reconciliation (see reconcileUnconfirmedDeposits): a deposit
+	// broadcast whose confirmation never persisted is ambiguous on disk —
+	// resolve it against the chain before the engine starts, so the refund
+	// sweep owns confirmed deposits immediately.
+	n.reconcileUnconfirmedDeposits()
+}
+
+// reconcileUnconfirmedDeposits resolves the broadcast→resume crash window at
+// startup. Since intent-before-broadcast, a restored live session can carry a
+// refund intent for a deposit whose broadcast never confirmed in phase 2 —
+// the deposit may or may not be on chain. For each such session the wallet is
+// asked for the deposit txid: found → DepositSent is marked so the refund
+// sweep (and the manual paths) own it; missing or unreachable wallet → left
+// alone for hub redelivery (rebuild) or cancel (the intent stays durable and
+// the pre-broadcast transcript entry names the hexes). Runs single-threaded
+// before the engine starts; one wallet RPC per ambiguous session (ambiguous
+// sessions only arise from a crash, so this is not a steady-state cost).
+func (n *Node) reconcileUnconfirmedDeposits() {
+	for id, s := range n.sessions {
+		if s.refundHex == "" || s.refundDone || s.state >= csCreatedA {
+			continue
+		}
+		if n.orderDepositSent(id) || s.ourDepositTxID == "" {
+			continue
+		}
+		conn := n.cfg().Connectors[s.srcCur]
+		if conn == nil {
+			xlog.Warn("reconcile: no connector, deposit state unknown", "order", id, "cur", s.srcCur, "txid", s.ourDepositTxID)
+			continue
+		}
+		hex, err := conn.GetRawTransaction(s.ourDepositTxID)
+		if err != nil || hex == "" {
+			xlog.Info("reconcile: deposit not on chain, awaiting redelivery or cancel", "order", id, "txid", s.ourDepositTxID)
+			continue
+		}
+		n.store.Update(id, func(o *Order) {
+			o.DepositSent = true
+		})
+		xlog.Warn("reconcile: deposit found on chain without confirmation record, marked sent", "order", id, "txid", s.ourDepositTxID)
+	}
 }
 
 // cfg returns the live configuration under a read lock. All config reads must

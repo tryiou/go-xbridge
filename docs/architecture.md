@@ -295,11 +295,19 @@ so the swap handshake and the refund sweep can never race each other.
   a channel buffered to the worker count, so the engine can never deadlock on a
   result send. A wallet that hangs on one coin cannot stall the engine or other
   sessions.
-- **Two-phase handshake**: `OnCreateA/B` and `OnConfirmA/B` split into stage 1
-  (engine: validate, snapshot the session, enqueue the task, set `await`) and a
-  resume (engine: apply the outcome, clear `await`, send the hub response,
-  persist). `await` is the retransmit guard: any hub packet arriving while a
-  task is in flight is dropped, so a deposit/claim is broadcast at most once.
+- **Three-phase handshake (intent-before-broadcast)**: `OnCreateA/B` and
+  `OnConfirmA/B` split into stage 1 (engine: validate, snapshot the session,
+  enqueue the build task, set `await`), a build resume (engine: adopt the
+  built intent — txid/lockTime/refundHex/claim hex — durably `persistNow` it,
+  post the broadcast task), and a broadcast resume (engine: record the
+  confirmed broadcast, clear `await`, send the hub response, persist). Nothing
+  reaches the chain until its refund is durable, so a crash at any seam leaves
+  the swap recoverable; a persist failure withholds the broadcast (fail
+  closed) and a broadcast failure leaves the pre-deposit state for hub
+  redelivery or cancel. `await` spans build+broadcast: any hub packet arriving
+  while either is in flight is dropped, so a deposit/claim is broadcast at
+  most once. The broadcast task uses the build-time snapshot connector, so a
+  `dxLoadXBridgeConf` landing mid-task cannot swap wallets mid-swap.
 - **`submit(run, await)`** queues a handler/HTTP command for the engine; when
   the engine is not started (single-threaded tests) it runs inline. Off-engine
   callers marshal work onto the engine with `submit`: the RPC handlers
@@ -319,6 +327,11 @@ so the swap handshake and the refund sweep can never race each other.
 Dependency-free: a size-based rotating file writer (`file.go`) and a `slog`
 multi-handler fanning records to multiple destinations (`multi.go`). Used by
 `cmd/xbridged` for `-logfile` logging and by the panic-safe RPC envelope.
+`txlog.go` is the dedicated per-day swap transcript
+(`<datadir>/log-tx/xbridgep2p_YYYYMMDD.log`, Core `log-tx` parity): every built
+and broadcast deposit/refund/claim lands there with order id, locktime, and
+full raw hex for manual recovery; the general log never carries trade hex or
+key material.
 
 ### `cmd/` — daemon & probe
 
@@ -336,9 +349,13 @@ response.
 **Make/take a trade:** dapp → `dxMakeOrder`/`dxTakeOrder` → `api` picks the hub
 (`findNodeWithService`) and pins its key → outbound packet
 envelope-addressed to the hub over `p2p` → `api/swap.go` `SwapSession` drives
-the handshake: build/broadcast HTLC deposits via `swap`+`coins` and the
-`wallet.Connector` (fund/sign/broadcast) → claim/refund as the hub advances the
-state → hub-pinned inbound packets re-verified before any state mutation.
+the handshake: build HTLC deposits via `swap`+`coins` and the
+`wallet.Connector` (fund/sign), durably persist the intent (txid/lockTime/
+pre-signed refund), then broadcast as a separate gated step → claim/refund as
+the hub advances the state → hub-pinned inbound packets re-verified before any
+state mutation. A restart reconciles ambiguous intents (built but unconfirmed
+deposits) against the chain before the engine starts, so the refund sweep owns
+confirmed deposits immediately.
 
 **Cancellation/refund:** `dxCancelOrder` or the engine-scheduled refund sweep on
 expiry; refund spends are built locally (`coins.BuildRefundScriptSig`) and

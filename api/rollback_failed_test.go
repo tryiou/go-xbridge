@@ -168,9 +168,9 @@ func TestRefundFailureStateGate(t *testing.T) {
 	}
 
 	// Session-less fallback (stored-order escape hatch): rollbackGate keys on
-	// RefundTx, not the order status — a session-less taker order stored
-	// "accepting" with RefundTx set still fires, while an order with no
-	// deposit (RefundTx "") is left alone.
+	// RefundTx + DepositSent, not the order status — a session-less taker
+	// order stored "accepting" with a broadcast-confirmed deposit still fires,
+	// while an order with no deposit (RefundTx "") is left alone.
 	var noDep [32]byte
 	copy(noDep[:], []byte("refund-fail-nodeposit-000"))
 	noDepKey := hexEncode(noDep[:])
@@ -187,7 +187,7 @@ func TestRefundFailureStateGate(t *testing.T) {
 	copy(sessless[:], []byte("refund-fail-sessless-000"))
 	sesslessKey := hexEncode(sessless[:])
 	n.store.Add(&Order{ID: sessless, FromCurrency: "LTC", ToCurrency: "LTC", Status: "accepting",
-		RefundTx: refundHexFixture()})
+		RefundTx: refundHexFixture(), DepositSent: true})
 	ltc.sendErr = errors.New("simulated rpc failure")
 	if !n.postRefundTask(sesslessKey, "LTC", refundHexFixture(), 0, false, nil) {
 		t.Fatal("postRefundTask dropped the task")

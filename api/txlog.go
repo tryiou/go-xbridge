@@ -31,6 +31,24 @@ func txLogDeposit(id [32]byte, role, srcCur string, srcAmt uint64, dstCur string
 		refundHex)
 }
 
+// txLogDepositBuilt records a BUILT but not yet broadcast deposit and its
+// pre-signed refund (Core logs both hexes at build time, before broadcast:
+// xbridgesession.cpp:2121-2125/:2168-2171). Labeled unbroadcast: if no
+// broadcast line follows for the order, the deposit may never have reached
+// the chain — check the deposit txid on chain before broadcasting the refund
+// (a refund for a nonexistent deposit is a harmless wallet reject, but the
+// check comes first).
+func txLogDepositBuilt(id [32]byte, role, srcCur string, srcAmt uint64, dstCur string, dstAmt uint64, lockTime uint32, depositHex, refundHex string) {
+	disp := orderIDString(id)
+	xlog.TxLog(disp,
+		fmt.Sprintf("deposit built (NOT YET BROADCAST) for order %s %d %s -> %d %s using locktime %d (submit manually using sendrawtransaction only if broadcast; check txid on chain first)",
+			disp, srcAmt, srcCur, dstAmt, dstCur, lockTime),
+		depositHex)
+	xlog.TxLog(disp,
+		fmt.Sprintf("refund pre-signed (unbroadcast deposit) for order %s role %s locktime %d", disp, role, lockTime),
+		refundHex)
+}
+
 // txLogClaim records a broadcast claim payTx (Core xbridgesession.cpp:3992-3995
 // analog). The claim reveals the HTLC secret on-chain by design (the taker
 // recovers it from this very hex), so a broadcast payTx is public chain data,
@@ -41,6 +59,17 @@ func txLogClaim(id [32]byte, role, cur, payTxID, payHex string) {
 	xlog.TxLog(disp,
 		fmt.Sprintf("redeem counterparty deposit for order %s role %s %s (submit manually using sendrawtransaction) paytx %s",
 			disp, role, cur, payTxID),
+		payHex)
+}
+
+// txLogClaimBuilt records a BUILT but not yet broadcast claim (same
+// unbroadcast labeling as txLogDepositBuilt; the payTx reveals the secret
+// only once broadcast).
+func txLogClaimBuilt(id [32]byte, role, cur, payHex string) {
+	disp := orderIDString(id)
+	xlog.TxLog(disp,
+		fmt.Sprintf("claim built (NOT YET BROADCAST) for order %s role %s %s (submit manually using sendrawtransaction only if broadcast)",
+			disp, role, cur),
 		payHex)
 }
 

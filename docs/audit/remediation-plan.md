@@ -154,6 +154,16 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   `TestCreateBWaitsOnNotReadyDeposit`.
 - **CRYPTO-F86:** `buildDeposit` signs → derives the local txid → pre-builds the
   CLTV refund → only then broadcasts (`TestDepositNotBroadcastWhenRefundFails`).
+  Recovery hardening (2026-09-10): the broadcast is now a separate engine-gated
+  step AFTER a synchronous `persistNow` of the intent (refund + txid + lockTime),
+  so no chain broadcast precedes its durable refund; a persist failure withholds
+  the broadcast and a broadcast failure leaves the pre-deposit state for hub
+  redelivery or cancel. Restart reconciles built-but-unconfirmed deposits
+  against the chain (`reconcileUnconfirmedDeposits`). Tests:
+  `TestDepositIntentDurableBeforeBroadcast`,
+  `TestCrashBetweenIntentAndBroadcastRecoversRefund`,
+  `TestCrashWithUnbroadcastDepositLeavesNoRefund`,
+  `TestClaimIntentDurableBeforeBroadcast`, `TestNoRefundAttemptWithoutBroadcast`.
 - **CRYPTO-F87:** maker `MakeOrder` records `Order.UsedCoins` (incl. autoSplit);
   `buildDeposit` consumes the `swapCtx.funding` snapshot, never `ListUnspent`
   (`TestDepositSpendsUsedCoins`).

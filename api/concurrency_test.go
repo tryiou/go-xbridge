@@ -803,7 +803,7 @@ func TestRefundTaskDropInvokesDone(t *testing.T) {
 	rtx := &coins.Tx{Version: 1}
 	rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("f0", 32)), Index: 0}, Sequence: 0xfffffffe}}
 	rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
-	n.store.Add(&Order{ID: sID, FromCurrency: "BTC", ToCurrency: "LTC", RefundTx: hex.EncodeToString(rtx.Serialize())})
+	n.store.Add(&Order{ID: sID, FromCurrency: "BTC", ToCurrency: "LTC", RefundTx: hex.EncodeToString(rtx.Serialize()), DepositSent: true})
 
 	done := make(chan error, 1)
 	go func() { _, err := n.BroadcastRefund(storedID); done <- err }()
