@@ -15,7 +15,6 @@ import (
 	"go-xbridge/coins"
 	"go-xbridge/config"
 	discovery "go-xbridge/p2p/discovery"
-	"go-xbridge/swap"
 	"go-xbridge/wallet"
 )
 
@@ -1282,125 +1281,15 @@ func (h *HandlerCtx) dxPartialOrderChainDetails(params []json.RawMessage) (inter
 // dxGetLockedUtxos — currently locked orders.
 // ---------------------------------------------------------------------------
 
-func (h *HandlerCtx) dxGetLockedUtxos(params []json.RawMessage) (interface{}, *rpcError) {
-	// arity (0..1) is enforced by checkArity (dispatch.go).
-	// C++ gates on the Exchange (Service Node) being started; a thin client with
-	// no configured exchange wallets cannot serve locked-utxo data. Guard the nil
-	// Node/Config so an unconfigured handler returns the business error instead of
-	// panicking.
-	if h.Node == nil || h.Node.cfg() == nil || len(h.Node.cfg().ExchangeWallets) == 0 {
-		return nil, makeError(errNotExchangeNode, "dxGetLockedUtxos", "not an exchange node")
-	}
-	keys, byOrder := h.Store.LockedUtxoInfo()
-	var id string
-	if len(params) == 1 {
-		var perr *rpcError
-		if id, _, perr = spStr(params, 0); perr != nil {
-			return nil, perr
-		}
-	}
-	// C++ treats a null id (empty, whitespace, "0x", or otherwise unparseable)
-	// as "all": Exchange::getUtxoItems returns every locked entry for a null
-	// txid (xbridgeexchange.cpp:278-283; rpcxbridge.cpp:2648-2652).
-	raw := parseOrderIDS(id)
-	if idIsNull(raw) {
-		// No id -> all locked utxos across the configured exchange wallets,
-		// rendered as C++ Exchange::getUtxoItems "txid:vout:amount:address"
-		// strings with the native amount streamed as a default-float double
-		// (xbridgewalletconnector.cpp:25-30).
-		all := make([]string, 0)
-		for _, ticker := range h.Node.cfg().ExchangeWallets {
-			conn, e := h.connector(ticker, "dxGetLockedUtxos")
-			if e != nil {
-				continue
-			}
-			utxos, err := conn.ListUnspent(0)
-			if err != nil {
-				continue
-			}
-			for _, u := range utxos {
-				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
-				if !keys[k] {
-					continue
-				}
-				all = append(all, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+nativeAmountString(u.Value)+":"+u.Address)
-			}
-		}
-		return map[string]interface{}{"all_locked_utxo": all}, nil
-	}
-	// The echoed id is the C++ display-hex (GetHex) of the parsed
-	// value, never the raw param (rpcxbridge.cpp:2672; error text 2641,2666).
-	idNorm := orderIDString(raw)
-	o := h.Store.Get(orderIDKey(id))
-	if o == nil {
-		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", idNorm)
-	}
-	// C++ errors 1021 TRANSACTION_NOT_FOUND when the id has NO locked
-	// utxos reserved (Exchange::getUtxoItems -> m_utxoTxMap miss, rpcxbridge.cpp:
-	// 2637, xbridgeexchange.cpp:294-303) or the transaction is in neither the
-	// pending nor the accepted map (rpcxbridge.cpp:2660-2670). A live order with
-	// nothing reserved must 1021, not return []. Terminal orders (finished /
-	// canceled, not yet moved to history) are excluded from the locked-utxo set
-	// by lockedInfoLocked's isOrderTerminal skip (store.go:378-380), so they
-	// also 1021 here via the hasLocked gate.
-	hasLocked := false
-	for _, oid := range byOrder {
-		if oid == idNorm {
-			hasLocked = true
-			break
-		}
-	}
-	if !hasLocked {
-		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", idNorm)
-	}
-	// Pending/accepted validity: C++ evicts expired transactions from both maps
-	// (xbridgeexchange.cpp:400,478), so an expired order is invalid -> 1021.
-	// Terminal states are not in the live store at all (Store.Get above).
-	st := stateOrdinal(o.Status)
-	if st < int(swap.DescrNew) {
-		return nil, makeError(errTxNotFound, "dxGetLockedUtxos", idNorm)
-	}
-	// Per-order locked utxos. C++ keys the array by the transaction's MAP
-	// membership (rpcxbridge.cpp:2674-2677): a pending offer uses a_currency,
-	// an accepted transaction a_currency_and_b_currency. Membership is not the
-	// raw state ordinal — a maker's own order lives in the accepted map from
-	// creation (xbridgeapp.cpp:2034), so o.Mine counts as accepted even while
-	// still pending/open.
-	entries := make([]string, 0)
-	key := o.FromCurrency
-	if o.Mine || st >= int(swap.DescrAccepting) {
-		key = o.FromCurrency + "_and_" + o.ToCurrency
-	}
-	if connFrom, e := h.connector(o.FromCurrency, "dxGetLockedUtxos"); e == nil {
-		utxos, err := connFrom.ListUnspent(0)
-		if err == nil {
-			for _, u := range utxos {
-				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
-				if byOrder[k] != idNorm {
-					continue
-				}
-				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+nativeAmountString(u.Value)+":"+u.Address)
-			}
-		}
-	}
-	// The order may also hold taker-currency UTXOs (accepted order); gather
-	// them into the same list, mirroring C++ Exchange::getUtxoItems.
-	if connTo, e := h.connector(o.ToCurrency, "dxGetLockedUtxos"); e == nil && o.ToCurrency != o.FromCurrency {
-		utxos, err := connTo.ListUnspent(0)
-		if err == nil {
-			for _, u := range utxos {
-				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
-				if byOrder[k] != idNorm {
-					continue
-				}
-				entries = append(entries, u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)+":"+nativeAmountString(u.Value)+":"+u.Address)
-			}
-		}
-	}
-	return map[string]interface{}{
-		"id": idNorm,
-		key:  entries,
-	}, nil
+func (h *HandlerCtx) dxGetLockedUtxos(_ []json.RawMessage) (interface{}, *rpcError) {
+	// arity (0..1) is enforced by checkArity (dispatch.go), matching C++'s
+	// "Too many parameters" 1025 for >1 (rpcxbridge.cpp:2619-2625).
+	// C++ then gates on the Exchange being started (rpcxbridge.cpp:2627-2633);
+	// a thin client never starts it, so EVERY call answers 1029
+	// NOT_EXCHANGE_NODE (canonical text in response.go, xbridgeerror.cpp:61-62).
+	// The params are intentionally unread: the gate fires before id parsing,
+	// regardless of params. No list is ever served.
+	return nil, makeError(errNotExchangeNode, "dxGetLockedUtxos", "")
 }
 
 // ---------------------------------------------------------------------------

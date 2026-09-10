@@ -12,6 +12,7 @@ import (
 	"go-xbridge/config"
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
+	"go-xbridge/proto"
 	"go-xbridge/wallet"
 )
 
@@ -403,7 +404,14 @@ func TestDxSplitInputsTxidVoutOnly(t *testing.T) {
 // order errors 1004.
 func TestDxSplitInputsLockedUtxo(t *testing.T) {
 	ctx := newWalletTestCtx()
-	seedOrderWithUtxo(ctx, [32]byte{}) // reserves the stub utxo
+	// Reserve the stub utxo on a live order via the store's mutation path
+	// (direct post-Add writes violate the ownership contract, store.go:125-126).
+	o := seedOrder(ctx)
+	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
+		ord.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
+	}) {
+		t.Fatal("order not found")
+	}
 	_, err := ctx.dxSplitInputs([]json.RawMessage{
 		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
 		json.RawMessage("true"), json.RawMessage("false"), json.RawMessage("false"),

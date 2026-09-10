@@ -14,7 +14,6 @@ import (
 	"go-xbridge/config"
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
-	"go-xbridge/proto"
 	"go-xbridge/wallet"
 )
 
@@ -71,29 +70,6 @@ func seedOrder(ctx *HandlerCtx) *Order {
 		Mine:         true,
 		MakerAddress: "mk",
 		TakerAddress: "tk",
-	}
-	ctx.Store.Add(o)
-	return o
-}
-
-// seedOrderWithUtxo seeds the standard BTC/BTC open made order with ONE
-// reserved utxo, populated BEFORE Store.Add to honor the store's ownership
-// contract ("must not be mutated afterward", store.go:116-119).
-func seedOrderWithUtxo(ctx *HandlerCtx, txid [32]byte) *Order {
-	o := &Order{
-		ID:           [32]byte{0x01},
-		Type:         OrderTypeMaker,
-		FromCurrency: "BTC",
-		FromAmount:   1500000,
-		ToCurrency:   "BTC",
-		ToAmount:     300000,
-		Created:      1,
-		Updated:      1,
-		Status:       "open",
-		Mine:         true,
-		MakerAddress: "mk",
-		TakerAddress: "tk",
-		Utxos:        []proto.UtxoEntry{{TxID: txid, Vout: 0}},
 	}
 	ctx.Store.Add(o)
 	return o
@@ -587,51 +563,17 @@ func TestDxGetOrderFillsRead(t *testing.T) {
 	}
 }
 
-func TestDxGetLockedAndFlush(t *testing.T) {
+func TestDxFlushCancelledOrdersEmptyThenPruned(t *testing.T) {
 	ctx := newWalletTestCtx()
-	// Side effect only: seed the store with the standard open made order; the
-	// value is replaced below by seedOrderWithUtxo (same id, reserved utxo).
-	seedOrder(ctx)
-
-	// No id -> all_locked_utxo (empty; backing not wired yet).
-	res, err := ctx.dxGetLockedUtxos(nil)
-	if err != nil {
-		t.Fatalf("dxGetLockedUtxos (empty) = %v %v", res, err)
-	}
-	m, ok := res.(map[string]interface{})
-	if !ok {
-		t.Fatalf("dxGetLockedUtxos (empty) = %v (%T)", res, res)
-	}
-	all, ok := m["all_locked_utxo"].([]string)
-	if !ok || len(all) != 0 {
-		t.Fatalf("dxGetLockedUtxos all_locked_utxo = %v", m["all_locked_utxo"])
-	}
-
-	// id -> object keyed by id and the order's currency key. An order with
-	// nothing reserved errors 1021, so the stub BTC utxo is reserved
-	// (replaces the utxo-less seedOrder {0x01} record, same id).
-	o := seedOrderWithUtxo(ctx, [32]byte{})
-	id := dispID(o.ID)
-	res, _ = ctx.dxGetLockedUtxos([]json.RawMessage{jstr(id)})
-	m, ok = res.(map[string]interface{})
-	if !ok {
-		t.Fatalf("dxGetLockedUtxos (id) = %v (%T)", res, res)
-	}
-	if m["id"] != id {
-		t.Errorf("dxGetLockedUtxos id = %v, want %v", m["id"], id)
-	}
-	// A made (Mine) order lives in the accepted map from creation
-	// (xbridgeapp.cpp:2034), so even an open order keys by maker_and_taker.
-	if _, ok := m["BTC_and_BTC"].([]string); !ok {
-		t.Errorf("dxGetLockedUtxos missing BTC_and_BTC key: %v", m)
-	}
+	// Seed the store with the standard open made order.
+	o := seedOrder(ctx)
 
 	// Flush (empty: the open made order is not cancelled).
-	res, err = ctx.dxFlushCancelledOrders(nil)
+	res, err := ctx.dxFlushCancelledOrders(nil)
 	if err != nil {
 		t.Fatalf("dxFlushCancelledOrders: %v", err)
 	}
-	m = mustJSONMap(t, res)
+	m := mustJSONMap(t, res)
 	if fo, _ := m["flushedOrders"].([]interface{}); len(fo) != 0 {
 		t.Fatalf("dxFlushCancelledOrders (empty) = %v", res)
 	}
@@ -697,68 +639,6 @@ func TestFlushCancelledPrunesBookAndHistory(t *testing.T) {
 			t.Fatalf("key %q out of C++ order in %s", k, s)
 		}
 		last = p
-	}
-}
-
-// TestDxGetLockedUtxosKeyByState verifies dxGetLockedUtxos keys the per-order
-// array by the transaction's MAP membership (C++ rpcxbridge.cpp:2674-2677),
-// never by which wallets happen to be connected: a made (Mine) order lives in
-// the accepted map from creation (xbridgeapp.cpp:2034), so both an open and a
-// created order key by maker_and_taker — with the same result whether or not
-// the taker wallet is connected.
-func TestDxGetLockedUtxosKeyByState(t *testing.T) {
-	ctx := newWalletTestCtx()
-
-	add := func(seed byte, status string) (string, *Order) {
-		id := [32]byte{seed}
-		o := &Order{
-			ID: id, Type: OrderTypeMaker, FromCurrency: "BTC", FromAmount: 1500000,
-			ToCurrency: "SYS", ToAmount: 300000, Created: 1, Updated: 1,
-			Status: status, Mine: true,
-			// An order must have reserved utxos or the handler 1021s.
-			// Each order reserves a DISTINCT utxo (byOrder maps one owner per
-			// "txid:vout", so sharing the stub utxo would make ownership
-			// nondeterministic).
-			Utxos: []proto.UtxoEntry{{TxID: [32]byte{seed}, Vout: 0}},
-		}
-		ctx.Store.Add(o)
-		return dispID(id), o
-	}
-
-	lockedKey := func(id string) string {
-		res, rerr := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(id)})
-		if rerr != nil {
-			t.Fatalf("dxGetLockedUtxos(%s) = %v", id, rerr)
-		}
-		m, ok := res.(map[string]interface{})
-		if !ok {
-			t.Fatalf("dxGetLockedUtxos(%s) = %T", id, res)
-		}
-		for k := range m {
-			if k != "id" {
-				return k
-			}
-		}
-		return ""
-	}
-
-	// Accepted (created) order with only the maker wallet connected: must still
-	// use the dual key (old code fell back to the maker currency here).
-	createdID, _ := add(0x11, "created")
-	if k := lockedKey(createdID); k != "BTC_and_SYS" {
-		t.Fatalf("accepted order (no taker wallet) key = %q, want BTC_and_SYS", k)
-	}
-
-	// Now connect the taker wallet: both the open and created MADE orders must
-	// keep the dual key (they are in the accepted map — a made order single-keys
-	// on the status ordinal alone only when it is not in the accepted map).
-	ctx.Node.config.Connectors["SYS"] = &stubConn{ticker: "SYS", addr: btcAddr}
-	openID, _ := add(0x12, "open")
-	if k := lockedKey(openID); k != "BTC_and_SYS" {
-		t.Fatalf("open made order key = %q, want BTC_and_SYS", k)
-	}
-	if k := lockedKey(createdID); k != "BTC_and_SYS" {
-		t.Fatalf("accepted order (taker wallet connected) key = %q, want BTC_and_SYS", k)
 	}
 }
 

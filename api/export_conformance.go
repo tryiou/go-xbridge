@@ -355,29 +355,6 @@ func conformanceSeedCancelled(store *Store) {
 	store.Add(o)
 }
 
-// conformanceSeedLocked adds a made order with one reserved utxo so
-// dxGetLockedUtxos reports a non-empty all_locked_utxo list. The reserved
-// entry is the BLOCK connector's utxo (txid ...04:vout 0), because the
-// no-id path scans only ExchangeWallets (BLOCK, LTC) for matching locked
-// keys (handlers.go:1311-1328) — locking a BTC utxo would leave the list
-// empty since BTC is not an exchange wallet.
-func conformanceSeedLocked(store *Store) {
-	o := &Order{
-		ID:           [32]byte{0x04},
-		Type:         OrderTypeMaker,
-		FromCurrency: "BTC",
-		FromAmount:   1500000,
-		ToCurrency:   "SYS",
-		ToAmount:     300000,
-		Created:      uint64(1),
-		Updated:      uint64(1),
-		Status:       "open",
-		Mine:         true,
-		Utxos:        []proto.UtxoEntry{{TxID: [32]byte{0x04}, Vout: 0}},
-	}
-	store.Add(o)
-}
-
 // conformanceJstr renders a string as a positional JSON-RPC param (json.Marshal
 // so quotes/backslashes are escaped correctly).
 func conformanceJstr(s string) json.RawMessage {
@@ -573,7 +550,8 @@ func conformanceResponseParams(method string) (*HandlerCtx, []json.RawMessage, e
 		o := conformanceSeedPartialOrder(store)
 		return read(), []json.RawMessage{conformanceJstr(orderIDString(o.ID))}, nil
 	case "dxGetLockedUtxos":
-		conformanceSeedLocked(store)
+		// No seeding: a thin client always answers 1029, so there is no
+		// success shape to drive (see the suite's skipped shape row).
 		return read(), nil, nil
 	case "dxGetTokenBalances":
 		return read(), nil, nil

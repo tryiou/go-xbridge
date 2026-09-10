@@ -305,29 +305,47 @@ func TestTakeOrderFundingRejectsNonP2PKH(t *testing.T) {
 	})
 }
 
+// TestDxGetLockedUtxosAlwaysNotExchangeNode locks in the thin-client
+// contract: C++ gates dxGetLockedUtxos on the Exchange being started
+// (rpcxbridge.cpp:2627-2633), which a thin client never does, so EVERY call
+// answers 1029 NOT_EXCHANGE_NODE with the canonical text
+// (xbridgeerror.cpp:61-62) — before id parsing, regardless of params or
+// configured exchange wallets. No list is ever served.
+func TestDxGetLockedUtxosAlwaysNotExchangeNode(t *testing.T) {
+	ctx := newWalletTestCtx() // ExchangeWallets configured: must not matter
+	for _, params := range [][]json.RawMessage{
+		nil,
+		{jstr("01")},
+		{jstr("not-an-id")},
+		{jstr("0000000000000000000000000000000000000000000000000000000000000000")},
+	} {
+		_, err := ctx.dxGetLockedUtxos(params)
+		if err == nil || err.Code != errNotExchangeNode || err.Name != "dxGetLockedUtxos" ||
+			err.Error != "Blocknet is not running as an exchange node" {
+			t.Fatalf("dxGetLockedUtxos(%v) = %+v, want 1029 NOT_EXCHANGE_NODE", params, err)
+		}
+	}
+}
+
 // TestDxLockedUtxoExclusion verifies that UTXOs reserved by an active order are
-// excluded from dxGetUtxos (include_used=false), reported in dxGetLockedUtxos,
-// and re-included (with orderid) when include_used=true. T2.1.
+// excluded from dxGetUtxos (include_used=false) and re-included (with orderid)
+// when include_used=true. T2.1. (dxGetLockedUtxos itself always answers 1029,
+// covered by TestDxGetLockedUtxosAlwaysNotExchangeNode.)
 func TestDxLockedUtxoExclusion(t *testing.T) {
 	ctx := newWalletTestCtx()
 	o := seedOrder(ctx)
-	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order.
-	o.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
+	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order via the
+	// store's mutation path (direct post-Add writes violate the ownership
+	// contract, store.go:125-126).
+	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
+		ord.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
+	}) {
+		t.Fatal("order not found")
+	}
 	id := dispID(o.ID)
 
-	// dxGetLockedUtxos("") reports the locked utxo.
-	res, err := ctx.dxGetLockedUtxos(nil)
-	if err != nil {
-		t.Fatalf("dxGetLockedUtxos: %v", err)
-	}
-	m := res.(map[string]interface{})
-	all, ok := m["all_locked_utxo"].([]string)
-	if !ok || len(all) != 1 {
-		t.Fatalf("all_locked_utxo = %v, want exactly 1 locked utxo", m["all_locked_utxo"])
-	}
-
 	// dxGetUtxos(BTC) with include_used=false excludes the locked utxo entirely.
-	res, err = ctx.dxGetUtxos([]json.RawMessage{json.RawMessage(`"BTC"`)})
+	res, err := ctx.dxGetUtxos([]json.RawMessage{json.RawMessage(`"BTC"`)})
 	if err != nil {
 		t.Fatalf("dxGetUtxos: %v", err)
 	}
@@ -346,102 +364,7 @@ func TestDxLockedUtxoExclusion(t *testing.T) {
 	}
 }
 
-// TestDxLockedUtxoNativeAmount verifies dxGetLockedUtxos renders the UTXO amount
-// in NATIVE coin units (matching C++ UtxoEntry::toString(), which streams the
-// whole-coin double — e.g. "1" for 1 BTC), not the XBridge 1e6 scale that the
-// previous port emitted ("1.000000"). This is C2. T2.1.
-func TestDxLockedUtxoNativeAmount(t *testing.T) {
-	ctx := newWalletTestCtx()
-	o := seedOrder(ctx)
-	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order so it is
-	// reported as locked. The stub utxo carries Amount 100000000 (= 1 BTC).
-	o.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
-	res, err := ctx.dxGetLockedUtxos(nil)
-	if err != nil {
-		t.Fatalf("dxGetLockedUtxos: %v", err)
-	}
-	m := res.(map[string]interface{})
-	all, ok := m["all_locked_utxo"].([]string)
-	if !ok || len(all) != 1 {
-		t.Fatalf("all_locked_utxo = %v, want exactly 1 locked utxo", m["all_locked_utxo"])
-	}
-	// Native rendering of 1 BTC must be the trimmed "1", never "1.000000"
-	// (XBridge 1e6 scale) nor a raw satoshi integer.
-	if !strings.Contains(all[0], ":1:") {
-		t.Fatalf("locked utxo amount not rendered natively: %q (want ...:1:...)", all[0])
-	}
-	if strings.Contains(all[0], "1.000000") {
-		t.Fatalf("locked utxo amount rendered in XBridge 1e6 scale: %q", all[0])
-	}
-}
-
-// TestDxGetLockedUtxosNoReserved locks in the behavior: C++ getUtxoItems(id) fails
-// (-> 1021 TRANSACTION_NOT_FOUND, rpcxbridge.cpp:2637) when the id has no locked
-// utxos reserved (m_utxoTxMap miss). A live order with nothing reserved must
-// error 1021, not return [].
-func TestDxGetLockedUtxosNoReserved(t *testing.T) {
-	ctx := newWalletTestCtx()
-	o := seedOrder(ctx) // open, Mine, no Utxos reserved
-	_, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(dispID(o.ID))})
-	if err == nil || err.Code != errTxNotFound {
-		t.Fatalf("dxGetLockedUtxos(no reserved utxos) = %v, want TRANSACTION_NOT_FOUND", err)
-	}
-}
-
-// TestDxGetLockedUtxosIdEchoNormalized locks in the id echo: the echoed id is the
-// C++ display-hex (GetHex) of the parsed value, never the raw param
-// (rpcxbridge.cpp:2672). A short id left-pads to the full 64-hex form.
-func TestDxGetLockedUtxosIdEchoNormalized(t *testing.T) {
-	ctx := newWalletTestCtx()
-	o := seedOrderWithUtxo(ctx, [32]byte{}) // ID {0x01}, reserves the stub utxo
-	res, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr("01")})
-	if err != nil {
-		t.Fatalf("dxGetLockedUtxos(short id): %v", err)
-	}
-	m := mustJSONMap(t, res)
-	if m["id"] != dispID(o.ID) {
-		t.Errorf("echoed id = %v, want normalized %v", m["id"], dispID(o.ID))
-	}
-}
-
-// TestDxGetLockedUtxosAmountDefaultDouble locks in the amount encoding: the amount is the
-// native whole-coin double streamed with the C++ default precision 6
-// (UtxoEntry::toString, xbridgewalletconnector.cpp:25-30), so 0.1234567 renders
-// "0.123457" — NOT the registry fixed-decimals / XBridge 1e6 forms the previous
-// port emitted.
-func TestDxGetLockedUtxosAmountDefaultDouble(t *testing.T) {
-	ctx := newWalletTestCtx()
-	seedOrderWithUtxo(ctx, [32]byte{}) // reserves the stub BTC utxo
-	btc := ctx.Node.config.Connectors["BTC"].(*stubConn)
-	btc.utxos[0].Value = 0.1234567
-	res, err := ctx.dxGetLockedUtxos(nil)
-	if err != nil {
-		t.Fatalf("dxGetLockedUtxos: %v", err)
-	}
-	m := mustJSONMap(t, res)
-	all := m["all_locked_utxo"].([]interface{})
-	if len(all) != 1 || !strings.Contains(all[0].(string), ":0.123457:") {
-		t.Fatalf("all_locked_utxo = %v, want ...:0.123457:...", m["all_locked_utxo"])
-	}
-}
-
-// TestDxGetLockedUtxosTerminalOrder locks in the no-reserved behavior for a finished/canceled
-// order still in the live store (status flipped, MoveToHistory not yet run):
-// lockedInfoLocked skips terminal orders (store.go:378-380) so the id has no
-// locked utxos -> 1021, matching C++ where a finished transaction is in
-// neither the pending nor the accepted map.
-func TestDxGetLockedUtxosTerminalOrder(t *testing.T) {
-	ctx := newWalletTestCtx()
-	o := seedOrderWithUtxo(ctx, [32]byte{})
-	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) { ord.Status = "finished" }) {
-		t.Fatal("order not found")
-	}
-	_, err := ctx.dxGetLockedUtxos([]json.RawMessage{jstr(dispID(o.ID))})
-	if err == nil || err.Code != errTxNotFound {
-		t.Fatalf("dxGetLockedUtxos(finished live order) = %v, want TRANSACTION_NOT_FOUND", err)
-	}
-}
-
+// NOTE: dxGetLockedUtxos list-render tests were removed with the render paths.
 // TestFlushCancelledUnderflow verifies a huge ageMillis does not underflow uint64
 // (keepTime stays large so every old entry is pruned) and age 0 prunes all
 // remaining entries. It drives the C++-faithful path: cancelled orders are
