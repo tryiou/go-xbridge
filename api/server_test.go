@@ -340,6 +340,23 @@ func TestServerParseErrorStatus500(t *testing.T) {
 	}
 }
 
+func TestServerEmptyBodyParseError(t *testing.T) {
+	// Empty body -> -32700 "Parse error", exactly as live Core (an empty
+	// request is a plain parse failure, not the top-level-object check).
+	ctx := newTestCtx()
+	srv := NewServer(ctx)
+	rec := callRPC(t, srv, ``)
+	var env rpcResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	ee := env.Error.(map[string]interface{})
+	if code, _ := ee["code"].(float64); int(code) != -32700 {
+		t.Fatalf("empty-body code = %v, want -32700", ee["code"])
+	}
+	if msg, _ := ee["message"].(string); msg != "Parse error" {
+		t.Errorf("empty-body message = %q, want %q", msg, "Parse error")
+	}
+}
+
 func TestServerInvalidRequest(t *testing.T) {
 	ctx := newTestCtx()
 	srv := NewServer(ctx)

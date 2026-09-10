@@ -315,6 +315,20 @@ func uvArr(params []json.RawMessage, i int) ([]json.RawMessage, *rpcError) {
 	return arr, nil
 }
 
+// uvInt is the UniValue get_int() equivalent ("JSON value is not an integer
+// as expected"), used for dxSplitInputs entry vout (COutPoint). A missing
+// vout reads NullUniValue in C++, which throws exactly like a wrong type.
+func uvInt(raw json.RawMessage) (uint32, *rpcError) {
+	if jsonTypeOf(raw) != "integer" {
+		return 0, spErr("JSON value is not an integer as expected")
+	}
+	var n uint32
+	if json.Unmarshal(raw, &n) != nil {
+		return 0, spErr("JSON value is not an integer as expected")
+	}
+	return n, nil
+}
+
 // uvTypeNameOf classifies a raw JSON value using UniValue's type names
 // (univalue.cpp:219-232): null, bool, object, array, string, number. Unlike
 // json_spirit, UniValue treats integer and real alike ("number").

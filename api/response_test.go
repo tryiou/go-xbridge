@@ -2,12 +2,30 @@ package api
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"go-xbridge/coins"
 )
+
+func TestWriteJSONLeavesAngleBracketsUnescaped(t *testing.T) {
+	// blocknetd emits raw < > & in messages (e.g. "get_value< string > ...",
+	// "Start time >= end time."); Go's encoder escapes them by default.
+	rec := httptest.NewRecorder()
+	writeJSON(rec, envelopeResponse(
+		&rpcError{Code: -1, Error: "get_value< string > called on integer Value & done"},
+		json.RawMessage(`"audit"`),
+	))
+	got := rec.Body.String()
+	if !strings.Contains(got, "get_value< string >") || !strings.Contains(got, "& done") {
+		t.Fatalf("writeJSON escaped HTML metacharacters: %q", got)
+	}
+	if strings.Contains(got, `\u003c`) || strings.Contains(got, `\u003e`) || strings.Contains(got, `\u0026`) {
+		t.Fatalf("writeJSON contains HTML escapes: %q", got)
+	}
+}
 
 func TestFormatXAmount(t *testing.T) {
 	cases := []struct {

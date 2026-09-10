@@ -1578,12 +1578,19 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 			}
 		}
 		if len(want) > 0 {
-			var missing string
-			for k := range want {
-				missing = k
-				break
+			// C++ reports the first unavailable outpoint truncated as
+			// COutPoint(<first 10 hex>, <vout>) (live Core:
+			// "COutPoint(69089f37e7, 0)").
+			for _, u := range utxos {
+				k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+				if want[k] {
+					txid := u.TxID
+					if len(txid) > 10 {
+						txid = txid[:10]
+					}
+					return nil, makeError(errBadRequest, method, "user specified utxo was not found or is not available: COutPoint("+txid+", "+strconv.FormatUint(uint64(u.Vout), 10)+")")
+				}
 			}
-			return nil, makeError(errBadRequest, method, "user specified utxo was not found or is not available: "+missing)
 		}
 		utxos = resolved
 	}
@@ -1933,19 +1940,29 @@ func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {
 // amount/scriptPubKey/address are optional and, when absent, resolved from the
 // wallet's unspent list by splitTx.
 func parseUtxoParam(c coins.Coin, raw json.RawMessage) ([]wallet.Utxo, *rpcError) {
-	var arr []struct {
-		TxID         string `json:"txid"`
-		Vout         uint32 `json:"vout"`
-		Amount       string `json:"amount"`
-		ScriptPubKey string `json:"scriptPubKey"`
-		Address      string `json:"address"`
-	}
+	var arr []json.RawMessage
 	if err := json.Unmarshal(raw, &arr); err != nil {
 		return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxos array")
 	}
 	out := make([]wallet.Utxo, 0, len(arr))
-	for _, x := range arr {
-		u := wallet.Utxo{TxID: x.TxID, Vout: x.Vout, Address: x.Address, ScriptPubKey: x.ScriptPubKey}
+	for _, e := range arr {
+		var x struct {
+			TxID         string          `json:"txid"`
+			Vout         json.RawMessage `json:"vout"`
+			Amount       string          `json:"amount"`
+			ScriptPubKey string          `json:"scriptPubKey"`
+			Address      string          `json:"address"`
+		}
+		if err := json.Unmarshal(e, &x); err != nil {
+			return nil, makeError(errInvalidParameters, "dxSplitInputs", "invalid utxos array")
+		}
+		// C++ reads vout via UniValue get_int() (COutPoint,
+		// rpcxbridge.cpp:3362-3367): a non-integer throws the -1 envelope.
+		vout, verr := uvInt(x.Vout)
+		if verr != nil {
+			return nil, verr
+		}
+		u := wallet.Utxo{TxID: x.TxID, Vout: vout, Address: x.Address, ScriptPubKey: x.ScriptPubKey}
 		if x.Amount != "" {
 			amt, err := coins.ParseAmount(c, x.Amount)
 			if err != nil {

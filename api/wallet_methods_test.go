@@ -548,6 +548,38 @@ func TestDxSplitInputsRejectsNonP2PKH(t *testing.T) {
 	}
 }
 
+// TestDxSplitInputsMissingUtxoCOutPointFormat locks in the C++ not-found
+// message shape: the offending outpoint renders truncated as
+// COutPoint(<first 10 hex>, <vout>), in request order (live Core:
+// "COutPoint(69089f37e7, 0)").
+func TestDxSplitInputsMissingUtxoCOutPointFormat(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxSplitInputs([]json.RawMessage{
+		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("false"), json.RawMessage("false"),
+		json.RawMessage(`[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":3}]`),
+	})
+	want := "Bad Request user specified utxo was not found or is not available: COutPoint(aaaaaaaaaa, 3)"
+	if err == nil || err.Code != errBadRequest || err.Error != want {
+		t.Fatalf("dxSplitInputs(missing utxo) = %+v, want 1004 %q", err, want)
+	}
+}
+
+// TestDxSplitInputsBadVoutTypeThrow locks in the C++ UniValue get_int()
+// throw for a non-integer entry vout: HTTP-500 envelope -1 "JSON value is
+// not an integer as expected" (live Core), never a 1025 business error.
+func TestDxSplitInputsBadVoutTypeThrow(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxSplitInputs([]json.RawMessage{
+		jstr("BTC"), jstr("0.005"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("true"), json.RawMessage("false"),
+		json.RawMessage(`[{"txid":"zz","vout":"x"}]`),
+	})
+	if err == nil || err.Code != -1 || err.Error != "JSON value is not an integer as expected" {
+		t.Fatalf("dxSplitInputs(bad vout) = %+v, want -1 %q", err, "JSON value is not an integer as expected")
+	}
+}
+
 // assertLexicalThrow asserts the C++ boost::lexical_cast<double> throw shape
 // for unparseable amounts: HTTP-500 envelope error code -1 with the exact
 // runtime message (rpc/server.cpp:584-586). Every dx* amount site must throw

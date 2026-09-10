@@ -214,6 +214,28 @@ func TestMakeOrderMissingTakerConnectorNoSession(t *testing.T) {
 	}
 }
 
+// TestMakeOrderUnknownTickerNoSession verifies an unknown maker currency
+// fails with NO_SESSION (1018) "Unable to connect to wallet", exactly as
+// live Core — the connector gate runs before address decoding, so it never
+// surfaces as 1025 "unsupported currency".
+func TestMakeOrderUnknownTickerNoSession(t *testing.T) {
+	n, _ := newHubNode(servicenode.NewRegistry())
+	o, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "XXX", MakerSize: "0.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.5", TakerAddress: btcAddr2,
+		DryRun: true,
+	})
+	if rerr == nil || rerr.Code != errNoSession {
+		t.Fatalf("MakeOrder(unknown maker) = [%v, %v], want NO_SESSION", o, rerr)
+	}
+	if want := "No session for currency Unable to connect to wallet: XXX"; rerr.Error != want {
+		t.Errorf("MakeOrder(unknown maker) message = %q, want %q", rerr.Error, want)
+	}
+	if o != nil {
+		t.Fatalf("expected nil order, got %+v", o)
+	}
+}
+
 // TestMakeOrderBadSizesThrow locks in the throw for dxMakeOrder maker/taker
 // sizes (rpcxbridge.cpp:929/933: lexical_cast<double> after the precision
 // gate). Dry-run still parses, so no broadcast is needed.

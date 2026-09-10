@@ -232,7 +232,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
-		s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Top-level object parse error"), nil))
+		// Live Core answers an empty body with the plain "Parse error".
+		s.writeResponse(w, envelopeResponse(makeEnvelopeError(-32700, "Parse error"), nil))
 		return
 	}
 	switch trimmed[0] {
@@ -397,7 +398,10 @@ func businessResponse(err *rpcError, id json.RawMessage) rpcResponse {
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
-	// blocknetd emits JSON-RPC 1.0: compact JSON, no "jsonrpc" field.
+	// blocknetd emits JSON-RPC 1.0: compact JSON, no "jsonrpc" field, and raw
+	// < > & in messages (e.g. "get_value< string >", "Start time >="), so HTML
+	// escaping must stay off to remain byte-identical.
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
 }

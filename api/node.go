@@ -1347,6 +1347,21 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if aerr != nil {
 		return nil, aerr
 	}
+	// Per-currency connector (NO_SESSION) gate. C++ dxMakeOrder resolves the
+	// wallet session before address decoding, so an unknown currency reports
+	// NO_SESSION "Unable to connect to wallet" (live Core), never 1025
+	// "unsupported currency". The maker connector handle is fetched once and
+	// reused below: dxLoadXBridgeConf can swap the config between the gate
+	// and the ListUnspent, and a second lookup there could return nil after
+	// the swap (an already-held handle stays valid, so a single fetch removes
+	// the reload race).
+	makerConn, cerr := n.connector(p.Maker)
+	if cerr != nil {
+		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
+	}
+	if _, e := n.connector(p.Taker); e != nil {
+		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
+	}
 	fromID, e := decodeAddr("dxMakeOrder", p.Maker, p.MakerAddress)
 	if e != nil {
 		return nil, e
@@ -1399,18 +1414,8 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		hubAddr = coins.KeyID(hubKey[:])
 	}
 
-	// Per-currency connector (NO_SESSION) gate. The maker connector handle is
-	// fetched once and reused below: dxLoadXBridgeConf can swap the config
-	// between the gate and the ListUnspent, and a second lookup there could
-	// return nil after the swap (an already-held handle stays valid, so a
-	// single fetch removes the reload race).
-	makerConn, cerr := n.connector(p.Maker)
-	if cerr != nil {
-		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
-	}
-	if _, e := n.connector(p.Taker); e != nil {
-		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
-	}
+	// Per-currency funding enumeration uses the maker handle fetched at the
+	// connector gate above.
 	partial := false
 	// C++ passes partialMinimum=0 for exact orders (sendXBridgeTransaction,
 	// xbridgeapp.cpp:1479); the partial branch below overwrites this with the
