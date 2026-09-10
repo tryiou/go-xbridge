@@ -1293,6 +1293,29 @@ func (h *HandlerCtx) dxGetLockedUtxos(_ []json.RawMessage) (interface{}, *rpcErr
 }
 
 // ---------------------------------------------------------------------------
+// dxHelp serves Core's help command: bare lists the supported commands,
+// one command returns its exact text plus Core's trailing newline, unknown
+// returns the exact unknown-command message. The command list is an honest
+// subset (this node only), never Core's full list.
+func (h *HandlerCtx) dxHelp(params []json.RawMessage) (interface{}, *rpcError) {
+	if len(params) == 0 {
+		var sb strings.Builder
+		sb.WriteString("== XBridge ==\n")
+		for _, m := range helpCommandNames {
+			sb.WriteString(m + "\n")
+		}
+		return sb.String(), nil
+	}
+	cmd, err := uvStr(params, 0)
+	if err != nil {
+		return nil, err
+	}
+	if text, ok := helpByMethod[cmd]; ok {
+		return text + "\n", nil
+	}
+	return "help: unknown command: " + cmd, nil
+}
+
 // dxFlushCancelledOrders.
 // ---------------------------------------------------------------------------
 
@@ -1308,7 +1331,10 @@ func (h *HandlerCtx) dxFlushCancelledOrders(params []json.RawMessage) (interface
 		if err != nil {
 			return nil, err
 		}
-		ageMillis = v
+		// C++ holds the age in 32 bits: huge values wrap mod 2^32 and a
+		// wrapped negative fails below (live Core: 9999999999999 echoes
+		// 1316134911, 2^31 and 2^32-1 give 1025, 2^32 echoes 0).
+		ageMillis = int(int32(v))
 	default:
 		return nil, makeError(errInvalidParameters, "dxFlushCancelledOrders", "ageMillis must be an integer >= 0")
 	}

@@ -59,6 +59,7 @@ var dispatch = map[string]Handler{
 	"dxSplitInputs":              (*HandlerCtx).dxSplitInputs,
 	"dxGetUtxos":                 (*HandlerCtx).dxGetUtxos,
 	"getnetworkinfo":             (*HandlerCtx).getNetworkInfo,
+	"help":                       (*HandlerCtx).dxHelp,
 }
 
 // Lookup returns the handler for a method name, or nil if unknown.
@@ -126,6 +127,7 @@ var arity = map[string]aritySpec{
 	"dxSplitInputs":              {3, 7, arityThrow, helpDxSplitInputs},
 	"dxGetUtxos":                 {1, 2, arityThrow, helpDxGetUtxos},
 	"dxGetTradingData":           {0, 2, arityThrow, helpDxGetTradingData},
+	"help":                       {0, 1, arityThrow, helpDxHelp},
 	// getnetworkinfo is a Go shim with its own gate.
 }
 

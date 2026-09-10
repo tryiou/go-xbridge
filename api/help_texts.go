@@ -1,5 +1,68 @@
 package api
 
+// helpCommandNames lists every supported command for the bare help output,
+// sorted. Kept explicit (not ranged from dispatch) because a handler in the
+// dispatch table cannot reference the table itself; TestDxHelpBare enforces
+// set-equality with the dispatch keys.
+var helpCommandNames = []string{
+	"dxCancelOrder",
+	"dxFlushCancelledOrders",
+	"dxGetLocalTokens",
+	"dxGetLockedUtxos",
+	"dxGetMyOrders",
+	"dxGetMyPartialOrderChain",
+	"dxGetNetworkTokens",
+	"dxGetNewTokenAddress",
+	"dxGetOrder",
+	"dxGetOrderBook",
+	"dxGetOrderFills",
+	"dxGetOrderHistory",
+	"dxGetOrders",
+	"dxGetTokenBalances",
+	"dxGetTradingData",
+	"dxGetUtxos",
+	"dxLoadXBridgeConf",
+	"dxMakeOrder",
+	"dxMakePartialOrder",
+	"dxPartialOrderChainDetails",
+	"dxSplitAddress",
+	"dxSplitInputs",
+	"dxTakeOrder",
+	"getnetworkinfo",
+	"help",
+}
+
+// helpByMethod maps every supported command to its RPCHelpMan text. The
+// help command appends Core's trailing newline; the arity-throw path uses
+// the bare text.
+var helpByMethod = map[string]string{
+	"dxMakeOrder":                helpDxMakeOrder,
+	"dxMakePartialOrder":         helpDxMakePartialOrder,
+	"dxTakeOrder":                helpDxTakeOrder,
+	"dxGetMyPartialOrderChain":   helpDxGetMyPartialOrderChain,
+	"dxPartialOrderChainDetails": helpDxPartialOrderChainDetails,
+	"dxSplitAddress":             helpDxSplitAddress,
+	"dxSplitInputs":              helpDxSplitInputs,
+	"dxGetUtxos":                 helpDxGetUtxos,
+	"dxGetTradingData":           helpDxGetTradingData,
+	"dxGetOrders":                helpDxGetOrders,
+	"dxGetOrder":                 helpDxGetOrder,
+	"dxGetOrderBook":             helpDxGetOrderBook,
+	"dxGetOrderFills":            helpDxGetOrderFills,
+	"dxGetOrderHistory":          helpDxGetOrderHistory,
+	"dxGetTokenBalances":         helpDxGetTokenBalances,
+	"dxGetLocalTokens":           helpDxGetLocalTokens,
+	"dxGetNetworkTokens":         helpDxGetNetworkTokens,
+	"dxGetNewTokenAddress":       helpDxGetNewTokenAddress,
+	"dxGetLockedUtxos":           helpDxGetLockedUtxos,
+	"dxCancelOrder":              helpDxCancelOrder,
+	"dxFlushCancelledOrders":     helpDxFlushCancelledOrders,
+	"dxLoadXBridgeConf":          helpDxLoadXBridgeConf,
+	"dxGetMyOrders":              helpDxGetMyOrders,
+	"getnetworkinfo":             helpGetnetworkinfo,
+	"help":                       helpDxHelp,
+}
+
 // Transcribed from Blocknet Core 4.4.1 src/xbridge/rpcxbridge.cpp via a
 // standalone reproduction of the 0.18 RPCHelpMan::ToString() rendering
 // (src/rpc/util.cpp). These are the exact byte strings thrown as the envelope
@@ -168,4 +231,381 @@ Examples:
 > curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetTradingData", "params": [43200] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
 > blocknet-cli dxGetTradingData 43200 true
 > curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetTradingData", "params": [43200, true] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetOrderBook = `dxGetOrderBook detail "maker" "taker" ( max_orders )
+
+This call is used to retrieve open orders at various detail levels:
+
+Detail 1 - Returns the best bid and ask.
+Detail 2 - Returns a list of aggregated orders. This is useful for charting.
+Detail 3 - Returns a list of non-aggregated orders. This is useful for bot trading.
+Detail 4 - Returns the best bid and ask with the order IDs.
+
+Note:
+This call will only return orders for markets with both assets supported by your node (view with dxGetLocalTokens). To view all orders, set ShowAllOrders=true in your xbridge.conf header and reload it with dxLoadXBridgeConf.
+
+Arguments:
+1. detail        (numeric, required) The detail level.
+2. maker         (string, required) The symbol of the token being sold by the maker (e.g. LTC).
+3. taker         (string, required) The symbol of the token being sold by the taker (e.g. BLOCK).
+4. max_orders    (numeric, optional, default=50) The maximum total orders to display for bids and asks combined.
+
+Result:
+
+
+Examples:
+> blocknet-cli dxGetOrderBook 3 BLOCK LTC
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderBook", "params": [3, "BLOCK", "LTC"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
+> blocknet-cli dxGetOrderBook 3 BLOCK LTC 60
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderBook", "params": [3, "BLOCK", "LTC", 60] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetOrderFills = `dxGetOrderFills "maker" "taker" ( combined )
+
+Returns all the recent trades by trade pair that have been filled (i.e. completed). This will only return orders that have been filled in your current session.
+
+Arguments:
+1. maker       (string, required) The symbol of the asset sold by the maker (e.g. LTC).
+2. taker       (string, required) The symbol of the asset sold by the taker (e.g. BLOCK).
+3. combined    (boolean, optional, default=true) If true, combines the results to return orders with the maker and taker as specified as well as orders of the inverse market. If false, only returns filled orders with the maker and taker assets as specified.
+
+Result:
+
+    [
+        {
+            "id": "a1f40d53f75357eb914554359b207b7b745cf096dbcb028eb77b7b7e4043c6b4",
+            "time": "2018-01-16T13:15:05.12345Z",
+            "maker": "SYS",
+            "maker_size": "101.00000000",
+            "taker": "LTC",
+            "taker_size": "0.01000000"
+        },
+        {
+            "id": "91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9",
+            "time": "2018-01-16T13:15:05.12345Z",
+            "maker": "LTC",
+            "maker_size": "0.01000000",
+            "taker": "SYS",
+            "taker_size": "101.00000000"
+        }
+    ]
+
+    Key             | Type | Description
+    ----------------|------|-----------------------------------------------------
+    Array           | arr  | Array of orders sorted by date descending.
+    id              | str  | The order ID.
+    time            | str  | Time the order was filled.
+    maker           | str  | Maker trading asset; the ticker of the asset being
+                    |      | sold by the maker.
+    maker_size      | str  | Maker trading size. String is used to preserve
+                    |      | precision.
+    taker           | str  | Taker trading asset; the ticker of the asset being
+                    |      | sold by the taker.
+    taker_size      | str  | Taker trading size. String is used to preserve
+                    |      | precision.
+                
+Examples:
+> blocknet-cli dxGetOrderFills BLOCK LTC
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderFills", "params": ["BLOCK", "LTC"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
+> blocknet-cli dxGetOrderFills BLOCK LTC true
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderFills", "params": ["BLOCK", "LTC", true] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetOrderHistory = `dxGetOrderHistory "maker" "taker" start_time end_time granularity ( order_ids with_inverse limit )
+
+Returns the OHLCV data by trade pair for a specified time range and interval. It can return the order history for any asset since all trade history is stored on-chain.
+
+Arguments:
+1. maker           (string, required) The symbol of the asset sold by the maker (e.g. LTC).
+2. taker           (string, required) The symbol of the asset sold by the taker (e.g. BLOCK).
+3. start_time      (numeric, required) The Unix time in seconds for the start time boundary to search.
+4. end_time        (numeric, required) The Unix time in seconds for the end time boundary to search.
+5. granularity     (numeric, required) Time interval slice in seconds. The slice options are: 60,300,900,3600,21600,86400
+6. order_ids       (boolean, optional, default=false) If true, returns the IDs of all filled orders in each slice. If false, IDs are omitted.
+7. with_inverse    (boolean, optional, default=false) If false, returns the order history for the specified market. If true, also returns the orders in the inverse pair too (e.g. if LTC SYS then SYS LTC would be returned as well).
+8. limit           (numeric, optional, default=2147483647) The max number of interval slices returned. maximum=2147483647
+
+Result:
+
+    [
+        //[ time, low, high, open, close, volume, id(s) ],
+        [ "2018-01-16T13:15:05.12345Z", 1.10, 2.0, 1.10, 1.4, 1000, [ "0cc2e8a7222f1416cda996031ca21f67b53431614e89651887bc300499a6f83e" ] ],
+        [ "2018-01-16T14:15:05.12345Z", 0, 0, 0, 0, 0, [] ],
+        [ "2018-01-16T15:15:05.12345Z", 1.12, 2.2, 1.10, 1.4, 1000, [ "91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9", "0cc2e8a7222f1416cda996031ca21f67b53431614e89651887bc300499a6f83e", "a1f40d53f75357eb914554359b207b7b745cf096dbcb028eb77b7b7e4043c6b4" ] ],
+        [ "2018-01-16T16:15:05.12345Z", 1.14, 2.0, 1.10, 1.4, 1000, [ "a1f40d53f75357eb914554359b207b7b745cf096dbcb028eb77b7b7e4043c6b4" ] ],
+        [ "2018-01-16T17:15:05.12345Z", 1.15, 2.0, 1.10, 1.4, 1000, [ "6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a" ] ]
+    ]
+
+    Key           | Type  | Description
+    --------------|-------|------------------------------------------------------
+    time          | str   | ISO 8601 datetime, with microseconds, of the time at
+                  |       | the beginning of the time slice.
+    low           | float | Exchange rate lower bound within the time slice.
+    high          | float | Exchange rate upper bound within the time slice.
+    open          | float | Exchange rate of first filled order at the beginning
+                  |       | of the time slice.
+    close         | float | Exchange rate of last filled order at the end of the
+                  |       | time slice.
+    volume        | int   | Total volume of the taker asset within the time
+                  |       | slice.
+    order_ids     | arr   | Array of GUIDs of all filled orders within the time
+                  |       | slice.
+                
+Examples:
+> blocknet-cli dxGetOrderHistory SYS LTC 1540660180 1540660420 60
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderHistory", "params": ["SYS", "LTC", 1540660180, 1540660420, 60] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
+> blocknet-cli dxGetOrderHistory SYS LTC 1540660180 1540660420 60 true false 18000
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetOrderHistory", "params": ["SYS", "LTC", 1540660180, 1540660420, 60, true, false, 18000] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetTokenBalances = `dxGetTokenBalances
+
+Returns a list of available balances for all connected wallets on your node (view with dxGetLocalTokens).
+
+Note:
+These balances do not include Segwit UTXOs or those being used in open or in process orders. XBridge works best with pre-sliced UTXOs so that your entire wallet balance is capable of multiple simultaneous trades. Use dxSplitInputs or dxSplitAddress to generate trading inputs.
+
+Result:
+
+    {
+        "BLOCK": "250.83492174",
+        "LTC": "0.568942",
+        "MONA": "3.452",
+        "SYS": "1050.128493"
+    }
+
+    Key          | Type | Description
+    -------------|------|--------------------------------------------------------
+    Object       | obj  | Key-value object of the assets and respective balances.
+    -- key       | str  | The asset symbol.
+    -- value     | str  | The available wallet balance amount.
+                
+Examples:
+> blocknet-cli dxGetTokenBalances 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetTokenBalances", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetLocalTokens = `dxGetLocalTokens
+
+Returns a list of assets supported by your node. You can only trade on markets with assets returned in both dxGetNetworkTokens and dxGetLocalTokens.
+
+Result:
+
+    [
+        "BLOCK",
+        "LTC",
+        "MONA",
+        "SYS"
+    ]
+
+    Key                    | Type | Description
+    -----------------------|------|----------------------------------------------
+    Array                  | arr  | An array of all the assets supported by the
+                           |      | local client.
+                
+Examples:
+> blocknet-cli dxGetLocalTokens 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetLocalTokens", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetNetworkTokens = `dxGetNetworkTokens
+
+Returns a list of all the assets currently supported by the network. You can only trade on markets with assets returned in both dxGetNetworkTokens and dxGetLocalTokens.
+
+Result:
+
+    [
+        "BLOCK",
+        "BTC",
+        "DGB",
+        "LTC",
+        "MONA",
+        "PIVX",
+        "SYS"
+    ]
+
+    Key                    | Type | Description
+    -----------------------|------|----------------------------------------------
+    Array                  | arr  | An array of all the assets supported by the
+                           |      | network.
+                
+Examples:
+> blocknet-cli dxGetNetworkTokens 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetNetworkTokens", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetNewTokenAddress = `dxGetNewTokenAddress "ticker"
+
+Returns a new address for the specified asset.
+
+Arguments:
+1. ticker    (string, required) The ticker symbol of the asset you want to generate an address for (e.g. LTC).
+
+Result:
+
+    [
+        "SVTbaYZ8oApVn3uNyimst3GKyvvfzXQgdK"
+    ]
+
+    Key                    | Type | Description
+    -----------------------|------|----------------------------------------------
+    Array                  | arr  | An array containing the newly generated
+                           |      | address for the given asset.
+                
+Examples:
+> blocknet-cli dxGetNewTokenAddress BTC
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetNewTokenAddress", "params": ["BTC"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxGetLockedUtxos = `dxGetLockedUtxos ( "id" )
+
+Returns a list of locked UTXOs used in orders. You can only use this call if you have a Service Node setup.
+
+Arguments:
+1. id    (string) The order ID. If omitted, a list of UTXOs used in all orders will be returned.
+
+Result:
+
+    [
+        {
+            "id" : "91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9",
+            "LTC" : [
+                6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a,
+                6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a,
+                6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a
+            ]
+        }
+    ]
+
+    Key             | Type | Description
+    ----------------|------|-----------------------------------------------------
+    id              | str  | The order ID.
+    Object          | obj  | Key-value object of the asset and UTXOs for the
+                    |      | forementioned order.
+    -- key          | str  | The asset symbol.
+    -- value        | arr  | The UTXOs locked for the given order ID.
+                
+Examples:
+> blocknet-cli dxGetLockedUtxos 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetLockedUtxos", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
+> blocknet-cli dxGetLockedUtxos 524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxGetLockedUtxos", "params": ["524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxCancelOrder = `dxCancelOrder "id"
+
+This call is used to cancel one of your own orders. This automatically rolls back the order if a trade is in process.
+
+Arguments:
+1. id    (string, required) The ID of the order to cancel.
+
+Result:
+
+    {
+        "id": "91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9",
+        "maker": "SYS",
+        "maker_size": "0.100",
+        "maker_address": "SVTbaYZ8oApVn3uNyimst3GKyvvfzXQgdK",
+        "taker": "LTC",
+        "taker_size": "0.01",
+        "taker_address": "LVvFhzRoMRGTtGihHp7jVew3YoZRX8y35Z",
+        "updated_at": "1970-01-01T00:00:00.00000Z",
+        "created_at": "2018-01-15T18:15:30.12345Z",
+        "status": "canceled"
+    }
+
+    Key             | Type | Description
+    ----------------|------|-----------------------------------------------------
+    id              | str  | The order ID.
+    maker           | str  | Sending asset of party cancelling the order.
+    maker_size      | str  | Sending trading size. String is used to preserve
+                    |      | precision.
+    maker_address   | str  | Address for sending the outgoing asset.
+    taker           | str  | Receiving asset of party cancelling the order.
+    taker_size      | str  | Receiving trading size. String is used to preserve
+                    |      | precision.
+    taker_address   | str  | Address for receiving the incoming asset.
+    updated_at      | str  | ISO 8601 datetime, with microseconds, of the last
+                    |      | time the order was updated.
+    created_at      | str  | ISO 8601 datetime, with microseconds, of when the
+                    |      | order was created.
+    status          | str  | The order status (canceled).
+                
+Examples:
+> blocknet-cli dxCancelOrder 524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxCancelOrder", "params": ["524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxFlushCancelledOrders = `dxFlushCancelledOrders ( ageMillis )
+
+This call is used to remove your cancelled orders that are older than the specified amount of time.
+
+Arguments:
+1. ageMillis    (numeric, optional, default=0) Remove cancelled orders older than this amount of milliseconds.
+
+Result:
+
+    {
+        "ageMillis": 0,
+        "now": "20191126T024005.352285",
+        "durationMicrosec": 0,
+        "flushedOrders": [
+            {
+                "id": "582a02ada05c8a4bb39b34de0eb54767bcb95a7792e5865d3a0babece4715f47",
+                "txtime": "20191126T023945.855058",
+                "use_count": 1
+            },
+            {
+                "id": "a508cd8d110bdc0b1fd819a89d94cdbf702e3aa40edbe654af5d556ff3c43a0a",
+                "txtime": "20191126T023956.270409",
+                "use_count": 1
+            }
+        ]
+    }
+
+    Key               | Type | Description
+    ------------------|------|---------------------------------------------------
+    ageMillis         | int  | Millisecond value specified when making the call.
+    now               | str  | ISO 8601 datetime, with microseconds, of when the
+                      |      | call was executed.
+    durationMicrosec* | int  | The amount of time in milliseconds it took to
+                      |      | process the call.
+    flushedOrders     | arr  | Array of cancelled orders that were removed.
+    id                | str  | The order ID.
+    txtime            | str  | ISO 8601 datetime, with microseconds, of when the
+                      |      | order was created.
+    use_count*        | int  | This value is strictly for debugging purposes.
+                
+Examples:
+> blocknet-cli dxFlushCancelledOrders 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxFlushCancelledOrders", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/
+> blocknet-cli dxFlushCancelledOrders 600000
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "dxFlushCancelledOrders", "params": [600000] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxLoadXBridgeConf = "dxLoadXBridgeConf\n\nHot loads the xbridge.conf file. Note, this may disrupt trades in progress.\n\nResult:\n\n    true\n\n    Type | Description\n    -----|----------------------------------------------\n    bool | `true`: Successfully reloaded file.\n                \nExamples:\n> blocknet-cli dxLoadXBridgeConf \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"dxLoadXBridgeConf\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/"
+	helpGetnetworkinfo    = `getnetworkinfo
+Returns an object containing various state info regarding P2P networking.
+
+Result:
+{
+  "version": xxxxx,                      (numeric) the server version
+  "subversion": "/Satoshi:x.x.x/",     (string) the server subversion string
+  "protocolversion": xxxxx,              (numeric) the protocol version
+  "xbridgeprotocolversion": xxxxx,       (numeric) the XBridge protocol version
+  "xrouterprotocolversion": xxxxx,       (numeric) the XRouter protocol version
+  "localservices": "xxxxxxxxxxxxxxxx", (string) the services we offer to the network
+  "localrelay": true|false,              (bool) true if transaction relay is requested from peers
+  "timeoffset": xxxxx,                   (numeric) the time offset
+  "connections": xxxxx,                  (numeric) the number of connections
+  "networkactive": true|false,           (bool) whether p2p networking is enabled
+  "networks": [                          (array) information per network
+  {
+    "name": "xxx",                     (string) network (ipv4, ipv6 or onion)
+    "limited": true|false,               (boolean) is the network limited using -onlynet?
+    "reachable": true|false,             (boolean) is the network reachable?
+    "proxy": "host:port"               (string) the proxy that is used for this network, or empty if none
+    "proxy_randomize_credentials": true|false,  (string) Whether randomized credentials are used
+  }
+  ,...
+  ],
+  "relayfee": x.xxxxxxxx,                (numeric) minimum relay fee for transactions in BLOCK/kB
+  "incrementalfee": x.xxxxxxxx,          (numeric) minimum fee increment for mempool limiting or BIP 125 replacement in BLOCK/kB
+  "localaddresses": [                    (array) list of local addresses
+  {
+    "address": "xxxx",                 (string) network address
+    "port": xxx,                         (numeric) network port
+    "score": xxx                         (numeric) relative score
+  }
+  ,...
+  ]
+  "warnings": "..."                    (string) any network and blockchain warnings
+}
+
+Examples:
+> blocknet-cli getnetworkinfo 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getnetworkinfo", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/`
+	helpDxHelp        = "help ( \"command\" )\n\nList all commands, or get help for a specified command.\n\nArguments:\n1. command    (string, optional, default=all commands) The command to get help on\n\nResult:\n\"text\"     (string) The help text\n"
+	helpDxGetOrders   = "dxGetOrders\n\nReturns a list of all orders of every market pair. \nIt will only return orders for assets returned in dxGetLocalTokens.\n\nResult:\n\n    [\n        {\n            \"id\": \"91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9\",\n            \"maker\": \"SYS\",\n            \"maker_size\": \"100.000000\",\n            \"taker\": \"LTC\",\n            \"taker_size\": \"10.500000\",\n            \"updated_at\": \"2018-01-15T18:25:05.12345Z\",\n            \"created_at\": \"2018-01-15T18:15:30.12345Z\",\n            \"order_type\": \"partial\",\n            \"partial_minimum\": \"10.000000\",\n            \"partial_orig_maker_size\": \"100.000000\",\n            \"partial_orig_taker_size\": \"10.500000\",\n            \"partial_repost\": false,\n            \"partial_parent_id\": \"\",\n            \"status\": \"open\"\n        },\n        {\n            \"id\": \"a1f40d53f75357eb914554359b207b7b745cf096dbcb028eb77b7b7e4043c6b4\",\n            \"maker\": \"SYS\",\n            \"maker_size\": \"0.100000\",\n            \"taker\": \"LTC\",\n            \"taker_size\": \"0.010000\",\n            \"updated_at\": \"2018-01-15T18:25:05.12345Z\",\n            \"created_at\": \"2018-01-15T18:15:30.12345Z\",\n            \"order_type\": \"exact\",\n            \"partial_minimum\": \"0.000000\",\n            \"partial_orig_maker_size\": \"0.000000\",\n            \"partial_orig_taker_size\": \"0.000000\",\n            \"partial_repost\": false,\n            \"partial_parent_id\": \"\",\n            \"status\": \"open\"\n        }\n    ]\n\n    Key                     | Type | Description\n    ------------------------|------|---------------------------------------------\n    Array                   | arr  | An array of all orders with each order\n                            |      | having the following parameters.\n    id                      | str  | The order ID.\n    maker                   | str  | Maker trading asset; the ticker of the asset\n                            |      | being sold by the maker.\n    maker_size              | str  | Maker trading size. String is used to\n                            |      | preserve precision.\n    maker_address           | str  | Address for sending the outgoing asset.\n    taker                   | str  | Taker trading asset; the ticker of the asset\n                            |      | being sold by the taker.\n    taker_size              | str  | Taker trading size. String is used to\n                            |      | preserve precision.\n    taker_address           | str  | Address for receiving the incoming asset.\n    updated_at              | str  | ISO 8601 datetime, with microseconds, of the\n                            |      | last time the order was updated.\n    created_at              | str  | ISO 8601 datetime, with microseconds, of\n                            |      | when the order was created.\n    order_type              | str  | The order type.\n    partial_minimum*        | str  | The minimum amount that can be taken.\n    partial_orig_maker_size*| str  | The partial order original maker_size.\n    partial_orig_taker_size*| str  | The partial order original taker_size.\n    partial_repost          | str  | Whether the order will be reposted or not.\n                            |      | This applies to `partial` order types and\n                            |      | will show `false` for `exact` order types.\n    partial_parent_id       | str  | The previous order id of a reposted partial\n                            |      | order. This will return an empty string if\n                            |      | there is no parent order.\n    status                  | str  | The order status.\n\n    * This only applies to `partial` order types and will show `0` on `exact`\n      order types.\n                \nExamples:\n> blocknet-cli dxGetOrders \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"dxGetOrders\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/"
+	helpDxGetOrder    = "dxGetOrder \"id\"\n\nReturns order info by order ID.\n\nArguments:\n1. id    (string, required) The order ID.\n\nResult:\n\n    {\n        \"id\": \"6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a\",\n        \"maker\": \"SYS\",\n        \"maker_size\": \"0.100\",\n        \"taker\": \"LTC\",\n        \"taker_size\": \"0.01\",\n        \"updated_at\": \"1970-01-01T00:00:00.00000Z\",\n        \"created_at\": \"2018-01-15T18:15:30.12345Z\",\n        \"order_type\": \"exact\",\n        \"partial_minimum\": \"0.000000\",\n        \"partial_orig_maker_size\": \"0.000000\",\n        \"partial_orig_taker_size\": \"0.000000\",\n        \"partial_repost\": false,\n        \"partial_parent_id\": \"\",\n        \"status\": \"open\"\n    }\n\n    Key                     | Type | Description\n    ------------------------|------|---------------------------------------------\n    Array                   | arr  | An array of all orders with each order\n                            |      | having the following parameters.\n    id                      | str  | The order ID.\n    maker                   | str  | Maker trading asset; the ticker of the asset\n                            |      | being sold by the maker.\n    maker_size              | str  | Maker trading size. String is used to\n                            |      | preserve precision.\n    maker_address           | str  | Address for sending the outgoing asset.\n    taker                   | str  | Taker trading asset; the ticker of the asset\n                            |      | being sold by the taker.\n    taker_size              | str  | Taker trading size. String is used to\n                            |      | preserve precision.\n    taker_address           | str  | Address for receiving the incoming asset.\n    updated_at              | str  | ISO 8601 datetime, with microseconds, of the\n                            |      | last time the order was updated.\n    created_at              | str  | ISO 8601 datetime, with microseconds, of\n                            |      | when the order was created.\n    order_type              | str  | The order type.\n    partial_minimum*        | str  | The minimum amount that can be taken.\n    partial_orig_maker_size*| str  | The partial order original maker_size.\n    partial_orig_taker_size*| str  | The partial order original taker_size.\n    partial_repost          | str  | Whether the order will be reposted or not.\n                            |      | This applies to `partial` order types and\n                            |      | will show `false` for `exact` order types.\n    partial_parent_id       | str  | The previous order id of a reposted partial\n                            |      | order. This will return an empty string if\n                            |      | there is no parent order.\n    status                  | str  | The order status.\n\n    * This only applies to `partial` order types and will show `0` on `exact`\n      order types.\n                \nExamples:\n> blocknet-cli dxGetOrder 524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"dxGetOrder\", \"params\": [\"524137449d9a35fa707ee395abab32bedae91aa2aefb6e3611fcd8574863e432\"] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/"
+	helpDxGetMyOrders = "dxGetMyOrders\n\nReturns a list of all of your orders (of all states). It will only return orders from your current session.\n\nResult:\n\n    [\n        {\n            \"id\": \"91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9\",\n            \"maker\": \"SYS\",\n            \"maker_size\": \"100.000000\",\n            \"maker_address\": \"SVTbaYZ8olpVn3uNyImst3GKyrvfzXQgdK\",\n            \"taker\": \"LTC\",\n            \"taker_size\": \"10.500000\",\n            \"taker_address\": \"LVvFhZroMRGTtg1hHp7jVew3YoZRX8y35Z\",\n            \"updated_at\": \"2018-01-15T18:25:05.12345Z\",\n            \"created_at\": \"2018-01-15T18:15:30.12345Z\",\n            \"order_type\": \"partial\",\n            \"partial_minimum\": \"10.000000\",\n            \"partial_orig_maker_size\": \"100.000000\",\n            \"partial_orig_taker_size\": \"10.500000\",\n            \"partial_repost\": true,\n            \"partial_parent_id\": \"\",\n            \"status\": \"open\"\n        },\n        {\n            \"id\": \"6be548bc46a3dcc69b6d56529948f7e679dd96657f85f5870a017e005caa050a\",\n            \"maker\": \"SYS\",\n            \"maker_size\": \"4.000000\",\n            \"maker_address\": \"SVTbaYZ8olpVn3uNyImst3GKyrvfzXQgdK\",\n            \"taker\": \"LTC\",\n            \"taker_size\": \"0.400000\",\n            \"taker_address\": \"LVvFhZroMRGTtg1hHp7jVew3YoZRX8y35Z\",\n            \"updated_at\": \"2018-01-15T18:25:05.12345Z\",\n            \"created_at\": \"2018-01-15T18:15:30.12345Z\",\n            \"order_type\": \"partial\",\n            \"partial_minimum\": \"0.400000\",\n            \"partial_orig_maker_size\": \"4.000000\",\n            \"partial_orig_taker_size\": \"0.400000\",\n            \"partial_repost\": true,\n            \"partial_parent_id\": \"91d0ea83edc79b9a2041c51d08037cff87c181efb311a095dfdd4edbcc7993a9\",\n            \"status\": \"open\"\n        }\n    ]\n\n    Key                     | Type | Description\n    ------------------------|------|---------------------------------------------\n    Array                   | arr  | An array of all orders with each order\n                            |      | having the following parameters.\n    id                      | str  | The order ID.\n    maker                   | str  | Maker trading asset; the ticker of the asset\n                            |      | being sold by the maker.\n    maker_size              | str  | Maker trading size. String is used to\n                            |      | preserve precision.\n    maker_address           | str  | Address for sending the outgoing asset.\n    taker                   | str  | Taker trading asset; the ticker of the asset\n                            |      | being sold by the taker.\n    taker_size              | str  | Taker trading size. String is used to\n                            |      | preserve precision.\n    taker_address           | str  | Address for receiving the incoming asset.\n    updated_at              | str  | ISO 8601 datetime, with microseconds, of the\n                            |      | last time the order was updated.\n    created_at              | str  | ISO 8601 datetime, with microseconds, of\n                            |      | when the order was created.\n    order_type              | str  | The order type.\n    partial_minimum*        | str  | The minimum amount that can be taken.\n    partial_orig_maker_size*| str  | The partial order original maker_size.\n    partial_orig_taker_size*| str  | The partial order original taker_size.\n    partial_repost          | str  | Whether the order will be reposted or not.\n                            |      | This applies to `partial` order types and\n                            |      | will show `false` for `exact` order types.\n    partial_parent_id       | str  | The previous order id of a reposted partial\n                            |      | order. This will return an empty string if\n                            |      | there is no parent order.\n    status                  | str  | The order status.\n\n    * This only applies to `partial` order types and will show `0` on `exact`\n      order types.\n                \nExamples:\n> blocknet-cli dxGetMyOrders \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"dxGetMyOrders\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:41414/"
 )

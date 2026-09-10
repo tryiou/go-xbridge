@@ -139,10 +139,21 @@ func TestHelpTextConstants(t *testing.T) {
 		"dxTakeOrder": helpDxTakeOrder, "dxGetMyPartialOrderChain": helpDxGetMyPartialOrderChain,
 		"dxPartialOrderChainDetails": helpDxPartialOrderChainDetails, "dxSplitAddress": helpDxSplitAddress,
 		"dxSplitInputs": helpDxSplitInputs, "dxGetUtxos": helpDxGetUtxos,
-		"dxGetTradingData": helpDxGetTradingData,
+		"dxGetTradingData": helpDxGetTradingData, "dxGetOrders": helpDxGetOrders,
+		"dxGetOrder": helpDxGetOrder, "dxGetOrderBook": helpDxGetOrderBook,
+		"dxGetOrderFills": helpDxGetOrderFills, "dxGetOrderHistory": helpDxGetOrderHistory,
+		"dxGetTokenBalances": helpDxGetTokenBalances, "dxGetLocalTokens": helpDxGetLocalTokens,
+		"dxGetNetworkTokens": helpDxGetNetworkTokens, "dxGetNewTokenAddress": helpDxGetNewTokenAddress,
+		"dxGetLockedUtxos": helpDxGetLockedUtxos, "dxCancelOrder": helpDxCancelOrder,
+		"dxFlushCancelledOrders": helpDxFlushCancelledOrders, "dxLoadXBridgeConf": helpDxLoadXBridgeConf,
+		"dxGetMyOrders": helpDxGetMyOrders, "getnetworkinfo": helpGetnetworkinfo,
+		"help": helpDxHelp,
 	} {
-		if !hasPrefix(help, method+" ") {
-			t.Errorf("%s help must start with the method name + oneline args", method)
+		if !hasPrefix(help, method+" ") && !hasPrefix(help, method+"\n") {
+			t.Errorf("%s help must start with the method name", method)
+		}
+		if method == "help" {
+			continue // Core's help-for-help carries no Examples section
 		}
 		if !contains(help, "\nExamples:\n> blocknet-cli "+method) {
 			t.Errorf("%s help must carry the Examples section with blocknet-cli lines", method)

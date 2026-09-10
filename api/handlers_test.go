@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -590,6 +591,23 @@ func TestDxFlushCancelledOrdersEmptyThenPruned(t *testing.T) {
 	}
 }
 
+// TestDxFlushAgeWraps32Bit locks in C++ reading the age into 32 bits:
+// huge values wrap mod 2^32 and a wrapped negative fails (live Core:
+// 9999999999999 -> echo 1316134911, 2^31 and 2^32-1 -> 1025, 2^32 -> 0).
+func TestDxFlushAgeWraps32Bit(t *testing.T) {
+	ctx := newWalletTestCtx()
+	res, err := ctx.dxFlushCancelledOrders([]json.RawMessage{json.RawMessage("9999999999999")})
+	if err != nil {
+		t.Fatalf("dxFlushCancelledOrders(huge) = %v", err)
+	}
+	if res.(flushCancelledResult).AgeMillis != 1316134911 {
+		t.Fatalf("ageMillis = %v, want 1316134911", res.(flushCancelledResult).AgeMillis)
+	}
+	if _, err := ctx.dxFlushCancelledOrders([]json.RawMessage{json.RawMessage("2147483648")}); err == nil || err.Code != errInvalidParameters {
+		t.Fatalf("dxFlushCancelledOrders(2^31) = %v, want 1025", err)
+	}
+}
+
 // TestFlushCancelledPrunesBookAndHistory locks in the flush semantics (C++
 // erases trCancelled orders from BOTH m_transactions and m_historicTransactions,
 // xbridgeapp.cpp:1331-1354) and the ordering/key-order: the flushed list is
@@ -1039,6 +1057,76 @@ func TestDxSplitInputsBadBoolParam(t *testing.T) {
 	}
 	if err.Error != "JSON value is not a boolean as expected" {
 		t.Errorf("err.Error = %q, want UniValue message", err.Error)
+	}
+}
+
+// TestDxHelpBare lists every supported command, one per line, under a
+// single category header.
+func TestDxHelpBare(t *testing.T) {
+	ctx := newWalletTestCtx()
+	res, err := ctx.dxHelp(nil)
+	if err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	text, ok := res.(string)
+	if !ok {
+		t.Fatalf("help result = %T, want string", res)
+	}
+	var want []string
+	for m := range dispatch {
+		want = append(want, m)
+	}
+	sort.Strings(want)
+	lines := strings.Split(text, "\n")
+	if lines[0] != "== XBridge ==" {
+		t.Errorf("help header = %q, want == XBridge ==", lines[0])
+	}
+	var got []string
+	for _, l := range lines[1:] {
+		if l != "" {
+			got = append(got, l)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("help commands = %v, want %v", got, want)
+	}
+}
+
+// TestDxHelpCommand returns the exact command text plus Core's trailing
+// newline, and the exact unknown-command message.
+func TestDxHelpCommand(t *testing.T) {
+	ctx := newWalletTestCtx()
+	for method, help := range map[string]string{
+		"dxGetOrders": helpDxGetOrders, "dxCancelOrder": helpDxCancelOrder,
+		"getnetworkinfo": helpGetnetworkinfo, "dxTakeOrder": helpDxTakeOrder,
+	} {
+		res, err := ctx.dxHelp([]json.RawMessage{jstr(method)})
+		if err != nil {
+			t.Fatalf("help [%s]: %v", method, err)
+		}
+		if res.(string) != help+"\n" {
+			t.Errorf("help [%s] mismatch", method)
+		}
+	}
+	res, err := ctx.dxHelp([]json.RawMessage{jstr("dxNope")})
+	if err != nil {
+		t.Fatalf("help [bogus]: %v", err)
+	}
+	if res.(string) != "help: unknown command: dxNope" {
+		t.Errorf("help [bogus] = %q", res)
+	}
+}
+
+// TestDxHelpEdges locks the Core edges: non-string params throw the UniValue
+// string error, and excess params throw help's own text via checkArity.
+func TestDxHelpEdges(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxHelp([]json.RawMessage{json.RawMessage("123")})
+	if err == nil || err.Code != -1 || err.Error != "JSON value is not a string as expected" {
+		t.Fatalf("help [123] = %v, want -1 string throw", err)
+	}
+	if aerr := checkArity("help", 2); aerr == nil || aerr.Code != -1 || aerr.Error != helpDxHelp {
+		t.Fatalf("help arity(2) = %v, want -1 help text", aerr)
 	}
 }
 
