@@ -2179,18 +2179,20 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		n.store.ReleaseReserve(key)
 		return orderListResult{}, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
-	// The Accepting broadcast and the local state commit run on the engine as
-	// ONE serialized unit (authoritative re-check → wire write → store
-	// commit), so a cancel/expiry can no longer land between the wire write
-	// and the re-check: a take that leaves the wire is a take that was
-	// committed (C++ acceptXBridgeTransaction does the same on its single
-	// thread, xbridgeapp.cpp:2122-2380). The take applies a TARGETED store
-	// update (never *stored = *o) so a concurrent engine-side field update
-	// (e.g. a remote cancel) is not clobbered.
+	// The take commits on the engine as ONE serialized unit (authoritative
+	// re-check → store commit → session → persistNow → wire write), so a
+	// cancel/expiry can no longer land between the wire write and the
+	// re-check: a take that leaves the wire is a take that was committed
+	// AND durably persisted (C++ acceptXBridgeTransaction does the same on
+	// its single thread, xbridgeapp.cpp:2122-2380). The take applies a
+	// TARGETED store update (never *stored = *o) so a concurrent engine-side
+	// field update (e.g. a remote cancel) is not clobbered. A persist or
+	// send failure rolls the store entry, session, and disk back, so no
+	// locally-live / hub-unknown orphan remains.
 	var result *Order
 	var terr *rpcError
 	n.submit(func() {
-		result, terr = n.commitTake(key, o, p, pkt, tPrivArr, tPub, proofs, usedCoins, feeInputs)
+		result, terr = n.commitTake(key, p, pkt, tPrivArr, tPub, proofs, usedCoins, feeInputs)
 	}, true)
 	if terr != nil {
 		return orderListResult{}, terr
@@ -2210,62 +2212,99 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	return result.toTakeResult(fromSize, toSize), nil
 }
 
-// commitTake runs on the engine: the authoritative re-check that the order is
-// still live, the Accepting broadcast, and the local taker-state commit for a
-// taken order. It returns the committed order, or (nil, nil) when the order
-// was cancelled/removed since the HTTP snapshot — in that case the reservation
-// is released and NO packet is broadcast (a take must never leave the wire
-// that the engine then refuses). The caller holds the reservation
-// (ReserveForTake); it is released on every path. The write runs here, after
-// the re-check, so the broadcast and the commit are one engine-serialized
-// unit.
-func (n *Node) commitTake(key string, o *Order, p TakeOrderParams, pkt *proto.Packet, tPrivArr [32]byte, tPub [33]byte, proofs []proto.UtxoEntry, usedCoins, feeInputs []wallet.Utxo) (*Order, *rpcError) {
+// commitTake runs on the engine as one serialized unit: the authoritative
+// re-check that the order is still live, the local taker-state commit, the
+// taker session, the durable persist, and the Accepting broadcast. It returns
+// the committed order, or (nil, nil) when the order was cancelled/removed
+// since the HTTP snapshot — in that case the reservation is released and NO
+// packet is broadcast (a take must never leave the wire that the engine then
+// refuses). The caller holds the reservation (ReserveForTake); it is released
+// on every path. The durable write precedes the send, and a persist or send
+// failure rolls the store entry, session, and disk back, so no locally-live /
+// hub-unknown orphan remains.
+func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPrivArr [32]byte, tPub [33]byte, proofs []proto.UtxoEntry, usedCoins, feeInputs []wallet.Utxo) (*Order, *rpcError) {
 	// Authoritative re-check on the engine: the order may have been
 	// cancelled/removed since the HTTP snapshot.
 	if n.store.Get(key) == nil {
 		n.store.ReleaseReserve(key)
 		return nil, nil
 	}
-	if err := n.conn.WritePacket(pkt, o.HubAddress); err != nil {
-		n.store.ReleaseReserve(key)
-		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
-	}
 	now := NowMicro()
 	makerKey := hexEncode(tPub[:])
-	// Local taker: set our per-trade M key and capture the original
-	// (maker-facing) currencies BEFORE the take reorients the order
-	// (C++ xbridgeapp.cpp:2380; the From/To swap happens in acc above).
-	// On a reject these Orig* values restore the order to pending.
-	o.Updated = now
-	o.Status = "accepting"
-	o.Role = 'B'
-	o.MakerKey = makerKey
-	o.OrigFromCurrency = o.FromCurrency
-	o.OrigToCurrency = o.ToCurrency
-	o.Utxos = proofs
-	o.UsedCoins = usedCoins
-	o.FeeUtxos = feeInputs
-	o.UtxoCurrency = o.ToCurrency // taker funding coins live on the take's from-currency
-	// Publish the take's mutations to the book under the store lock.
+	// Everything below reads the live book (store.go:141 snapshots): the HTTP
+	// snapshot predates the engine re-check, so the book is the authority
+	// for the commit. (The Accepting body above is snapshot-built, but it
+	// carries only immutable order-identity fields — ID, currencies,
+	// amounts, heights, hashes — which no engine path mutates on a live
+	// order.)
+	var prevOrder *Order
 	n.store.Update(key, func(stored *Order) {
+		// Full live pre-take snapshot under the store lock (order.go:198 deep
+		// copy). On a failed persist/send this is restored wholesale, so a revert
+		// never depends on today's data model (e.g. remote orders carry no Utxos).
+		prevOrder = stored.Copy()
 		stored.Updated = now
 		stored.Status = "accepting"
 		stored.Role = 'B'
+		stored.Mine = true // local taker swap — persisted by saveOrders (C++ isLocal, xbridgetransactiondescr.h:646)
 		stored.MakerKey = makerKey
-		stored.OrigFromCurrency = o.FromCurrency
-		stored.OrigToCurrency = o.ToCurrency
+		stored.OrigFromCurrency = prevOrder.FromCurrency
+		stored.OrigToCurrency = prevOrder.ToCurrency
 		stored.Utxos = proofs
 		stored.UsedCoins = usedCoins
 		stored.FeeUtxos = feeInputs
-		stored.UtxoCurrency = o.ToCurrency
+		// Taker funding coins live on the order's ToCurrency (order.go:90).
+		stored.UtxoCurrency = prevOrder.ToCurrency
 	})
 	// The committed Utxos/FeeUtxos now carry the reserved keys (LockedUtxoInfo
 	// reads them off the order), so the in-flight reservation is exhausted.
 	n.store.ReleaseReserve(key)
+	revertTake := func() {
+		// Restore the exact pre-take record; a failed take must leave no phantom
+		// local swap on disk. Runs on the engine goroutine, so prevOrder
+		// (captured under store.mu) is the true live pre-take state.
+		if prevOrder != nil {
+			// Deep restore: Copy() re-allocates the slice headers so the
+			// revived record shares no backing arrays with the discarded
+			// snapshot (order.go:198 deep-copy invariant).
+			n.store.Update(key, func(s *Order) { *s = *prevOrder.Copy() })
+		}
+		delete(n.sessions, key)
+		if err := n.persistNow(); err != nil {
+			xlog.Error("swap revert persist failed; on-disk state may diverge from memory", "order", key, "err", err)
+		}
+	}
+	// Drive the session + broadcast destination off the live committed
+	// record: the HTTP snapshot predates the engine re-check, so only the
+	// live book is authoritative for the session pinning (swap.go:456) and
+	// the Accepting destination. (The Accepting body itself is
+	// snapshot-built above, carrying only immutable order-identity fields.)
+	live := n.store.Get(key)
+	if live == nil {
+		// Unreachable: the take just committed this record on the engine
+		// goroutine and no other engine closure can interleave. Fail closed.
+		revertTake()
+		return nil, makeError(errUnknown, "dxTakeOrder", "order vanished after commit")
+	}
 	// Begin driving the client-side deposit handshake for this taken order.
-	n.newTakerSession(o, p, tPrivArr, tPub)
-	// Persist the new local swap (incl. its per-trade M keypair) to disk.
-	n.persist()
+	n.newTakerSession(live, p, tPrivArr, tPub)
+	// Durably persist the new local swap (incl. its per-trade M keypair) BEFORE
+	// broadcasting the Accepting response, so a crash/restart can never find the
+	// hub knowing a take the local state lacks (which would strand the taker
+	// swap — fund loss). C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes
+	// on a timer with no before-send guarantee; this port makes the durable
+	// write precede the send, like MakeOrder (node.go:1769-1788). On a persist
+	// or send failure, roll back the store entry + session (and the durable
+	// copy) so no locally-live / hub-unknown orphan remains. C++
+	// acceptXBridgeTransaction commits on its single thread (xbridgeapp.cpp:2122-2380).
+	if err := n.persistNow(); err != nil {
+		revertTake()
+		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
+	}
+	if err := n.conn.WritePacket(pkt, live.HubAddress); err != nil {
+		revertTake()
+		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
+	}
 	return n.store.Get(key), nil
 }
 

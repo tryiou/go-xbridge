@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/hex"
+	"errors"
 	"sync"
 	"testing"
 
@@ -58,7 +59,7 @@ func TestTakeCommitOrderGoneNoBroadcast(t *testing.T) {
 	var got *Order
 	var terr *rpcError
 	n.submit(func() {
-		got, terr = n.commitTake(key, o, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
+		got, terr = n.commitTake(key, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
 	}, true)
 	if terr != nil {
 		t.Fatalf("commitTake on a gone order errored: %v", terr)
@@ -83,6 +84,225 @@ func TestTakeCommitOrderGoneNoBroadcast(t *testing.T) {
 	n.store.Add(o2)
 	if got := n.store.ReserveForTake(hexEncode(o2.ID[:]), []string{"blk:0"}, []string{"fund:1"}, "BTC"); got != reserveOK {
 		t.Errorf("reuse of released keys after gone-order commit = %v, want reserveOK", got)
+	}
+}
+
+// TestTakeCommitSetsMineAndPersists locks in the local-taker durability fix: a
+// committed take must mark the order Mine=true (so snapshotSwaps persists it,
+// like C++ saveOrders' isLocal filter) and the durable swap file must contain
+// it after persistNow. It also proves the Orig* currencies come from the live
+// book record: commitTake takes no order snapshot at all, so the values
+// necessarily come from the live book, never a stale HTTP snapshot.
+func TestTakeCommitSetsMineAndPersists(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cc := &captureXConn{}
+	n := newTestNode(t, map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}})
+	n.conn = cc
+	n.config.DataDir = t.TempDir()
+
+	o := &Order{
+		ID: [32]byte{0x09}, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "SYS",
+		FromAmount: 1000000, ToAmount: 2000000, Status: "open",
+	}
+	key := hexEncode(o.ID[:])
+	n.store.Add(o)
+
+	// commitTake takes no order snapshot at all — Orig*, UtxoCurrency, the
+	// session pinning, and the broadcast destination necessarily come from
+	// the live book record, so a stale HTTP snapshot can never leak into
+	// the committed take. Assert they match the live BTC/SYS pair.
+	pkt := proto.NewPacket(proto.XbcTransactionAccepting, (&proto.AcceptingBody{ID: o.ID}).Marshal())
+	if err := crypto.NewBtcSigner().Sign(pkt, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var got *Order
+	var terr *rpcError
+	n.submit(func() {
+		got, terr = n.commitTake(key, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
+	}, true)
+	if terr != nil {
+		t.Fatalf("commitTake errored: %v", terr)
+	}
+	if got == nil {
+		t.Fatal("commitTake returned nil on a live order")
+	}
+	if !got.Mine {
+		t.Error("committed take has Mine=false, want true (local taker swap must persist)")
+	}
+	if got.OrigFromCurrency != "BTC" || got.OrigToCurrency != "SYS" {
+		t.Errorf("Orig currencies = %q/%q, want live BTC/SYS",
+			got.OrigFromCurrency, got.OrigToCurrency)
+	}
+	if got.UtxoCurrency != "SYS" {
+		t.Errorf("UtxoCurrency = %q, want live SYS", got.UtxoCurrency)
+	}
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("wrote %d packets, want 1 Accepting broadcast", len(pkts))
+	}
+	s, ok := n.sessions[key]
+	if !ok {
+		t.Fatal("no taker session registered for the committed take")
+	}
+	// The session must pin the live currencies too.
+	if s.srcCur != "SYS" || s.dstCur != "BTC" {
+		t.Errorf("session currencies = %q/%q, want live SYS/BTC",
+			s.srcCur, s.dstCur)
+	}
+	// The durable copy must contain the taken order: a restart must rebuild it.
+	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	if err != nil {
+		t.Fatalf("loadSwaps: %v", err)
+	}
+	found := false
+	for _, p := range ps {
+		if p.ID == o.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("durable swap file lacks taken order %s (has %d swaps)", key, len(ps))
+	}
+}
+
+// TestTakeCommitSendFailureReverts proves a failed Accepting broadcast rolls
+// back the store entry to its exact pre-take record, drops the taker session,
+// broadcasts nothing, and leaves no phantom swap on disk.
+func TestTakeCommitSendFailureReverts(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cc := &captureXConn{}
+	n := newTestNode(t, map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}})
+	n.config.DataDir = t.TempDir()
+	fwc := &failWriteConn{captureXConn: cc}
+	n.conn = fwc
+
+	o := &Order{
+		ID: [32]byte{0x0a}, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "SYS",
+		FromAmount: 1000000, ToAmount: 2000000, Status: "open",
+	}
+	key := hexEncode(o.ID[:])
+	n.store.Add(o)
+
+	pkt := proto.NewPacket(proto.XbcTransactionAccepting, (&proto.AcceptingBody{ID: o.ID}).Marshal())
+	if err := crypto.NewBtcSigner().Sign(pkt, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var got *Order
+	var terr *rpcError
+	n.submit(func() {
+		got, terr = n.commitTake(key, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
+	}, true)
+	if terr == nil {
+		t.Fatal("commitTake with failing send should error")
+	}
+	if terr.Code != errUnknown {
+		t.Fatalf("commitTake error code = %d, want errUnknown (%d)", terr.Code, errUnknown)
+	}
+	if !fwc.called {
+		t.Fatal("WritePacket was never called — the revert path was not reached")
+	}
+	if got != nil {
+		t.Fatalf("expected nil order on failed send, got %+v", got)
+	}
+	assertTakeReverted(t, n, key)
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("wrote %d packets on failed send, want 0", len(pkts))
+	}
+	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	if err != nil {
+		t.Fatalf("loadSwaps: %v", err)
+	}
+	if len(ps) != 0 {
+		t.Fatalf("persisted %d swaps after failed send, want 0 (orphan leaked on disk)", len(ps))
+	}
+}
+
+// TestTakeCommitPersistFailureReverts proves a failed durable write rolls back
+// the store entry and session before anything reaches the wire.
+func TestTakeCommitPersistFailureReverts(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cc := &captureXConn{}
+	n := newTestNode(t, map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}})
+	n.conn = cc
+	n.config.DataDir = t.TempDir()
+	orig := writeSwaps
+	writeSwaps = func(path string, data []byte) error { return errors.New("injected disk failure") }
+	t.Cleanup(func() { writeSwaps = orig })
+
+	o := &Order{
+		ID: [32]byte{0x0b}, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "SYS",
+		FromAmount: 1000000, ToAmount: 2000000, Status: "open",
+	}
+	key := hexEncode(o.ID[:])
+	n.store.Add(o)
+
+	pkt := proto.NewPacket(proto.XbcTransactionAccepting, (&proto.AcceptingBody{ID: o.ID}).Marshal())
+	if err := crypto.NewBtcSigner().Sign(pkt, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var got *Order
+	var terr *rpcError
+	n.submit(func() {
+		got, terr = n.commitTake(key, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
+	}, true)
+	if terr == nil {
+		t.Fatal("commitTake with failing persist should error")
+	}
+	if got != nil {
+		t.Fatalf("expected nil order on failed persist, got %+v", got)
+	}
+	assertTakeReverted(t, n, key)
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("wrote %d packets on failed persist, want 0 (send must follow durability)", len(pkts))
+	}
+}
+
+// assertTakeReverted checks the store entry for key is back to its pre-take
+// remote-order record and no taker session remains.
+func assertTakeReverted(t *testing.T, n *Node, key string) {
+	t.Helper()
+	restored := n.store.Get(key)
+	if restored == nil {
+		t.Fatalf("order %s missing after revert, want pre-take record restored", key)
+	}
+	if restored.Status != "open" {
+		t.Errorf("Status = %q, want open", restored.Status)
+	}
+	if restored.Mine {
+		t.Error("Mine = true after revert, want false")
+	}
+	if restored.Role != 0 {
+		t.Errorf("Role = %q, want 0", restored.Role)
+	}
+	if restored.MakerKey != "" {
+		t.Errorf("MakerKey = %q, want empty", restored.MakerKey)
+	}
+	if restored.OrigFromCurrency != "" || restored.OrigToCurrency != "" {
+		t.Errorf("Orig currencies = %q/%q, want empty", restored.OrigFromCurrency, restored.OrigToCurrency)
+	}
+	if len(restored.Utxos) != 0 || len(restored.UsedCoins) != 0 || len(restored.FeeUtxos) != 0 {
+		t.Errorf("funding residue after revert: %d utxos/%d used/%d fee, want 0/0/0",
+			len(restored.Utxos), len(restored.UsedCoins), len(restored.FeeUtxos))
+	}
+	if _, ok := n.sessions[key]; ok {
+		t.Error("taker session still registered after revert, want removed")
 	}
 }
 
