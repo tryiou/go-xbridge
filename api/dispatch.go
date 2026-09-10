@@ -193,6 +193,20 @@ func jsonTypeOf(raw json.RawMessage) string {
 
 func spErr(msg string) *rpcError { return makeEnvelopeError(-1, msg) }
 
+// lexicalAmount parses an amount string the way C++
+// boost::lexical_cast<double> does at the dx* amount sites (rpcxbridge.cpp:
+// 929/933 dxMakeOrder, 1157 dxTakeOrder, 3042 dxMakePartialOrder,
+// 3269/3383 dxSplitAddress/dxSplitInputs): an unparseable string throws the
+// HTTP-500 envelope error code -1 with the exact runtime message — it is
+// never a 1025 business error.
+func lexicalAmount(s string) (uint64, *rpcError) {
+	v, err := parseXAmount(s)
+	if err != nil {
+		return 0, spErr("bad lexical cast: source type value could not be interpreted as target")
+	}
+	return v, nil
+}
+
 // spStr is the json_spirit get_str() equivalent: a present non-string (incl.
 // null) is a thrown envelope -1 "get_value< string > called on <T> Value".
 func spStr(params []json.RawMessage, i int) (string, bool, *rpcError) {

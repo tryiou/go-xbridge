@@ -1339,13 +1339,13 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if !xBridgeValidCoin(p.TakerSize) {
 		return nil, makeError(errInvalidParameters, "dxMakeOrder", "The taker_size is too precise. The maximum precision supported is 6 digits.")
 	}
-	fromAmt, err := parseXAmount(p.MakerSize)
-	if err != nil {
-		return nil, makeError(errInvalidParameters, "dxMakeOrder", "invalid maker_size")
+	fromAmt, aerr := lexicalAmount(p.MakerSize)
+	if aerr != nil {
+		return nil, aerr
 	}
-	toAmt, err := parseXAmount(p.TakerSize)
-	if err != nil {
-		return nil, makeError(errInvalidParameters, "dxMakeOrder", "invalid taker_size")
+	toAmt, aerr := lexicalAmount(p.TakerSize)
+	if aerr != nil {
+		return nil, aerr
 	}
 	fromID, e := decodeAddr("dxMakeOrder", p.Maker, p.MakerAddress)
 	if e != nil {
@@ -1430,9 +1430,9 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		if p.MinSize == "" {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "minimum_size is required for partial orders")
 		}
-		m, err := parseXAmount(p.MinSize)
-		if err != nil {
-			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "invalid minimum_size")
+		m, merr := lexicalAmount(p.MinSize)
+		if merr != nil {
+			return nil, merr
 		}
 		minFrom = m
 		if minFrom > fromAmt {
@@ -1443,7 +1443,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		// native dust threshold (xbridgewalletconnectorbtc.cpp:1900-1904).
 		// minFrom is XBridge 1e6 base, so scale it up with the same double
 		// arithmetic C++ uses before comparing. minimum_size is not
-		// precision-validated (unlike maker/taker sizes), so parseXAmount
+		// precision-validated (unlike maker/taker sizes), so lexicalAmount
 		// truncates to 6 decimals; a sub-6-decimal min like "0.0000546" (native
 		// 5460, NOT dust in C++) truncates to 0.000054 (native 5400, dust here)
 		// — a pre-existing truncation narrow-band divergence, accepted.
@@ -1505,9 +1505,9 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		minConf = cc.Confirmations
 	}
 	locked := n.store.LockedUtxoInfoFor(p.Maker)
-	outputs, err := conn.ListUnspent(minConf)
-	if err != nil {
-		return nil, makeError(errInsufficientFunds, "dxMakeOrder", err.Error())
+	outputs, listErr := conn.ListUnspent(minConf)
+	if listErr != nil {
+		return nil, makeError(errInsufficientFunds, "dxMakeOrder", listErr.Error())
 	}
 	filtered := outputs[:0]
 	for _, u := range outputs {
@@ -1869,9 +1869,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// RAW string even when the order id is unknown.
 	var takeAmount uint64
 	if p.Amount != "" {
-		a, err := parseXAmount(p.Amount)
+		a, err := lexicalAmount(p.Amount)
 		if err != nil {
-			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
+			return orderListResult{}, err
 		}
 		if a == 0 {
 			return orderListResult{}, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+p.Amount)

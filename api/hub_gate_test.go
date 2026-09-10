@@ -214,6 +214,48 @@ func TestMakeOrderMissingTakerConnectorNoSession(t *testing.T) {
 	}
 }
 
+// TestMakeOrderBadSizesThrow locks in the throw for dxMakeOrder maker/taker
+// sizes (rpcxbridge.cpp:929/933: lexical_cast<double> after the precision
+// gate). Dry-run still parses, so no broadcast is needed.
+func TestMakeOrderBadSizesThrow(t *testing.T) {
+	n, _ := newHubNode(servicenode.NewRegistry())
+	mk := func(maker, taker string) *rpcError {
+		_, rerr := n.MakeOrder(MakeOrderParams{
+			Maker: "BTC", MakerSize: maker, MakerAddress: btcAddr,
+			Taker: "SYS", TakerSize: taker, TakerAddress: btcAddr2,
+			DryRun: true,
+		})
+		return rerr
+	}
+	assertLexicalThrow(t, mk("abc", "0.3"))
+	assertLexicalThrow(t, mk("1.5", "abc"))
+}
+
+// TestMakePartialBadMinSizeThrow locks in the throw for dxMakePartialOrder
+// minimum_size (rpcxbridge.cpp:3042).
+func TestMakePartialBadMinSizeThrow(t *testing.T) {
+	n, _ := newHubNode(servicenode.NewRegistry())
+	_, rerr := n.MakeOrder(MakeOrderParams{
+		Maker: "BTC", MakerSize: "1.5", MakerAddress: btcAddr,
+		Taker: "SYS", TakerSize: "0.3", TakerAddress: btcAddr2,
+		Type: "partial", MinSize: "abc", DryRun: true,
+	})
+	assertLexicalThrow(t, rerr)
+}
+
+// TestTakeOrderBadAmountThrow locks in the throw for the TakeOrder amount
+// re-check (rpcxbridge.cpp:1157), reached by direct callers past the handler.
+func TestTakeOrderBadAmountThrow(t *testing.T) {
+	n, _ := newHubNode(servicenode.NewRegistry())
+	id := [32]byte{0x23}
+	n.store.Add(&Order{
+		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
+		ToCurrency: "BTC", ToAmount: 300000, Status: "open", Mine: false,
+	})
+	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2, Amount: "abc", DryRun: true})
+	assertLexicalThrow(t, rerr)
+}
+
 // TestMakeOrderDryRunSkipsHubGate verifies the hub gate does not block Go's
 // dry-run preview: with an empty registry and no hub, a dry-run make still
 // succeeds (validation/render only; nothing broadcast, no session created) and

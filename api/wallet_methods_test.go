@@ -540,6 +540,41 @@ func TestDxSplitInputsRejectsNonP2PKH(t *testing.T) {
 	}
 }
 
+// assertLexicalThrow asserts the C++ boost::lexical_cast<double> throw shape
+// for unparseable amounts: HTTP-500 envelope error code -1 with the exact
+// runtime message (rpc/server.cpp:584-586). Every dx* amount site must throw
+// this instead of a 1025 business error.
+func assertLexicalThrow(t *testing.T, err *rpcError) {
+	t.Helper()
+	const want = "bad lexical cast: source type value could not be interpreted as target"
+	if err == nil || err.Code != -1 || err.Error != want {
+		t.Fatalf("err = %+v, want code -1 %q", err, want)
+	}
+}
+
+// TestDxSplitAddressBadAmountThrow locks in the throw for dxSplitAddress
+// (rpcxbridge.cpp:3269: xBridgeIntFromReal(lexical_cast<double>(splitAmount))).
+func TestDxSplitAddressBadAmountThrow(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxSplitAddress([]json.RawMessage{
+		jstr("BTC"), jstr("abc"), jstr(btcAddr),
+		json.RawMessage("false"), json.RawMessage("true"), json.RawMessage("false"),
+	})
+	assertLexicalThrow(t, err)
+}
+
+// TestDxTakeOrderBadAmountThrow locks in the throw for dxTakeOrder
+// (rpcxbridge.cpp:1157). The amount check precedes the order lookup, so no
+// store setup is needed.
+func TestDxTakeOrderBadAmountThrow(t *testing.T) {
+	ctx := newWalletTestCtx()
+	_, err := ctx.dxTakeOrder([]json.RawMessage{
+		jstr("0000000000000000000000000000000000000000000000000000000000000000"),
+		jstr(btcAddr), jstr(btcAddr2), jstr("abc"),
+	})
+	assertLexicalThrow(t, err)
+}
+
 // TestDxSplitSubmitFailure locks in the failure shape: a submit failure is 1004
 // BAD_REQUEST named after the actual method (rpcxbridge.cpp:3278/3392).
 func TestDxSplitSubmitFailure(t *testing.T) {

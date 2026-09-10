@@ -470,9 +470,9 @@ func (h *HandlerCtx) dxTakeOrder(params []json.RawMessage) (interface{}, *rpcErr
 		return nil, makeError(errInvalidParameters, "dxTakeOrder", "The from_address and to_address cannot be the same: "+fromAddr)
 	}
 	if amount != "" {
-		a, perr := parseXAmount(amount)
+		a, perr := lexicalAmount(amount)
 		if perr != nil {
-			return nil, makeError(errInvalidParameters, "dxTakeOrder", "invalid amount")
+			return nil, perr
 		}
 		if a == 0 {
 			return nil, makeError(errInvalidParameters, "dxTakeOrder", "The amount cannot be less than or equal to 0: "+amount)
@@ -1600,9 +1600,9 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if !ok {
 		return nil, makeError(errInvalidParameters, method, "unknown coin: "+ticker)
 	}
-	targetXB, err := parseXAmount(splitAmountStr)
+	targetXB, err := lexicalAmount(splitAmountStr)
 	if err != nil {
-		return nil, makeError(errInvalidParameters, method, "invalid split amount")
+		return nil, err
 	}
 	cc := h.Node.cfg().Confs[ticker]
 	relayFee, _ := conn.GetRelayFee()
@@ -1636,9 +1636,9 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if cc != nil {
 		minConf = cc.Confirmations
 	}
-	walletUtxos, err := conn.ListUnspent(minConf)
-	if err != nil {
-		return nil, makeError(errBadRequest, method, err.Error())
+	walletUtxos, lerr := conn.ListUnspent(minConf)
+	if lerr != nil {
+		return nil, makeError(errBadRequest, method, lerr.Error())
 	}
 	// C++ getUnspent keeps only P2PKH outputs and re-derives the entry
 	// address from the script (fromXAddr), for both the auto and the
@@ -1778,9 +1778,9 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	for _, u := range utxos {
 		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
 	}
-	signedHex, complete, err := conn.SignRawTransaction(unsigned, prevTxs)
-	if err != nil {
-		return nil, makeError(errBadRequest, method, err.Error())
+	signedHex, complete, signErr := conn.SignRawTransaction(unsigned, prevTxs)
+	if signErr != nil {
+		return nil, makeError(errBadRequest, method, signErr.Error())
 	}
 	if !complete {
 		return nil, makeError(errBadRequest, method, "failed to sign the split transaction "+ticker)
