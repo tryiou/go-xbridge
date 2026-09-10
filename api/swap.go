@@ -149,20 +149,26 @@ type SwapSession struct {
 }
 
 // depositOutcome is the worker-produced result of a deposit build+broadcast
-// (CreateA/CreateB).
+// (CreateA/CreateB). depositHex is the signed deposit raw hex (for the swap
+// transcript); txid is the locally-derived txid (authoritative, C++ binTxId).
 type depositOutcome struct {
-	txid      string
-	lockTime  uint32
-	refundHex string
+	txid       string
+	lockTime   uint32
+	refundHex  string
+	depositHex string
 }
 
 // confirmOutcome is the worker-produced result of a claim (ConfirmA/B). secret
 // is the recovered HTLC preimage (ConfirmB only; zero for ConfirmA). check
 // carries the validated counterparty deposit (ConfirmA's deposit check; zero for
-// ConfirmB, whose check ran at CreateB).
+// ConfirmB, whose check ran at CreateB). payHex is the signed claim raw hex
+// (for the swap transcript); payTxID is the broadcast chain id. cur is the
+// chain the claim spends on.
 type confirmOutcome struct {
 	secret  [33]byte
 	payTxID string
+	payHex  string
+	cur     string
 	check   wallet.DepositCheck
 }
 
@@ -745,6 +751,8 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	xlog.Info("deposit A broadcast", "order", orderID, "txid", out.txid,
 		"lockTime", out.lockTime, "secretHash", hexEncode(s.secretHash[:]))
 	xlog.Debug("deposit A refund pre-signed", "order", orderID)
+	// Swap transcript (dedicated log-tx file): the manual-recovery record.
+	txLogDeposit(s.id, "A", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.lockTime, out.depositHex, out.refundHex)
 	body := responseBody(&proto.CreatedABody{
 		HubAddress: s.hub, ID: s.id,
 		ADepositTxID: out.txid, HashedSecret: s.secretHash, ALockTime: out.lockTime,
@@ -886,6 +894,8 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	xlog.Info("deposit B broadcast", "order", orderID, "txid", out.out.txid,
 		"lockTime", out.out.lockTime, "makerDeposit", s.theirDepositTxID)
 	xlog.Debug("deposit B refund pre-signed", "order", orderID)
+	// Swap transcript (dedicated log-tx file): the manual-recovery record.
+	txLogDeposit(s.id, "B", s.srcCur, s.srcAmt, s.dstCur, s.dstAmt, out.out.lockTime, out.out.depositHex, out.out.refundHex)
 	body := responseBody(&proto.CreatedBBody{
 		HubAddress: s.hub, ID: s.id,
 		BDepositTxID: out.out.txid, BLockTime: out.out.lockTime,
@@ -973,7 +983,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
 			}
-			return confirmOutcome{payTxID: payTxID, check: dcheck}, nil
+			return confirmOutcome{payTxID: payTxID, payHex: payHex, cur: cur, check: dcheck}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedA(v, terr) },
 	}
@@ -1009,6 +1019,8 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	s.theirOverpayment = out.check.Excess
 	s.state = csConfirmedA
 	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
+	// Swap transcript (dedicated log-tx file): the broadcast claim.
+	txLogClaim(s.id, "A", out.cur, out.payTxID, out.payHex)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()); the
 	// validated deposit out-params feed the order record.
 	s.n.store.Update(orderID, func(o *Order) {
@@ -1097,7 +1109,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 			if err != nil {
 				return nil, fmt.Errorf("api: broadcast payTx: %w", err)
 			}
-			return confirmOutcome{secret: secret, payTxID: payTxID}, nil
+			return confirmOutcome{secret: secret, payTxID: payTxID, payHex: payHex2, cur: cur}, nil
 		},
 		apply: func(v any, terr error) { s.applyConfirmedB(v, terr) },
 	}
@@ -1129,6 +1141,8 @@ func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	s.secret = out.secret
 	s.state = csConfirmedB
 	xlog.Info("ConfirmB: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
+	// Swap transcript (dedicated log-tx file): the broadcast claim.
+	txLogClaim(s.id, "B", out.cur, out.payTxID, out.payHex)
 	// Counterparty-deposit redeemed (C++ hasRedeemedCounterpartyDeposit()).
 	s.n.store.Update(orderID, func(o *Order) {
 		o.CounterpartyRedeemed = true
@@ -1234,8 +1248,13 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 				return // not yet refundable; the next sweep retries
 			}
 			xlog.Info("refund broadcast", "order", orderID, "txid", txid)
+			// Swap transcript (dedicated log-tx file): tie the pre-signed refund
+			// to its on-chain txid for manual verification.
 			if s := n.sessions[orderID]; s != nil {
 				s.refundDone = true
+				txLogRefund(s.id, cur, lockTime, txid)
+			} else if o := n.store.Get(orderID); o != nil {
+				txLogRefund(o.ID, cur, lockTime, txid)
 			}
 			// C++ redeemOrderDeposit success sets trRollback (:3911): a deposit
 			// redeemed via the refund is rolled back, whether the prior attempt
@@ -1634,7 +1653,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if sentID != "" && sentID != localTxID {
 		xlog.Warn("buildDeposit: wallet reported a different sent txid", "order", c.orderID, "local", localTxID, "sent", sentID)
 	}
-	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex}, nil
+	return depositOutcome{txid: localTxID, lockTime: lockTime, refundHex: refundHex, depositHex: signed}, nil
 }
 
 // buildRefundTx pre-signs the IF-branch (CLTV) refund that returns the deposit to

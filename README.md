@@ -267,6 +267,12 @@ fills only) are documented under "Tier 3" there.
   Each trade's per-trade M keypair, HTLC secret, and pre-signed refund are
   always persisted (C++ `orders.dat` parity — there is no opt-out, so a
   restarted mid-flight swap can always auto-refund and re-sign cancels).
+  Independently, every broadcast deposit/refund/claim is appended with its
+  order id, locktime, and full raw hex to the dedicated per-day transcript
+  `<datadir>/log-tx/xbridgep2p_YYYYMMDD.log` (C++ `log-tx` parity) — the
+  manual-recovery record, usable with the deposit coin's own wallet even if
+  the daemon and swap-state file are both gone. The general log
+  (`xbridged.log`/stderr) never carries trade hex or private key material.
 - `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` require the relevant wallets to
   be connected (they fund/sign/broadcast); without a reachable wallet the call
   returns a "no session" / "unable to connect to wallet" error.

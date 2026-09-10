@@ -148,6 +148,14 @@ func main() {
 		rw = r
 	}
 
+	// Dedicated per-day swap transcript (<datadir>/log-tx/xbridgep2p_*.log,
+	// Core log-tx analog): every broadcast deposit/refund/claim lands here
+	// with the order id, locktime, and full raw hex for manual recovery. It is
+	// always on — unlike the general log, which never carries trade hex.
+	if err := xlog.SetTxLogDir(filepath.Join(dataDir, "log-tx")); err != nil {
+		fatalf("txlog dir: %v", err)
+	}
+
 	var magic [4]byte
 	if *magicHex != "" {
 		if b, err := hex.DecodeString(*magicHex); err != nil || len(b) != 4 {
@@ -317,6 +325,7 @@ func main() {
 			xlog.Error("log close", "err", err)
 		}
 	}
+	xlog.CloseTxLog()
 	stopSig()
 	os.Exit(0)
 }
