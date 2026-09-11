@@ -1839,7 +1839,12 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			if pending {
 				// Pending autoSplit orders are held locally until the prep tx
 				// confirms (C++ :2019 broadcast gate: only broadcast when
-				// !isOrderPending() || partialExactUtxoMatch). No SEND, no session.
+				// !isOrderPending() || partialExactUtxoMatch): no SEND. The
+				// maker session IS registered — like C++ TransactionDescr.mPrivKey
+				// (xbridgeapp.cpp:1997, generated before the broadcast gate), the
+				// order carries its signing key from creation so a pending order
+				// stays cancelable without any swap activity.
+				n.newMakerSession(o, p, mPrivArr, mPub)
 				n.persist()
 				stored = n.store.Get(hexEncode(o.ID[:]))
 				return

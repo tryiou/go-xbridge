@@ -61,7 +61,9 @@ func TestMakeOrderDeterministicID(t *testing.T) {
 // from a single 3.0 BTC utxo, min 1.0). The prep tx is built, signed, hashed
 // (real txid, not the wallet's return) and broadcast, then the utxo set is
 // rebuilt from the prep outputs and the id re-hashed. The order stays pending
-// ("open", PrepTx set): no SEND, no maker session (C++ :2019 broadcast gate).
+// ("open", PrepTx set): no SEND, but the maker session IS registered — C++
+// generates the descriptor key before the broadcast gate (:1997), so the
+// pending order carries its signing key from creation and stays cancelable.
 func TestMakeOrderAutoSplitPrepTx(t *testing.T) {
 	reg, _ := runningHub(t)
 	n, cc := newHubNode(reg)
@@ -113,8 +115,10 @@ func TestMakeOrderAutoSplitPrepTx(t *testing.T) {
 	if len(cc.snapshot()) != 0 {
 		t.Fatalf("pending autoSplit order wrote %d packets, want 0 (no SEND)", len(cc.snapshot()))
 	}
-	if s := n.sessions[hexEncode(o.ID[:])]; s != nil {
-		t.Fatalf("pending order must not start a maker session, got %+v", s)
+	if s := n.sessions[hexEncode(o.ID[:])]; s == nil {
+		t.Fatal("pending order must register a maker session (cancel signs with its key)")
+	} else if hexEncode(s.pubKey[:]) != o.MakerKey {
+		t.Fatal("pending session key must match the order MakerKey")
 	}
 	if n.store.Get(hexEncode(o.ID[:])) == nil {
 		t.Fatal("pending order must be stored locally")
