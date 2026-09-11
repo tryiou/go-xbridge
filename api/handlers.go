@@ -1030,9 +1030,10 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			out[ticker] = formatBalanceNative(c, avail)
 		}
 	}
-	// RPC-F23 (fix-queued, tracked in docs/audit/register.md): C++ always emits
-	// a "Wallet" key (the native BLOCK available balance). Until synthesized,
-	// only per-ticker keys are returned; C++ ticker ordering is race-dependent.
+	// RPC-F23 (closed by design, see docs/audit/decisions.md): C++ emits a
+	// "Wallet" key for its embedded core wallet; this standalone port reports
+	// the BLOCK connector balance under its own ticker instead. C++ ticker
+	// ordering is race-dependent.
 	return out, nil
 }
 

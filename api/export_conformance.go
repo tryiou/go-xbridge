@@ -250,7 +250,6 @@ func conformanceReadNode(store *Store, hub bool) *HandlerCtx {
 			"XB": &conformanceStubConn{ticker: "XB", addr: conformanceAddr, utxos: []wallet.Utxo{conformanceXbUtxo()}},
 		},
 		ExchangeWallets: []string{"BLOCK", "LTC"},
-		NetworkTokens:   []string{"BTC", "SYS", "LTC", "BLOCK", "XB"},
 	}
 	n := &Node{
 		config:   cfg,

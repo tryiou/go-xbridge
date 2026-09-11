@@ -1242,7 +1242,6 @@ func TestDxLoadConfHotReload(t *testing.T) {
 		Confs:           cc.Coins,
 		Connectors:      map[string]wallet.Connector{},
 		ExchangeWallets: cc.Main.ExchangeWallets,
-		NetworkTokens:   []string{"BTC"},
 		ConfPath:        confPath,
 	}
 	node := &Node{config: cfg, store: NewStore(), signer: crypto.NewBtcSigner(), stop: make(chan struct{}), snReg: servicenode.NewRegistry()}

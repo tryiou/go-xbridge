@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -104,7 +103,7 @@ func main() {
 	walletVersionStr := flag.String("walletversionstr", "/Blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
 	logLevel := flag.String("loglevel", "info", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
-	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log; set to \"\" to disable file logging")
+	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log (file logging is always on)")
 	rpcServerTimeout := flag.Int("rpcservertimeout", 30, "timeout in seconds for HTTP RPC requests (C++ DEFAULT_HTTP_SERVER_TIMEOUT parity)")
 	// -dxnowallets mirrors C++ gArgs.GetBoolArg("-dxnowallets",
 	// settings().showAllOrders()) (xbridgeapp.cpp:372): show all orders across
@@ -131,8 +130,8 @@ func main() {
 	}
 
 	// Set up file logging (stderr remains active). Default to
-	// <datadir>/xbridged.log unless -logfile overrides. An empty -logfile
-	// disables the file entirely.
+	// <datadir>/xbridged.log unless -logfile overrides. File logging is
+	// always on: an empty -logfile selects the default file.
 	var rw io.Closer
 	if *logFile != "" {
 		r, err := xlog.SetFileLogger(*logFile, 10<<20, 2)
@@ -197,12 +196,6 @@ func main() {
 		xlog.Warn("wallet not activated", "coin", d.Ticker, "reason", d.Reason)
 	}
 
-	networkTokens := make([]string, 0, len(admitted))
-	for t := range admitted {
-		networkTokens = append(networkTokens, t)
-	}
-	sort.Strings(networkTokens)
-
 	// Explicit peers (-addnode) augment the discovered pool.
 	var addNodes []string
 	if *addNode != "" {
@@ -222,7 +215,6 @@ func main() {
 		Confs:            admitted,
 		Connectors:       connectors,
 		ExchangeWallets:  conf.Main.ExchangeWallets,
-		NetworkTokens:    networkTokens,
 		WalletVersion:    *walletVersion,
 		WalletVersionStr: *walletVersionStr,
 		DataDir:          dataDir,

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,8 +103,6 @@ type Config struct {
 	// used at startup so failed-startup wallets stay "bad" until their retry
 	// window elapses; when nil, NewNode creates one.
 	Activator *wallet.Activator
-	// NetworkTokens is the full set of coins known from xbridge.conf.
-	NetworkTokens []string
 	// Network is the Blocknet network to discover on: "mainnet" (default),
 	// "testnet", or "regtest". Used only when NodeAddr is empty (discovery).
 	Network string
@@ -478,11 +475,6 @@ func (n *Node) reloadConf() error {
 	for _, d := range drops {
 		xlog.Warn("wallet not activated after reload", "coin", d.Ticker, "reason", d.Reason)
 	}
-	networkTokens := make([]string, 0, len(admitted))
-	for t := range admitted {
-		networkTokens = append(networkTokens, t)
-	}
-	sort.Strings(networkTokens)
 
 	fresh := &Config{
 		NodeAddr:           n.cfg().NodeAddr,
@@ -495,7 +487,6 @@ func (n *Node) reloadConf() error {
 		// survives a reload (gArgs is process-global, xbridgeapp.cpp:372).
 		ShowAllOrders:     conf.Main.ShowAllOrders || n.cfg().ForceShowAllOrders,
 		CheckReachability: n.cfg().CheckReachability,
-		NetworkTokens:     networkTokens,
 		Network:           n.cfg().Network,
 		AddNodes:          n.cfg().AddNodes,
 		WalletVersion:     n.cfg().WalletVersion,

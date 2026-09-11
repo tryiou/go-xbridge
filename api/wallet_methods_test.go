@@ -145,7 +145,6 @@ func newWalletTestCtx() *HandlerCtx {
 			},
 		},
 		ExchangeWallets: []string{"BTC"},
-		NetworkTokens:   []string{"BTC"},
 	}
 	if err := coins.InitFromConf(cfg.Confs); err != nil {
 		panic(err)
@@ -273,11 +272,11 @@ func TestDxGetTokenBalances(t *testing.T) {
 	if m["BTC"] != "1.000000" {
 		t.Errorf("BTC balance = %v, want 1.000000", m["BTC"])
 	}
-	// DOCUMENTED divergence: no synthesized "Wallet" key — the
-	// thin client exposes the BLOCK connector balance under its own ticker and
-	// does not duplicate it into a wallet tag.
+	// Ruled divergence (docs/audit/decisions.md): no synthesized "Wallet"
+	// key — the thin client exposes the BLOCK connector balance under its own
+	// ticker and does not duplicate it into a wallet tag.
 	if _, hasWallet := m["Wallet"]; hasWallet {
-		t.Errorf("result contains a synthesized 'Wallet' key (deliberately removed): %v", m)
+		t.Errorf("result contains a synthesized 'Wallet' key (ruled out by design): %v", m)
 	}
 }
 
@@ -638,9 +637,9 @@ func TestDxTokenListsFromConf(t *testing.T) {
 	if ls, _ := local.([]string); len(ls) != 1 || ls[0] != "BTC" {
 		t.Errorf("local tokens = %v", local)
 	}
-	// dxGetNetworkTokens is the pure SN service union — the config's
-	// NetworkTokens/ExchangeWallets do NOT contribute, so with no connected
-	// servicenodes it is empty even though the config names BTC.
+	// dxGetNetworkTokens is the pure SN service union — ExchangeWallets does
+	// NOT contribute, so with no connected servicenodes it is empty even
+	// though the config names BTC.
 	net, err := ctx.dxGetNetworkTokens(nil)
 	if err != nil {
 		t.Fatalf("dxGetNetworkTokens: %v", err)
