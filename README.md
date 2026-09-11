@@ -3,7 +3,7 @@
 A portable, standalone **Go** reimplementation of the Blocknet **XBridge**
 atomic-swap engine — a **thin client** that speaks the existing XBridge wire
 protocol to the live Blocknet service-node P2P network and trades through your
-own (SPV) wallets, **without running `blocknetd`**.
+own wallets, **without running `blocknetd`**.
 
 This is a from-scratch reimplementation, **not** a wrapper around `blocknetd`.
 
@@ -17,7 +17,7 @@ JSON-RPC against your connected wallets; `xbridged` itself holds no coin keys.
 
 ## What you need
 
-- **Go 1.25+** (toolchain 1.26 works) to build.
+- **Go 1.25+** to build (see `go.mod`; CI uses `1.25.x`).
 - An **`xbridge.conf`** describing your coins and wallet(s). The file is
   **read-only** — `xbridged` never creates or mutates it. If `-conf` points at
   a missing file, startup is **fatal**.
@@ -26,9 +26,8 @@ JSON-RPC against your connected wallets; `xbridged` itself holds no coin keys.
   `ExchangeWallets` you must run that coin's own wallet/node (e.g. `bitcoind`
   for BTC, the Blocknet BLOCK wallet for BLOCK). `xbridged` drives those daemons
   over RPC to sign, broadcast, and (for BLOCK) pay the service-node fee.
-- A **connected Blocknet-core-compatible wallet** (or local keys via
-  `LocalConnector`) for anything that signs or broadcasts. Read-only commands
-  (`dxGetOrders`, etc.) need only the order book fed over P2P.
+- A **connected wallet** for anything that signs or broadcasts. Read-only
+  commands (`dxGetOrders`, etc.) need only the order book fed over P2P.
 
 Trades incur the Blocknet **service-node fee**, paid by your connected **BLOCK**
 wallet via core RPC — BLOCK is just another coin through the wallet connector.
@@ -36,13 +35,15 @@ wallet via core RPC — BLOCK is just another coin through the wallet connector.
 ## Build
 
 ```sh
-go build ./...      # builds cmd/xbridged and cmd/liveprobe
-go test ./...       # optional, runs the unit tests
+go build ./...      # builds all packages, incl. cmd/xbridged and cmd/liveprobe
+go vet ./...        # static checks
+go test ./...       # unit tests (hermetic, no live-network dials)
 ```
 
-This produces the `xbridged` daemon (plus `cmd/liveprobe` for ad-hoc live node
-checks). Point a dapp's RPC URL at `xbridged`'s JSON-RPC listener to use the
-`dx*` surface unchanged.
+The daemon binary is built from `./cmd/xbridged` (e.g.
+`go build ./cmd/xbridged`); `cmd/liveprobe` is the ad-hoc live-node check.
+Point a dapp's RPC URL at `xbridged`'s JSON-RPC listener to use the `dx*`
+surface unchanged. Full build/test/lint gates are in `AGENTS.md`.
 
 ## Configuration — `xbridge.conf`
 
@@ -54,11 +55,15 @@ The same INI format the original core wallet reads. Two section kinds:
   coin data. The schema below mirrors `config/conf.go` (a faithful port of
   `src/xbridge/xbridgeapp.cpp createConf()`).
 
+Section and key names are **case-sensitive** (`[main]` is a coin, not `[Main]`;
+`"COIN"` is not `"coin"`). A section named exactly `[Rpc]` is skipped — it is
+never treated as a coin.
+
 ### `[Main]`
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `ExchangeWallets` | csv | Tickers that have a local wallet configured (the connectors `xbridged` drives). |
+| `ExchangeWallets` | csv (`','`/`';'`/`':'` separated, uppercased, 1–8 chars) | Tickers that have a local wallet configured (the connectors `xbridged` drives). Overridden by `-dxnowallets`. |
 | `ShowAllOrders` | bool | Show orders for coins without a local wallet. |
 | `FullLog` | bool | Verbose logging. |
 
@@ -66,19 +71,19 @@ The same INI format the original core wallet reads. Two section kinds:
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `Title` | string | Human name (defaults to the section name). |
+| `Title` | string | Human name (empty when unset — it does **not** default to the section name). |
 | `Address` | string | Wallet/RPC bind address (optional). |
 | `Ip` / `Port` | string / int | Wallet/node JSON-RPC endpoint. |
 | `Username` / `Password` | string | Wallet RPC auth. |
-| `CreateTxMethod` | string | Selects the tx-construction path (e.g. `"BTC"`). Drives segwit/bech32 support in `coins/`. |
+| `CreateTxMethod` | string | Selects the tx-construction path. Must be one of `BTC SYS LTC DGB BCH BTG DEVAULT`; anything else (incl. `PART BCD STEALTH XST`) is refused. `BCH` selects the BCH family (CashAddr; legacy base58 version bytes collide with BTC's). |
 | `CashAddrPrefix` | string | BCH CashAddr HRP (e.g. `bitcoincash`); empty for non-BCH coins. |
 | `AddressPrefix` / `ScriptPrefix` / `SecretPrefix` | int | base58check version bytes (P2PKH / P2SH / WIF) as decimals. |
 | `COIN` | uint64 | Base-unit multiplier (e.g. `100000000`); decimals are derived from its trailing zeros. |
-| `MinimumAmount` | uint64 | Dust / minimum amount source (base units) — C++ maps it onto the exchange wallets' `dustAmount` (xbridgeexchange.cpp:145); go-xbridge's conf dust fallback. |
+| `MinimumAmount` | uint64 | Dust / minimum amount source (base units); effective dust is the wallet relay fee when available, else this key, else the `5460` fallback. |
 | `TxVersion` | int | Transaction version (default `1`). |
 | `MinTxFee` / `FeePerByte` | uint64 | Fee rules (base units / sat-per-byte). |
 | `DustAmount` | uint64 | createConf-template key never read back by C++; parsed for fidelity only. |
-| `BlockTime` | int | Seconds per block (used for HTLC lock-time math). |
+| `BlockTime` | int | Seconds per block (used for HTLC lock-time math and wallet admission gates). |
 | `Confirmations` | int | Required confirmations. |
 | `TxWithTimeField` | bool | Tx carries a time field. |
 | `LockCoinsSupported` / `GetNewKeySupported` / `ImportWithNoScanSupported` | bool | Wallet capability flags. |
@@ -149,9 +154,9 @@ LockCoinsSupported=false
 ```
 
 > Only the coins listed in `[Main]`'s `ExchangeWallets` are driven as local
-> connectors; the rest of the network's orders still appear via P2P. BCH uses
-> **CashAddr** and would set `CreateTxMethod=BCH` (its legacy base58 version
-> bytes collide with BTC's). See [`docs/architecture.md`](docs/architecture.md).
+> connectors; the rest of the network's orders still appear via P2P subject to
+> `ShowAllOrders`. See [`docs/architecture.md`](docs/architecture.md) for the
+> contributor-side view.
 
 ## Running `xbridged`
 
@@ -169,24 +174,31 @@ LockCoinsSupported=false
 Network discovery resolves DNS seeds, connects to healthy peers, and learns
 more via `addr` gossip — like a core wallet. Discovery picks the network magic
 and default port from `-network` (`-magic` overrides the magic). The per-network
-magics and default ports are in [`docs/protocol.md`](docs/protocol.md).
+magics and default ports are in [`docs/protocol.md`](docs/protocol.md); there
+is **no** Blocknet staging network (the third network is `regtest`).
 
 ### Flag reference
 
+This table is the complete flag authority (`cmd/xbridged/main.go`).
+
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `-network` | `mainnet` | Network to discover on: `mainnet`\|`testnet`\|`staging`. Still selects the P2P magic for an explicit `-node` dial (`-magic` overrides). |
-| `-node` | `""` | Explicit service-node P2P address `host:port`; empty enables network discovery. |
-| `-addnode` | `""` | Comma-separated peer addresses added to the discovered set. |
+| `-network` | `mainnet` | Network to discover on: `mainnet`\|`testnet`\|`regtest`. Still selects the P2P magic for an explicit `-node` dial (`-magic` overrides). |
+| `-node` | `""` | Explicit service-node P2P address `host:port`; empty enables network discovery. Ignores `-addnode`. |
+| `-addnode` | `""` | Comma-separated peer addresses added to the discovered set (discovery mode only). |
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
 | `-rpcbind` | `127.0.0.1:41414` | JSON-RPC listen address `host:port` for the `dx*` API. Defaults to **loopback only**; set explicitly to bind elsewhere. |
-| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth for RPC. Enforced only when **both** are set; a non-loopback `-rpcbind` without auth logs a warning. |
+| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth pair. Auth is enforced when the pair is set **or** any `-rpcauth` entry is configured; a non-loopback `-rpcbind` without auth logs a warning. With no credentials the daemon is open on its loopback bind (there is no cookie-auth fallback, unlike C++). |
+| `-rpcauth` | `""` | Comma-separated multi-user auth entries, `user:salt$hash` (HMAC-SHA256, the same credential path C++ offers). |
 | `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
-| `-walletversionstr` | `/blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
-| `-datadir` | OS config dir | Directory for local swap state (incl. each trade's per-trade M keypair). Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). |
-| `-logfile` | `<datadir>/xbridged.log` | Log file path (stderr stays active). |
+| `-walletversionstr` | `/Blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
+| `-datadir` | OS config dir | Directory for local swap state. Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). Created `0700`. |
+| `-logfile` | `<datadir>/xbridged.log` | Log file path (stderr stays active). File logging is always on: an empty value selects the default file. Rotation: 10 MiB × 2 backups. |
 | `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
+| `-rpcservertimeout` | `30` | HTTP RPC timeout in seconds (C++ `DEFAULT_HTTP_SERVER_TIMEOUT` parity), applied to read/write; plus a 10 s header and 60 s idle timeout. |
+| `-dxnowallets` | `false` | Show all orders for non-local wallets (C++ `-dxnowallets`; overrides `Main.ShowAllOrders`). |
+| `-enableexchange` | `false` | Accepted for blocknetd CLI parity only; exchange mode is inherent to `xbridged` (no-op). |
 
 ## Making a trade
 
@@ -225,21 +237,17 @@ Steps (params shown positionally — wrap them in the `"params"` array as above)
     - `dxTakeOrder <order_id>` — full take (omit amount).
     - `dxTakeOrder <order_id> 0.005` — partial take.
 
-    Per trade, `xbridged` generates a fresh ephemeral secp256k1 keypair
-    (C++ `mPubKey`/`mPrivKey`) that signs the order/accept packets and becomes
-    the HTLC deposit pubkey. No operator key is configured. The client driver
-    (`api/swap.go`) runs the Maker ⇄ ServiceNode ⇄ Taker handshake: it
-    builds/broadcasts the HTLC deposits and claims/refunds as the hub advances
-    the state. Every outbound packet is envelope-addressed to the trade's hub
-    (chosen at `dxMakeOrder`; `dxTakeOrder` adopts the order's hub), and every
-    inbound handshake packet is re-verified against that hub's pinned key — a
-    forged packet can never disable the auto-refund watcher. An order with no
-    trusted hub cannot be taken (`NO_SERVICE_NODE`). Before committing our own
-    deposit (or redeeming the counterparty's), the counterparty HTLC deposit is
-    validated on-chain against its expected p2sh script, amount, confirmations,
-    sequences, prevouts, and fees (`wallet.CheckDepositTransaction`, C++
-    `checkDepositTransaction` parity); a bad deposit is wire-cancelled and rolled
-    back, so a never-established trust basis cannot be turned into theft.
+    Per trade, `xbridged` generates a fresh ephemeral secp256k1 keypair that
+    signs the order/accept packets and becomes the HTLC deposit pubkey — no
+    operator key is configured. The swap driver runs the Maker ⇄ ServiceNode ⇄
+    Taker handshake: it builds/broadcasts the HTLC deposits and claims/refunds
+    as the hub advances the state. Every outbound packet is envelope-addressed
+    to the trade's hub, and every inbound handshake packet is re-verified
+    against that hub's pinned key. Before committing our own deposit (or
+    redeeming the counterparty's), the counterparty HTLC deposit is validated
+    on-chain; a bad deposit is wire-cancelled and rolled back.
+    Details: [`docs/protocol.md`](docs/protocol.md) (wire),
+    [`docs/architecture.md`](docs/architecture.md) (driver).
  5. **Cancel** an open order: `dxCancelOrder <order_id>`.
 
 Full field/param contracts for every `dx*` command (positional params, response
@@ -251,43 +259,38 @@ fills only) are documented under "Tier 3" there.
 
 - **`-conf` is required and fatal if missing** — `xbridged` never creates it.
 - The conf file is **read-only**; edit it yourself, don't expect regeneration.
+  `dxLoadXBridgeConf` reloads it at runtime (keeps the last good config on
+  failure; answers `false`, not an error, when the reload fails).
 - Discovery needs at least one reachable service node; if all seeds/peers are
-  unreachable, use `-node <host:port>` to pin one.
-- **Local swap state survives a restart** (matches C++ `orders.dat` /
-  `loadOrders()` / `saveOrders()`). Each trade's order and its per-trade M
-  keypair are persisted to `<datadir>/xbridged-swaps.json` (default OS config
-  dir: `~/.config/xbridged` Linux, `~/Library/Application Support/xbridged`
-  macOS, `%AppData%\xbridged` Windows; override with `-datadir`). Persistence
-  is **on by default**; to point it at a throwaway location, pass `-datadir`.
-  On `xbridged` start the node reloads these swaps *before* it dials, so
-  `dxCancelOrder` and the refund path keep working after a restart using the
-  restored key. Only locally-created orders (`Mine=true`) are persisted
-  (mirroring C++'s `isLocal()` filter). Persistence is best-effort: a
-  corrupt/missing file is logged and the node starts fresh rather than crashing.
-  Each trade's per-trade M keypair, HTLC secret, and pre-signed refund are
-  always persisted (C++ `orders.dat` parity — there is no opt-out, so a
-  restarted mid-flight swap can always auto-refund and re-sign cancels).
-  Independently, every broadcast deposit/refund/claim is appended with its
+  unreachable, use `-node <host:port>` to pin one. `-addnode` only augments
+  discovery mode — it is ignored with `-node`.
+- **Local swap state survives a restart.** Each trade's order, per-trade key
+  material, HTLC secret, and pre-signed refund are persisted to
+  `<datadir>/xbridged-swaps.json` (there is no opt-out, so a restarted
+  mid-flight swap can always auto-refund and re-sign cancels). Only
+  locally-created orders are persisted. Persistence is best-effort: a
+  corrupt/missing file is quarantined (`xbridged-swaps.json.bad.<unixnano>`)
+  with individually-valid records salvaged, and the node starts rather than
+  crashing.
+- Independently, every broadcast deposit/refund/claim is appended with its
   order id, locktime, and full raw hex to the dedicated per-day transcript
-  `<datadir>/log-tx/xbridgep2p_YYYYMMDD.log` (C++ `log-tx` parity) — the
-  manual-recovery record, usable with the deposit coin's own wallet even if
-  the daemon and swap-state file are both gone. The general log
-  (`xbridged.log`/stderr) never carries trade hex or private key material.
+  `<datadir>/log-tx/xbridgep2p_YYYYMMDD.log` — the manual-recovery record,
+  usable with the deposit coin's own wallet even if the daemon and swap-state
+  file are both gone. The general log (`xbridged.log`/stderr) never carries
+  trade hex or private key material.
 - `dxMakeOrder`/`dxTakeOrder`/`dxCancelOrder` require the relevant wallets to
   be connected (they fund/sign/broadcast); without a reachable wallet the call
   returns a "no session" / "unable to connect to wallet" error.
-- **No operator key is configured.** `xbridged` generates a fresh ephemeral
-  secp256k1 keypair per trade to sign packets and build the HTLC deposit (the
-  trader identity is not a static, operator-supplied key). Coin signing is
-  delegated to your connected wallets.
+- **No operator key is configured.** Coin signing is delegated to your
+  connected wallets.
 
 ## Documentation
 
 | Document | Purpose |
 |----------|---------|
-| **This README** | How to install, configure, run, and trade. |
-| [`docs/protocol.md`](docs/protocol.md) | The XBridge wire contract: transport, packet layout, commands, swap handshake, signing. |
-| [`docs/api.md`](docs/api.md) | The `dx*` JSON-RPC surface (params, response shapes, error codes). |
+| **This README** | How to install, configure, run, and trade. Flag + `xbridge.conf` authority. |
+| [`docs/protocol.md`](docs/protocol.md) | The XBridge wire contract: transport, packet layout, commands, swap handshake, signing. Network magic/port authority. |
+| [`docs/api.md`](docs/api.md) | The `dx*` JSON-RPC surface (params, response shapes, error codes). Method-inventory + auth/transport authority. |
 | [`docs/architecture.md`](docs/architecture.md) | Contributor guide: package-by-package code architecture, build/test/verify, conventions. |
-| [`conformance/`](conformance/) | Behavioral/wire conformance suite (external Go module, build-tag `conformance`; runs via `make parity` stage F). |
-| [`CLAUDE.md`](CLAUDE.md) | Repo conventions and hard rules for coding agents/contributors. |
+| [`AGENTS.md`](AGENTS.md) | Repo conventions and hard rules for coding agents/contributors. |
+| [`conformance/`](conformance/) | Behavioral/wire conformance suite (external Go module, build-tag `conformance`; stage F of the parity gate). |

@@ -4,12 +4,12 @@
 RPC URL at the daemon's `-rpcbind` address (default `127.0.0.1:41414`) and the
 API works as a drop-in replacement for blocknetd's XBridge RPC.
 
-All 24 methods are documented below: 23 `dx*` commands plus `getnetworkinfo`.
-The C++ `gettradingdata` command is not exposed — only `dxGetTradingData` is.
-This is a deliberate removal: the lowercase command is a
+All 25 methods are documented below: 23 `dx*` commands plus `getnetworkinfo`
+and `help`.
+The C++ `gettradingdata` command is not exposed — only `dxGetTradingData` is
+(WAIVER, trading-data family, register §0): the lowercase command is a
 blocknetd-internal registration (`rpcxbridge.cpp:3520`) with a different schema
-and a duplicated `to` key; `xbridged` is a thin client and only surfaces the
-`dxGetTradingData` variant. Calling `gettradingdata` against `xbridged` returns
+and a duplicated `to` key. Calling `gettradingdata` against `xbridged` returns
 the envelope error `-32601 Method not found`.
 
 ## Calling convention
@@ -33,8 +33,9 @@ curl -s http://127.0.0.1:41414 \
   250 ms before the 401 (C++ brute-force deterrence `MilliSleep(250)`,
   `httprpc.cpp:168-171`; a missing header fails immediately). With **no**
   credentials configured the daemon is default-open on its loopback bind — a
-  documented divergence: go-xbridge has no cookie auth, unlike C++ which
-  falls back to one when no credentials are set.
+  documented divergence: go-xbridge has no cookie auth (no cookie file exists),
+  unlike C++ which falls back to auto-cookie when no credentials are set. No
+  swap-sequence effect.
 
 ## Transport
 
@@ -296,30 +297,36 @@ defaulted or trailing parameter.
 
 **`dxGetNetworkTokens`**
 - `params`: none.
-- `result`: sorted array of tickers advertised by the connected servicenodes
-  (fallback to the conf `NetworkTokens` list). P2P-bounded — see Tier 3.
+- `result`: sorted array of tickers advertised by the connected servicenodes.
+  P2P-bounded — see Tier 3. There is no config fallback: the handler reads only
+  the servicenode registry's wallet-services union.
 
 **`dxGetTokenBalances`**
 - `params`: none.
 - `result`: object mapping each configured exchange-wallet ticker to its
   spendable balance (6-decimal string, locked UTXOs subtracted). No `"Wallet"`
-  key is synthesized (documented divergence): the BLOCK fee
-  balance is exposed under the `BLOCK` ticker, and C++'s key order is
-  race-dependent thread-completion order anyway. Empty object when no wallet
-  loads.
+  key is emitted, by design: C++ `"Wallet"` names the embedded core wallet of
+  the combined core+xbridge binary (`rpcxbridge.cpp:2531-2532`), while here
+  BLOCK is just another connector and its balance is reported under its own
+  ticker (ruled divergence — `docs/audit/decisions.md`). Ticker order
+  serializes sorted (the handler returns `map[string]string` from
+  `dxGetTokenBalances` — ordering comes from Go `encoding/json` map-key
+  sorting, no explicit sort); C++ emits connector insertion order, not a fixed
+  cross-call contract. Empty object when no wallet loads.
 
 **`dxGetNewTokenAddress`**
 - `params`: `ticker` (string).
 - `result`: array with one fresh address; empty `[]` when no wallet is loaded
-  for the ticker.
-- `errors`: 1002 (wallet failure).
+  for the ticker or the wallet fails (never an error — C++ returns an empty
+  array the same way).
 
 **`dxGetUtxos`**
 - `params`: `token` (string), `include_used` (bool, default `false`).
 - `result`: array of UTXO objects: `txid`, `vout`, `address`, `amount`,
   `scriptPubKey`, `confirmations`, `orderid` (the order locking it, or `""`).
   Locked UTXOs are excluded unless `include_used=true`.
-- `errors`: 1025, 1018 (no wallet for token), 1002 (wallet failure).
+- `errors`: 1018 (no wallet for token), 1004 (wallet failure to list
+  unspent outputs).
 
 **`dxGetLockedUtxos`**
 - `params`: `id` (string) [optional].
@@ -353,16 +360,15 @@ defaulted or trailing parameter.
 - `params`: `blocks` (int, default `43200`) [optional], `errors` (bool, default
   `false`) [optional].
 - `result`: array of 8-field records `{timestamp, fee_txid, nodepubkey, id,
-  taker, taker_size, maker, maker_size}`. Session-local fills only — see
-  Tier 3. `fee_txid`/`nodepubkey` are always `""`: they come from the on-chain
-  BLOCK scan that a thin client cannot replay. `blocks`/`errors`
-  are accepted for contract compatibility but cannot bound a BLOCK block scan.
+  taker, taker_size, maker, maker_size}`. WAIVER (trading-data family,
+  register §0): session-local fills only; `fee_txid`/`nodepubkey` are always
+  `""` (they require the on-chain BLOCK scan); `blocks`/`errors` accepted for
+  contract compatibility but bound nothing.
 
 **`dxLoadXBridgeConf`**
 - `params`: none.
-- `result`: `true`. Reloads `xbridge.conf` (keeps the last good config on
-  failure).
-- `errors`: 1025 (reload failure).
+- `result`: `true` on success, `false` when the reload fails (keeps the last
+  good config — C++ `uret(success)`, never a business error).
 
 **`getnetworkinfo`**
 - `params`: none.
@@ -372,10 +378,21 @@ defaulted or trailing parameter.
   `relayfee`, `incrementalfee`, `localaddresses`, `warnings`.
 - `errors`: 1025 (any params).
 
-## Tier 3 — thin-client limits
+**`help`**
+- `params`: `command` (string) [optional].
+- `result`: with no params, `"== XBridge ==\n"` followed by the supported
+  command names (the honest this-node subset — 23 `dx*` plus `getnetworkinfo`
+  and `help` — never Core's full list); with a command name, that command's
+  exact help text plus Core's trailing newline; with an unknown name,
+  `"help: unknown command: <name>"`.
+- `errors`: envelope `-1` on a wrong-typed param.
+
+## Tier 3 — thin-client limits (waiver scope, register §0)
 
 `xbridged` is a thin client: it has no BLOCK block index and no network-wide
-view, so three families of commands are bounded by what this node has observed:
+view, so three families of commands are bounded by what this node has observed.
+The trading-data family is WAIVED (register §0); order history additionally
+records own fills (RPC-F19 fix-queued):
 
 - **`dxGetOrderHistory` / `dxGetTradingData`** aggregate from **session-local
   fills** only (fills this node saw on its P2P feed); they cannot replay
@@ -387,10 +404,11 @@ view, so three families of commands are bounded by what this node has observed:
   `dxGetTokenBalances`) reflects orders **this node** has seen; a UTXO locked by
   an unseen order is not subtracted.
 
-## Divergences from blocknetd
+## Fidelity
 
-The known response-shape differences — `dxGetMyPartialOrderChain` unknown-id
-behavior, `dxSplitInputs` utxo schema, per-command amount formats — are
-described inline at each command above, and the wire contract they derive from
-is [`docs/protocol.md`](protocol.md). This document is the stable contract for
-the port as built.
+Response shapes are identical to blocknetd per the §0 identity standard except
+as listed fix-queued in the register (`audit/register.md`), which is canonical
+for every known difference and its verdict (identical / fix-queued / waiver). Per-command notes above describe
+current behavior; anything not yet identical is fix-queued there, never
+accepted. The wire contract is [`docs/protocol.md`](protocol.md). This document
+is the stable contract for the port as built.

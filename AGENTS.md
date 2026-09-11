@@ -10,7 +10,7 @@ guide (package-by-package architecture, build/test/verify, conventions) is
 `go-xbridge` is a **portable, standalone Go reimplementation** of the Blocknet
 **XBridge** atomic-swap engine — a **thin client** that speaks the existing
 XBridge wire protocol to the live Blocknet service-node P2P network, trading
-through the user's own (SPV) wallets **without running `blocknetd`**. It is a
+through the user's own wallets **without running `blocknetd`**. It is a
 from-scratch port, **not** a wrapper. The wire contract is the source of truth
 (`docs/protocol.md`); the C++ reference is the upstream Blocknet Core XBridge
 source (`src/xbridge/`), where header-comment enums are frequently **stale** —
@@ -26,18 +26,29 @@ Go scaffold.
 ```bash
 go build ./...          # build all packages
 go vet ./...            # static checks
-go test ./...           # unit tests
+go test ./...           # unit tests (add -run TestName to scope)
+go test -race -count=1 ./...  # CI-equivalent race run
+gofmt -l .              # must print nothing
+go mod tidy -diff       # module hygiene gate
 golangci-lint run ./... # lint gate (.golangci.yml): errcheck, ineffassign,
                         # staticcheck, unused
 ```
 
-Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
+Requires Go 1.25+ (`go.mod`: `go 1.25.0`; CI uses `1.25.x`).
 
-The lint gate is wired into CI (`ci.yml` `lint` job, golangci-lint v2.11.4) and
-must stay green: **never** silence a finding with a blanket nolint or a
-`//nolint:staticcheck` without a per-site justification (the RIPEMD-160 import
-sites in `coins/htlc.go` and `swap/deposit.go` are the template — HASH160 is
-the on-chain/wire identifier hash, so a replacement would break parity).
+The lint gate is wired into CI (`.github/workflows/ci.yml`, golangci-lint
+v2.11.4, `--timeout 5m`) and must stay green: **never** silence a finding with
+a blanket nolint or a `//nolint:staticcheck` without a per-site justification
+(the RIPEMD-160 import sites in `coins/htlc.go` and `swap/deposit.go` are the
+template — HASH160 is the on-chain/wire identifier hash, so a replacement
+would break parity).
+
+Wire/`dx*` parity is checked by the conformance suite in `conformance/`
+(separate Go module, build tag `conformance`; CI runs
+`go test -tags conformance -count=1 ./...` there). The full cross-repo parity
+gate (`make parity`, `make canary`) lives in external tooling outside this
+repo — in-repo, run the conformance module. Run it after touching the port or
+C++ XBridge.
 
 ## Dead-code hygiene
 
@@ -66,7 +77,7 @@ callers marshal them onto the engine goroutine with `submit`.
   XBridge behavior exactly is the goal.
 - **Fidelity over shortcuts.** Ports must be byte-for-byte 1:1 with the C++ wire
   contract. Validate against live captured packets and the C++ writers, not
-  comments. Run the parity gate (`make parity`) after touching the port or C++
+  comments. Run the conformance suite (above) after touching the port or C++
   XBridge.
 - **Separate concerns in commits** — logic / style (gofmt) / refactor kept apart.
 - Run `gofmt` before committing.

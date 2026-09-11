@@ -169,12 +169,14 @@ services(8 LE) || ip(16) || port(2 BE)
   the `version` addrs misaligns every following field and causes the peer to
   drop the handshake.
 
-**VERIFIED:** the version/verack handshake was exercised against a live
-Blocknet 4.4.1 service node (`coreproxy.airdns.org:42111`, magic `a1 a0 a2 a3`);
-the peer returned `proto=70713`, `ua="/Blocknet:4.4.1/"`, `relay=true`, and
-immediately began emitting `xbridge` messages (the `xbridge` command string is
-confirmed). The 26-byte (no-nTime) `version` CAddress layout is the form
-real service nodes accept.
+**Operational note (not contract):** the version/verack handshake was exercised
+against a live Blocknet 4.4.1 service node at `coreproxy.airdns.org:42111`
+(magic `a1 a0 a2 a3`); the peer returned `proto=70713`,
+`ua="/Blocknet:4.4.1/"`, `relay=true`, and immediately began emitting
+`xbridge` messages (the `xbridge` command string is confirmed). Port 42111 is
+that node's public service port — it differs from the default P2P port in §1.1
+because operators may expose any port. The 26-byte (no-nTime) `version`
+CAddress layout is the form real service nodes accept.
 
 ---
 

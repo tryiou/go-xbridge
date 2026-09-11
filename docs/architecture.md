@@ -87,7 +87,8 @@ pinged within the 5-minute running window. Feeds `dxGetNetworkTokens`.
 `ServiceNode::isValid` (`servicenode.h:398-484`): the on-chain checks a full
 chain index requires — block ancestry and collateral-utxo
 existence/amount/ownership (`servicenode.h:401,447-478`) — cannot be made by a
-thin client and are skipped (a thin-client limitation).
+thin client (register WIRE-F71 FIXED (B1) for the enforceable subset; on-chain
+index checks remain thin-client-unreachable — see Rulings pending below).
 
 ### `crypto/` — signing
 
@@ -248,13 +249,15 @@ taker recovers the secret from the maker's payTx via
 
 ### `api/` — `dx*` RPC + swap driver
 
-`dx*` JSON-RPC surface — all 23 `dx*` commands registered and ported 1:1 from
-`rpcxbridge.cpp` (field names, positional params, JSON value types). The C++
-`gettradingdata` command is intentionally NOT exposed — only `dxGetTradingData`
-is. Contracts, response shapes and error codes are in [`api.md`](api.md).
+`dx*` JSON-RPC surface — 25 methods registered (23 `dx*` plus `getnetworkinfo`
+and `help`), ported 1:1 from `rpcxbridge.cpp` (field names, positional params,
+JSON value types). The C++
+`gettradingdata` command is NOT exposed — only `dxGetTradingData` is (WAIVER,
+trading-data family, register §0). Contracts, response shapes and error codes
+are in [`api.md`](api.md).
 
 - `server.go` / `response.go` — JSON-RPC 1.0 envelope, panic-safe, HTTP Basic
-  auth, 4 MiB request-body cap.
+  auth, 32 MiB request-body cap (non-envelope 413).
 - `dispatch.go` — command dispatch table.
 - `node.go` — `Node`: inbound packet handling, hub-key re-verification of
   handshake packets, engine-scheduled refund sweep, persistence reload.
@@ -406,8 +409,10 @@ The suite is hermetic — no live-network dials. Notable coverage:
 - `log/` — write-after-close is a nil-safe no-op, also under concurrent
   writer-vs-close (`-race`).
 
-Cross-repo parity gate: `make parity` fact-checks the port
-against the C++ `dx*` contract — run it after touching the port or C++ XBridge.
+Cross-repo parity gate: the conformance suite in `conformance/` (stage F)
+fact-checks the port against the C++ `dx*` contract — run it after touching
+the port or C++ XBridge. The full `make parity` / `make canary` gate lives in
+external tooling outside this repo.
 
 ## Conventions
 
@@ -426,12 +431,44 @@ against the C++ `dx*` contract — run it after touching the port or C++ XBridge
 
 Long-standing open work:
 
-- Non-UTXO coin adapters: Decred (`DCR`), Particl (`PART`); DEVAULT is
-  misclassified as the BTC family (its `CreateTxMethod` should be set to its
-  own family, not BTC).
+- Non-UTXO coin adapters: Particl (`PART`) and Bitcoin Diamond (`BCD`) are
+  non-portable formats (see `docs/audit/decisions.md`); Decred (`DCR`)
+  is not in the live manifest. DEVAULT is classified BCH-family (cashaddr
+  `devault`, fork value 0 — `coins/coin.go`, `coins/tx.go`).
 - Live-service-node verification of the swap-handshake claim/refund spends
   (in-memory connectors only today; `cmd/liveprobe` dials + handshakes but does
-  not drive a swap).
-- Thin-client architectural limits (`dxGetOrderHistory` / `dxGetTradingData`
-  reflect session-local fills; `dxGetNetworkTokens` is P2P-bounded) — see
-  [`api.md`](api.md) "Tier 3".
+  not drive a swap). Likewise unverified live: byte-level capture of
+  order/accept/cancel UTXO-entry encoding vs a C++ node (one captured packet
+  today), `p2p/seeds.go` vs `chainparamsseeds.h`, and a real C++ node accepting
+  a Go deposit.
+- Swap-identity fix queue (`docs/audit/register.md` open rows): Init `&&` (STATE-F84), finished-at-claim
+  (STATE-F80), watch-claim (STATE-F81), processLater (STATE-F82),
+  already-in-chain (STATE-F83), cancel-vs-rollback (STATE-F85), sweep 60 s→15 s
+  (STATE-F86), fee fallback 0 (CRYPTO-F79), address leniency (CRYPTO-F81),
+  dust-change gate (CRYPTO-F100), secret prevout binding (CRYPTO-F101),
+  own-fills recording (RPC-F19), accepting-window
+  exposure (CONC-F95), partial-chain child-walk (RPC-F27), cancel txtime
+  (RPC-F35), wallet RPC timeout (CFG-F92).
+- Ruled divergence (not fix-queued): no `Wallet` key in `dxGetTokenBalances`
+  (RPC-F23 closed by design, RPC-F24 re-scoped to ticker order —
+  `docs/audit/decisions.md`).
+- Waiver family: trading-data (`dxGetTradingData`, lowercase, fee fields,
+  bounds, key order, error records — register §0). Pending rulings live in
+  `docs/audit/decisions.md`.
+
+## Swap-sequence identity (register §0 standard)
+
+Swap phases match C++ except as listed fix-queued below; the trading-data
+family is waived (§0):
+
+| Phase | C++ | Go | Verdict |
+|---|---|---|---|
+| Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898); Go mirrors it (`persist()` every 60 s, `api/engine.go:257-260`; `restoreLocalSwaps`, `api/node.go:283-290,338+`; format, `api/persist.go:18-24`) |
+| Hold/Init handshake | `processTransactionHold/Init` + replies | `OnHold/OnInit` + replies | fix-queued (STATE-F84: Go rejects any mismatch, C++ `&&` bug accepts single-field mismatches, so Go can stall against a Core hub emitting them) |
+| Maker/taker deposits | build → pre-signed refund → broadcast; `trCreated` | build → intent persist → broadcast; `csCreatedA/B` | identical |
+| Claims (maker/taker) | verify → build → broadcast; `trFinished` at claim | verify → intent persist → broadcast; `csConfirmedA/B` | fix-queued (STATE-F80: Go waits for hub `Finished` instead of finishing at claim) |
+| Finished | hub `Finished` → history | `OnFinished` → history | identical |
+| Refunds | locktime-gated `redeemOrderDeposit`, 15 s watch | locktime-gated sweep, 60 s cadence | fix-queued (STATE-F86: 60 s cadence vs 15 s watch) |
+| Cancel (pre-deposit) | tx lookup + key + packet, `trCancelled` | order lookup + session key + packet, `"canceled"` | identical |
+| Cancel (deposit-sent) | `trRollback` path | `"canceled"` path | fix-queued (STATE-F85) |
+| Errors/help | codes, messages, help texts | same | identical |
