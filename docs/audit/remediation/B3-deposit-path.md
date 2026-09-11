@@ -36,12 +36,12 @@ C++ writers; the register rows (`CRYPTO-F85/F86/F87/F78/F90`, `STATE-F71`,
 
 ## Session decisions (documented divergences)
 
-1. **Init order-detail check is the intended OR**, not the C++ `&&` bug. C++
+1. **Init order-detail check is currently OR; C++ is `&&`.** C++
    `processTransactionInit` rejects only when **every** field mismatches
-   (`xbridgesession.cpp:1750-1756`, `&&` of `!=`s); the intended semantics —
-   and the secure one — is to reject on **any** single-field mismatch. The Go
-   port implements the intended OR (deliberate security divergence; security >
-   bug-for-bug fidelity).
+   (`xbridgesession.cpp:1750-1756`, `&&` of `!=`s); Go rejects on **any**
+   single-field mismatch. Tracked as STATE-F84 (fix-queued, bug-for-bug `&&`
+   required by the §0 identity standard); the old "security > fidelity"
+   rationale is void.
 2. **Wire-Cancel on bad deposit**: C++ sends `crBadADepositTx`/`crBadBDepositTx`
    on a definitively-bad deposit and **no response** on "wait" (`processLater` —
    the hub retransmits). Go mirrors both.

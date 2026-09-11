@@ -100,7 +100,8 @@ dxGetMyOrders no gate→`==0`; dxGetOrderHistory message missing
   configured (`-rpcuser`+`-rpcpassword` **or** `-rpcauth user:salt$hash`
   repeated). Missing header ⇒ immediate 401 empty body; bad creds ⇒ log +
   250 ms sleep + 401 empty body; `WWW-Authenticate: Basic realm="jsonrpc"`.
-  **No cookie** (documented divergence from C++ auto-cookie): no creds ⇒
+  **No cookie** (residual identical: auth is process-local startup posture with zero
+  swap-sequence effect — no dx response differs): no creds ⇒
   loopback-default-open + non-loopback warning. Drop the custom `-401`.
   `-rpcauth` is a CLI flag here; conf-key parsing stays B10.
 - **POST-only** — non-POST ⇒ 405 `"JSONRPC server handles only POST requests"`

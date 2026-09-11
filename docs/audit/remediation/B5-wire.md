@@ -19,11 +19,13 @@ Go subject: `p2p/`, `proto/`, `cmd/xbridged/` (12 OPEN findings; F65/F66 stay
 | F64 | Bad checksum disconnects instead of log-and-drop | `net_processing.cpp:3138-3145` logs + drops, keeps the conn | `p2p/message.go:78-80` → sentinel `ErrChecksum`; `p2p/conn.go` `readMessage` loops |
 | F67 | cmd-2 `xbcXChatMessage` body speculative | no C++ writer ("not implemented", `xbridgesession.cpp:373-375`) | `proto/body_types.go:913-927` → DELETE the type |
 | F68 | cmd-50 `xbcServicesPing` claim unbacked | no C++ writer (TODO, `servicenodemgr.h:113-117`); DecodeBody already refuses | `proto/body_types.go:933-956` → DELETE the type |
-| F69 | getaddr policy + addr cap differ | outbound-ignore `net_processing.cpp:2665-2686`; `Misbehaving(20)` on `>1000` `:1825-1830` | `p2p/discovery/peer_manager.go:322-324`; `p2p/addr.go:32-43` |
-| F70 | Handshake deadline 30 s vs C++ 60 s | `net.h:83` `DEFAULT_PEER_CONNECT_TIMEOUT = 60` | `p2p/conn.go:26` `handshakeTimeout` |
+| F69 | getaddr policy + addr cap differ | outbound-ignore `net_processing.cpp:2665-2668`; `Misbehaving(20)` on `>1000` `:1825-1830` | `p2p/discovery/peer_manager.go:420-424`; `p2p/addr.go:32-43` |
+| F70 | Handshake deadline 30 s vs C++ 60 s | `net.h:83` `DEFAULT_PEER_CONNECT_TIMEOUT = 60` | `p2p/conn.go:43-46` `handshakeTimeout` |
 
-Stays DOCUMENTED (not touched): WIRE-F65 (Go 1 MiB XBridge body cap — deliberate
-hardening), WIRE-F66 (cmd-4 dual-writer — Go matches the authoritative writer).
+Stays DOCUMENTED (rulings pending, not accepted): WIRE-F65 (Go 1 MiB XBridge body cap —
+hardening; waiver ruling pending), WIRE-F66 (cmd-4 dual-writer — Go matches the
+authoritative writer and tolerates the second form; ruling pending whether
+tolerance or strictness is the §0-conformant reader).
 
 ## Design notes / decisions
 

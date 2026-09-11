@@ -47,5 +47,5 @@ and inbound maker UTXO ownership proofs are verified before booking (SEC-F02).
   reconnect (C++ `nMisbehavior` is per-connection).
 - A pre-existing divergence surfaced by F74: `dxCancelOrder` writes `"canceled"`
   for deposit-sent orders where C++ would route through the rollback path
-  (`trRollback` → `trRollbackFailed`/`trRollback`). Not fixed here (outside
-  STATE-F74's scope); the new failure write pulls the failure side toward C++.
+  (`trRollback` → `trRollbackFailed`/`trRollback`). Tracked as STATE-F85
+  (fix-queued); not fixed on the F74 branch.

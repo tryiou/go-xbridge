@@ -136,11 +136,9 @@ confirmed conforming at HEAD and are pinned by tests only.
   for the order-history OHLCV doubles (F17); `xBridgeStringValueFromPrice`
   equivalent for the order book (F20). A `xBridgeValueFromAmount` helper
   (`amount/COIN + 1/::COIN` round-up-sat) for the price bump.
-- **DOCUMENTED divergences (no code change)** — F23/F24 (no synthesized
-  `"Wallet"` key; C++ ticker order is race-dependent), F37 (gettradingdata
-  alias deliberately absent), F38/F39 (trading-data needs a 43200-block/30-day
-  on-chain scan the thin client cannot do). Each has a register row +
-  rationale.
+- **Reworded under §0 (no accepted gaps)** — F23/F24 (fix-queued: synthesize `Wallet`
+  first with ordered emission); F37/F38/F39 (trading-data
+  waiver). Each has a register row with its verdict.
 - **Scope** — STATE-F79 and CRYPTO-F89 were tagged Owner B7 in the register but
   belong to B8 / B9; G15 reassigned them (STATE-F79 → B8, CRYPTO-F89 → B9,
   SEC-F02 → B8) instead of expanding scope.

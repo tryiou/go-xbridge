@@ -32,10 +32,10 @@ count/dups/ownership/total, payment address, and both signatures
   - `:434-436` no duplicate COutPoints (thin-client checkable)
   - `:438-441` `RecoverCompact(sigHash, signature)` must succeed; the recovered
     pubkey is then matched against on-chain collateral utxos `:447-476`
-    (needs chain index — thin-client RESIDUAL, documented in
-    `../register.md` WIRE-F71 / `../evidence/inventory.md`)
-  - `:478` SPV total >= `COLLATERAL_SPV` = 5000 * COIN (needs chain index —
-    RESIDUAL)
+    (needs chain index in C++; Go enforces the SPV-checkable subset — FIXED,
+    `register.md` WIRE-F71 / `evidence/inventory.md`)
+  - `:478` SPV total >= `COLLATERAL_SPV` = 5000 * COIN (same: chain-index tier
+    out of thin-client scope; SPV-tier subset enforced, WIRE-F71 FIXED)
 - `ServiceNodePing::isValid` — `servicenode.h:782-821`: `:818` runs
   `snode.isValid(...)` (registration checks) unless `skipBlockchainValidation`.
   Wire pings: `processPing(vRecv, ping)` with default `skipValidation=false`

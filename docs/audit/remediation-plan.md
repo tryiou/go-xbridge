@@ -62,12 +62,8 @@ acceptance: B1's verified hub + B3/CRYPTO-F85's validated deposit kill the
 theft. B3 carries the end-to-end refusal test and corrects the attacker model
 in the register.
 
-**Deliberate/documented (no branch):** RPC-F19/F39 (Tier-3 data source),
-WIRE-F65/F66 (hardening/doc), STATE-F76, CONC-F95/F96, CRYPTO-F79 (fee
-fallback; CRYPTO-F80 FIXED on B10), CRYPTO-F81 (address hardening),
-INV-F97–F100, STATE-F77/F78, CONC-F97–F102, SEC-F01, RPC-F59,
-CRYPTO-F84/F93–F96 (fixed; regression-covered), CFG-F86 (never-creates). Each
-is marked `FIXED`/`DOCUMENTED` in `register.md`.
+**Deliberate/documented (no branch):** RPC-F19/F39 + RPC-F37/F38 (trading-data waiver, §0), CONC-F95 (fix-queued: expose accepting), CONC-F96/STATE-F76/INV-F97/INV-F99 (identical: internal model, no observable), WIRE-F65/WIRE-F66 (DOCUMENTED, ruling pending), CRYPTO-F79/F81 (fix-queued), CFG-F86 (identical: startup posture), PART/BCD (waiver ruling pending), STATE-F77/F78, CONC-F97–F102, SEC-F01, RPC-F59, CRYPTO-F84/F93–F96 (fixed; regression-covered). Each
+is marked per its verdict in `register.md`.
 
 **Status (2026-08-15):** B1 and B2 merged to `main` (WIRE-F71, CRYPTO-F84 +
 A1–A7 + per-token D4). **B6 merged** (SEC-F04: `-persistsecrets` gate,
@@ -187,7 +183,8 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   base units via `fromXBridgeAmt` at the boundary — for COIN≠1e6 (BTC) the
   on-chain deposit previously locked 100× too little (`TestDepositNativeScale`).
 - **STATE-F71:** `OnHold`/`OnInit` re-verify amounts/price/identity against the
-  order (intended-OR for Init — documented divergence from the C++ `&&` bug);
+  order (Init check currently OR; STATE-F84 fix-queued for bug-for-bug `&&`
+  per the §0 identity standard);
   state gate on duplicate Init (`TestHoldInitVerification`).
 - **SEC-F03 closure:** composite acceptance — taker and maker refuse an
   unvalidated counterparty deposit end-to-end (`TestSecF03CompositeRefusal`);
@@ -250,10 +247,12 @@ same-order gate, A1–A7 closeout, per-token lock exclusion (D4). See
   `-network regtest`); `snl` answered with a raw accepted-ping echo;
   `proto.Unmarshal` exact-length body; `readVarInt` rejects non-canonical
   CompactSize + `> MAX_SIZE` (32 MiB); cmd-2/cmd-50 speculative body types
-  deleted (`DecodeBody` rejects); `getaddr` never answered (outbound-only) +
-  1000-record `addr` cap. F65 (1 MiB body cap) and F66 (cmd-4 dual writer) stay
-  DOCUMENTED; SENDHEADERS/SENDCMPCT + periodic pings remain DOCUMENTED under
-  F70. See `remediation/B5-wire.md`.
+   deleted (`DecodeBody` rejects); `getaddr` never answered (outbound-only) +
+   1000-record `addr` cap. F65 stays DOCUMENTED (hardening; waiver ruling
+   pending, `register.md`); F66 stays DOCUMENTED (cmd-4 dual writer; ruling
+   pending whether tolerance or strictness is the §0-conformant reader);
+   SENDHEADERS/SENDCMPCT + periodic pings stay DOCUMENTED under F72 (ruling
+   pending whether live-peering evidence suffices). See `remediation/B5-wire.md`.
 - **Verify:** as B1; `make parity` + `make canary`.
 
 ### B6 — `fix/secrets-hygiene` — SEC-F04 (high) — MERGED (opt-out since removed;

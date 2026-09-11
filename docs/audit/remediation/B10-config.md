@@ -23,7 +23,7 @@ sensitivity, CLI flags, and the conf-key set with the C++ reader.
 |---|---|---|---|
 | F84 | `[Rpc]` section aborts startup (S2) | `util/settings.h:49-65` — `Rpc.*` keys defined but never read (dead section) | `config.Load` whitelists `[Main]`/`[Rpc]` (exact-case); the `"COIN not set"` fatal is unreachable for stock confs; `TestLoadSkipsRpcSection` |
 | F85 | Wallet admission gates absent (S2) | `xbridgeapp.cpp:1002-1040` — connect check, maker/taker locktime targets (incl. slow chains), confirmation drift `max(900/blockTime,4)`; dispatch `:1043-1090` | new `config.Admit` + `config.Admitted`, constants single-sourced (`xbridgewallet.h:96-102`) and aliased by `api`; applied at startup/reload/sweep; `TestAdmitGates`, `TestAdmitCreateTxMethod`, `TestAdmittedFilters` |
-| F86 | Missing conf: C++ creates template and runs; Go exits(1) (S2) | `xbridgeapp.cpp:306-358` `createConf` writes a template to `GetDataDir(false)/xbridge.conf` | **DOCUMENTED** — the never-creates hard rule stands: the library AND daemon require an existing conf; deliberate divergence |
+| F86 | Missing conf: C++ creates template and runs; Go exits(1) (S2) | `xbridgeapp.cpp:306-358` `createConf` writes a template to `GetDataDir(false)/xbridge.conf` | IDENTICAL (startup posture, zero swap effect): the never-creates hard rule stands — the library AND daemon require an existing conf |
 | F87 | Hot-reload semantics differ (S2) | `xbridgeapp.cpp:917-1214` `updateActiveWallets` (EW keying, gates, `init()` probe, bad-wallet retry `:963-971`), `:3674-3677` (30 s re-post), `rpcxbridge.cpp:229-233` (ClearBad + clearNonLocalOrders unless showAllOrders) | `wallet.Activator` (EW ∩ gates ∩ probe, 300 s bad-wallet retry); reload preserves `ForceShowAllOrders`/`CheckReachability` and prunes non-local orders via `Store.PruneUnconnected`; 30 s `sweepLoop` re-probes in-memory settings (no file re-read, no prune); `TestActivateExchangeWalletsOnly`, `TestActivateProbe`, `TestActivateBadWalletRetry`, `TestActivateClearBad`, `TestReloadAppliesEWKeying`, `TestReloadPrunesUnconnectedOrders`, `TestReloadPreservesFlagOverrides`, `TestSweepConnectors`, `TestPruneUnconnected` |
 | F88 | `ExchangeWallets` parsing differs (S3) | `util/settings.cpp:143-166` split on `,;:`; `ccy::Symbol::validate` (`currency.h:29-47`) — uppercase, len 1..8, no trim | `config.parseMain` mirrors the separator set + validation; `TestExchangeWalletsCppSemantics` |
 | F89 | Case-insensitive keys in Go (S3) | boost property_tree case-sensitivity (`COIN` ≠ `coin`) | exact-case key + `[Main]` lookups in `config`; `TestCaseSensitiveKeys` |
@@ -66,11 +66,13 @@ orders and never re-reads the file.
   reload vs update with `m_updatingWalletsLock`; Go probes sequentially
   (bounded per-probe) and `sweepConnectors` bails out under `cfgMu` if a reload
   replaced the config during the probe window — no lost update.
-- **CFG-F86 (documented):** never-creates stance — `config.Load` and the daemon
-  require an existing xbridge.conf; C++'s `createConf` template is not ported.
-- **`CreateTxMethod` set:** Go accepts `BTC/SYS/LTC/DGB/BCH/BTG/DEVAULT`
-  (LTC a documented Go extension — C++ has no LTC dispatch), refuses
-  `BCD/PART/STEALTH/XST` (non-portable, `CRYPTO-F98/F99`), rejects ETH/unknown.
+- **CFG-F86 (identical):** never-creates stance — `config.Load` and the daemon
+  require an existing xbridge.conf; C++'s `createConf` template is not ported
+  (startup posture, no swap-sequence effect).
+- **`CreateTxMethod` set:** Go accepts `BTC/SYS/LTC/DGB/BCH/BTG/DEVAULT`,
+  refuses `BCD/PART/STEALTH/XST` (PART/BCD non-portable, `CRYPTO-F98/F99`;
+  STEALTH/XST un-rowed, refused at admission since no live manifest conf uses
+  them; waiver ruling pending), rejects ETH/unknown.
 
 ## Golden vectors
 

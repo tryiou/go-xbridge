@@ -33,10 +33,7 @@ const (
 // (documented for PART and BCD; STEALTH/XST appear in
 // no live manifest conf); admitting them would build BTC-format transactions
 // for a chain that rejects them. Go therefore refuses them at admission instead
-// of broadcasting malformed transactions. LTC is accepted as a deliberate Go
-// extension: C++ has no LTC connector dispatch (method "LTC" would be
-// "unknown" there), but the Go codec supports it (coins/coin.go) and it is
-// harmless — no live conf uses the LTC method (LTC confs use CreateTxMethod=BTC).
+// of broadcasting malformed transactions.
 var supportedCreateTxMethods = map[string]bool{
 	"BTC":     true,
 	"SYS":     true,
