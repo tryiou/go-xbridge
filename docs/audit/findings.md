@@ -163,11 +163,11 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - IMPACT: a dApp sees a missing "Wallet" entry from Go.
 - FIX: always emit "Wallet" from the core-wallet balance path.
 
-### RPC-F24 · S3 · RPC · dxGetTokenBalances key order (Go map-sorted, Wallet last)
+### RPC-F24 · S3 · RPC · dxGetTokenBalances key order (sorted position, not first)
 - REF: C++ `"Wallet"` first + insertion order.
-- CAND: `api/handlers.go:762-834` map → `encoding/json` sorts keys; Wallet last.
+- CAND: `api/handlers.go:990-1038` map → `encoding/json` sorts keys lexicographically.
 - IMPACT: byte-level and positional differences.
-- FIX: emit keys in insertion order (ordered builder) with Wallet first.
+- FIX: emit keys in insertion order (ordered builder) with Wallet first (RPC-F23 fix).
 
 ### RPC-F25 · S3 · RPC · dxGetTokenBalances precision (C++ per-UTXO double sum vs Go exact integer)
 - REF: `rpcxbridge.cpp` sums native-unit doubles per-UTXO (no explicit divide).
@@ -245,19 +245,19 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: `rpcxbridge.cpp:3520-3521` registers `gettradingdata`.
 - CAND: `api/dispatch.go:38-63` — absent → `-32601 Method not found`.
 - IMPACT: a dApp calling `gettradingdata` (a registered blocknetd command) breaks against go-xbridge.
-- FIX: add the lowercase alias.
+- FIX: WAIVER (trading-data family, register §0) — do not add; lowercase is blocknetd-internal with a different schema.
 
 ### RPC-F38 · S2 · RPC · dxGetTradingData fee_txid/nodepubkey always `""`
 - REF: `rpcxbridge.cpp:2860-2863` — on-chain txid + service-node address.
 - CAND: `api/handlers.go:1207-1208` — hardcoded `""`.
 - IMPACT: fee-tracking dApps get empty data.
-- FIX: populate from the on-chain scan (see RPC-F39).
+- FIX: WAIVER (trading-data family, register §0) — needs the BLOCK scan a thin client cannot replay.
 
 ### RPC-F39 · S2 · RPC · dxGetTradingData data source: local fills vs on-chain scan
 - REF: scans the BLOCK chain (43200 blocks / 30-day window) with `errors=true` records.
 - CAND: reads local `Store.Fills()` only (never written in production).
 - IMPACT: always-empty result from Go.
-- FIX: port the on-chain scan (or a filled-order feed).
+- FIX: RPC-F19 split — own fills recorded at completion (fix-queued); non-local fills WAIVER (trading-data family, register §0).
 
 ### RPC-F40 · S2 · RPC · dxSplitInputs requires amount/scriptPubKey/address; C++ needs only txid/vout
 - REF: C++ `utxos` entries need only txid/vout (documented example works).
@@ -418,13 +418,17 @@ Every finding was double-checked by a verification subagent that re-traced the f
 - REF: no per-packet body cap (only the 4 MB P2P cap).
 - CAND: `proto/packet.go:31` `MaxBodySize = 1<<20`.
 - IMPACT: legal oversized packets rejected by Go (robustness; no C++ interop break).
-- FIX: align or document as a deliberate hardening limit.
+- FIX: WIRE-F65 — waiver ruling pending (hardening; no legit-swap impact); not assumed accepted.
 
 ### WIRE-F66 · S3 · WIRE · Command 4 (xbcPendingTransaction) has two C++ writers differing by a trailing minFromAmount
 - REF: `xbridgesession.cpp:3626` (`sendListOfTransactions`, 126 B, omits minFromAmount) vs `:3666` (`sendTransaction`, 134 B, appends it); the C++ reader requires exactly 134 B, so the minFromAmount writer is authoritative.
 - CAND: `proto/body_types.go` always writes minFromAmount and tolerates both on read — matches the authoritative writer.
-- IMPACT: none interop-wise; the 126 B variant would fail decode. Document only.
-- FIX: document; no code change required (Go is correct).
+- IMPACT: interop-relevant; C++'s strict reader rejects the 126 B form its own
+  broadcast writer emits, Go tolerates it to stay compatible with live C++
+  broadcasts.
+- FIX: WIRE-F66 DOCUMENTED, ruling pending (register) — writer byte-identical;
+  reader tolerance required for interop with C++ broadcast writers; proof
+  pointers `proto/body_test.go:130-157`, `conformance/conformance_suite_test.go:1064-1150`.
 
 ### WIRE-F67 · S2 · WIRE · Command 2 (xbcXChatMessage) body is speculative
 - REF: no C++ writer (unimplemented); header comment claims `uint160 + message`.
@@ -558,9 +562,9 @@ Every finding was double-checked by a verification subagent that re-traced the f
 
 ### CFG-F86 · S2 · CONFIG · Missing conf: C++ creates template and runs; Go exits(1)
 - REF: `init.cpp:1920`, `settings.cpp:75-79` — creates the default xbridge.conf and continues.
-- CAND: `config/conf.go:98-103`, `cmd/xbridged/main.go:159-162` — exits(1).
+- CAND: `config/conf.go:104`, `cmd/xbridged/main.go:181` — exits(1).
 - IMPACT: first-run behavior differs; a dApp's unattended Go daemon fails to start.
-- FIX (B10): **DOCUMENTED** — the never-creates hard rule stands (library AND daemon require an existing conf); C++ `createConf` template at `xbridgeapp.cpp:306-358` is not ported (`B10-config.md`).
+- FIX (B10): IDENTICAL — startup posture with zero swap-sequence effect; the never-creates hard rule stands (library AND daemon require an existing conf); C++ `createConf` template at `xbridgeapp.cpp:306-358` is not ported (`B10-config.md`).
 
 ### CFG-F87 · S2 · CONFIG · Hot-reload semantics differ
 - REF: reload re-applies admission gates, drops wallets leaving ExchangeWallets, clears non-local orders, keeps prior state on failure (`rpcxbridge.cpp:229-233`; `xbridgeapp.cpp:931-948,3811-3826`).
@@ -748,17 +752,18 @@ appendix maps every old ID to its canonical home.
   outputs (`vpout` vector-of-pointers) and the amount-committing digest
   (`xbridgewalletconnectorpart.cpp:113-195`) cannot be faithfully reproduced
   by `coins.Tx`; a thin client broadcasting a PART deposit/refund in BTC format
-  would put malformed bytes on-chain. DOCUMENTED (B9): deferred, non-portable
-  tier (`B9-crypto.md`); `[PART]` is one conf in the live manifest
-  (particl--v0.19.2.5.conf).
+   would put malformed bytes on-chain. CRYPTO-F98: non-portable format, waiver
+   ruling pending; `[PART]` refused loudly at admission (`B9-crypto.md`); `[PART]` is one conf in the live manifest
+   (particl--v0.19.2.5.conf).
 
 ### CRYPTO-F99 · S3 · BCD (Bitcoin Diamond) connector non-portable
 - `BCDTransaction` serialization writes an extra `preBlockHash` (uint256) field
   when `nVersion == CURRENT_VERSION_FORK` (`xbridgewalletconnectorbcd.cpp:106-108`),
   and its `SignatureHash` mirrors that; `coins.Tx` has no conditional-serialize
-  flag. DOCUMENTED
-  (B9): deferred, non-portable tier (`B9-crypto.md`); `[BCD]` is one conf in the
-  live manifest (bitcoindiamond--v1.3.0.conf).
+   flag. CRYPTO-F99: non-portable format, waiver ruling pending; `[BCD]` refused
+   loudly at admission
+   (`B9-crypto.md`); `[BCD]` is one conf in the
+   live manifest (bitcoindiamond--v1.3.0.conf).
 
 ### CONC-F97 · S2 · SwapSession fields single-owner
 - Engine-only ownership; race-covered. FIXED.
@@ -818,6 +823,85 @@ all CONFIRMED or PARTIAL, zero TBD).
 4. **Wire hardening (WIRE-F57–F60, WIRE-F62–F64)** — align caps, magic/version gates, checksum handling.
 5. **BCH sighash (CRYPTO-F77)** and **fee formulas (CRYPTO-F78, RPC-F41)** — on-chain correctness first.
 6. **Startup/survival (CFG-F84, CFG-F86)** — a stock xbridge.conf must not kill xbridged.
+
+## New fidelity-triage rows (register §0)
+
+Cards for rows added under the identity standard; each names REF/CAND and the fix direction.
+
+### RPC-F60 · S3 · bare `help` lists only `dx*` vs Core full list
+- REF: Core `help` enumerates every registered command.
+- CAND: `HandlerCtx.dxHelp` (`api/handlers.go:1298`) lists dispatched `dx*` only.
+- FIX: DOCUMENTED, ruling pending (mirror list vs waiver).
+
+### RPC-F61 · S3 · `localservices` bits reflect thin client
+- REF: full-node service bits.
+- CAND: `api/response.go:130` (`LocalServices` of this node).
+- FIX: DOCUMENTED, ruling pending (bits report the reporting node by construction).
+
+### RPC-F62 · S3 · `use_count` always 1 vs shared_ptr refcount
+- REF: C++ `use_count` from shared ownership.
+- CAND: constant 1 (`api/store.go:722,729`; rendered `api/response.go:157` via `api/handlers.go:1350`).
+- FIX: DOCUMENTED, ruling pending (refcounting has no Go equivalent; debug-only field).
+
+### STATE-F80 · S2 · never `finished` at claim
+- REF: C++ maker `trFinished` at ConfirmA (`xbridgesession.cpp:3003`), taker at ConfirmB (`:3186`).
+- CAND: `applyConfirmedABroadcast` (`api/swap.go:1166`) / `applyConfirmedBBroadcast` (`api/swap.go:1338`) advance only `csConfirmedA/B`; `OnFinished` (`api/swap.go:1376`) is the sole history path.
+- FIX: adopt C++ claim-completion locally; exclude claim-confirmed sessions from `scanRefunds`.
+
+### STATE-F81 · S2 · no chain-watch claim
+- REF: C++ taker completes via `checkWatchesOnDepositSpends` without hub packets.
+- CAND: `scanRefunds` (`api/swap.go:1611`) only refunds; no spend-scan exists.
+- FIX: port taker watch (spend-scan own deposit, learn payTx, derive secret, build claim).
+
+### STATE-F82 · S2 · no `processLater` retry queue
+- REF: C++ requeues not-ready/deferred work server-side.
+- CAND: no-response drops (`api/swap.go:931-938`, `api/node.go:1264-1266` await-drop) wait for hub retransmit.
+- FIX: bounded local retry queue for not-ready/build/broadcast failures.
+
+### STATE-F83 · S3 · no `ALREADY_IN_CHAIN`-as-success
+- REF: C++ tolerates it (`xbridgesession.cpp:4012-4024`) and proceeds.
+- CAND: `postBroadcastTask` (`api/swap.go:1574`) treats any broadcast error as fail.
+- FIX: treat already-in-chain as success, send `Confirmed`.
+
+### STATE-F84 · S2 · Init OR vs C++ `&&`
+- REF: C++ rejects only when every field mismatches (`xbridgesession.cpp:1750-1756`).
+- CAND: `verifyInit` (`api/swap.go:612`) rejects on any mismatch; pinned by `TestHoldInitVerification`.
+- FIX: bug-for-bug `&&` (register row carries the risk note; no sign-off recorded — implementation must obtain it).
+
+### STATE-F85 · S2 · deposit-sent cancel takes `"canceled"` not `trRollback`
+- REF: C++ `xbridgesession.cpp:3384-3420`.
+- CAND: `CancelOrder` writes `"canceled"` (`api/node.go:2407-2475`, write at :2469-2475).
+- FIX: route deposit-sent cancels through the rollback path.
+
+### STATE-F86 · S3 · refund sweep 60 s vs C++ 15 s watch
+- REF: C++ `TIMER_INTERVAL` (`xbridgeapp.cpp:90`).
+- CAND: `refundCheckInterval` (`api/swap.go:37`).
+- FIX: tighten toward 15 s (Item 7).
+
+### CRYPTO-F100 · S3 · dust-ungated change output
+- REF: C++ requires `!isDustAmount(rest)` (`xbridgesession.cpp:2621-2623`).
+- CAND: `swap/deposit.go:128` emits change when `>0`.
+- FIX: gate change on dust.
+
+### CRYPTO-F101 · S3 · secret scan not prevout-bound
+- REF: C++ skips vins whose `(txid,vout)` isn't the own deposit (`xbridgewalletconnectorbtc.cpp:2252-2253`).
+- CAND: `secretFromScriptSig` (`api/swap.go:2178-2214`) adopts the first hash-matching push in any input.
+- FIX: bind the vin to `(theirDepositTxID, theirDepositVout)`.
+
+### CRYPTO-F102 · S3 · dust source relay-derived vs 5460 fallback
+- REF: C++ live relay fee.
+- CAND: `effectiveDust` fallback chain (`api/handlers.go:1744-1755`) — no relay feed on a thin client.
+- FIX: DOCUMENTED, ruling pending; keep swap amounts well above dust meanwhile.
+
+### CFG-F92 · S3 · wallet RPC timeout 30 s vs C++ 120 s
+- REF: `-rpcxbridgetimeout` 120 s.
+- CAND: `defaultRPCTimeout` 30 s (`wallet/rpc.go:63`).
+- FIX: honor the C++ timeout on slow-wallet paths.
+
+### WIRE-F72 · S3 · outbound SENDHEADERS/SENDCMPCT/pings never sent
+- REF: C++ sends them (`net_processing.cpp:1779-1798`, `net.h:43`).
+- CAND: never constructed; inbound pings answered (`p2p/discovery/peer_manager.go:425-426`).
+- FIX: DOCUMENTED, ruling pending (multi-hour live peerings stable without them).
 
 ## Evidence
 - RPC per-method cards with vectors: `evidence/rpc.md` + `evidence/rpc-groups/`

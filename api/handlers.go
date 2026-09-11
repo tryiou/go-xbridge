@@ -1030,11 +1030,9 @@ func (h *HandlerCtx) dxGetTokenBalances(params []json.RawMessage) (interface{}, 
 			out[ticker] = formatBalanceNative(c, avail)
 		}
 	}
-	// DOCUMENTED divergence: C++ always emits a "Wallet" key (the
-	// native BLOCK available balance). go-xbridge deliberately does NOT
-	// synthesize one — the thin client pays service-node fees from the BLOCK
-	// connector balance, which is already exposed under its ticker, and the
-	// C++ ticker ordering is race-dependent anyway.
+	// RPC-F23 (fix-queued, tracked in docs/audit/register.md): C++ always emits
+	// a "Wallet" key (the native BLOCK available balance). Until synthesized,
+	// only per-ticker keys are returned; C++ ticker ordering is race-dependent.
 	return out, nil
 }
 
