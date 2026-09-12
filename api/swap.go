@@ -819,6 +819,34 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 	return 0, nil, nil // deferred; applyCreatedA sends on worker completion
 }
 
+// sessionAlive reports whether s is still the registered live session for
+// its order: pruned (or replaced) sessions must not act. Worker results queue
+// in the buffered results channel while the tick runs prune in between, so an
+// apply can land after its session is gone — acting on the detached object
+// would resurrect state the engine deliberately dropped (store flips, hub
+// responses, broadcasts) while the order record tells a different story.
+// Engine-side and inline tests are single-threaded; direct map read matches
+// postSwapTask/postBroadcastTask practice.
+func (n *Node) sessionAlive(s *SwapSession) bool {
+	if n == nil || s == nil {
+		return false
+	}
+	cur, ok := n.sessions[hexEncode(s.id[:])]
+	return ok && cur == s
+}
+
+// dropGhostResult is the shared head of every phase resume: results for a
+// pruned session are dropped (logged) instead of mutating a ghost. Broadcast
+// facts are still tracked by the caller (chain truth outlives the session).
+// Returns true when the caller must stop.
+func (s *SwapSession) dropGhostResult(phase string) bool {
+	if s.n.sessionAlive(s) {
+		return false
+	}
+	xlog.Warn("ghost result dropped: session pruned before worker result", "order", hexEncode(s.id[:]), "phase", phase)
+	return true
+}
+
 // applyCreatedA is the engine-side resume for a CreateA deposit BUILD task
 // (phase 1): it adopts the built intent (txid/lockTime/refundHex) to the
 // session and order, durably persists it via persistNow, and posts the
@@ -830,6 +858,9 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 // and the deposit is rebuilt.
 func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("build") {
+		return nil
+	}
 	if terr != nil {
 		s.releaseAwait()
 		xlog.Error("CreateA deposit task failed", "order", orderID, "err", terr)
@@ -883,6 +914,14 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 // exists, and enqueueRefund refuses unbroadcast intents).
 func (s *SwapSession) applyCreatedABroadcast(out depositOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("broadcast") {
+		// Chain truth outlives the session: track the broadcast so
+		// confirmation-watch owns it; mutate nothing else.
+		if s.n != nil {
+			s.n.recordBroadcast(orderID, broadcastDeposit, s.srcCur, out.txid, out.depositHex)
+		}
+		return nil
+	}
 	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("CreateA deposit broadcast failed", "order", orderID, "err", terr)
@@ -992,6 +1031,9 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 // and the deposit is rebuilt.
 func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("build") {
+		return nil
+	}
 	if terr != nil {
 		s.releaseAwait()
 		if s.failSelfCancel(terr) {
@@ -1056,6 +1098,14 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 // exists, and enqueueRefund refuses unbroadcast intents).
 func (s *SwapSession) applyCreatedBBroadcast(out createdBOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("broadcast") {
+		// Chain truth outlives the session: track the broadcast so
+		// confirmation-watch owns it; mutate nothing else.
+		if s.n != nil {
+			s.n.recordBroadcast(orderID, broadcastDeposit, s.srcCur, out.out.txid, out.out.depositHex)
+		}
+		return nil
+	}
 	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("CreateB deposit broadcast failed", "order", orderID, "err", terr)
@@ -1156,6 +1206,9 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 // claim is rebuilt, as does the tick-driven claim retry.
 func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("build") {
+		return nil
+	}
 	if terr != nil {
 		s.releaseAwait()
 		if s.failSelfCancel(terr) {
@@ -1207,6 +1260,14 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 // redelivery (rebuild), the claim-retry sweep, or cancel (the counterparty deposit is untouched).
 func (s *SwapSession) applyConfirmedABroadcast(out confirmOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("broadcast") {
+		// Chain truth outlives the session: track the broadcast so
+		// confirmation-watch owns it; mutate nothing else.
+		if s.n != nil {
+			s.n.recordBroadcast(orderID, broadcastClaim, out.cur, out.payTxID, out.payHex)
+		}
+		return nil
+	}
 	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("ConfirmA claim broadcast failed", "order", orderID, "err", terr)
@@ -1308,6 +1369,9 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 // as does the tick-driven claim retry.
 func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("build") {
+		return nil
+	}
 	if terr != nil {
 		s.releaseAwait()
 		xlog.Error("ConfirmB claim task failed", "order", orderID, "err", terr)
@@ -1353,6 +1417,14 @@ func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 // from hub redelivery (rebuild) or cancel.
 func (s *SwapSession) applyConfirmedBBroadcast(out confirmOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
+	if s.dropGhostResult("broadcast") {
+		// Chain truth outlives the session: track the broadcast so
+		// confirmation-watch owns it; mutate nothing else.
+		if s.n != nil {
+			s.n.recordBroadcast(orderID, broadcastClaim, out.cur, out.payTxID, out.payHex)
+		}
+		return nil
+	}
 	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("ConfirmB claim broadcast failed", "order", orderID, "err", terr)
@@ -1590,7 +1662,7 @@ func (n *Node) postSwapTask(orderID string, task workTask) bool {
 		return true
 	default:
 		if s := n.sessions[orderID]; s != nil {
-			s.await = false
+			s.releaseAwait()
 		}
 		xlog.Warn("swap task dropped, engine busy", "order", orderID)
 		return false
@@ -1646,7 +1718,7 @@ func (n *Node) postBroadcastTask(orderID string, conn wallet.Connector, cur, hex
 		return true
 	default:
 		if s := n.sessions[orderID]; s != nil {
-			s.await = false
+			s.releaseAwait()
 		}
 		xlog.Warn("broadcast task dropped, engine busy", "order", orderID)
 		return false

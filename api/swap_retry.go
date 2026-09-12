@@ -41,6 +41,13 @@ const (
 	// alerts, staying watched. Rebuilds (which revalidate from scratch) are
 	// uncapped — only blind re-sends are bounded.
 	broadcastRepostMax = 10
+	// awaitStuckMicro bounds a worker round-trip: RPC timeouts kill real
+	// work far sooner, so an `await` older than this means the result was
+	// lost (dropped queue entry, panic in apply, result after prune). Three
+	// minutes sits between with full margin both sides: far beyond healthy
+	// worker RPC (seconds, even to lagging EXR backends) and far below the
+	// 30-minute watchdog, so a released guard re-drives long before cancel.
+	awaitStuckMicro = 3 * 60 * 1000000
 )
 
 // holdAwait marks a worker task in flight with its start stamp. Every
@@ -56,6 +63,23 @@ func (s *SwapSession) holdAwait() {
 func (s *SwapSession) releaseAwait() {
 	s.await = false
 	s.awaitSince = 0
+}
+
+// clearStuckAwait releases worker-in-flight guards whose result never
+// arrived, re-arming the stage retry. Engine-side (first in the 60 s tick so
+// every downstream sweep sees a consistent guard state). It never touches
+// lastProgress: the watchdog keeps judging the session's original silence,
+// and any re-drive refreshes progress on its own. Fresh guards (worker
+// plausibly running) are untouched.
+func (n *Node) clearStuckAwait(now uint64) {
+	for orderID, s := range n.sessions {
+		if !s.await || s.awaitSince == 0 || now < s.awaitSince || now-s.awaitSince <= awaitStuckMicro {
+			continue
+		}
+		xlog.Warn("stuck guard: worker result lost, releasing", "order", orderID,
+			"state", s.state.String(), "stuckSec", (now-s.awaitSince)/1000000)
+		s.releaseAwait()
+	}
 }
 
 // retryBackoff returns the backoff after `retries` consecutive failures:

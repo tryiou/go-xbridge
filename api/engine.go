@@ -100,6 +100,43 @@ func (n *Node) submit(run func(), await bool) {
 	}
 }
 
+// tickStage is one named step of the 60 s engine tick (the `t` case of
+// engineLoop). The table in tickStages is the contract: stuck guards release
+// first (so every downstream sweep sees a consistent guard state), then
+// recovery sweeps run BEFORE termination sweeps, and the persist flush runs
+// last. Recovery and termination act on the same sessions; the retry sweeps
+// set `await`/refresh progress so the watchdog later in the SAME tick stands
+// down. Reverse the order and a session with a due retry gets canceled
+// (crTimeout + wire-Cancel) instead of healed. TestTickStageOrder… pins the
+// sequence; reorder here and the test fails loudly instead of shipping a
+// silent race.
+type tickStage struct {
+	name string
+	run  func()
+}
+
+// tickStages returns the 60 s engine-tick sweep sequence. Recovery before
+// termination, persist last (crash-resumability: flush after all mutations).
+func (n *Node) tickStages() []tickStage {
+	return []tickStage{
+		{"clearStuckAwait", func() { n.clearStuckAwait(NowMicro()) }},
+		{"scanRefunds", func() { n.scanRefunds() }},
+		{"scanStoredRefunds", func() { n.scanStoredRefunds() }},
+		{"resendHoldApplies", func() { n.resendHoldApplies(NowMicro()) }},
+		{"retryFailedClaimBuilds", func() { n.retryFailedClaimBuilds(NowMicro()) }},
+		{"retryFailedDepositBuilds", func() { n.retryFailedDepositBuilds(NowMicro()) }},
+		{"recordSilentHubs", func() { n.recordSilentHubs(NowMicro()) }},
+		{"watchStalledSessions", func() { n.watchStalledSessions() }},
+		{"gcStaleMineOrders", func() { n.gcStaleMineOrders() }},
+		{"watchCounterpartyDeposits", func() { n.watchCounterpartyDeposits() }},
+		{"pollBroadcastConfirmations", func() { n.pollBroadcastConfirmations() }},
+		{"rebroadcastUnconfirmed", func() { n.rebroadcastUnconfirmed() }},
+		{"pruneTracked", func() { n.pruneTracked() }},
+		{"pruneSessions", func() { n.pruneSessions() }},
+		{"persist", func() { n.persist() }},
+	}
+}
+
 // start launches the engine goroutine and its satellites: the socket reader,
 // the periodic status logger, the anti-replay block refresher, and the wallet
 // worker pool. NewNode calls it once after the peer connection is wired; the
@@ -248,17 +285,13 @@ func (n *Node) engineLoop() {
 		case r := <-n.results:
 			n.safeRun(func() { r.task.apply(r.value, r.err) })
 		case <-t.C:
-			// Fund-safety sweep: auto-broadcast any pre-signed refund whose
-			// deposit lockTime has passed. Engine-owned: workers do the wallet
-			// I/O; the engine applies the results.
-			n.safeRun(func() { n.scanRefunds() })
-			// Lifecycle sweep: drop terminal sessions (finished swaps, orders
-			// whose refund has been broadcast) so the live set stays bounded.
-			n.safeRun(func() { n.pruneSessions() })
-			// Mirror C++ saveOrders cadence: flush local swap state to disk
-			// every 60 s so a crash loses at most a minute of progress
-			// (xbridgeapp.cpp:3744, every 4th 15 s timer tick).
-			n.safeRun(func() { n.persist() })
+			// The 60 s fund-safety sweep sequence (see tickStages for the
+			// ordering contract: recovery before termination, persist
+			// last). Engine-owned: workers do the wallet I/O; the engine
+			// applies the results.
+			for _, st := range n.tickStages() {
+				n.safeRun(st.run)
+			}
 		case <-te.C:
 			// Order-book expiry sweep (C++ checkAndEraseExpiredTransactions on
 			// the 15 s timer): prune open orders past their TTL/deadline.
