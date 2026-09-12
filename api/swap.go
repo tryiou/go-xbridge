@@ -117,15 +117,44 @@ type SwapSession struct {
 	ourDepositTxID string
 	refundHex      string // pre-signed IF-branch refund, for cancel/expiry
 	refundDone     bool   // guard so the watcher broadcasts the refund at most once
+	// alongside ourDepositTxID. A tick-driven repost re-sends these IDENTICAL
 
-	// claimHex is the built ELSE-branch claim raw hex, empty until built.
-	// The stall watchdog skips sessions with a built-but-unbroadcast claim
-	// (Phase-2 owns those); the build itself lands with the claim retry work.
-	claimHex string
+	// Built ELSE-branch claim (maker: redeem of B; taker: redeem of A),
+	// persisted before broadcast so a crash between claim-build and broadcast
+	// no longer loses payHex (C++ keeps the built payTx in the in-memory xtx
+	// until send). Hub redelivery rebuilds the claim from the trigger
+	// pointers, as does the tick-driven claim retry (swap_retry.go); the
+	// built hex itself is the manual-recovery record (broadcastable as-is
+	// with sendrawtransaction alongside the txlog entry).
+	claimHex  string // signed claim raw hex, empty until built
+	claimTxID string // locally-derived claim txid (authoritative)
+	claimCur  string // chain the claim spends on
 
 	theirDepositTxID string // counterparty's deposit txid (from ConfirmA/CreateB)
 	theirLockTime    uint32
 	theirSecretHash  [20]byte
+
+	// theirPayTxID is the counterparty's claim payTx that reveals the secret
+	// (taker side: the maker's APayTxID from ConfirmB, stored at stage 1 even
+	// when the claim build fails). A hub retransmit is ephemeral; this pointer
+	// is what lets the tick retry rebuild the claim without the hub.
+	theirPayTxID string
+
+	// claimRetryAt is the wall-microsecond timestamp after which the engine
+	// tick re-posts a failed ELSE-branch claim build (0 = none scheduled).
+	// A failed build is transient until proven otherwise (backend lag,
+	// mempool blindness): the trigger pointers above are sufficient to
+	// rebuild, so dropping the retry would strand a claimable HTLC whenever
+	// the hub stays quiet (live-proven e6730fe2). claimRetries counts
+	// consecutive failures and drives the backoff; a successful build clears
+	// both. Retries refresh lastProgress — the session is actively
+	// recovering, not silent — while hub/user cancel still terminates it.
+	claimRetryAt uint64
+	claimRetries uint32
+
+	// slot, one stage earlier. A failed deposit build is transient until
+	// proven otherwise (backend lag, mempool blindness); selfCancel aborts
+	// never land here.
 
 	// Validated counterparty deposit: the C++
 	// checkDepositTransaction out-params recorded when we accept the
@@ -151,6 +180,12 @@ type SwapSession struct {
 	// response, so any packet arriving during await is a retransmit and is
 	// dropped by processSwap. Engine-owned; never read off the engine goroutine.
 	await bool
+	// awaitSince stamps when await was set (wall micros, 0 when unset). A
+	// worker result clears both together; a result that never arrives leaves
+	// a stuck guard the tick timeout (clearStuckAwait) releases. Memory-only
+	// like await itself: a restart starts unstamped, and hub redelivery plus
+	// the retry sweeps re-drive whatever was in flight.
+	awaitSince uint64
 
 	// lastProgress is the wall-microsecond timestamp of the last observable
 	// forward motion: session creation, an accepted hub packet, or a broadcast
@@ -1098,54 +1133,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		o.OBinTxId = b.BDepositTxID
 	})
 	c := s.snapshot()
-	task := workTask{
-		orderID: orderID,
-		run: func() (any, error) {
-			// Validate the counterparty (taker) B-deposit lockTime (C++
-			// acceptableLockTimeDrift). Compare against our own expectation for
-			// that same deposit role on the taker's coin (dstCur). In Go's
-			// hub-driven flow this is the earliest the maker learns it (after
-			// our own deposit is already broadcast); if it fails we must not
-			// proceed to redeem.
-			expLT := c.computeLockTimeFor(c.dstCur, false)
-			if !acceptableLockTimeDrift(expLT, b.BLockTime, c.blockTimeFor(c.dstCur)) {
-				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
-				return nil, &selfCancelErr{reason: crBadBLockTime}
-			}
-			// Validate the taker's B deposit before redeeming it
-			// (C++ :2957). Wait → no response (hub retransmits); bad → Cancel.
-			dcheck, err := c.checkCounterpartyDeposit(c.secretHash, c.dstAmt)
-			if err != nil {
-				return nil, err
-			}
-			if !dcheck.IsGood {
-				return nil, &selfCancelErr{reason: crBadBDepositTx}
-			}
-			c.theirDepositVout = dcheck.DepositVout
-			c.theirP2SHNative = dcheck.P2SHNative
-			xlog.Info("ConfirmA: redeeming taker deposit", "order", orderID, "takerDeposit", b.BDepositTxID)
-			payHex, cur, err := c.redeemCounterparty(true)
-			if err != nil {
-				return nil, err
-			}
-			xlog.Debug("ConfirmA: claim tx built", "order", orderID, "cur", cur)
-			// Fail fast when the spending chain has no connector, but do NOT
-			// broadcast here: the engine persists the claim intent first and
-			// the broadcast runs as a separate gated step. Derive the payTx id
-			// locally (authoritative, like the deposit txid); the wallet's
-			// reported id is only ever logged, never adopted.
-			wconn, e := c.connector(cur)
-			if e != nil {
-				return nil, e
-			}
-			localPayID, err := txIDFromHex(payHex)
-			if err != nil {
-				return nil, err
-			}
-			return confirmOutcome{payTxID: localPayID, payHex: payHex, cur: cur, check: dcheck, conn: wconn}, nil
-		},
-		apply: func(v any, terr error) { s.applyConfirmedA(v, terr) },
-	}
+	task := makerClaimBuildTask(s, c)
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
@@ -1155,7 +1143,7 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 		}
 		return proto.XbcTransactionConfirmedA, s.applyConfirmedA(v, nil), nil
 	}
-	s.await = true
+	s.holdAwait()
 	s.n.postSwapTask(orderID, task)
 	return 0, nil, nil // deferred; applyConfirmedA sends on worker completion
 }
@@ -1165,29 +1153,38 @@ func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, r
 // the claim intent via persistNow, and posts the broadcast task — it never
 // broadcasts itself (see applyCreatedA for the phase contract). A persist
 // failure withholds the broadcast (fail closed); the hub retransmits and the
-// claim is rebuilt.
+// claim is rebuilt, as does the tick-driven claim retry.
 func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	if terr != nil {
-		s.await = false
+		s.releaseAwait()
 		if s.failSelfCancel(terr) {
 			return nil
 		}
 		xlog.Error("ConfirmA claim task failed", "order", orderID, "err", terr)
+		// Transient until proven otherwise (backend lag, mempool blindness):
+		// schedule a tick-driven rebuild instead of stranding at createdA
+		// when the hub stays quiet. A built claim (claimTxID set) never
+		// reaches here — only the no-broadcast case retries.
+		if s.claimTxID == "" {
+			scheduleClaimRetry(s, NowMicro(), "maker", terr)
+		}
 		return nil
 	}
 	out := v.(confirmOutcome)
+	clearClaimRetry(s)
 	s.theirDepositVout = out.check.DepositVout
 	s.theirP2SHNative = out.check.P2SHNative
 	s.theirOverpayment = out.check.Excess
 	// Durable intent BEFORE broadcast: from here on, a crash restores the
-	// session identity plus the counterparty deposit pointers
-	// (theirDepositTxID/LockTime/SecretHash) from disk, and the claim itself
-	// rebuilds on hub redelivery (the counterparty deposit is still on
-	// chain). Only the deposit path is fully rebroadcastable from disk
-	// (refundHex + txid + lockTime persist); claims re-derive.
+	// session identity, the counterparty deposit pointers
+	// (theirDepositTxID/LockTime/SecretHash plus the validated
+	// vout/P2SHNative), and the built claim itself (claimHex/TxID/Cur) from
+	// disk as the manual-recovery record. The automatic path still rebuilds
+	// on hub redelivery; persistNow only guarantees nothing is lost.
+	s.claimHex, s.claimTxID, s.claimCur = out.payHex, out.payTxID, out.cur
 	if err := s.n.persistNow(); err != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("ConfirmA intent persist failed, claim withheld", "order", orderID, "err", err)
 		return nil
 	}
@@ -1207,14 +1204,20 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 // transcript entry, and sends the ConfirmedA response (started mode) or
 // returns it (inline mode). A broadcast failure leaves the session at its
 // pre-claim state with the intent durable — resumption comes from hub
-// redelivery (rebuild) or cancel (the counterparty deposit is untouched).
+// redelivery (rebuild), the claim-retry sweep, or cancel (the counterparty deposit is untouched).
 func (s *SwapSession) applyConfirmedABroadcast(out confirmOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
+	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("ConfirmA claim broadcast failed", "order", orderID, "err", terr)
+		// The intent (hex + txid) is durable: schedule a tick-driven repost
+		// of the IDENTICAL bytes instead of stranding pre-confirmed.
+		if s.claimTxID != "" && s.claimHex != "" {
+			scheduleClaimRetry(s, NowMicro(), "maker-broadcast", terr)
+		}
 		return nil
 	}
+	clearClaimRetry(s)
 	// The wallet's reported id is logged but never adopted: the locally
 	// derived payTx id stays authoritative.
 	if sentID != "" && sentID != out.payTxID {
@@ -1274,56 +1277,14 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		xlog.Info("ConfirmB ignored: claim worker in flight", "order", orderID)
 		return 0, nil, nil
 	}
+	// Record the maker's payTx id on the session BEFORE the build: a failed
+	// build must still know its trigger so the tick retry can rebuild without
+	// a hub retransmit (the packet is ephemeral). Durable via the async
+	// persist; a crash before the flush falls back to hub redelivery.
+	s.theirPayTxID = b.APayTxID
+	s.n.persist()
 	c := s.snapshot()
-	task := workTask{
-		orderID: orderID,
-		run: func() (any, error) {
-			// Recover the 33-byte secret preimage from the maker's payTx.
-			conn := c.connectors[c.srcCur]
-			if conn == nil {
-				return nil, fmt.Errorf("api: no connector for %s", c.srcCur)
-			}
-			payHex, err := conn.GetRawTransaction(b.APayTxID)
-			if err != nil {
-				return nil, fmt.Errorf("api: getrawtransaction %s: %w", b.APayTxID, err)
-			}
-			// The maker's payTx was serialized by the maker's XBridge connector;
-			// if that coin sets serializeWithTimeField we must parse the nTime
-			// field accordingly.
-			hasTime := false
-			if cc := c.conf(c.srcCur); cc != nil {
-				hasTime = cc.TxWithTimeField
-			}
-			secret, ok := secretFromPayTx(payHex, c.theirSecretHash, hasTime)
-			if !ok {
-				return nil, fmt.Errorf("api: could not recover secret from payTx %s", b.APayTxID)
-			}
-			c.secret = secret // the claim's payment scriptSig pushes the preimage
-			xlog.Info("ConfirmB: secret recovered from maker payTx", "order", orderID,
-				"makerPayTx", b.APayTxID, "secretHash", hexEncode(c.theirSecretHash[:]))
-
-			payHex2, cur, err := c.redeemCounterparty(false)
-			if err != nil {
-				return nil, err
-			}
-			xlog.Debug("ConfirmB: claim tx built", "order", orderID, "cur", cur)
-			// Fail fast when the spending chain has no connector, but do NOT
-			// broadcast here: the engine persists the claim intent (including
-			// the recovered secret) first and the broadcast runs separately.
-			// Derive the payTx id locally (authoritative); the wallet's
-			// reported id is only ever logged, never adopted.
-			wconn, e := c.connector(cur)
-			if e != nil {
-				return nil, e
-			}
-			localPayID, err := txIDFromHex(payHex2)
-			if err != nil {
-				return nil, err
-			}
-			return confirmOutcome{secret: secret, payTxID: localPayID, payHex: payHex2, cur: cur, conn: wconn}, nil
-		},
-		apply: func(v any, terr error) { s.applyConfirmedB(v, terr) },
-	}
+	task := takerClaimBuildTask(s, c, b.APayTxID)
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
@@ -1333,7 +1294,7 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 		}
 		return proto.XbcTransactionConfirmedB, s.applyConfirmedB(v, nil), nil
 	}
-	s.await = true
+	s.holdAwait()
 	s.n.postSwapTask(orderID, task)
 	return 0, nil, nil // deferred; applyConfirmedB sends on worker completion
 }
@@ -1343,23 +1304,33 @@ func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, r
 // claim intent via persistNow, and posts the broadcast task — it never
 // broadcasts itself (see applyCreatedA for the phase contract). A persist
 // failure withholds the broadcast (fail closed); the hub retransmits and the
-// claim is rebuilt (the secret is re-recoverable from the maker's payTx).
+// claim is rebuilt (the secret is re-recoverable from the maker's payTx),
+// as does the tick-driven claim retry.
 func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	if terr != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("ConfirmB claim task failed", "order", orderID, "err", terr)
+		// Transient until proven otherwise (backend lag, mempool blindness):
+		// schedule a tick-driven rebuild instead of stranding at createdB
+		// when the hub stays quiet (live-proven e6730fe2). A built claim
+		// (claimTxID set) never reaches here — only the no-broadcast case
+		// retries, so a retry can never double-broadcast.
+		if s.claimTxID == "" {
+			scheduleClaimRetry(s, NowMicro(), "taker", terr)
+		}
 		return nil
 	}
 	out := v.(confirmOutcome)
+	clearClaimRetry(s)
 	s.secret = out.secret
 	// Durable intent BEFORE broadcast: from here on, a crash restores the
-	// recovered secret plus the counterparty deposit pointers from disk, and
-	// the claim itself rebuilds on hub redelivery (the secret re-derives from
-	// the maker's on-chain payTx). Only the deposit path is fully
-	// rebroadcastable from disk (refundHex + txid + lockTime persist).
+	// recovered secret, the counterparty deposit pointers, and the built
+	// claim itself (claimHex/TxID/Cur) from disk as the manual-recovery
+	// record (see applyConfirmedA).
+	s.claimHex, s.claimTxID, s.claimCur = out.payHex, out.payTxID, out.cur
 	if err := s.n.persistNow(); err != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("ConfirmB intent persist failed, claim withheld", "order", orderID, "err", err)
 		return nil
 	}
@@ -1382,11 +1353,17 @@ func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 // from hub redelivery (rebuild) or cancel.
 func (s *SwapSession) applyConfirmedBBroadcast(out confirmOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
+	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("ConfirmB claim broadcast failed", "order", orderID, "err", terr)
+		// The intent (hex + txid) is durable: schedule a tick-driven repost
+		// of the IDENTICAL bytes instead of stranding pre-confirmed.
+		if s.claimTxID != "" && s.claimHex != "" {
+			scheduleClaimRetry(s, NowMicro(), "taker-broadcast", terr)
+		}
 		return nil
 	}
+	clearClaimRetry(s)
 	// The wallet's reported id is logged but never adopted: the locally
 	// derived payTx id stays authoritative.
 	if sentID != "" && sentID != out.payTxID {
@@ -2433,14 +2410,22 @@ func depositDustLimit(cc *config.CoinConf, conn wallet.Connector) uint64 {
 	return effectiveDust(cc, relayFee)
 }
 
+// ownDepositVout is the output index of our own deposit's P2SH HTLC output.
+// BuildDepositTx always emits it as output 0 (change, if any, follows).
+const ownDepositVout = 0
+
 // secretFromPayTx extracts the 33-byte HTLC secret preimage from a serialized
 // payTx, verifying it against the expected secretHash hx (the deposit's
 // HashedSecret). C++ does the same in getSecretFromPaymentTransaction
-// (xbridgewalletconnectorbtc.cpp:2241-2276), which scans every vin's scriptSig
-// and only adopts a push whose getKeyId(push) equals hx. Scan ALL
-// inputs, not just input 0 — the deposit-spending input is not guaranteed to be
-// the first, and the hash check makes a wrong-input match impossible.
-func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) {
+// (xbridgewalletconnectorbtc.cpp:2241-2276), called at xbridgesession.cpp:3935
+// with the taker's OWN deposit (binTxId, binTxVout=0 — createDepositTransaction
+// stamps txVout=0, connectorbtc.cpp:2413): it first requires the vin to spend
+// that outpoint (:2249-2254) and only then adopts a push whose getKeyId(push)
+// equals hx. depTxID/depVout are that expected outpoint (display-order txid,
+// usually our own deposit at vout 0); inputs not spending it are skipped, so
+// a decoy payTx carrying the (already public) secret without spending the
+// deposit can never satisfy extraction.
+func secretFromPayTx(payHex string, hx [20]byte, hasTime bool, depTxID string, depVout uint32) ([33]byte, bool) {
 	raw, err := hex.DecodeString(payHex)
 	if err != nil {
 		xlog.Debug("secretFromPayTx: bad hex", "err", err)
@@ -2451,7 +2436,19 @@ func secretFromPayTx(payHex string, hx [20]byte, hasTime bool) ([33]byte, bool) 
 		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
 		return [33]byte{}, false
 	}
+	var depHash [32]byte
+	if b, derr := hex.DecodeString(depTxID); derr != nil || len(b) != 32 {
+		xlog.Debug("secretFromPayTx: bad deposit txid", "txid", depTxID)
+		return [33]byte{}, false
+	} else {
+		for i := 0; i < 32; i++ {
+			depHash[i] = b[31-i] // display order -> internal little-endian
+		}
+	}
 	for _, in := range tx.Inputs {
+		if in.PrevOut.Hash != depHash || in.PrevOut.Index != depVout {
+			continue
+		}
 		if secret, ok := secretFromScriptSig(in.ScriptSig, hx); ok {
 			return secret, true
 		}

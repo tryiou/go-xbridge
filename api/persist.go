@@ -94,10 +94,32 @@ type persistedSwap struct {
 	TheirDepositTxID string   `json:"theirDepositTxID"`
 	TheirLockTime    uint32   `json:"theirLockTime"`
 	TheirSecretHash  [20]byte `json:"theirSecretHash"`
+	// TheirPayTxID is the counterparty's claim payTx id (taker side: the
+	// maker's APayTxID from ConfirmB): the trigger the tick-driven claim
+	// retry rebuilds from when the hub never redelivers (swap_retry.go).
+	TheirPayTxID string `json:"theirPayTxID,omitempty"`
+	// ClaimRetryAt/ClaimRetries schedule that retry (wall micros, 0 = none;
+	// consecutive-failure count driving the backoff). omitempty keeps
+	// pre-upgrade snapshots decodable; a zero value simply never fires.
+	ClaimRetryAt uint64 `json:"claimRetryAt,omitempty"`
+	ClaimRetries uint32 `json:"claimRetries,omitempty"`
 	// as the claim slot.
+	// Validated counterparty-deposit out-params (C++ oBinTxVout /
+	// oBinTxP2SHAmount / oOverpayment): needed to rebuild a claim after a
+	// restart without re-running the deposit check. All three ride the
+	// session record — the phase-1 claim intent persists BEFORE the order
 	// record's OBinTx* copy is updated (phase-2 broadcast), so restoring
+	// from the order copy would resurrect a stale (usually zero)
+	// overpayment after a build/broadcast-window crash.
+	TheirDepositVout uint32 `json:"theirDepositVout,omitempty"`
+	TheirP2SHNative  uint64 `json:"theirP2SHNative,omitempty"`
+	TheirOverpayment uint64 `json:"theirOverpayment,omitempty"`
 
+	// Built-claim intent (C++ in-memory payTx equivalent): the signed claim
 	// hex plus its locally-derived id and chain, persisted before broadcast.
+	ClaimHex  string `json:"claimHex,omitempty"`
+	ClaimTxID string `json:"claimTxID,omitempty"`
+	ClaimCur  string `json:"claimCur,omitempty"`
 
 	Hub    [20]byte    `json:"hub"`
 	HubKey [33]byte    `json:"hubKey"`
@@ -563,6 +585,15 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.TheirDepositTxID = s.theirDepositTxID
 	ps.TheirLockTime = s.theirLockTime
 	ps.TheirSecretHash = s.theirSecretHash
+	ps.TheirPayTxID = s.theirPayTxID
+	ps.ClaimRetryAt = s.claimRetryAt
+	ps.ClaimRetries = s.claimRetries
+	ps.TheirDepositVout = s.theirDepositVout
+	ps.TheirP2SHNative = s.theirP2SHNative
+	ps.TheirOverpayment = s.theirOverpayment
+	ps.ClaimHex = s.claimHex
+	ps.ClaimTxID = s.claimTxID
+	ps.ClaimCur = s.claimCur
 	ps.Hub = s.hub
 	ps.HubKey = s.hubKey
 	ps.State = s.state
@@ -618,12 +649,24 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		theirDepositTxID: ps.TheirDepositTxID,
 		theirLockTime:    ps.TheirLockTime,
 		theirSecretHash:  ps.TheirSecretHash,
+		theirPayTxID:     ps.TheirPayTxID,
+		claimRetryAt:     ps.ClaimRetryAt,
+		claimRetries:     ps.ClaimRetries,
+		// Validated out-params ride the session record (adopted at
+		// claim-build, before the order record is updated) so a restarted
 		// claim rebuilds against the exact deposit output without
+		// re-running the check; the order's OBinTx* copy stays the display
 		// source of truth once broadcast.
-		hub:             ps.Hub,
-		hubKey:          ps.HubKey,
-		state:           ps.State,
-		holdApplySentAt: ps.HoldApplySentAt,
+		theirDepositVout: ps.TheirDepositVout,
+		theirP2SHNative:  ps.TheirP2SHNative,
+		theirOverpayment: ps.TheirOverpayment,
+		claimHex:         ps.ClaimHex,
+		claimTxID:        ps.ClaimTxID,
+		claimCur:         ps.ClaimCur,
+		hub:              ps.Hub,
+		hubKey:           ps.HubKey,
+		state:            ps.State,
+		holdApplySentAt:  ps.HoldApplySentAt,
 		// Watchdog clock restarts at restore: pre-upgrade records predate
 		// the stamp, and the downtime itself is not hub silence.
 		lastProgress: uint64(NowMicro()),
