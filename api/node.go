@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -170,6 +171,34 @@ type Node struct {
 	// by the engine goroutine (and inline by tests, which never start it).
 	sessions map[string]*SwapSession
 
+	// silentHubs records hub pubkeys whose sessions sat in csHoldApplied
+	// with HoldApplies sent and no Init past the silence threshold
+	// (api/hold_resend.go), mapped to exclusion-expiry micros. Future makes
+	// steer around them via pickHub; lapsed entries are pruned on read.
+	// Written on the engine tick, read on the engine tick and the make path
+	// (which may run off-engine), so silentHubsMu guards it.
+	silentHubsMu sync.Mutex
+	silentHubs   map[[33]byte]uint64
+
+	// startedAtMicro is the process-start wall clock. The silence recorder
+	// ignores HoldApply stamps predating it: pre-restart parked time is
+	// downtime, not hub silence (mirroring the lastProgress re-stamp on
+	// restore). The resender keeps the durable stamp and recovers promptly.
+	// Zero on directly-constructed test nodes, which disables the guard.
+	startedAtMicro uint64
+
+	// tracked is the confirmation-watch table for local broadcasts
+	// (api/reconcile.go): record sites run on worker/HTTP goroutines, so
+	// trackedMu guards it (unlike sessions, it is NOT engine-confined).
+	// trackedSeq orders entries for cap pruning without chain I/O.
+	// pendingConfirm is the poll single-flight guard (a sweep never stacks).
+	// pendingRebroadcast is the rebroadcast single-flight guard.
+	trackedMu          sync.Mutex
+	tracked            map[string]*trackedBroadcast
+	trackedSeq         atomic.Uint64
+	pendingConfirm     atomic.Bool
+	pendingRebroadcast atomic.Bool
+
 	// engineRunning is true once start() has launched the engine goroutine.
 	// Node.submit runs commands inline on the caller when it is false (tests,
 	// or a node that never started) — the single-threaded behaviour the test
@@ -231,6 +260,17 @@ type Node struct {
 	// refund broadcast for an order whose sweep task is already in flight.
 	pendingRefunds map[string]bool
 
+	// refundAttempts/refundRetryAt are the engine-owned rollback backoff
+	// schedule (Phase 1 R2b): failed refund broadcasts retry on an escalating
+	// delay instead of every sweep. Lazily initialized; in-memory only (a
+	// restart retries once immediately, then resumes backing off).
+	refundAttempts map[string]int
+	refundRetryAt  map[string]uint64
+
+	// pendingWatch is the engine-owned guard against double-enqueueing a
+	// counterparty-deposit watch probe for a session already being polled.
+	pendingWatch map[string]bool
+
 	// blockMu guards the cached anti-replay blockHash stamped on outgoing
 	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
 	// we mirror that by querying the BLOCK connector's getblockcount/getblockhash.
@@ -265,13 +305,14 @@ type Node struct {
 // NewNode dials the configured peer (if any) and starts ingesting broadcasts.
 func NewNode(cfg *Config, store *Store) (*Node, error) {
 	n := &Node{
-		config:    cfg,
-		store:     store,
-		signer:    crypto.NewBtcSigner(),
-		stop:      make(chan struct{}),
-		sessions:  map[string]*SwapSession{},
-		snReg:     servicenode.NewRegistry(),
-		activator: cfg.Activator,
+		config:         cfg,
+		store:          store,
+		signer:         crypto.NewBtcSigner(),
+		stop:           make(chan struct{}),
+		sessions:       map[string]*SwapSession{},
+		snReg:          servicenode.NewRegistry(),
+		activator:      cfg.Activator,
+		startedAtMicro: uint64(NowMicro()),
 	}
 	if n.activator == nil {
 		n.activator = wallet.NewActivator()
@@ -341,7 +382,7 @@ func NewNode(cfg *Config, store *Store) (*Node, error) {
 // envelope, or a failed quarantine, still starts fresh and loud.
 func (n *Node) restoreLocalSwaps(dataDir string) {
 	path := swapStatePath(dataDir)
-	ps, strictErr := loadSwaps(path)
+	ps, bc, strictErr := loadSwaps(path)
 	if strictErr == nil {
 		for _, p := range ps {
 			n.restoreSwap(p)
@@ -349,6 +390,7 @@ func (n *Node) restoreLocalSwaps(dataDir string) {
 		if len(ps) > 0 {
 			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
 		}
+		n.restoreTracked(bc)
 		// Crash-window reconciliation (see reconcileUnconfirmedDeposits): a deposit
 		// broadcast whose confirmation never persisted is ambiguous on disk —
 		// resolve it against the chain before the engine starts, so the refund
@@ -906,6 +948,15 @@ func (n *Node) rebroadcastOpenOrders() {
 		if now-o.Updated < gap {
 			continue
 		}
+		// C++ re-validates the order's UTXOs before re-posting and cancels
+		// with crBadAUtxo when they are spent (orderUtxosAreStillValid,
+		// xbridgeapp.cpp:3557-3569, called from checkAndRelayPendingOrders
+		// :3263-3298). A definitively-spent funding output cancels here;
+		// a wallet error only skips this round (transient outage must not
+		// nuke a live order).
+		if !n.orderUtxosStillValid(o) {
+			continue
+		}
 		hubAddr := o.HubAddress
 		if hubAddr == [20]byte{} {
 			hubAddr = s.hub
@@ -917,11 +968,99 @@ func (n *Node) rebroadcastOpenOrders() {
 		}
 		if err := n.conn.WritePacket(pkt, hubAddr); err != nil {
 			xlog.Error("rebroadcast: send failed", "order", id, "err", err)
-			continue
+			// C++ rotates to another servicenode when the send fails
+			// (checkAndRelayPendingOrders passes the failed node in
+			// `notIn`, xbridgeapp.cpp:3274/3311): migrate the anchor and
+			// retry once there instead of sticking to a dead hub.
+			if newAddr, ok := n.rotateHub(id, s, o); ok {
+				if rerr := n.conn.WritePacket(pkt, newAddr); rerr != nil {
+					xlog.Error("rebroadcast: retry send failed", "order", id, "err", rerr)
+					continue
+				}
+			} else {
+				continue
+			}
 		}
 		n.store.Update(id, func(ord *Order) { ord.Updated = now })
 		xlog.Debug("order rebroadcast", "order", id)
 	}
+}
+
+// rotateHub migrates an untaken maker order to a freshly-picked hub,
+// excluding the failed one (C++ `notIn`, xbridgeapp.cpp:2910). It is only
+// valid before any handshake packet (csMaker): the pinned trust anchor has
+// authenticated nothing yet, so re-pinning it alongside the route is safe —
+// later states keep their anchor (verifyHubPacket pins it for the whole
+// handshake). The order id is unaffected (it commits to the per-trade M key,
+// not the hub). Returns the new hub address, or false when no alternative
+// hub exists (the caller keeps the old anchor and retries next round).
+// Engine-owned (mutates session, order, and the durable copy).
+func (n *Node) rotateHub(id string, s *SwapSession, o *Order) ([20]byte, bool) {
+	if n.snReg == nil || !s.isMaker || s.state != csMaker {
+		return [20]byte{}, false
+	}
+	var newKey [33]byte
+	var ok bool
+	if s.hubKey != ([33]byte{}) {
+		newKey, ok = n.snReg.Pick([]string{o.FromCurrency, o.ToCurrency}, s.hubKey)
+	} else {
+		newKey, ok = n.snReg.Pick([]string{o.FromCurrency, o.ToCurrency})
+	}
+	if !ok {
+		xlog.Warn("rebroadcast: no alternative hub, keeping anchor", "order", id)
+		return [20]byte{}, false
+	}
+	newAddr := coins.KeyID(newKey[:])
+	newPubHex := hexEncode(newKey[:])
+	s.hub, s.hubKey = newAddr, newKey
+	n.store.Update(id, func(ord *Order) {
+		ord.HubAddress = newAddr
+		ord.SNodePubkey = newPubHex
+	})
+	n.persist()
+	xlog.Info("rebroadcast: migrated to new hub", "order", id, "hub", newPubHex)
+	return newAddr, true
+}
+
+// orderUtxosStillValid reports whether every funding UTXO of a locally-made
+// open order is still unspent (C++ orderUtxosAreStillValid,
+// xbridgeapp.cpp:3557-3569). A definitively-spent output cancels the order
+// with crBadAUtxo (like C++ checkAndRelayPendingOrders); a wallet error
+// returns true so a transient outage only skips the rebroadcast round.
+// Engine-owned (called from rebroadcastOpenOrders on the engine goroutine).
+func (n *Node) orderUtxosStillValid(o *Order) bool {
+	if len(o.UsedCoins) == 0 {
+		return true
+	}
+	cfg := n.cfg()
+	if cfg == nil {
+		return true
+	}
+	conn := cfg.Connectors[o.FromCurrency]
+	if conn == nil {
+		return true
+	}
+	for _, u := range o.UsedCoins {
+		_, ok, err := conn.GetTxOut(u.TxID, u.Vout)
+		if err != nil {
+			xlog.Warn("rebroadcast: utxo check unavailable, skipping round", "order", hexEncode(o.ID[:]), "err", err)
+			return true
+		}
+		if !ok {
+			xlog.Info("rebroadcast: funding spent, cancelling", "order", hexEncode(o.ID[:]), "utxo", u.TxID)
+			if serr := n.sendCancelTransaction(hexEncode(o.ID[:]), uint32(crBadAUtxo)); serr != nil {
+				xlog.Error("rebroadcast: cancel send failed", "order", hexEncode(o.ID[:]), "err", serr)
+			}
+			now := NowMicro()
+			n.store.Update(hexEncode(o.ID[:]), func(stored *Order) {
+				stored.Status = "canceled"
+				stored.Updated = now
+			})
+			n.persist()
+			return false
+		}
+	}
+	return true
 }
 
 // buildOrderPacket reconstructs the xbcPendingTransaction packet for a stored
@@ -1220,10 +1359,17 @@ type responseBody interface {
 // for the given order id and runs the session handler. handlePacket (node.go:795)
 // calls it on the engine goroutine (which owns sessions); off-engine callers
 // marshal it onto the engine with submit. Packets for order ids we are not a
-// party to are ignored. The `hub` parameter (the address the packet embeds) is
-// intentionally ignored: the response destination is the hub pinned at session
-// creation, never learned from the packet. When the engine is not started
-// (tests) the work runs inline on the caller.
+// party to are ignored. The `hub` parameter carries the route the packet
+// embeds (the hub's per-session m_myid); it is ADOPTED as the live route for
+// the reply and everything after it — mirroring C++, where every directed
+// reply echoes the inbound packet's hub field (xbridgesession.cpp:1534-1541
+// HoldApply, :1768-1774 Initialized, :2229-2239 CreateA, and the same pattern
+// for CreateB/ConfirmedA/ConfirmedB). Answering with the make-time KeyID
+// instead stalls the swap: the hub's checkPacketAddress
+// (xbridgesession.cpp:264-280) silently drops any packet whose body[0:20] is
+// not its live session id, so the join counter never completes and Init never
+// fires. When the engine is not started (tests) the work runs inline on the
+// caller.
 //
 // Hub-key auth: every handshake packet is re-verified against the
 // session's TRUSTED hub key before dispatch — mirroring C++
@@ -1232,6 +1378,8 @@ type responseBody interface {
 // time; taker: the order's SNodePubkey) — never learned from network packets.
 // A packet that fails verification is dropped and never reaches the handler, so
 // a forged Finished can never set csFinished and disable the refund watcher.
+// Route adoption below happens only past this gate, so a forged route can
+// never be adopted.
 func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName string, fn func(*SwapSession) (proto.XBridgeCommand, responseBody, error)) {
 	s := n.sessions[hexEncode(id[:])]
 	if s == nil {
@@ -1247,7 +1395,21 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 			"state", s.state.String(), "snode", hexEncode(pkt.Pubkey[:]))
 		return
 	}
+	// Adopt the hub's live route (C++ echo contract, see above): the reply
+	// envelope and body, plus all later sends (resends via s.hub), must carry
+	// the inbound packet's hub bytes, not the make-time KeyID. The hub key
+	// itself stays pinned (verifyHubPacket) — only the 20-byte route moves.
+	// Zero-hub commands (Finished) carry no route and keep the current one.
+	// Durability rides on send()'s pre-send persistNow, which always follows
+	// in this function when a reply exists.
+	if hub != ([20]byte{}) {
+		s.hub = hub
+	}
 	swlog.Info("swap packet received", "command", cmdName, "state", s.state.String())
+	// Any hub-verified packet proves the hub path is alive (even an
+	// await-dropped retransmit) — stamp watchdog progress here, past the
+	// signature gate, before any state-specific handling.
+	s.lastProgress = uint64(NowMicro())
 	// Two-phase handshake: while a deposit/claim task for this session is in
 	// flight (await set), the hub sends the next packet only after our response,
 	// so any packet arriving now is a retransmit. Drop it rather than re-running
@@ -1277,6 +1439,12 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 		swlog.Error("swap response send failed", "command", cmd.String(), "err", err)
 	} else {
 		swlog.Info("swap response sent", "command", cmd.String())
+		// Stamp the first HoldApply send so the resender
+		// (api/hold_resend.go) knows when the silence interval starts.
+		// Resends restamp themselves; nothing else writes this field.
+		if cmd == proto.XbcTransactionHoldApply {
+			s.holdApplySentAt = NowMicro()
+		}
 	}
 }
 
@@ -1285,14 +1453,20 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 // trusted key is pinned at session creation for BOTH roles — the maker's chosen
 // servicenode, the taker's order SNodePubkey — never learned from network
 // packets. A packet signed by any other key is dropped before it reaches the
-// handler. The registry membership of the trusted hub is also re-checked,
-// mirroring C++ getSn on every handshake packet (xbridgesession.cpp:1384).
+// handler. The registry membership of the trusted hub is re-checked only while
+// the handshake has not started (mirroring C++ getSn at the Hold/accept
+// intake, xbridgesession.cpp:1384): once the session advances past Hold the
+// pinned key alone authenticates, so a hub whose registration lapses
+// mid-swap cannot abort an in-flight trade C++ would still honour.
 func (n *Node) verifyHubPacket(pkt *proto.Packet, s *SwapSession) bool {
 	if s.hubKey == [33]byte{} {
 		return false // no trusted hub anchor -> cannot authenticate
 	}
 	if ok, _ := n.signer.VerifyAgainst(pkt, hexEncode(s.hubKey[:])); !ok {
 		return false // packet not signed by the trusted hub key
+	}
+	if s.state >= csHoldApplied {
+		return true // handshake underway: pinned key suffices
 	}
 	return n.hubRegistered(s.hubKey[:])
 }
@@ -1338,7 +1512,20 @@ func (n *Node) send(dest [20]byte, cmd proto.XBridgeCommand, body responseBody, 
 	if err := n.persistNow(); err != nil {
 		return err
 	}
-	return n.conn.WritePacket(pkt, dest)
+	if err := n.conn.WritePacket(pkt, dest); err != nil {
+		return err
+	}
+	// Forensic transcript: the exact sent bytes at Debug (packets are small —
+	// a HoldApply is ~200 wire bytes — and Debug is off by default, so live
+	// logs stay quiet while a stall can still be replayed byte-for-byte from
+	// a debug run). packetHex output replays via proto.Unmarshal (pinned by
+	// TestPacketHexReplays). The hex is rendered only when Debug is enabled:
+	// slog discards disabled-level args AFTER evaluating them, so an
+	// unconditional packetHex call would Marshal+hex-encode on every send.
+	if xlog.Level() <= slog.LevelDebug {
+		xlog.Debug("swap packet sent", "command", cmd.String(), "hex", packetHex(pkt))
+	}
+	return nil
 }
 
 // MakeOrderParams are the parsed dxMakeOrder / dxMakePartialOrder arguments.
@@ -1473,7 +1660,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errNoServiceNode, "dxMakeOrder", "")
 		}
 		var ok bool
-		hubKey, ok = reg.Pick([]string{p.Maker, p.Taker})
+		hubKey, ok = n.pickHub([]string{p.Maker, p.Taker}, NowMicro())
 		if !ok {
 			xlog.Warn("dxMakeOrder refused: no running hub advertising both currencies", "maker", p.Maker, "taker", p.Taker)
 			return nil, makeError(errNoServiceNode, "dxMakeOrder", "")
@@ -1701,6 +1888,11 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 				if _, err := conn.SendRawTransaction(signedHex); err != nil {
 					return nil, makeError(errUnknown, "dxMakePartialOrder", err.Error())
 				}
+				// Track for confirmation watch (Phase 0): the order stays
+				// pending until the prep tx confirms. txid is the locally
+				// derived prep id (buildPrepTx); the order id is derived
+				// below, so the entry is order-less by design.
+				n.recordBroadcast("", broadcastPrep, p.Maker, txid, signedHex)
 			}
 			prepTxID = txid
 			// d) Rebuild the used-utxo set: the exact utxos plus enough prep

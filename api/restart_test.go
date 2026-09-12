@@ -103,7 +103,7 @@ func TestRestartRecoversCreatedA(t *testing.T) {
 	}
 
 	// On disk: exactly one persisted swap, already at csCreatedA with its txid.
-	ps, err := loadSwaps(swapStatePath(dir))
+	ps, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -238,6 +238,17 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 	s.theirPub = to33(mkPub)
 	s.theirDepositVout = 0
 	s.theirP2SHNative = 2.5e8
+	// The fixture payTx spends outpoint ee:0: that is the taker's own LTC
+	// deposit (C++ binTxId/binTxVout), which the maker redeemed to reveal
+	// the secret. Extraction binds to it (xbridgesession.cpp:3935).
+	s.ourDepositTxID = strings.Repeat("ee", 32)
+	// The validated maker BTC deposit must exist on-chain for the claim-path
+	// unspent re-check (in production it was broadcast at CreateA and
+	// validated at CreateB; this fixture seeds validation directly).
+	ccTx := &coins.Tx{Version: 1}
+	ccTx.Inputs = append(ccTx.Inputs, coins.TxIn{Sequence: 0xffffffff})
+	ccTx.Outputs = append(ccTx.Outputs, coins.TxOut{Value: 2.5e8, ScriptPubKey: []byte{0x51}})
+	btcConn.setRawTx(strings.Repeat("cc", 32), hex.EncodeToString(ccTx.Serialize()))
 
 	drive := func(node *Node, sess *SwapSession) {
 		node.submit(func() {
@@ -252,7 +263,7 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 		t.Fatalf("claim broadcast %d times, want 1", len(got))
 	}
 
-	ps, err := loadSwaps(swapStatePath(dir))
+	ps, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -346,7 +357,7 @@ func TestRestartRecoversPreDeposit(t *testing.T) {
 	// (no deposit task was started, so the session is at csMaker with no txid).
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		ps, perr := loadSwaps(swapStatePath(dir))
+		ps, _, perr := loadSwaps(swapStatePath(dir))
 		if perr == nil && len(ps) == 1 && ps[0].State < csCreatedA && ps[0].OurDepositTxID == "" {
 			break
 		}

@@ -166,6 +166,10 @@ func (s *conformanceStubConn) GetTxOut(txid string, vout uint32) (wallet.Utxo, b
 	return wallet.Utxo{}, false, nil
 }
 
+func (s *conformanceStubConn) GetRawTransactionVerbose(string) (wallet.VerboseTx, error) {
+	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
+}
+
 // conformanceXConn is a stub api.XConn whose ReadPacket blocks forever (returns
 // io.EOF) so a fixture cannot accidentally consume real input; WritePacket
 // succeeds so the write-command paths (requireWrite + broadcast) are reachable.

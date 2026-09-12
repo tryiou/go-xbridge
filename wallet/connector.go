@@ -152,6 +152,10 @@ type Connector interface {
 	// P2SHAmount/Excess are XBridge 1e6 base units. Returns ErrDepositNotReady
 	// when the deposit cannot be judged yet (C++ return false → processLater) —
 	// a non-error result with IsGood=false means the deposit is definitively bad.
+	// At requiredConfirmations=0 (no gettxout gate) the deposit must still be
+	// visible in the verbose chain/mempool view: wallet-local bytes alone are
+	// not proof the network saw the broadcast, and unknown/conflicted there is
+	// NotReady, never proceed.
 	CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (DepositCheck, error)
 	// SignMessage produces a BIP137 ownership proof (compact 65-byte signature)
 	// over message for the given address. XBridge embeds a SignMessage proof for
@@ -170,4 +174,28 @@ type Connector interface {
 	// counterparty order UTXOs before booking (C++ processTransaction,
 	// xbridgesession.cpp:535-575).
 	GetTxOut(txid string, vout uint32) (Utxo, bool, error)
+	// GetRawTransactionVerbose returns the decoded transaction with chain
+	// context (confirmations, per-output native value + script hex) via
+	// verbose getrawtransaction. Used ONLY as a degraded deposit-existence
+	// check where gettxout is backend-blind: non-Core backends answer -5
+	// "unknown/non-wallet transaction" for any tx outside their wallet, so a
+	// confirmed counterparty deposit can never read unspent there. Spent
+	// status stays opaque in this path (a claim broadcast on a spent output
+	// cannot confirm, so proceeding is fund-safe); confirmation depth itself
+	// was established at deposit-validation time.
+	GetRawTransactionVerbose(txid string) (VerboseTx, error)
+}
+
+// VerboseTxOut is one decoded transaction output: native base-unit value and
+// raw script hex, keyed by output index in VerboseTx.Outputs.
+type VerboseTxOut struct {
+	Value     uint64
+	ScriptHex string
+}
+
+// VerboseTx is a decoded chain transaction with confirmation context.
+type VerboseTx struct {
+	TxID          string
+	Confirmations int
+	Outputs       map[uint32]VerboseTxOut
 }

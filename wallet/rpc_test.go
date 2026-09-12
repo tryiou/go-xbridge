@@ -663,13 +663,15 @@ func buildDepositFixtures(t *testing.T) *depositFixtures {
 // prevout's verbose JSON is served only for the fixture funding txid, so any
 // other vin txid lookup fails as "vin tx not found ...waiting".
 type checkDepositServer struct {
-	fx           *depositFixtures
-	depositRaw   string // getrawtransaction [txid,0] raw hex
-	depositErr   bool   // getrawtransaction fails (tx not found)
-	confs        string // gettxout result body ("" → default 6 confirmations)
-	confsNull    bool   // gettxout returns null (unknown output)
-	fundingValue string // prevout value (whole BTC); "" → "3.0"
-	calls        []string
+	fx             *depositFixtures
+	depositRaw     string // getrawtransaction [txid,0] raw hex
+	depositErr     bool   // getrawtransaction fails (tx not found)
+	depositVerbose string // verbose body for the DEPOSIT txid ("" → error, wallet-only)
+	confs          string // gettxout result body ("" → default 6 confirmations)
+	confsNull      bool   // gettxout returns null (unknown output)
+	confsVout1     string // gettxout result body when vout==1 ("null" → null; "" → default path)
+	fundingValue   string // prevout value (whole BTC); "" → "3.0"
+	calls          []string
 }
 
 func newCheckDepositServer(t *testing.T, cfg *checkDepositServer) *httptest.Server {
@@ -703,12 +705,26 @@ func newCheckDepositServer(t *testing.T, cfg *checkDepositServer) *httptest.Serv
 						respond(fundingVerbose)
 						return
 					}
+					if txid, _ := req.Params[0].(string); txid == fx.depositTxID && cfg.depositVerbose != "" {
+						respond(cfg.depositVerbose)
+						return
+					}
 					respondErr("vin tx not found")
 					return
 				}
 			}
 			respond(`"` + cfg.depositRaw + `"`)
 		case "gettxout":
+			if len(req.Params) > 1 {
+				if v, ok := req.Params[1].(float64); ok && v == 1 && cfg.confsVout1 != "" {
+					if cfg.confsVout1 == "null" {
+						respond(`null`)
+						return
+					}
+					respond(cfg.confsVout1)
+					return
+				}
+			}
 			if cfg.confsNull {
 				respond(`null`)
 				return
@@ -800,6 +816,53 @@ func TestCheckDepositTransaction(t *testing.T) {
 	t.Run("gettxout unknown waits", func(t *testing.T) {
 		c, _ := newDeposit(&checkDepositServer{confsNull: true}, nil)
 		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+
+	// Zero-conf chain visibility (live-proven S2 hole: the facade serves
+	// wallet-known bytes for a broadcast the chain never saw, and with
+	// Confirmations=0 the gettxout gate is skipped — B validated a phantom).
+	t.Run("zero-conf wallet-only waits", func(t *testing.T) {
+		c, cfg := newDeposit(&checkDepositServer{}, nil)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 0)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+		// Must have asked the chain (verbose), not trusted wallet bytes alone.
+		found := false
+		for _, m := range cfg.calls {
+			if m == "getrawtransaction" {
+				found = true
+			}
+		}
+		if !found || len(cfg.calls) < 2 {
+			t.Fatalf("call log = %v, want a verbose chain-visibility query", cfg.calls)
+		}
+	})
+
+	t.Run("zero-conf chain-visible proceeds", func(t *testing.T) {
+		verbose := fmt.Sprintf(`{"txid":%q,"confirmations":0,"vin":[],"vout":[]}`, fx.depositTxID)
+		c, cfg := newDeposit(&checkDepositServer{depositVerbose: verbose}, nil)
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 0)
+		if err != nil {
+			t.Fatalf("CheckDepositTransaction: %v", err)
+		}
+		if !dc.IsGood {
+			t.Fatalf("expected IsGood, got %+v", dc)
+		}
+		// No gettxout gate at 0-conf; verbose deposit + verbose prevout seen.
+		want := []string{"getrawtransaction", "getrawtransaction", "getrawtransaction"}
+		if len(cfg.calls) != len(want) {
+			t.Fatalf("call log = %v, want %v", cfg.calls, want)
+		}
+	})
+
+	t.Run("zero-conf conflicted waits", func(t *testing.T) {
+		verbose := fmt.Sprintf(`{"txid":%q,"confirmations":-1,"vin":[],"vout":[]}`, fx.depositTxID)
+		c, _ := newDeposit(&checkDepositServer{depositVerbose: verbose}, nil)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 0)
 		if !errors.Is(err, ErrDepositNotReady) {
 			t.Fatalf("err = %v, want ErrDepositNotReady", err)
 		}
@@ -904,13 +967,278 @@ func TestCheckDepositTransaction(t *testing.T) {
 	})
 
 	t.Run("no confirmation gate when required=0", func(t *testing.T) {
-		c, _ := newDeposit(&checkDepositServer{confsNull: true}, nil)
+		// gettxout is never consulted at 0-conf (confsNull proves it), but
+		// the chain-visibility gate applies instead: wallet bytes alone are
+		// not enough.
+		verbose := fmt.Sprintf(`{"txid":%q,"confirmations":0,"vin":[],"vout":[]}`, fx.depositTxID)
+		c, _ := newDeposit(&checkDepositServer{confsNull: true, depositVerbose: verbose}, nil)
 		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 0)
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
 		if !dc.IsGood {
-			t.Fatalf("expected good (gate skipped), got %+v", dc)
+			t.Fatalf("expected good (gettxout skipped, chain visible), got %+v", dc)
 		}
 	})
+
+	t.Run("p2sh at vout1 gates on vout1", func(t *testing.T) {
+		// Deposit with the P2SH at output 1 (change first): the entry gate
+		// reads gettxout(txid, 0) like C++ (whose depositTxVout out-param is
+		// still 0 there), but confirmations must be judged on the actual
+		// P2SH output once discovered.
+		swapOutputs := func(tx *coins.Tx) {
+			tx.Outputs[0], tx.Outputs[1] = tx.Outputs[1], tx.Outputs[0]
+		}
+		c, _ := newDeposit(&checkDepositServer{}, swapOutputs)
+		dc, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !dc.IsGood || dc.DepositVout != 1 || dc.P2SHAmount != 2500226 {
+			t.Fatalf("verdict = %+v, want IsGood with P2SHAmount 2500226 vout 1", dc)
+		}
+	})
+
+	t.Run("spent p2sh at vout1 waits", func(t *testing.T) {
+		// gettxout(txid, 0) reports 6 confirmations but the P2SH output
+		// itself is spent/missing: judging the tx-level hit would accept a
+		// deposit whose HTLC output is gone. Must wait, not accept.
+		swapOutputs := func(tx *coins.Tx) {
+			tx.Outputs[0], tx.Outputs[1] = tx.Outputs[1], tx.Outputs[0]
+		}
+		c, _ := newDeposit(&checkDepositServer{confsVout1: "null"}, swapOutputs)
+		_, err := c.CheckDepositTransaction(fx.depositTxID, fx.p2shScriptHex, depositAmountXB, 3)
+		if !errors.Is(err, ErrDepositNotReady) {
+			t.Fatalf("err = %v, want ErrDepositNotReady", err)
+		}
+	})
+}
+
+// GetBalance fallback goldens — live-proven against non-Core backends
+// (xlite-daemon 0.5.15 facades), which answer -32601 Method not found to
+// "getbalance" while serving "listunspent". C++ never calls getbalance over
+// RPC (it uses its in-process CWallet::GetBalance()), so the Go connector
+// must degrade to a confirmed-UTXO sum there instead of failing every take.
+// ---------------------------------------------------------------------------
+
+// balanceServer serves getbalance/listunspent with per-test bodies and records
+// call order, so tests can assert fallback precedence (legacy first,
+// listunspent only on -32601, never on other errors).
+type balanceServer struct {
+	getbalance  string // result body; "" → RPC error -32601
+	authFail    bool   // getbalance answers HTTP 401
+	otherErr    bool   // getbalance answers RPC error -1 (non-fallback error)
+	listunspent string // result body for listunspent
+	listErr     bool   // listunspent answers RPC error -5
+	calls       []string
+}
+
+func newBalanceServer(t *testing.T, cfg *balanceServer) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		cfg.calls = append(cfg.calls, req.Method)
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		res := func(raw string) { _ = enc.Encode(rpcResponse{Result: json.RawMessage(raw), ID: req.ID}) }
+		rerr := func(code int, msg string) {
+			_ = enc.Encode(rpcResponse{Error: &rpcError{Code: code, Message: msg}, ID: req.ID})
+		}
+		switch req.Method {
+		case "getbalance":
+			switch {
+			case cfg.authFail:
+				w.WriteHeader(http.StatusUnauthorized)
+			case cfg.otherErr:
+				rerr(-1, "some other failure")
+			case cfg.getbalance != "":
+				res(cfg.getbalance)
+			default:
+				rerr(-32601, "Method not found.")
+			}
+		case "listunspent":
+			if cfg.listErr {
+				rerr(-5, "listunspent failed")
+			} else {
+				res(cfg.listunspent)
+			}
+		case "sendrawtransaction":
+			res(`"txid1234567890"`)
+		default:
+			res(`null`)
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+// balanceFixture mixes every C++ listUnspent filter branch: 1.5 confirmed
+// (kept), 2.0 zero-conf (dropped), 0.4 unspendable (dropped), 0.0 amount
+// (dropped), 0.5 with absent confirmations (kept, C++ confs==-1 rule).
+const balanceFixture = `[
+		{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0,"address":"addr1","amount":1.5,"scriptPubKey":"76a914deadbeef88ac","confirmations":6,"spendable":true},
+		{"txid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","vout":1,"address":"addr2","amount":2.0,"scriptPubKey":"76a914deadbeef88ac","confirmations":0,"spendable":true},
+		{"txid":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","vout":2,"address":"addr3","amount":0.4,"scriptPubKey":"76a914deadbeef88ac","confirmations":9,"spendable":false},
+		{"txid":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","vout":3,"address":"addr4","amount":0.0,"scriptPubKey":"76a914deadbeef88ac","confirmations":9,"spendable":true},
+		{"txid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","vout":4,"address":"addr5","amount":0.5,"scriptPubKey":"76a914deadbeef88ac"}
+	]`
+
+func balanceConn(t *testing.T, cfg *balanceServer) (*RPCConnector, *httptest.Server) {
+	t.Helper()
+	srv := newBalanceServer(t, cfg)
+	return NewRPCConnector(Chain{Ticker: "BLOCK", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8}), srv
+}
+
+func TestGetBalanceLegacyPrimary(t *testing.T) {
+	cfg := &balanceServer{getbalance: `2.5`, listunspent: balanceFixture}
+	c, srv := balanceConn(t, cfg)
+	defer srv.Close()
+	bal, err := c.GetBalance()
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if bal != 250000000 {
+		t.Fatalf("bal = %d, want 250000000", bal)
+	}
+	// Precedence lock: the legacy path must not touch listunspent, so a
+	// backend that serves getbalance sees byte-identical behavior to before.
+	for _, m := range cfg.calls {
+		if m == "listunspent" {
+			t.Fatalf("legacy getbalance path called listunspent: %v", cfg.calls)
+		}
+	}
+}
+
+func TestGetBalanceFallbackMethodNotFound(t *testing.T) {
+	cfg := &balanceServer{listunspent: balanceFixture}
+	c, srv := balanceConn(t, cfg)
+	defer srv.Close()
+	bal, err := c.GetBalance()
+	if err != nil {
+		t.Fatalf("GetBalance fallback: %v", err)
+	}
+	// Kept: 1.5 (confirmed) + 0.5 (absent confirmations) = 2.0 BTC.
+	if bal != 200000000 {
+		t.Fatalf("bal = %d, want 200000000", bal)
+	}
+	if len(cfg.calls) != 2 || cfg.calls[0] != "getbalance" || cfg.calls[1] != "listunspent" {
+		t.Fatalf("call order = %v, want [getbalance listunspent]", cfg.calls)
+	}
+}
+
+func TestGetBalanceFallbackPropagatesListUnspentError(t *testing.T) {
+	cfg := &balanceServer{listErr: true}
+	c, srv := balanceConn(t, cfg)
+	defer srv.Close()
+	if _, err := c.GetBalance(); err == nil {
+		t.Fatal("GetBalance with failing listunspent must error, not report zero")
+	}
+}
+
+func TestGetBalanceNoFallbackOnOtherError(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		authFail bool
+		otherErr bool
+	}{
+		{"auth", true, false},
+		{"rpc-other", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &balanceServer{authFail: tc.authFail, otherErr: tc.otherErr, listunspent: balanceFixture}
+			c, srv := balanceConn(t, cfg)
+			defer srv.Close()
+			if _, err := c.GetBalance(); err == nil {
+				t.Fatal("GetBalance must surface non-32601 errors, not fall back")
+			}
+			// Anti-masking: an auth/credential failure must never be hidden
+			// behind a listunspent call (which would report INSUFFICIENT_FUNDS).
+			for _, m := range cfg.calls {
+				if m == "listunspent" {
+					t.Fatalf("non-32601 error triggered listunspent: %v", cfg.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestSendRawTransactionSingleParam(t *testing.T) {
+	var gotParams []interface{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		gotParams = req.Params
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"result":"txid1234567890","error":null,"id":%q}`, req.ID)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BLOCK", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	txid, err := c.SendRawTransaction("abcd")
+	if err != nil {
+		t.Fatalf("SendRawTransaction: %v", err)
+	}
+	if txid != "txid1234567890" {
+		t.Fatalf("txid = %q", txid)
+	}
+	// Strict wallets (facade usage gate: exactly 1 param) reject the Core
+	// 2-arg form; Core accepts 1 arg with identical semantics
+	// (allowhighfees defaults false), so a single hex param works on both.
+	if len(gotParams) != 1 || gotParams[0] != "abcd" {
+		t.Fatalf("sendrawtransaction params = %v, want [abcd]", gotParams)
+	}
+}
+
+// TestGetRawTransactionVerbose proves the verbose decoder serves the
+// deposit-existence fallback: confirmations plus per-output native value and
+// script hex, converted through the coin's decimals (facade wire shape:
+// whole-coin float value, hex scriptPubKey).
+func TestGetRawTransactionVerbose(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if req.Method != "getrawtransaction" {
+			t.Errorf("method = %q, want getrawtransaction", req.Method)
+		}
+		// Verbose form is [txid, 1] (C++ show-tx shape); anything else is
+		// a usage error so a wrong-arity call cannot silently pass.
+		if len(req.Params) != 2 {
+			t.Errorf("params = %v, want [txid 1]", req.Params)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"result":{"txid":"%s","confirmations":15,"vout":[{"value":0.01010002,"n":0,"scriptPubKey":{"hex":"a9146a1c36bb5ad92adb9e65c5968652f364326581ec87"}},{"value":0.16943998,"n":1,"scriptPubKey":{"hex":"76a914abea45e4519baa43b1b2683558c8fca2c978641b88ac"}}]},"error":null,"id":%q}`,
+			"396ddcdaf9bcd6beeedb0951b982bb1af8f935e3d906a39a1f1fc7365487636d", req.ID)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BLOCK", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	vtx, err := c.GetRawTransactionVerbose("396ddcdaf9bcd6beeedb0951b982bb1af8f935e3d906a39a1f1fc7365487636d")
+	if err != nil {
+		t.Fatalf("GetRawTransactionVerbose: %v", err)
+	}
+	if vtx.Confirmations != 15 {
+		t.Fatalf("confirmations = %d, want 15", vtx.Confirmations)
+	}
+	out, ok := vtx.Outputs[0]
+	if !ok {
+		t.Fatalf("vout 0 missing: %+v", vtx.Outputs)
+	}
+	if out.Value != 1010002 {
+		t.Fatalf("vout0 value = %d, want 1010002", out.Value)
+	}
+	if out.ScriptHex != "a9146a1c36bb5ad92adb9e65c5968652f364326581ec87" {
+		t.Fatalf("vout0 script = %q", out.ScriptHex)
+	}
+	if _, ok := vtx.Outputs[1]; !ok {
+		t.Fatalf("vout 1 missing: %+v", vtx.Outputs)
+	}
 }

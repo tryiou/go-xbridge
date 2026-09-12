@@ -58,6 +58,37 @@ type rpcResponse struct {
 	ID     string          `json:"id"`
 }
 
+// RPCError is a wallet RPC "error" object (code + message). Call returns it
+// (not a plain fmt error) so callers can branch on the code — e.g. -32601
+// Method not found selects the non-Core-backend fallback in GetBalance,
+// while every other failure keeps today's surface behavior.
+type RPCError struct {
+	Code    int
+	Message string
+}
+
+func (e *RPCError) Error() string {
+	return fmt.Sprintf("wallet: rpc error %d: %s", e.Code, e.Message)
+}
+
+// RPCErrorCode unwraps the RPC status code from a Call error (nil-safe via
+// errors.As, so it survives wrapErr). Callers branch on backend capability
+// codes (e.g. -32601 method-not-found fallbacks) while every other failure
+// keeps today's surface behavior.
+func RPCErrorCode(err error) (int, bool) {
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) {
+		return rpcErr.Code, true
+	}
+	return 0, false
+}
+
+// isMethodNotFound reports whether err is (or wraps) an RPC -32601.
+func isMethodNotFound(err error) bool {
+	code, ok := RPCErrorCode(err)
+	return ok && code == -32601
+}
+
 // defaultRPCTimeout bounds each JSON-RPC call when a chain sets no explicit
 // timeout, so a hung wallet/node cannot wedge the caller indefinitely.
 const defaultRPCTimeout = 30 * time.Second
@@ -145,7 +176,7 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 	}
 	if r.Error != nil {
 		xlog.Error("rpc error", "coin", c.ticker, "method", method, "code", r.Error.Code, "msg", r.Error.Message)
-		return fmt.Errorf("wallet: rpc error %d: %s", r.Error.Code, r.Error.Message)
+		return &RPCError{Code: r.Error.Code, Message: r.Error.Message}
 	}
 	if out != nil && len(r.Result) > 0 && string(r.Result) != "null" {
 		if err := json.Unmarshal(r.Result, out); err != nil {
@@ -186,13 +217,30 @@ func (c *RPCConnector) Ticker() string { return c.chain.Ticker }
 // Endpoint returns the configured wallet RPC endpoint (e.g. http://host:port).
 func (c *RPCConnector) Endpoint() string { return c.chain.Endpoint }
 
-// GetBalance returns the wallet-wide available balance in native base units via
-// the getbalance RPC (C++ CWallet::GetBalance()). The wallet returns a
-// whole-coin float; it is converted to base units through the coin's decimals.
+// GetBalance returns the wallet-wide available balance in native base units.
+// It calls the getbalance RPC (C++ CWallet::GetBalance()); the wallet returns
+// a whole-coin float converted through the coin's decimals. Backends without
+// getbalance (C++ never calls it over RPC — it uses its in-process wallet;
+// non-Core backends answer -32601) fall back to summing confirmed UTXOs via
+// ListUnspent(1): same confirmed-only, lock-inclusive, script-unfiltered
+// semantics as CWallet::GetBalance, in integer base units. The fallback
+// engages ONLY on -32601; any other getbalance failure surfaces unchanged so
+// an auth/transport fault is never masked as an empty balance.
 func (c *RPCConnector) GetBalance() (uint64, error) {
 	var v float64
 	if err := c.cli.Call("getbalance", nil, &v); err != nil {
-		return 0, c.wrapErr("getbalance", err)
+		if !isMethodNotFound(err) {
+			return 0, c.wrapErr("getbalance", err)
+		}
+		out, lerr := c.ListUnspent(1)
+		if lerr != nil {
+			return 0, lerr
+		}
+		var total uint64
+		for _, u := range out {
+			total += u.Amount
+		}
+		return total, nil
 	}
 	bal, err := amountFloatToBase(c.chain.Decimals, v)
 	if err != nil {
@@ -332,10 +380,14 @@ func (c *RPCConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (strin
 	return res.Hex, res.Complete, nil
 }
 
-// SendRawTransaction broadcasts txHex, returning the network txid.
+// SendRawTransaction broadcasts txHex, returning the network txid. The hex is
+// sent as the SOLE param: the second parameter is optional on every Core
+// version (legacy allowhighfees, modern maxfeerate — both defaulted when
+// omitted), while strict wallets reject the explicit 2-arg [hex, false] form
+// with a usage error (facade: exactly 1 param).
 func (c *RPCConnector) SendRawTransaction(txHex string) (string, error) {
 	var txid string
-	if err := c.cli.Call("sendrawtransaction", []interface{}{txHex, false}, &txid); err != nil {
+	if err := c.cli.Call("sendrawtransaction", []interface{}{txHex}, &txid); err != nil {
 		return "", c.wrapErr("sendrawtransaction", err)
 	}
 	return txid, nil
@@ -511,6 +563,29 @@ func (c *RPCConnector) getRawTransactionVerbose(txid string) (*rpcRawTxVerbose, 
 	return &out, nil
 }
 
+// GetRawTransactionVerbose returns the decoded transaction with chain context
+// (confirmations, per-output native value + script hex) for the
+// deposit-existence fallback (see the Connector contract). Values convert
+// through the coin's decimals; outputs key by their on-chain index.
+func (c *RPCConnector) GetRawTransactionVerbose(txid string) (VerboseTx, error) {
+	raw, err := c.getRawTransactionVerbose(txid)
+	if err != nil {
+		return VerboseTx{}, err
+	}
+	vtx := VerboseTx{TxID: txid, Outputs: make(map[uint32]VerboseTxOut, len(raw.Vout))}
+	if raw.Confirmations != nil {
+		vtx.Confirmations = *raw.Confirmations
+	}
+	for _, o := range raw.Vout {
+		amt, aerr := amountFloatToBase(c.chain.Decimals, o.Value)
+		if aerr != nil {
+			return VerboseTx{}, c.wrapErr("getrawtransaction", aerr)
+		}
+		vtx.Outputs[o.N] = VerboseTxOut{Value: amt, ScriptHex: o.ScriptPubKey.Hex}
+	}
+	return vtx, nil
+}
+
 // getTxOutConfirmations fetches a tx output's confirmations via gettxout
 // (C++ checkDepositTransaction confirmation gate, :2025-2034). ok=false when the
 // output is unknown or carries no confirmation count (both are "wait").
@@ -598,6 +673,23 @@ func (c *RPCConnector) CheckDepositTransaction(depositTxID, expectedScriptHex st
 			xlog.Debug("checkDepositTransaction: ...waiting", "txid", depositTxID, "confs", confs, "required", requiredConfirmations)
 			return dc, fmt.Errorf("%w: confirmations %d of %d", ErrDepositNotReady, confs, requiredConfirmations)
 		}
+	} else {
+		// Zero-conf chain-visibility gate (no C++ analog — C++ reads its own
+		// mempool, which IS the chain view). The verbosity-0 fetch above is
+		// wallet-local: a facade serves wallet-known bytes for a broadcast
+		// the chain never saw (live-proven: accepted send, absent everywhere,
+		// counterparty validated the phantom). Require the verbose
+		// chain/mempool view to know the tx too; unknown or conflicted there
+		// is "wait", never proceed.
+		vtx, verr := c.getRawTransactionVerbose(depositTxID)
+		if verr != nil {
+			xlog.Debug("checkDepositTransaction: deposit not visible to chain ...waiting", "txid", depositTxID, "err", verr)
+			return dc, fmt.Errorf("%w: chain visibility unknown", ErrDepositNotReady)
+		}
+		if vtx.Confirmations != nil && *vtx.Confirmations < 0 {
+			xlog.Debug("checkDepositTransaction: deposit conflicted ...waiting", "txid", depositTxID)
+			return dc, fmt.Errorf("%w: deposit conflicted", ErrDepositNotReady)
+		}
 	}
 
 	// Vin scan: sequence + prevout amounts (C++ :2049-2127).
@@ -661,6 +753,26 @@ func (c *RPCConnector) CheckDepositTransaction(depositTxID, expectedScriptHex st
 	if depositP2SHAmount == 0 {
 		xlog.Debug("checkDepositTransaction: no valid p2sh in deposit transaction", "txid", depositTxID)
 		return dc, nil // done: bad
+	}
+
+	// Confirmation re-gate on the ACTUAL P2SH output. The entry gate above
+	// reads gettxout(txid, 0) — matching C++, whose depositTxVout out-param
+	// is still 0 on first entry — but when the deposit places the P2SH at a
+	// nonzero index, spent-ness and confirmations must be judged on that
+	// output: a tx-level hit on vout 0 says nothing about the HTLC output.
+	// An honest unspent deposit reports the same confirmations on both, so
+	// the accept set is unchanged; a spent/missing P2SH output waits instead
+	// of judging a stale view.
+	if requiredConfirmations > 0 && depositTxVout != 0 {
+		confs, ok := c.getTxOutConfirmations(depositTxID, depositTxVout)
+		if !ok {
+			xlog.Debug("checkDepositTransaction: p2sh output spent or missing in gettxout", "txid", depositTxID, "vout", depositTxVout)
+			return dc, fmt.Errorf("%w: p2sh gettxout unknown", ErrDepositNotReady)
+		}
+		if confs < requiredConfirmations {
+			xlog.Debug("checkDepositTransaction: p2sh ...waiting", "txid", depositTxID, "confs", confs, "required", requiredConfirmations)
+			return dc, fmt.Errorf("%w: p2sh confirmations %d of %d", ErrDepositNotReady, confs, requiredConfirmations)
+		}
 	}
 
 	// Fee checks (C++ :2172-2193).

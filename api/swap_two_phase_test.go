@@ -246,6 +246,17 @@ func TestTwoPhaseConfirmBSecretRecovery(t *testing.T) {
 	s.theirPub = to33(mkPub)
 	s.theirDepositVout = 0
 	s.theirP2SHNative = 2.5e8
+	// The fixture payTx spends outpoint ee:0: that is the taker's own LTC
+	// deposit (C++ binTxId/binTxVout), which the maker redeemed to reveal
+	// the secret. Extraction binds to it (xbridgesession.cpp:3935).
+	s.ourDepositTxID = strings.Repeat("ee", 32)
+	// The validated maker BTC deposit must exist on-chain for the claim-path
+	// unspent re-check (in production it was broadcast at CreateA and
+	// validated at CreateB; this fixture seeds validation directly).
+	ccTx := &coins.Tx{Version: 1}
+	ccTx.Inputs = append(ccTx.Inputs, coins.TxIn{Sequence: 0xffffffff})
+	ccTx.Outputs = append(ccTx.Outputs, coins.TxOut{Value: 2.5e8, ScriptPubKey: []byte{0x51}})
+	btcConn.setRawTx(strings.Repeat("cc", 32), hex.EncodeToString(ccTx.Serialize()))
 
 	n.submit(func() {
 		if _, _, err := s.OnConfirmB(&proto.ConfirmBBody{HubAddress: [20]byte{}, ID: orderID, APayTxID: makerPayTxID}); err != nil {

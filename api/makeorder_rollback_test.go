@@ -67,7 +67,7 @@ func TestMakeOrderStoreAddSendFailureRollback(t *testing.T) {
 
 	// The durable copy must also lack the order: a restart must not resurrect an
 	// orphan the hub never received.
-	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	ps, _, err := loadSwaps(swapStatePath(n.config.DataDir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}

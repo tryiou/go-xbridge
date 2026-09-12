@@ -404,6 +404,11 @@ func (b *HoldBody) Unmarshal(data []byte) error {
 	if b.ToAmount, err = r.Uint64(); err != nil {
 		return err
 	}
+	// C++ requires exactly 20+32+8+8 = 68 bytes (xbridgesession.cpp:1328);
+	// trailing bytes are a malformed packet, not an extension.
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionHold body")
+	}
 	return nil
 }
 
@@ -432,6 +437,10 @@ func (b *HoldApplyBody) Unmarshal(data []byte) error {
 	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
+	}
+	// C++ requires exactly 20+20+32 = 72 bytes (xbridgesession.cpp:1554).
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionHoldApply body")
 	}
 	return nil
 }
@@ -496,6 +505,10 @@ func (b *InitBody) Unmarshal(data []byte) error {
 	if b.ToAmount, err = r.Uint64(); err != nil {
 		return err
 	}
+	// C++ requires exactly 144 bytes (xbridgesession.cpp:1680).
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionInit body")
+	}
 	return nil
 }
 
@@ -524,6 +537,11 @@ func (b *InitializedBody) Unmarshal(data []byte) error {
 	}
 	if b.ID, err = r.Hash(); err != nil {
 		return err
+	}
+	// C++ requires exactly 20+20+32 = 72 bytes (xbridgesession.cpp:1786; the
+	// message text saying 104 is stale).
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionInitialized body")
 	}
 	return nil
 }
@@ -571,6 +589,10 @@ func (b *CreateABody) Unmarshal(data []byte) error {
 	}
 	if b.BPubKey, err = r.PubKey(); err != nil {
 		return err
+	}
+	// C++ requires exactly 20+32+33 = 85 bytes (xbridgesession.cpp:1898).
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionCreateA body")
 	}
 	return nil
 }
@@ -748,6 +770,10 @@ func (b *ConfirmABody) Unmarshal(data []byte) error {
 	if b.BLockTime, err = r.Uint32(); err != nil {
 		return err
 	}
+	// C++ requires 56 < size <= 1000 (xbridgesession.cpp:2853).
+	if len(data) <= 56 || len(data) > 1000 {
+		return errors.New("xbridge: bad length in xbcTransactionConfirmA body")
+	}
 	return nil
 }
 
@@ -777,6 +803,10 @@ func (b *ConfirmedABody) Unmarshal(data []byte) error {
 	}
 	if b.APayTxID, err = r.String(); err != nil {
 		return err
+	}
+	// C++ requires 52 < size <= 1000 (xbridgesession.cpp:3026).
+	if len(data) <= 52 || len(data) > 1000 {
+		return errors.New("xbridge: bad length in xbcTransactionConfirmedA body")
 	}
 	return nil
 }
@@ -808,6 +838,10 @@ func (b *ConfirmBBody) Unmarshal(data []byte) error {
 	if b.APayTxID, err = r.String(); err != nil {
 		return err
 	}
+	// C++ requires 52 < size <= 1000 (xbridgesession.cpp:3110).
+	if len(data) <= 52 || len(data) > 1000 {
+		return errors.New("xbridge: bad length in xbcTransactionConfirmB body")
+	}
 	return nil
 }
 
@@ -836,6 +870,10 @@ func (b *ConfirmedBBody) Unmarshal(data []byte) error {
 	}
 	if b.BPayTxID, err = r.String(); err != nil {
 		return err
+	}
+	// C++ requires 52 < size <= 1000 (xbridgesession.cpp:3209).
+	if len(data) <= 52 || len(data) > 1000 {
+		return errors.New("xbridge: bad length in xbcTransactionConfirmedB body")
 	}
 	return nil
 }
@@ -921,6 +959,10 @@ func (b *FinishedBody) Unmarshal(data []byte) error {
 	var err error
 	if b.ID, err = r.Hash(); err != nil {
 		return err
+	}
+	// C++ requires exactly 32 bytes (xbridgesession.cpp:3778).
+	if r.remaining() != 0 {
+		return errors.New("xbridge: trailing bytes in xbcTransactionFinished body")
 	}
 	return nil
 }

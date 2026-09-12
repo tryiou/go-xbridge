@@ -45,6 +45,15 @@ type stubConn struct {
 	// verifyFail, when set, makes VerifyMessage reject every proof (forged
 	// inbound-order proof tests).
 	verifyFail bool
+	// txOutErr, when set, makes GetTxOut fail (facade-blind gettxout tests).
+	txOutErr error
+	// verboseTx serves GetRawTransactionVerbose per txid; verboseErr, when
+	// set, makes it fail (deposit-existence fallback tests).
+	verboseTx  map[string]wallet.VerboseTx
+	verboseErr error
+	// verboseCalls records GetRawTransactionVerbose calls (precedence lock:
+	// the Core path must never touch it).
+	verboseCalls int
 }
 
 func (s *stubConn) Ticker() string { return s.ticker }
@@ -113,12 +122,26 @@ func (s *stubConn) VerifyMessage(address string, sig []byte, message string) (bo
 }
 
 func (s *stubConn) GetTxOut(txid string, vout uint32) (wallet.Utxo, bool, error) {
+	if s.txOutErr != nil {
+		return wallet.Utxo{}, false, s.txOutErr
+	}
 	for _, u := range s.utxos {
 		if u.TxID == txid && u.Vout == vout {
 			return u, true, nil
 		}
 	}
 	return wallet.Utxo{}, false, nil
+}
+
+func (s *stubConn) GetRawTransactionVerbose(txid string) (wallet.VerboseTx, error) {
+	s.verboseCalls++
+	if s.verboseErr != nil {
+		return wallet.VerboseTx{}, s.verboseErr
+	}
+	if v, ok := s.verboseTx[txid]; ok {
+		return v, nil
+	}
+	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
 }
 
 // valid BTC P2PKH address (prefix 0x00), used as both destination and change.
@@ -693,5 +716,32 @@ func TestDxGetNetworkTokensLive(t *testing.T) {
 		if !want[tk] {
 			t.Errorf("unexpected token %q in %v", tk, ns)
 		}
+	}
+}
+
+// TestConfirmDepositKnownByRawTxConfBar unit-proves the degraded claim gate's
+// confirmation bar with minConf>0 (the swap-level test only exercises
+// minConf=0): exact script+value at depth passes, shallow depth fails, and a
+// verbose failure fails closed.
+func TestConfirmDepositKnownByRawTxConfBar(t *testing.T) {
+	const txid = "deposit-txid"
+	const script = "a914deadbeef87"
+	s := &stubConn{verboseTx: map[string]wallet.VerboseTx{
+		txid: {TxID: txid, Confirmations: 6, Outputs: map[uint32]wallet.VerboseTxOut{
+			0: {Value: 100000, ScriptHex: script},
+		}},
+	}}
+	if !confirmDepositKnownByRawTx(s, txid, 0, script, 100000, 2) {
+		t.Fatal("depth 6, bar 2: must proceed")
+	}
+	if confirmDepositKnownByRawTx(s, txid, 0, script, 100000, 7) {
+		t.Fatal("depth 6, bar 7: must wait")
+	}
+	if confirmDepositKnownByRawTx(s, txid, 1, script, 100000, 2) {
+		t.Fatal("missing vout: must wait")
+	}
+	s.verboseErr = &wallet.RPCError{Code: -5, Message: "gone"}
+	if confirmDepositKnownByRawTx(s, txid, 0, script, 100000, 2) {
+		t.Fatal("verbose failure: must wait")
 	}
 }

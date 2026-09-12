@@ -304,6 +304,32 @@ func TestPickEligible(t *testing.T) {
 	}
 }
 
+// TestPickExcludesNotIn verifies Pick honors C++'s `notIn` exclusion set
+// (xbridgeapp.cpp:2910): a node a previous attempt failed against (e.g. a
+// cancel rebroadcast, :3274/:3311) is never re-picked.
+func TestPickExcludesNotIn(t *testing.T) {
+	reg := NewRegistry()
+	bad := pickPubkey(t, 6)
+	reg.AddPing(ServiceNode{PubKey: bad, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: proto.ProtocolVersion})
+	good := pickPubkey(t, 7)
+	reg.AddPing(ServiceNode{PubKey: good, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: proto.ProtocolVersion})
+
+	pk, ok := reg.Pick([]string{"BTC", "LTC"}, bad)
+	if !ok {
+		t.Fatal("Pick with one exclusion should still succeed")
+	}
+	if pk != good {
+		t.Fatalf("Pick returned excluded node %x, want %x", pk, good)
+	}
+	if _, ok := reg.Pick([]string{"BTC", "LTC"}, bad, good); ok {
+		t.Fatal("Pick excluding every eligible node must return false")
+	}
+	// No exclusion preserves the old behavior.
+	if _, ok := reg.Pick([]string{"BTC", "LTC"}); !ok {
+		t.Fatal("Pick without exclusions must succeed")
+	}
+}
+
 // TestParseServiceNodePingRejectsFloatVersion verifies a float-formatted or
 // out-of-int32-range xbridgeversion is REJECTED like C++ UniValue::get_int()
 // (univalue_get.cpp:104-112): get_int() throws, parseConfig's catch

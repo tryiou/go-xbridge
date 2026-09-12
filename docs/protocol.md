@@ -304,9 +304,12 @@ Addressing and trust model (client side):
   handshake commands; an inbound `xbcTransaction` (cmd-3, server-side command)
   has no client handler and is ignored (C++ `xbridgesession.cpp:184-198`).
 - Inbound handshake packets are re-verified against the order's trusted hub key
-  (C++ `packet->verify(xtx->sPubKey)`, `xbridgesession.cpp:1364`) plus the
-  registry `getSn` check (`:1384`), so a forged `Finished` can never disable the
-  refund watcher. `xbcPendingTransaction` (cmd-4) is authenticated by the packet
+  (C++ `packet->verify(xtx->sPubKey)`, `xbridgesession.cpp:1364`). Registry
+  membership of that hub (`getSn`, `:1384`) is re-checked only before the
+  handshake starts; once the session advances past `Hold` the pinned key alone
+  authenticates, so a hub whose registration lapses mid-swap cannot abort an
+  in-flight trade C++ would still honour. A forged `Finished` can therefore
+  never disable the refund watcher. `xbcPendingTransaction` (cmd-4) is authenticated by the packet
   signature against its header pubkey (C++ `packet->verify(spubkey)`,
   `:736`) — the 20-byte "hub" field is the broadcaster's per-session id
   (`m_myid`, `xbridgesession.cpp:182-183`), a routing handle stored verbatim,
@@ -357,6 +360,14 @@ be trusted. The most important correction: the `Create*` / `Created*` /
 | 21 | `xbcTransactionConfirmedB` | Hub ‖ ID ‖ BPayTxID |
 | 24 | `xbcTransactionFinished`   | ID |
 
+Body-size enforcement mirrors the C++ receivers: fixed-size handshake bodies
+(`Hold` 68, `HoldApply` 72, `Init` 144, `Initialized` 72, `CreateA` 85,
+`Finished` 32, `Cancel`/`Reject` 36) reject trailing bytes exactly like C++
+(`xbridgesession.cpp:1328,1554,1680,1786,1898,3778,3293,3437`); the pay-txid
+bodies (`ConfirmA`, `ConfirmedA`, `ConfirmB`, `ConfirmedB`) enforce the C++
+`52/56 < size <= 1000` bounds (`:2853,3026,3110,3209`). Variable bodies
+(`CreatedA/B`, order/accept) enforce underflow only, like C++.
+
 Notes:
 
 - **`HashedSecret`** is the 20-byte HASH160 of the maker's secret preimage (the
@@ -376,8 +387,12 @@ Notes:
     the same `secretHash`.
 - The maker reveals the secret by broadcasting the ELSE-branch payTx that spends
   B's deposit; the taker recovers the 33-byte preimage from A's payTx
-  (`GetRawTransaction(APayTxID)`, first 33-byte push of input[0].ScriptSig) and
-  spends A's deposit. This is implemented in `api/swap.go` (`TestSwapHandshake`
+  (`GetRawTransaction(APayTxID)`), accepting only a vin that spends the
+  taker's own deposit at vout 0 with a 33-byte push whose HASH160 matches the
+  secret hash (C++ `getSecretFromPaymentTransaction`,
+  `xbridgewalletconnectorbtc.cpp:2249-2254`, called with the taker's own
+  `binTxId/binTxVout` at `xbridgesession.cpp:3935` — own deposits always place
+  the P2SH at output 0). This is implemented in `api/swap.go` (`TestSwapHandshake`
   in `api/swap_test.go` drives it end-to-end with fake connectors).
 
 ### 4.2 Non-swap body layouts (order broadcast, accept, cancel)

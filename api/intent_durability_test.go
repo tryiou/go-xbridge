@@ -43,7 +43,7 @@ func TestDepositIntentDurableBeforeBroadcast(t *testing.T) {
 		t.Fatalf("broadcasts = %d, want 0 (intent must precede broadcast)", len(conn.broadcasts))
 	}
 	// The intent is durable: refundHex + txid + lockTime on disk.
-	ps, err := loadSwaps(swapStatePath(dir))
+	ps, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}

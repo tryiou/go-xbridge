@@ -671,6 +671,16 @@ const runningWindow = 5 * time.Minute
 // (mirrors ServiceNode::running(), servicenode.h:244-247). The subtraction is
 // signed like C++ GetAdjustedTime() - pingtime, so a pingtime in the future
 // (clock skew) still counts as running.
+//
+// C++ additionally gates on !invalid || within VALID_GRACEPERIOD_BLOCKS(2)
+// (servicenode.h:244-247,254-260): a node whose ping validation starts
+// failing stays eligible for a 2-block grace. This port has no invalid state
+// to grace: pings failing validation are never admitted (AddPing drops them,
+// registrationValid rejects them), so no invalid node can be running here.
+// That is strictly fail-closed relative to C++ (fewer eligible hubs, never
+// more) — a liveness-only direction; an order sent to a hub C++ would
+// still honor is unaffected, and a hub only Go rejects surfaces as a
+// NO_SERVICE_NODE / timeout-cancel, never a fund-loss path.
 func (r *Registry) running(e *entry) bool {
 	if e == nil {
 		return false
@@ -684,17 +694,24 @@ func (r *Registry) running(e *entry) bool {
 // version equals XBRIDGE_PROTOCOL_VERSION, that are running(), and whose service
 // list contains every requested currency; shuffle; return the first. An empty
 // result means no eligible hub (C++ sendXBridgeTransaction fails the order
-// with NO_SERVICE_NODE, xbridgeapp.cpp:1515). C++ also excludes a `notIn`
-// key set (:2910), omitted because Go's sole caller (api/node.go:921) passes
-// an empty set like sendXBridgeTransaction (:1507-1508); rebroadcast callers
-// (:3274, :3311) pass non-empty sets but are not ported here. The shuffle
-// uses Go's rand rather than C++'s seed-0 default_random_engine — the choice
-// has no wire effect.
-func (r *Registry) Pick(need []string) ([33]byte, bool) {
+// with NO_SERVICE_NODE, xbridgeapp.cpp:1515). exclude carries C++'s `notIn`
+// key set (:2910): nodes a previous attempt already failed against (e.g. a
+// cancel rebroadcast, :3274/:3311) are never re-picked. Callers with no
+// exclusion pass none, matching sendXBridgeTransaction's empty set
+// (:1507-1508). The shuffle uses Go's rand rather than C++'s seed-0
+// default_random_engine — the choice has no wire effect.
+func (r *Registry) Pick(need []string, exclude ...[33]byte) ([33]byte, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	banned := make(map[[33]byte]bool, len(exclude))
+	for _, k := range exclude {
+		banned[k] = true
+	}
 	var list [][33]byte
 	for k, e := range r.nodes {
+		if banned[k] {
+			continue
+		}
 		if e.xbridgeVersion != proto.ProtocolVersion || !r.running(e) {
 			continue
 		}

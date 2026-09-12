@@ -56,7 +56,7 @@ func TestDepositBuildAndSign(t *testing.T) {
 	}}
 
 	c := coins.Coin{Decimals: 8}
-	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0, 0)
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRefundScriptSig(t *testing.T) {
 		ScriptPubKey: hex.EncodeToString(fundScript),
 	}}
 	c := coins.Coin{Decimals: 8}
-	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 0, 0)
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestDepositLocksAmountPlusFee2(t *testing.T) {
 	c := coins.Coin{Decimals: 8}
 	fee := uint64(1000)
 	fee2 := uint64(250)
-	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), fee, fee2)
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), fee, fee2, 0)
 	if err != nil {
 		t.Fatalf("BuildDepositTx: %v", err)
 	}
@@ -331,5 +331,49 @@ func TestDepositLocksAmountPlusFee2(t *testing.T) {
 	minAccepted := uint64(float64(fee2) * 0.95)
 	if deposit < spec.Amount+minAccepted {
 		t.Errorf("deposit %d < amount + 0.95*fee2 (%d)", deposit, spec.Amount+minAccepted)
+	}
+}
+
+// TestDepositDustChangeSuppressed verifies dust change is folded into the
+// miner fee instead of emitted as an output the relay would reject, mirroring
+// C++ (xbridgesession.cpp:2098-2106 `if (!connFrom->isDustAmount(rest))`).
+func TestDepositDustChangeSuppressed(t *testing.T) {
+	localPub, _ := randKey(t)
+	otherPub, _ := randKey(t)
+
+	spec := &DepositSpec{
+		Currency:        "BTC",
+		Amount:          1_000_000,
+		DepositorPub:    localPub,
+		CounterpartyPub: otherPub,
+		LockTime:        600,
+	}
+	fundScript := coins.BuildP2PKHScript(coins.KeyID(localPub[:]))
+	funding := []wallet.Utxo{{
+		TxID:         "0000000000000000000000000000000000000000000000000000000000000001",
+		Vout:         0,
+		Amount:       1_000_000 + 1000 + 250 + 100, // change of 100 < dustLimit
+		ScriptPubKey: hex.EncodeToString(fundScript),
+	}}
+	c := coins.Coin{Decimals: 8}
+	tx, err := spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 250, 546)
+	if err != nil {
+		t.Fatalf("BuildDepositTx: %v", err)
+	}
+	if len(tx.Outputs) != 1 {
+		t.Fatalf("dust change must be suppressed (1 output), got %d outputs", len(tx.Outputs))
+	}
+	if got := tx.Outputs[0].Value; got != spec.Amount+250 {
+		t.Fatalf("deposit P2SH value = %d, want %d (Amount+fee2)", got, spec.Amount+250)
+	}
+
+	// Change at exactly the dust limit is still emitted.
+	funding[0].Amount = 1_000_000 + 1000 + 250 + 546
+	tx, err = spec.BuildDepositTx(c, funding, coins.KeyID(localPub[:]), 1000, 250, 546)
+	if err != nil {
+		t.Fatalf("BuildDepositTx: %v", err)
+	}
+	if len(tx.Outputs) != 2 || tx.Outputs[1].Value != 546 {
+		t.Fatalf("change at dust limit must be emitted, got %+v", tx.Outputs)
 	}
 }

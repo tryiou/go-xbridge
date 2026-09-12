@@ -1720,6 +1720,11 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 			// actual method (rpcxbridge.cpp:3278/3392).
 			return nil, makeError(errBadRequest, method, err.Error())
 		}
+		// Track for confirmation watch (Phase 0): wallet utility tx, no
+		// order context by design.
+		if h.Node != nil {
+			h.Node.recordBroadcast("", broadcastSplit, ticker, txid, signedHex)
+		}
 	}
 	return splitTxResult{
 		Token:                ticker,

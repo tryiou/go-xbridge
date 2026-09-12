@@ -89,6 +89,10 @@ chain index requires — block ancestry and collateral-utxo
 existence/amount/ownership (`servicenode.h:401,447-478`) — cannot be made by a
 thin client (register WIRE-F71 FIXED (B1) for the enforceable subset; on-chain
 index checks remain thin-client-unreachable — see Rulings pending below).
+`Pick` ports `findShuffledNodesWithService` including the `notIn` exclusion
+set (failed hubs are never re-picked); `running()` has no `invalid` grace
+state because invalid pings are never admitted — strictly fail-closed
+relative to C++ (fewer eligible hubs, never more).
 
 ### `crypto/` — signing
 
@@ -209,7 +213,10 @@ driver is `api.SwapSession`/`clientState` (see "Client driver" below). Contents:
   minTxFee2(1,1)`, satisfying the C++ `depositP2SHAmount >= amount + 0.95*fee2`
   check), spending funding UTXOs stamped `SEQUENCE_FINAL` (0xffffffff, matching
   C++ `createRawTransaction(..., cltv=true)`); the CLTV-enabling non-final
-  sequence belongs on the *refund* spend only. The depositor generates a 33-byte
+  sequence belongs on the *refund* spend only. Change is dust-gated
+  (`!isDustAmount`, C++ `xbridgesession.cpp:2098-2106`) and returns to the
+  largest funding UTXO's address (C++ `largestUtxo.address`, `:2102`), a
+  wallet-watched address. The depositor generates a 33-byte
   `Secret`; `SecretHash()` is HASH160(Secret); the counterparty adopts only the
   `Hash`. Consumed by `api/swap.go`.
 - **`PartialOrderDriftCheck`** (`price.go`) — the price-integrity / satoshi-level
@@ -242,10 +249,16 @@ responds to hub-originated packets and performs the on-chain work
 the secret, pre-build the CLTV refund). Its progression is the `clientState`
 enum (`csMaker → csHoldApplied → csInitialized → csCreatedA/B → csConfirmedA/B →
 csFinished`). Driven end-to-end by `TestSwapHandshake` in `api/swap_test.go`
-with fake connectors. The CLTV refund (`BuildRefundScriptSig`) and ELSE-branch
+with fake connectors. At `Hold` the maker adopts the hub-relayed partial
+amounts into the session and the stored order (C++ `fromAmount=damount;
+toAmount=samount`, `xbridgesession.cpp:1525-1528`), so the maker deposit locks
+the partial amount; the taker requires an exact match. The CLTV refund (`BuildRefundScriptSig`) and ELSE-branch
 payment (`BuildPaymentScriptSig`, revealing the secret) are built locally; the
 taker recovers the secret from the maker's payTx via
-`conn.GetRawTransaction(APayTxID)`.
+`conn.GetRawTransaction(APayTxID)`, accepting only a vin that spends the
+taker's own deposit at vout 0 with a 33-byte push whose HASH160 matches
+(C++ `getSecretFromPaymentTransaction`, `xbridgewalletconnectorbtc.cpp:2249-2254`,
+called with the taker's own `binTxId/binTxVout` at `xbridgesession.cpp:3935`).
 
 ### `api/` — `dx*` RPC + swap driver
 
@@ -260,7 +273,10 @@ are in [`api.md`](api.md).
   auth, 32 MiB request-body cap (non-envelope 413).
 - `dispatch.go` — command dispatch table.
 - `node.go` — `Node`: inbound packet handling, hub-key re-verification of
-  handshake packets, engine-scheduled refund sweep, persistence reload.
+  handshake packets (registry membership re-checked only before the handshake
+  starts; the pinned key alone authenticates once underway), engine-scheduled
+  refund sweep, counterparty-deposit watch, open-order rebroadcast with hub
+  rotation, persistence reload.
 - `handlers.go` / `order.go` / `store.go` — per-command handlers, order model,
   bounded copy-on-write fills/history store.
 - `swap.go` — the three-party swap client driver, with the two-phase handshake
@@ -269,7 +285,11 @@ are in [`api.md`](api.md).
 - `persist.go` — per-trade state + keypair persistence to
   `<datadir>/xbridged-swaps.json`, flattened on the engine goroutine; the
   JSON marshal + checksum and the disk write run on the background `persistLoop`
-  (when the engine is not started, they run synchronously). On startup the
+  (when the engine is not started, they run synchronously). Persisted per
+  session: funding set, secrets, lockTimes, txids, the pre-signed refund, the
+  built claim (hex/id/chain, the manual-recovery record), and the validated
+  counterparty-deposit out-params (txid/vout/P2SHNative/overpayment) so a
+  restarted claim rebuilds against the exact output. On startup the
   strict checksum path loads valid files unchanged; a corrupt file is
   quarantined to `xbridged-swaps.json.bad.<unixnano>` and every
   individually-valid record is salvaged (unparseable and zero-ID records
@@ -277,7 +297,10 @@ are in [`api.md`](api.md).
   in-flight refund material — stale quarantine files accumulate for operator
   cleanup.
 - `locktime.go` — `acceptableLockTimeDrift`/`computeLockTimeFor` validating the
-  counterparty deposit lockTime before our deposit/redeem.
+  counterparty deposit lockTime before our deposit/redeem (a zero counterparty
+  lockTime fails the drift check into `crBadALockTime`/`crBadBLockTime`), and
+  failing the deposit build closed when our own lockTime is unavailable
+  (C++ cancels on `lockTime==0`, `xbridgesession.cpp:2037-2043`).
 
 ### Engine & concurrency (`api/`)
 
@@ -320,13 +343,21 @@ so the swap handshake and the refund sweep can never race each other.
 - **`submit(run, await)`** queues a handler/HTTP command for the engine; when
   the engine is not started (single-threaded tests) it runs inline. Off-engine
   callers marshal work onto the engine with `submit`: the RPC handlers
-  (`MakeOrder` node.go:1617, `TakeOrder` node.go:2037, `CancelOrder`
-  node.go:2156) and the `BroadcastRefund` escape hatch (swap.go:1389); tests
+  (`MakeOrder` node.go:1503, `TakeOrder` node.go:2039, `CancelOrder`
+  node.go:2505) and the `BroadcastRefund` escape hatch (swap.go:1923); tests
   drive the same path. Code already on the engine calls the internal functions
   directly (`processSwap`, `handleRemoteCancel`/`Reject`, `scanRefunds`).
 - **Ticker duties**: `scanRefunds` auto-broadcasts due pre-signed refunds (posting
-  worker tasks, never doing I/O on the engine), `pruneSessions` drops terminal
-  sessions so the live set stays bounded, and every 4th tick persists.
+  worker tasks, never doing I/O on the engine), `watchCounterpartyDeposits`
+  probes each live pre-claim session's validated counterparty deposit and
+  self-cancels with the role's deposit reason when it vanishes
+  (spent/reorged) instead of stalling on it, `pruneSessions` drops terminal
+  sessions so the live set stays bounded, and every 4th tick persists. The
+  15-second ticker prunes expired orders and re-posts open maker orders
+  (`rebroadcastOpenOrders`): funding UTXOs are re-validated first (spent
+  funding cancels with `crBadAUtxo`, C++ `orderUtxosAreStillValid`), and a
+  failed send rotates the order to a freshly-picked hub excluding the dead
+  one (C++ `notIn`).
 - **`Close()`** closes `n.stop`, then waits (`wg.Wait`) for every goroutine —
   including an in-flight wallet task — to drain *before* closing the connection,
   so no task ever writes after teardown.
@@ -368,7 +399,9 @@ confirmed deposits immediately.
 
 **Cancellation/refund:** `dxCancelOrder` or the engine-scheduled refund sweep on
 expiry; refund spends are built locally (`coins.BuildRefundScriptSig`) and
-broadcast through the wallet connector.
+broadcast through the wallet connector. Between validation and claim, the
+deposit watch cancels swaps whose counterparty deposit disappears instead of
+leaving them stranded.
 
 **Engine channels:** the reader pushes decoded packets onto `n.packets` (a
 full channel parks the reader until the engine drains — backpressure, matching
@@ -392,15 +425,23 @@ go test ./...           # unit tests
 Requires Go 1.25+ (toolchain 1.26 works). Add `-run TestName` to scope tests.
 The suite is hermetic — no live-network dials. Notable coverage:
 
-- `proto/` — packet/body codec round-trips + tamper.
-- `p2p/` — framing, envelope, version marshal; live-verified against a real
+- `proto/` — packet/body codec round-trips + tamper, fixed-body exact-size
+  gates, pay-txid length bounds.
+- `p2p/` — framing, envelope, version marshal; servicenode `Pick` exclusion;
+  live-verified against a real
   Blocknet 4.4.1 node via `cmd/liveprobe`.
 - `coins/` — BIP143 known-answer vectors, CashAddr round-trips, time-field
   sighash golden digests (C++ oracle), HTLC sign/verify.
-- `wallet/` — `httptest` JSON-RPC mock + a real P2SH HTLC sign/verify round-trip.
-- `swap/` — descriptor-enum ordinals, TTL constants, deposit-build/sign, price-drift check.
+- `wallet/` — `httptest` JSON-RPC mock + a real P2SH HTLC sign/verify round-trip;
+  deposit confirmation re-gated on the actual P2SH output.
+- `swap/` — descriptor-enum ordinals, TTL constants, deposit-build/sign
+  (dust-gated change), price-drift check.
 - `api/` — `TestSwapHandshake` drives the full three-party handshake end-to-end
-  with fake connectors; `api/concurrency_test.go` proves the single-owner engine
+  with fake connectors; partial-take Hold resize, locktime-zero fail-closed,
+  largest-funding change, hub-packet grace, claim-intent persist round-trip,
+  spent-funding rebroadcast cancel, hub rotation, and the deposit-watch
+  cancel/quiet/transient paths; secret extraction bound to the own-deposit
+  outpoint (decoy-vin rejection); `api/concurrency_test.go` proves the single-owner engine
   under `-race`: refund sweep interleaving with a deposit resume, no-fork
   concurrent takes, a parked wallet not stalling other sessions, and `Close()`
   draining in-flight tasks.
@@ -445,7 +486,6 @@ Long-standing open work:
   (STATE-F80), watch-claim (STATE-F81), processLater (STATE-F82),
   already-in-chain (STATE-F83), cancel-vs-rollback (STATE-F85), sweep 60 s→15 s
   (STATE-F86), fee fallback 0 (CRYPTO-F79), address leniency (CRYPTO-F81),
-  dust-change gate (CRYPTO-F100), secret prevout binding (CRYPTO-F101),
   own-fills recording (RPC-F19), accepting-window
   exposure (CONC-F95), partial-chain child-walk (RPC-F27), cancel txtime
   (RPC-F35), wallet RPC timeout (CFG-F92).
@@ -463,7 +503,7 @@ family is waived (§0):
 
 | Phase | C++ | Go | Verdict |
 |---|---|---|---|
-| Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898); Go mirrors it (`persist()` every 60 s, `api/engine.go:257-260`; `restoreLocalSwaps`, `api/node.go:283-290,338+`; format, `api/persist.go:18-24`) |
+| Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898);   Go mirrors it (`persist()` every 60 s, `api/engine.go:263-266`; `restoreLocalSwaps`, `api/node.go:283-290,338+`; format, `api/persist.go:18-24`) |
 | Hold/Init handshake | `processTransactionHold/Init` + replies | `OnHold/OnInit` + replies | fix-queued (STATE-F84: Go rejects any mismatch, C++ `&&` bug accepts single-field mismatches, so Go can stall against a Core hub emitting them) |
 | Maker/taker deposits | build → pre-signed refund → broadcast; `trCreated` | build → intent persist → broadcast; `csCreatedA/B` | identical |
 | Claims (maker/taker) | verify → build → broadcast; `trFinished` at claim | verify → intent persist → broadcast; `csConfirmedA/B` | fix-queued (STATE-F80: Go waits for hub `Finished` instead of finishing at claim) |

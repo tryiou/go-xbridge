@@ -110,6 +110,7 @@ func (n *Node) start() {
 	n.tasks = make(chan workTask, 16)
 	n.results = make(chan workResult, engineWorkers)
 	n.pendingRefunds = map[string]bool{}
+	n.pendingWatch = map[string]bool{}
 	n.persistSignal = make(chan struct{}, 1)
 	n.wg.Add(6) // reader, engine, blockLoop, statusLoop, wallet sweep, persist
 	go n.readerLoop()
@@ -324,7 +325,7 @@ func (n *Node) writeLatestPersist() {
 	if job == nil {
 		return
 	}
-	data, err := marshalSwapFile(job.swaps)
+	data, err := marshalSwapFile(job.swaps, job.bc)
 	if err != nil {
 		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
 		n.persistFailures.Add(1)

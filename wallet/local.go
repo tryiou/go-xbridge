@@ -150,3 +150,8 @@ func (l *LocalConnector) VerifyMessage(address string, sig []byte, message strin
 func (l *LocalConnector) GetTxOut(txid string, vout uint32) (Utxo, bool, error) {
 	return Utxo{}, false, ErrNoChainSource
 }
+
+// GetRawTransactionVerbose has no local chain source (see GetTxOut).
+func (l *LocalConnector) GetRawTransactionVerbose(txid string) (VerboseTx, error) {
+	return VerboseTx{}, ErrNoChainSource
+}

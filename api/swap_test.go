@@ -117,6 +117,16 @@ type fakeConnector struct {
 	// sendErr, when non-nil, makes SendRawTransaction fail with it — the
 	// refund/deposit broadcast-failure path tests.
 	sendErr error
+
+	// txOutErr, when non-nil, makes GetTxOut fail with it (facade-blind
+	// gettxout tests: a backend answering -5 for non-wallet txs).
+	txOutErr error
+	// verboseTx serves GetRawTransactionVerbose per display txid;
+	// verboseErr, when non-nil, makes it fail.
+	verboseTx  map[string]wallet.VerboseTx
+	verboseErr error
+	// verboseCalls counts GetRawTransactionVerbose calls (precedence lock).
+	verboseCalls int
 }
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
@@ -221,6 +231,19 @@ func (f *fakeConnector) GetRawTransaction(txid string) (string, error) {
 		return "", errNotFound
 	}
 	return h, nil
+}
+
+func (f *fakeConnector) GetRawTransactionVerbose(txid string) (wallet.VerboseTx, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verboseCalls++
+	if f.verboseErr != nil {
+		return wallet.VerboseTx{}, f.verboseErr
+	}
+	if v, ok := f.verboseTx[txid]; ok {
+		return v, nil
+	}
+	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
 }
 
 // chainScale returns the coin's native base scale (10^Decimals), falling back
@@ -376,14 +399,30 @@ func (f *fakeConnector) VerifyMessage(address string, sig []byte, message string
 }
 
 // GetTxOut reports the fixture funding set: a txid:vout matching the funding or
-// funders utxo returns it (whole-coin Value) as the chain does; anything else
-// is unknown/spent.
+// funders utxo returns it (whole-coin Value) as the chain does. Broadcasts
+// recorded in rawTx are also served (a real wallet's gettxout sees its own
+// mempool/on-chain transactions, which is exactly what the claim-path
+// unspent re-check queries); anything else is unknown/spent.
 func (f *fakeConnector) GetTxOut(txid string, vout uint32) (wallet.Utxo, bool, error) {
+	if f.txOutErr != nil {
+		return wallet.Utxo{}, false, f.txOutErr
+	}
 	cands := []wallet.Utxo{f.funding}
 	cands = append(cands, f.funders...)
 	for _, u := range cands {
 		if u.TxID == txid && u.Vout == vout {
 			return u, true, nil
+		}
+	}
+	f.mu.Lock()
+	rawHex, ok := f.rawTx[txid]
+	f.mu.Unlock()
+	if ok {
+		raw, err := hex.DecodeString(rawHex)
+		if err == nil {
+			if tx, derr := coins.Deserialize(raw); derr == nil && vout < uint32(len(tx.Outputs)) {
+				return wallet.Utxo{TxID: txid, Vout: vout, Amount: tx.Outputs[vout].Value}, true, nil
+			}
 		}
 	}
 	return wallet.Utxo{}, false, nil
@@ -1731,5 +1770,125 @@ func TestRefundEscapeHatch(t *testing.T) {
 	}
 	if len(conn.broadcasts) != before+1 {
 		t.Errorf("escape-hatch refund not broadcast (broadcasts %d, want %d)", len(conn.broadcasts), before+1)
+	}
+}
+
+// TestRedeemCounterpartyFacadeBlindGetTxOut proves the claim gate degrades
+// when gettxout is backend-blind (non-Core backends answer -5 for non-wallet
+// txs, so a confirmed counterparty deposit can never read unspent there —
+// live-proven on mainnet S1): with the verbose raw-tx fallback serving the
+// exact validated vout (script + value), the claim proceeds; without it the
+// claim waits. A spent proof (ok=false, nil error) still waits even when the
+// verbose record exists — a definitive spent verdict always wins.
+func TestRedeemCounterpartyFacadeBlindGetTxOut(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkMPriv, mkMPub := newKey(t)
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	drive := func(t *testing.T, tag string, txOutErr error, verbose map[string]wallet.VerboseTx) (*proto.ConfirmedABody, int, error) {
+		t.Helper()
+		mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+		tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+		node := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+		var oid [32]byte
+		h := hash20("redeem-blind-" + tag)
+		copy(oid[:], h[:])
+		ord := &Order{ID: oid, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+		node.newMakerSession(withUsedCoins(t, node, ord, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+		sess := node.sessions[hexEncode(oid[:])]
+		sess.hub = hub
+		_, bA, err := sess.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: oid, BPubKey: to33(tkPub)})
+		if err != nil {
+			t.Fatalf("[%s] OnCreateA: %v", tag, err)
+		}
+		createdA := bA.(*proto.CreatedABody)
+		ltcCoin, _ := coins.Get("LTC")
+		fundingInternal, _ := reverseTxidHex(strings.Repeat("bb", 32))
+		fee2 := estimateFee(confs["LTC"], 1, 1)
+		nativeTaker := fromXBridgeAmt(ltcCoin, 2e6)
+		inner := coins.BuildDepositUnlockScript(tkPub[:], mkMPub[:], createdA.HashedSecret[:], createdA.ALockTime)
+		bigB := &coins.Tx{Version: 1}
+		bigB.Inputs = append(bigB.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+		bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: nativeTaker + fee2, ScriptPubKey: coins.BuildP2SHScript(coins.KeyID(inner))})
+		bigB.Outputs = append(bigB.Outputs, coins.TxOut{Value: 5e8 - nativeTaker - fee2, ScriptPubKey: []byte{0x51}})
+		bigBTxID := strings.Repeat("ee", 32)
+		tkLtc.setRawTx(bigBTxID, hex.EncodeToString(bigB.Serialize()))
+		p2shHex := hex.EncodeToString(coins.BuildP2SHScript(coins.KeyID(inner)))
+		tkLtc.txOutErr = txOutErr
+		if verbose == nil {
+			verbose = map[string]wallet.VerboseTx{}
+		}
+		// Fill the exact-match record unless the case overrides it.
+		if _, ok := verbose[bigBTxID]; !ok && txOutErr != nil {
+			verbose[bigBTxID] = wallet.VerboseTx{TxID: bigBTxID, Confirmations: 6, Outputs: map[uint32]wallet.VerboseTxOut{
+				0: {Value: nativeTaker + fee2, ScriptHex: p2shHex},
+			}}
+		}
+		switch tag {
+		case "blind-value-mismatch":
+			v := verbose[bigBTxID]
+			o := v.Outputs[0]
+			o.Value--
+			v.Outputs[0] = o
+			verbose[bigBTxID] = v
+		case "blind-script-mismatch":
+			v := verbose[bigBTxID]
+			o := v.Outputs[0]
+			o.ScriptHex = "76a914000000000000000000000000000000000000000088ac"
+			v.Outputs[0] = o
+			verbose[bigBTxID] = v
+		case "blind-unknown":
+			delete(verbose, bigBTxID)
+		case "blind-unconfirmed":
+			v := verbose[bigBTxID]
+			v.Confirmations = -1
+			verbose[bigBTxID] = v
+		}
+		tkLtc.verboseTx = verbose
+		_, bCA, err := sess.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: oid, BDepositTxID: bigBTxID, BLockTime: createdA.ALockTime})
+		if err != nil {
+			return nil, tkLtc.verboseCalls, err
+		}
+		return bCA.(*proto.ConfirmedABody), tkLtc.verboseCalls, nil
+	}
+
+	// Core path (precedence lock): healthy gettxout never touches verbose.
+	if _, calls, err := drive(t, "healthy", nil, nil); err != nil {
+		t.Fatalf("healthy gettxout: %v", err)
+	} else if calls != 0 {
+		t.Fatalf("healthy gettxout path made %d verbose calls, want 0", calls)
+	}
+
+	// Blind gettxout + exact verbose record → claim proceeds.
+	body, calls, err := drive(t, "blind-exact", &wallet.RPCError{Code: -5, Message: "cannot be ours"}, nil)
+	if err != nil {
+		t.Fatalf("blind gettxout, exact verbose: %v", err)
+	}
+	if calls == 0 {
+		t.Fatal("blind gettxout path made no verbose call")
+	}
+	if body.APayTxID == "" {
+		t.Fatal("blind gettxout claim returned empty pay txid")
+	}
+
+	// Degraded mismatches still wait — never claim on a wrong output.
+	for _, tag := range []string{"blind-value-mismatch", "blind-script-mismatch", "blind-unknown", "blind-unconfirmed"} {
+		if _, _, err := drive(t, tag, &wallet.RPCError{Code: -5, Message: "cannot be ours"}, nil); err == nil {
+			t.Fatalf("[%s] must wait, not claim", tag)
+		}
 	}
 }

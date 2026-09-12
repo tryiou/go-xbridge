@@ -155,7 +155,7 @@ func TestTakeCommitSetsMineAndPersists(t *testing.T) {
 			s.srcCur, s.dstCur)
 	}
 	// The durable copy must contain the taken order: a restart must rebuild it.
-	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	ps, _, err := loadSwaps(swapStatePath(n.config.DataDir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestTakeCommitSendFailureReverts(t *testing.T) {
 	if pkts := cc.snapshot(); len(pkts) != 0 {
 		t.Fatalf("wrote %d packets on failed send, want 0", len(pkts))
 	}
-	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	ps, _, err := loadSwaps(swapStatePath(n.config.DataDir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}

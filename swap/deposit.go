@@ -86,7 +86,12 @@ func (d *DepositSpec) P2SHScript() []byte {
 // enforced on the *refund spend*, whose single input correctly uses
 // SEQUENCE_FINAL-1 (C++ createRefundTransaction, xbridgewalletconnectorbtc.cpp:2464).
 // Legacy (P2PKH) change only — native segwit change is a follow-up.
-func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee, fee2 uint64) (*coins.Tx, error) {
+// dustLimit is the minimum non-dust change value in native base units (C++
+// isDustAmount): dust change is suppressed into the miner fee exactly like C++
+// (xbridgesession.cpp:2098-2106), which drops a dust rest instead of emitting
+// an output the relay would reject. A zero dustLimit preserves the legacy
+// emit-if-positive behavior for callers without a dust source.
+func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, changeAddr [20]byte, fee, fee2, dustLimit uint64) (*coins.Tx, error) {
 	if len(funding) == 0 {
 		return nil, errors.New("swap: no funding UTXOs for deposit")
 	}
@@ -125,7 +130,7 @@ func (d *DepositSpec) BuildDepositTx(c coins.Coin, funding []wallet.Utxo, change
 		})
 	}
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: d.Amount + fee2, ScriptPubKey: d.P2SHScript()})
-	if change := total - d.Amount - fee - fee2; change > 0 {
+	if change := total - d.Amount - fee - fee2; change > 0 && (dustLimit == 0 || change >= dustLimit) {
 		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: change, ScriptPubKey: coins.BuildP2PKHScript(changeAddr)})
 	}
 	return tx, nil

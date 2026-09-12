@@ -76,10 +76,10 @@ func TestPersistMarshalOffEngine(t *testing.T) {
 	var parkOnce, releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	orig := marshalSwapFile
-	marshalSwapFile = func(swaps []persistedSwap) ([]byte, error) {
+	marshalSwapFile = func(swaps []persistedSwap, bc []persistedBroadcast) ([]byte, error) {
 		parkOnce.Do(func() { close(marshalParked) })
 		<-release
-		return orig(swaps)
+		return orig(swaps, bc)
 	}
 	// Cleanup order matters: this runs BEFORE persistNode's Close cleanup (LIFO),
 	// so the parked marshal is released before Close joins the persistLoop.
@@ -191,7 +191,7 @@ func TestPersistFlushedOnClose(t *testing.T) {
 
 	_ = n.Close() // joins all goroutines, then flushes the latest slot
 
-	ps, err := loadSwaps(swapStatePath(n.config.DataDir))
+	ps, _, err := loadSwaps(swapStatePath(n.config.DataDir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}

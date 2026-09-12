@@ -510,7 +510,7 @@ func (s *Store) lockedInfoLocked() (keys map[string]bool, byOrder map[string]str
 	keys = map[string]bool{}
 	byOrder = map[string]string{}
 	for _, o := range s.orders {
-		if isOrderTerminal(o.Status) {
+		if orderLockReleased(o.Status) {
 			continue
 		}
 		oid := orderIDString(o.ID)
@@ -529,9 +529,11 @@ func (s *Store) lockedInfoLocked() (keys map[string]bool, byOrder map[string]str
 		// A reservation only holds while its owner order is live and
 		// non-terminal; once the order ends the take cannot proceed, so the
 		// in-flight inputs are released like committed ones (isOrderTerminal).
-		// The reported owner is the display id (orderIDString), matching the
-		// committed-input loop above.
-		if o := s.orders[oid]; o == nil || isOrderTerminal(o.Status) {
+		// Rolled-back orders release too (orderLockReleased): their refund
+		// succeeded, so the committed inputs are spent. The reported owner
+		// is the display id (orderIDString), matching the committed-input
+		// loop above.
+		if o := s.orders[oid]; o == nil || orderLockReleased(o.Status) {
 			continue
 		}
 		disp := orderIDString(s.orders[oid].ID)
@@ -585,7 +587,7 @@ func (s *Store) LockedUtxoInfoFor(ticker string) map[string]bool {
 	defer s.mu.RUnlock()
 	keys := map[string]bool{}
 	for _, o := range s.orders {
-		if isOrderTerminal(o.Status) {
+		if orderLockReleased(o.Status) {
 			continue
 		}
 		for _, u := range o.FeeUtxos {
@@ -599,7 +601,7 @@ func (s *Store) LockedUtxoInfoFor(ticker string) map[string]bool {
 		}
 	}
 	for oid, r := range s.reserved {
-		if o := s.orders[oid]; o == nil || isOrderTerminal(o.Status) {
+		if o := s.orders[oid]; o == nil || orderLockReleased(o.Status) {
 			continue
 		}
 		for _, k := range r.fee {

@@ -57,8 +57,6 @@ behavioral (MUST FIX) · **S3** edge-input divergence (FIX or rule) ·
 | STATE-F86 | S3 | Refund sweep 60 s vs C++ 15 s timer | Tighten `refundCheckInterval` toward C++ `TIMER_INTERVAL` (xbridgeapp.cpp:90) |
 | CRYPTO-F79 | S3 | Fee fallback: C++ 0 vs Go 2 sat/vB when FeePerByte unset | Fallback must be C++ 0 exactly (deposit fee math is on-chain visible) |
 | CRYPTO-F81 | S3 | Address decoding strictness differs (base58check, cashaddr) | Match C++ `toXAddr` leniency exactly (swap-visible at make/take) |
-| CRYPTO-F100 | S3 | Deposit change emitted when `>0` without the C++ dust check | Gate change on dust (`!isDustAmount`, xbridgesession.cpp:2621-2623) |
-| CRYPTO-F101 | S3 | Secret scan hash-only, not bound to own deposit outpoint | Bind vin to `(theirDepositTxID, theirDepositVout)` (xbridgewalletconnectorbtc.cpp:2252-2253) |
 | CRYPTO-F98 | S3 | PART connector non-portable (confidential outputs, amount-committing digest) | RULING-PENDING: `[PART]` refused at admission meanwhile (`decisions.md`) |
 | CRYPTO-F99 | S3 | BCD connector non-portable (fork-version `preBlockHash` field) | RULING-PENDING: `[BCD]` refused at admission meanwhile (`decisions.md`) |
 | CRYPTO-F102 | S3 | Dust source: live relay-derived (C++) vs 5460 fallback (Go) | RULING-PENDING: thin client has no relay feed; keep amounts well above dust meanwhile (`decisions.md`) |

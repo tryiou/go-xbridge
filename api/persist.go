@@ -94,10 +94,22 @@ type persistedSwap struct {
 	TheirDepositTxID string   `json:"theirDepositTxID"`
 	TheirLockTime    uint32   `json:"theirLockTime"`
 	TheirSecretHash  [20]byte `json:"theirSecretHash"`
+	// as the claim slot.
+	// record's OBinTx* copy is updated (phase-2 broadcast), so restoring
+
+	// hex plus its locally-derived id and chain, persisted before broadcast.
 
 	Hub    [20]byte    `json:"hub"`
 	HubKey [33]byte    `json:"hubKey"`
 	State  clientState `json:"state"`
+
+	// HoldApplySentAt is the last HoldApply send time (api/hold_resend.go):
+	// the resender and the silent-hub recorder key off it, so it rides the
+	// session record like lastProgress-equivalent clocks. omitempty keeps
+	// pre-upgrade snapshots decodable; restoreSwap re-stamps a zero value
+	// for a still-parked session so old records resume resending instead
+	// of skipping forever.
+	HoldApplySentAt uint64 `json:"holdApplySentAt,omitempty"`
 
 	// Historical marks a terminal record persisted from Store.history (C++
 	// saveOrders writes m_historicTransactions alongside the live map).
@@ -105,13 +117,36 @@ type persistedSwap struct {
 	Historical bool `json:"historical,omitempty"`
 }
 
+// persistedBroadcast is the durable form of one tracked broadcast
+// (api/reconcile.go): the locally-derived txid plus the exact bytes, so a
+// restart resumes confirmation watch (and later phases can rebroadcast the
+// identical bytes). Confs is the last confirmed depth (0 = unknown).
+type persistedBroadcast struct {
+	OrderID        string        `json:"orderID"`
+	Kind           broadcastKind `json:"kind"`
+	Coin           string        `json:"coin"`
+	TxID           string        `json:"txid"`
+	Hex            string        `json:"hex"`
+	Seq            uint64        `json:"seq,omitempty"`
+	Confs          int           `json:"confs,omitempty"`
+	FirstSeenMicro uint64        `json:"firstSeenMicro,omitempty"`
+	Attempts       int           `json:"attempts,omitempty"`
+}
+
 // swapFile is the on-disk envelope: a sha256 checksum of the swaps blob plus
 // the blob, so loadSwaps can detect a truncated/corrupted file. C++ guards
 // orders.dat with a fixed RecordChecksum in SerializeFileDB; we instead hash
 // the actual data.
+//
+// Broadcasts ride in the same envelope (omitted when empty). The checksum
+// covers swaps AND broadcasts; files written before broadcasts existed verify
+// through the legacy swaps-only fallback in parseSwapFile. Downgrade note: an
+// older binary reading a file WITH broadcasts fails closed (checksum
+// mismatch) — upgrade is one-way for the state file, back it up first.
 type swapFile struct {
-	Sum   string          `json:"sum"`
-	Swaps []persistedSwap `json:"swaps"`
+	Sum        string               `json:"sum"`
+	Swaps      []persistedSwap      `json:"swaps"`
+	Broadcasts []persistedBroadcast `json:"broadcasts,omitempty"`
 }
 
 // swapStatePath returns the local swap-state file path inside dir (the
@@ -155,23 +190,51 @@ func snapshotSwaps(n *Node) []persistedSwap {
 	return ps
 }
 
-// marshalSwapFile builds the swap-file envelope (sha256 checksum of the swaps
-// blob plus the blob) from a flattened snapshot. Pure CPU over the slice, so it
+// snapshotBroadcasts flattens the confirmation-watch table for the swap-file
+// envelope. Mutex-guarded (record sites are not engine-confined); the marshal
+// runs on the background persistLoop like swaps.
+func snapshotBroadcasts(n *Node) []persistedBroadcast {
+	n.trackedMu.Lock()
+	defer n.trackedMu.Unlock()
+	out := make([]persistedBroadcast, 0, len(n.tracked))
+	for _, tb := range n.tracked {
+		out = append(out, persistedBroadcast{
+			OrderID: tb.OrderID, Kind: tb.Kind, Coin: tb.Coin,
+			TxID: tb.TxID, Hex: tb.Hex, Seq: tb.Seq, Confs: tb.Confs,
+			FirstSeenMicro: tb.FirstSeenMicro, Attempts: tb.Attempts,
+		})
+	}
+	return out
+}
+
+// runs on the background persistLoop goroutine, never the engine. A var so
+// marshalSwapFile builds the swap-file envelope (sha256 checksum over swaps
+// plus broadcasts) from flattened snapshots. Pure CPU over the slices, so it
 // runs on the background persistLoop goroutine, never the engine. A var so
 // tests can instrument (count/block) the marshal boundary without touching the
 // engine-owned flatten.
-var marshalSwapFile = func(swaps []persistedSwap) ([]byte, error) {
-	blob, err := json.Marshal(swaps)
+var marshalSwapFile = func(swaps []persistedSwap, broadcasts []persistedBroadcast) ([]byte, error) {
+	if broadcasts == nil {
+		broadcasts = []persistedBroadcast{}
+	}
+	blob, err := json.Marshal(swapEnvelope{Swaps: swaps, Broadcasts: broadcasts})
 	if err != nil {
 		return nil, fmt.Errorf("api: marshal swaps: %w", err)
 	}
 	sum := sha256.Sum256(blob)
-	env := swapFile{Sum: hex.EncodeToString(sum[:]), Swaps: swaps}
+	env := swapFile{Sum: hex.EncodeToString(sum[:]), Swaps: swaps, Broadcasts: broadcasts}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("api: marshal swap file: %w", err)
 	}
 	return data, nil
+}
+
+// swapEnvelope is the checksummed body: swaps plus broadcasts, with nil
+// normalized to [] so old-shape and empty-shape files hash deterministically.
+type swapEnvelope struct {
+	Swaps      []persistedSwap      `json:"swaps"`
+	Broadcasts []persistedBroadcast `json:"broadcasts"`
 }
 
 // writeSwaps durably writes a marshaled swap-file blob via temp-write, fsync
@@ -208,28 +271,44 @@ var writeSwaps = func(path string, data []byte) error {
 // loadSwaps reads the swap-state file. A missing file is not an error (returns
 // (nil, nil)); a present but unparseable/corrupt file returns an error so the
 // caller can decide whether to start fresh rather than silently lose state.
-func loadSwaps(path string) ([]persistedSwap, error) {
+func loadSwaps(path string) ([]persistedSwap, []persistedBroadcast, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("api: read swap file: %w", err)
+		return nil, nil, fmt.Errorf("api: read swap file: %w", err)
 	}
+	return parseSwapFile(data, path)
+}
+
+// parseSwapFile verifies and splits a swap-file blob. The checksum covers
+// swaps AND broadcasts (nil normalized to [] for determinism); files written
+// before broadcasts existed verify through the legacy swaps-only checksum.
+func parseSwapFile(data []byte, path string) ([]persistedSwap, []persistedBroadcast, error) {
 	var env swapFile
 	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, fmt.Errorf("api: parse swap file %s: %w", path, err)
+		return nil, nil, fmt.Errorf("api: parse swap file %s: %w", path, err)
 	}
-	// Re-marshal the in-file list and re-hash to verify integrity.
-	blob, err := json.Marshal(env.Swaps)
-	if err != nil {
-		return nil, fmt.Errorf("api: re-marshal swaps: %w", err)
+	bc := env.Broadcasts
+	if bc == nil {
+		bc = []persistedBroadcast{}
 	}
-	sum := sha256.Sum256(blob)
-	if hex.EncodeToString(sum[:]) != env.Sum {
-		return nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
+	if blob, err := json.Marshal(swapEnvelope{Swaps: env.Swaps, Broadcasts: bc}); err == nil {
+		sum := sha256.Sum256(blob)
+		if hex.EncodeToString(sum[:]) == env.Sum {
+			return env.Swaps, bc, nil
+		}
 	}
-	return env.Swaps, nil
+	if len(env.Broadcasts) == 0 {
+		if blob, err := json.Marshal(env.Swaps); err == nil {
+			sum := sha256.Sum256(blob)
+			if hex.EncodeToString(sum[:]) == env.Sum {
+				return env.Swaps, nil, nil
+			}
+		}
+	}
+	return nil, nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
 }
 
 // errSwapEnvelopeUnusable marks a swap-state file whose envelope cannot even
@@ -305,6 +384,7 @@ func quarantineSwapFile(path string) (string, error) {
 type persistJob struct {
 	path  string
 	swaps []persistedSwap
+	bc    []persistedBroadcast
 }
 
 // persistNow durably writes the current swap snapshot to disk synchronously
@@ -332,7 +412,8 @@ func (n *Node) persistNow() error {
 	n.persistWriteMu.Lock()
 	defer n.persistWriteMu.Unlock()
 	swaps := snapshotSwaps(n)
-	data, err := marshalSwapFile(swaps)
+	bc := snapshotBroadcasts(n)
+	data, err := marshalSwapFile(swaps, bc)
 	if err != nil {
 		xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
 		n.persistFailures.Add(1)
@@ -363,8 +444,9 @@ func (n *Node) persist() {
 	}
 	path := swapStatePath(cfg.DataDir)
 	swaps := snapshotSwaps(n)
+	bc := snapshotBroadcasts(n)
 	if !n.persistUp.Load() {
-		data, err := marshalSwapFile(swaps)
+		data, err := marshalSwapFile(swaps, bc)
 		if err != nil {
 			xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
 			n.persistFailures.Add(1)
@@ -376,7 +458,7 @@ func (n *Node) persist() {
 		}
 		return
 	}
-	n.publishLatest(&persistJob{path: path, swaps: swaps})
+	n.publishLatest(&persistJob{path: path, swaps: swaps, bc: bc})
 }
 
 // publishLatest records the newest swap-file write job and wakes the background
@@ -484,6 +566,7 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.Hub = s.hub
 	ps.HubKey = s.hubKey
 	ps.State = s.state
+	ps.HoldApplySentAt = s.holdApplySentAt
 	return ps
 }
 
@@ -535,9 +618,23 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		theirDepositTxID: ps.TheirDepositTxID,
 		theirLockTime:    ps.TheirLockTime,
 		theirSecretHash:  ps.TheirSecretHash,
-		hub:              ps.Hub,
-		hubKey:           ps.HubKey,
-		state:            ps.State,
+		// claim rebuilds against the exact deposit output without
+		// source of truth once broadcast.
+		hub:             ps.Hub,
+		hubKey:          ps.HubKey,
+		state:           ps.State,
+		holdApplySentAt: ps.HoldApplySentAt,
+		// Watchdog clock restarts at restore: pre-upgrade records predate
+		// the stamp, and the downtime itself is not hub silence.
+		lastProgress: uint64(NowMicro()),
+	}
+	// A pre-upgrade record (no HoldApplySentAt field) for a still-parked
+	// session would otherwise skip the resender and the silence recorder
+	// forever on its zero stamp. Re-stamp to restore time: the resender
+	// waits one fresh interval (no post-restart burst) and the silence
+	// clock restarts alongside the watchdog above.
+	if s.state == csHoldApplied && s.holdApplySentAt == 0 {
+		s.holdApplySentAt = uint64(NowMicro())
 	}
 	n.sessions[hexEncode(ps.ID[:])] = s
 }

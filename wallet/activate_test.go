@@ -228,6 +228,9 @@ func (c *hangingProbeConnector) VerifyMessage(string, []byte, string) (bool, err
 func (c *hangingProbeConnector) GetTxOut(string, uint32) (Utxo, bool, error) {
 	return Utxo{}, false, errors.New("unused")
 }
+func (c *hangingProbeConnector) GetRawTransactionVerbose(string) (VerboseTx, error) {
+	return VerboseTx{}, errors.New("unused")
+}
 
 // GetBlockCountContext blocks until ctx is done, then reports the context's
 // error and signals that the call exited.
