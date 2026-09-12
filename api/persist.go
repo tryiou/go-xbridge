@@ -90,6 +90,10 @@ type persistedSwap struct {
 	OurDepositTxID string `json:"ourDepositTxID"`
 	RefundHex      string `json:"refundHex"`
 	RefundDone     bool   `json:"refundDone"`
+	// DepositHex is the signed deposit raw hex for tick-driven repost of a
+	// failed broadcast (swap_retry.go). omitempty: pre-upgrade records lack
+	// it and simply never repost.
+	DepositHex string `json:"depositHex,omitempty"`
 
 	TheirDepositTxID string   `json:"theirDepositTxID"`
 	TheirLockTime    uint32   `json:"theirLockTime"`
@@ -103,7 +107,11 @@ type persistedSwap struct {
 	// pre-upgrade snapshots decodable; a zero value simply never fires.
 	ClaimRetryAt uint64 `json:"claimRetryAt,omitempty"`
 	ClaimRetries uint32 `json:"claimRetries,omitempty"`
+	// DepositRetryAt/DepositRetries schedule the tick-driven rebuild of a
+	// failed HTLC deposit build (swap_retry.go). Same omitempty upgrade rule
 	// as the claim slot.
+	DepositRetryAt uint64 `json:"depositRetryAt,omitempty"`
+	DepositRetries uint32 `json:"depositRetries,omitempty"`
 	// Validated counterparty-deposit out-params (C++ oBinTxVout /
 	// oBinTxP2SHAmount / oOverpayment): needed to rebuild a claim after a
 	// restart without re-running the deposit check. All three ride the
@@ -582,12 +590,15 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.OurDepositTxID = s.ourDepositTxID
 	ps.RefundHex = s.refundHex
 	ps.RefundDone = s.refundDone
+	ps.DepositHex = s.depositHex
 	ps.TheirDepositTxID = s.theirDepositTxID
 	ps.TheirLockTime = s.theirLockTime
 	ps.TheirSecretHash = s.theirSecretHash
 	ps.TheirPayTxID = s.theirPayTxID
 	ps.ClaimRetryAt = s.claimRetryAt
 	ps.ClaimRetries = s.claimRetries
+	ps.DepositRetryAt = s.depositRetryAt
+	ps.DepositRetries = s.depositRetries
 	ps.TheirDepositVout = s.theirDepositVout
 	ps.TheirP2SHNative = s.theirP2SHNative
 	ps.TheirOverpayment = s.theirOverpayment
@@ -646,12 +657,15 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		ourDepositTxID:   ps.OurDepositTxID,
 		refundHex:        ps.RefundHex,
 		refundDone:       ps.RefundDone,
+		depositHex:       ps.DepositHex,
 		theirDepositTxID: ps.TheirDepositTxID,
 		theirLockTime:    ps.TheirLockTime,
 		theirSecretHash:  ps.TheirSecretHash,
 		theirPayTxID:     ps.TheirPayTxID,
 		claimRetryAt:     ps.ClaimRetryAt,
 		claimRetries:     ps.ClaimRetries,
+		depositRetryAt:   ps.DepositRetryAt,
+		depositRetries:   ps.DepositRetries,
 		// Validated out-params ride the session record (adopted at
 		// claim-build, before the order record is updated) so a restarted
 		// claim rebuilds against the exact deposit output without

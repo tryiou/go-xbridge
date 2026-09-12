@@ -117,7 +117,11 @@ type SwapSession struct {
 	ourDepositTxID string
 	refundHex      string // pre-signed IF-branch refund, for cancel/expiry
 	refundDone     bool   // guard so the watcher broadcasts the refund at most once
+	// depositHex is the signed deposit raw hex, adopted at build success
 	// alongside ourDepositTxID. A tick-driven repost re-sends these IDENTICAL
+	// bytes when the first broadcast fails (swap_retry.go) — never a rebuild,
+	// so a repost can never double-deposit.
+	depositHex string
 
 	// Built ELSE-branch claim (maker: redeem of B; taker: redeem of A),
 	// persisted before broadcast so a crash between claim-build and broadcast
@@ -152,9 +156,13 @@ type SwapSession struct {
 	claimRetryAt uint64
 	claimRetries uint32
 
+	// depositRetryAt/depositRetries schedule the tick-driven rebuild of a
+	// failed HTLC deposit build (swap_retry.go): same contract as the claim
 	// slot, one stage earlier. A failed deposit build is transient until
 	// proven otherwise (backend lag, mempool blindness); selfCancel aborts
 	// never land here.
+	depositRetryAt uint64
+	depositRetries uint32
 
 	// Validated counterparty deposit: the C++
 	// checkDepositTransaction out-params recorded when we accept the
@@ -794,13 +802,7 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 		o.OtherPubkey = hexEncode(b.BPubKey[:])
 	})
 	c := s.snapshot()
-	task := workTask{
-		orderID: orderID,
-		run: func() (any, error) {
-			return c.buildDeposit(true)
-		},
-		apply: func(v any, terr error) { s.applyCreatedA(v, terr) },
-	}
+	task := makerDepositBuildTask(s, c)
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
@@ -812,7 +814,7 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 		}
 		return proto.XbcTransactionCreatedA, s.applyCreatedA(v, nil), nil
 	}
-	s.await = true
+	s.holdAwait()
 	s.n.postSwapTask(orderID, task)
 	return 0, nil, nil // deferred; applyCreatedA sends on worker completion
 }
@@ -829,14 +831,23 @@ func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, res
 func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	if terr != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("CreateA deposit task failed", "order", orderID, "err", terr)
+		// Transient until proven otherwise (wallet offline, fee estimation):
+		// schedule a tick-driven rebuild instead of stranding pre-deposit
+		// when the hub stays quiet. Nothing was broadcast (ourDepositTxID is
+		// only set on success), so a retry can never double-broadcast.
+		if s.ourDepositTxID == "" {
+			scheduleDepositRetry(s, NowMicro(), "maker", terr)
+		}
 		return nil
 	}
 	out := v.(depositOutcome)
+	clearDepositRetry(s)
 	s.ourDepositTxID = out.txid
 	s.ourLockTime = out.lockTime
 	s.refundHex = out.refundHex
+	s.depositHex = out.depositHex
 	s.n.store.Update(orderID, func(o *Order) {
 		o.BinTxId = out.txid
 		o.DepositSent = false
@@ -847,7 +858,7 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	// Durable intent BEFORE broadcast: from here on, a crash recovers the
 	// pre-signed refund from disk (and the sweep owns it post-restart).
 	if err := s.n.persistNow(); err != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("CreateA intent persist failed, deposit withheld", "order", orderID, "err", err)
 		return nil
 	}
@@ -872,11 +883,17 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 // exists, and enqueueRefund refuses unbroadcast intents).
 func (s *SwapSession) applyCreatedABroadcast(out depositOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
+	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("CreateA deposit broadcast failed", "order", orderID, "err", terr)
+		// The intent (hex + txid) is durable: schedule a tick-driven repost
+		// of the IDENTICAL bytes instead of stranding pre-created.
+		if s.ourDepositTxID != "" && s.depositHex != "" {
+			scheduleDepositRetry(s, NowMicro(), "maker-broadcast", terr)
+		}
 		return nil
 	}
+	clearDepositRetry(s)
 	// The wallet's reported id is logged (C++ :2187-2191) but never adopted:
 	// C++ keeps binTxId (the locally-derived txid) as authoritative.
 	if sentID != "" && sentID != out.txid {
@@ -952,40 +969,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	xlog.Info("CreateB: learned maker deposit", "order", orderID,
 		"makerDeposit", b.ADepositTxID, "makerLockTime", b.ALockTime, "secretHash", hexEncode(b.HashedSecret[:]))
 	c := s.snapshot()
-	task := workTask{
-		orderID: orderID,
-		run: func() (any, error) {
-			// Validate the counterparty (maker) A-deposit lockTime BEFORE we
-			// broadcast our own deposit (mirrors C++ xbridgesession.cpp:2464
-			// bad-locktime cancel). Compare the received value against our own
-			// expectation for that same deposit role on the maker's coin
-			// (dstCur) — NOT against our B lockTime, which legitimately differs
-			// by ~90 blocks.
-			expLT := c.computeLockTimeFor(c.dstCur, true)
-			if !acceptableLockTimeDrift(expLT, b.ALockTime, c.blockTimeFor(c.dstCur)) {
-				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
-				return nil, &selfCancelErr{reason: crBadALockTime}
-			}
-			// Validate the maker's A deposit BEFORE committing ours
-			// (C++ :2495). Wait → no response (hub retransmits); bad → Cancel.
-			dcheck, err := c.checkCounterpartyDeposit(c.theirSecretHash, c.dstAmt)
-			if err != nil {
-				return nil, err
-			}
-			if !dcheck.IsGood {
-				return nil, &selfCancelErr{reason: crBadADepositTx}
-			}
-			c.theirDepositVout = dcheck.DepositVout
-			c.theirP2SHNative = dcheck.P2SHNative
-			c.theirOverpayment = dcheck.Excess
-			out, err := c.buildDeposit(false)
-			if err != nil {
-				return nil, err
-			}
-			return createdBOutcome{out: out, check: dcheck}, nil
-		},
-		apply: func(v any, terr error) { s.applyCreatedB(v, terr) },
-	}
+	task := takerDepositBuildTask(s, c)
 	if !s.n.engineRunning.Load() {
 		v, terr := safeTaskRun(task)
 		if terr != nil {
@@ -995,7 +979,7 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 		}
 		return proto.XbcTransactionCreatedB, s.applyCreatedB(v, nil), nil
 	}
-	s.await = true
+	s.holdAwait()
 	s.n.postSwapTask(orderID, task)
 	return 0, nil, nil // deferred; applyCreatedB sends on worker completion
 }
@@ -1009,17 +993,27 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
 	if terr != nil {
-		s.await = false
+		s.releaseAwait()
 		if s.failSelfCancel(terr) {
 			return nil
 		}
 		xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
+		// Transient until proven otherwise (backend lag, mempool blindness):
+		// schedule a tick-driven rebuild instead of stranding at initialized
+		// when the hub stays quiet (live-proven d4df334e). Nothing was
+		// broadcast (ourDepositTxID is only set on success), so a retry can
+		// never double-broadcast.
+		if s.ourDepositTxID == "" {
+			scheduleDepositRetry(s, NowMicro(), "taker", terr)
+		}
 		return nil
 	}
 	out := v.(createdBOutcome)
+	clearDepositRetry(s)
 	s.ourDepositTxID = out.out.txid
 	s.ourLockTime = out.out.lockTime
 	s.refundHex = out.out.refundHex
+	s.depositHex = out.out.depositHex
 	s.theirDepositVout = out.check.DepositVout
 	s.theirP2SHNative = out.check.P2SHNative
 	s.theirOverpayment = out.check.Excess
@@ -1038,7 +1032,7 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 	// Durable intent BEFORE broadcast: from here on, a crash recovers the
 	// pre-signed refund from disk (and the sweep owns it post-restart).
 	if err := s.n.persistNow(); err != nil {
-		s.await = false
+		s.releaseAwait()
 		xlog.Error("CreateB intent persist failed, deposit withheld", "order", orderID, "err", err)
 		return nil
 	}
@@ -1062,11 +1056,17 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 // exists, and enqueueRefund refuses unbroadcast intents).
 func (s *SwapSession) applyCreatedBBroadcast(out createdBOutcome, sentID string, terr error) responseBody {
 	orderID := hexEncode(s.id[:])
-	s.await = false
+	s.releaseAwait()
 	if terr != nil {
 		xlog.Error("CreateB deposit broadcast failed", "order", orderID, "err", terr)
+		// The intent (hex + txid) is durable: schedule a tick-driven repost
+		// of the IDENTICAL bytes instead of stranding pre-created.
+		if s.ourDepositTxID != "" && s.depositHex != "" {
+			scheduleDepositRetry(s, NowMicro(), "taker-broadcast", terr)
+		}
 		return nil
 	}
+	clearDepositRetry(s)
 	// The wallet's reported id is logged (C++ :2710-2714) but never adopted:
 	// the locally-derived txid stays authoritative.
 	if sentID != "" && sentID != out.out.txid {

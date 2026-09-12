@@ -218,6 +218,152 @@ func takerClaimBuildTask(s *SwapSession, c swapCtx, payTxID string) workTask {
 	}
 }
 
+// scheduleDepositRetry records a failed HTLC deposit build for tick-driven
+// rebuild. Same contract as scheduleClaimRetry: selfCancel aborts must NOT
+// come here — failSelfCancel owns those.
+func scheduleDepositRetry(s *SwapSession, now uint64, role string, err error) {
+	orderID := hexEncode(s.id[:])
+	delay := retryBackoff(s.depositRetries)
+	s.depositRetries++
+	s.depositRetryAt = now + delay
+	s.lastProgress = now
+	xlog.Warn("deposit build failed, retry scheduled", "order", orderID, "role", role,
+		"err", err, "retryInSec", delay/1000000, "attempt", s.depositRetries)
+	if perr := s.n.persistNow(); perr != nil {
+		xlog.Error("deposit retry persist failed, in-memory schedule kept", "order", orderID, "err", perr)
+	}
+}
+
+// clearDepositRetry drops the retry schedule after a successful build.
+// Engine-side.
+func clearDepositRetry(s *SwapSession) {
+	s.depositRetryAt = 0
+	s.depositRetries = 0
+}
+
+// makerDepositBuildTask returns the CreateA HTLC deposit BUILD task: it
+// builds (never broadcasts) our deposit A. Identical for the hub-driven
+// first attempt and tick-driven rebuilds — everything it needs (own funding,
+// counterparty key) is stage-1 session state.
+func makerDepositBuildTask(s *SwapSession, c swapCtx) workTask {
+	orderID := hexEncode(s.id[:])
+	return workTask{
+		orderID: orderID,
+		run: func() (any, error) {
+			return c.buildDeposit(true)
+		},
+		apply: func(v any, terr error) { s.applyCreatedA(v, terr) },
+	}
+}
+
+// takerDepositBuildTask returns the CreateB HTLC deposit BUILD task: it
+// drift-checks and validates the maker's A deposit, then builds (never
+// broadcasts) our deposit B. The counterparty pointers come from the
+// snapshot, which the sweep refreshes from the session before posting.
+func takerDepositBuildTask(s *SwapSession, c swapCtx) workTask {
+	orderID := hexEncode(s.id[:])
+	return workTask{
+		orderID: orderID,
+		run: func() (any, error) {
+			// Validate the counterparty (maker) A-deposit lockTime BEFORE we
+			// broadcast our own deposit (mirrors C++ xbridgesession.cpp:2464
+			// bad-locktime cancel). Compare the received value against our own
+			// expectation for that same deposit role on the maker's coin
+			// (dstCur) — NOT against our B lockTime, which legitimately differs
+			// by ~90 blocks.
+			expLT := c.computeLockTimeFor(c.dstCur, true)
+			if !acceptableLockTimeDrift(expLT, c.theirLockTime, c.blockTimeFor(c.dstCur)) {
+				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
+				return nil, &selfCancelErr{reason: crBadALockTime}
+			}
+			// Validate the maker's A deposit BEFORE committing ours
+			// (C++ :2495). Wait → no response (hub retransmits); bad → Cancel.
+			dcheck, err := c.checkCounterpartyDeposit(c.theirSecretHash, c.dstAmt)
+			if err != nil {
+				return nil, err
+			}
+			if !dcheck.IsGood {
+				return nil, &selfCancelErr{reason: crBadADepositTx}
+			}
+			c.theirDepositVout = dcheck.DepositVout
+			c.theirP2SHNative = dcheck.P2SHNative
+			c.theirOverpayment = dcheck.Excess
+			out, err := c.buildDeposit(false)
+			if err != nil {
+				return nil, err
+			}
+			return createdBOutcome{out: out, check: dcheck}, nil
+		},
+		apply: func(v any, terr error) { s.applyCreatedB(v, terr) },
+	}
+}
+
+// adoptOrRepostDeposit handles a tick-due session whose deposit was BUILT
+// (ourDepositTxID + depositHex persisted) but never confirmed broadcast.
+// Engine-side. First it checks whether the "failed" broadcast actually
+// landed (wallet accepted, response lost): a verbose lookup with
+// confirmations >= 1 adopts the confirmation by running the success resume
+// directly — never rebroadcast. Otherwise it re-posts the IDENTICAL bytes
+// (same txid by construction): a repost can never double-deposit.
+func (n *Node) adoptOrRepostDeposit(s *SwapSession, now uint64) {
+	orderID := hexEncode(s.id[:])
+	c := s.snapshot()
+	conn := c.connectors[s.srcCur]
+	out := depositOutcome{txid: s.ourDepositTxID, lockTime: s.ourLockTime,
+		refundHex: s.refundHex, depositHex: s.depositHex, conn: conn}
+	if conn != nil {
+		if v, err := conn.GetRawTransactionVerbose(s.ourDepositTxID); err == nil && v.Confirmations >= 1 {
+			xlog.Info("deposit rebuild: adopting on-chain confirmation", "order", orderID,
+				"txid", s.ourDepositTxID, "confs", v.Confirmations)
+			s.depositRetryAt = 0
+			if s.isMaker {
+				s.applyCreatedABroadcast(out, s.ourDepositTxID, nil)
+			} else {
+				check := wallet.DepositCheck{IsGood: true, DepositVout: s.theirDepositVout,
+					P2SHNative: s.theirP2SHNative, Excess: s.theirOverpayment}
+				s.applyCreatedBBroadcast(createdBOutcome{out: out, check: check}, s.ourDepositTxID, nil)
+			}
+			return
+		}
+	}
+	if s.depositRetries >= broadcastRepostMax {
+		xlog.Warn("deposit rebuild: repost cap reached, operator attention", "order", orderID,
+			"txid", s.ourDepositTxID, "attempts", s.depositRetries)
+		s.depositRetryAt = 0
+		return
+	}
+	if conn == nil {
+		s.depositRetryAt = now + claimRetryBaseMicro
+		return
+	}
+	s.depositRetryAt = 0 // consumed; a failed repost reschedules
+	s.holdAwait()
+	s.lastProgress = now
+	xlog.Info("deposit rebuild: re-posting built deposit", "order", orderID,
+		"txid", s.ourDepositTxID, "attempt", s.depositRetries+1)
+	var ok bool
+	if s.isMaker {
+		out.conn = conn
+		o := out
+		ok = n.postBroadcastTask(orderID, conn, s.srcCur, s.depositHex, broadcastDeposit,
+			func(sentID string, berr error) { s.applyCreatedABroadcast(o, sentID, berr) })
+	} else {
+		check := wallet.DepositCheck{IsGood: true, DepositVout: s.theirDepositVout,
+			P2SHNative: s.theirP2SHNative, Excess: s.theirOverpayment}
+		bo := createdBOutcome{out: out, check: check}
+		bo.out.conn = conn
+		o := bo
+		ok = n.postBroadcastTask(orderID, conn, s.srcCur, s.depositHex, broadcastDeposit,
+			func(sentID string, berr error) { s.applyCreatedBBroadcast(o, sentID, berr) })
+	}
+	if !ok {
+		// Engine busy and the task was dropped (postBroadcastTask cleared
+		// await): try again next tick instead of losing the retry.
+		s.releaseAwait()
+		s.depositRetryAt = now + claimRetryBaseMicro
+	}
+}
+
 // adoptOrRepostClaim handles a tick-due session whose claim was BUILT
 // (claimTxID + claimHex persisted) but never confirmed broadcast. Same
 // adopt-then-repost contract as deposits: confirmations adopt, otherwise the
@@ -271,6 +417,78 @@ func (n *Node) adoptOrRepostClaim(s *SwapSession, now uint64) {
 	if !ok {
 		s.releaseAwait()
 		s.claimRetryAt = now + claimRetryBaseMicro
+	}
+}
+
+// retryFailedDepositBuilds re-posts the deposit BUILD for sessions whose
+// build failed but whose trigger pointers are complete and whose retry is
+// due. Engine-side (called from the 60 s tick). Only rebuilds while our own
+// deposit was never broadcast (ourDepositTxID empty): a retry can never
+// double-broadcast, and a hub/user cancel in between wins by removing the
+// session first. Pre-fix sessions (failed before the retry fields existed)
+// are adopted: pointers complete + no deposit + not awaiting + silent past
+// one base delay means the build must have died without a schedule.
+func (n *Node) retryFailedDepositBuilds(now uint64) {
+	for orderID, s := range n.sessions {
+		if s.await {
+			continue
+		}
+		// REPOST branch: intent built (txid + hex persisted) but broadcast
+		// never confirmed. Re-send the identical bytes or adopt the
+		// on-chain confirmation — never rebuild (which would double-deposit).
+		if s.ourDepositTxID != "" && s.depositHex != "" {
+			rolePreCreated := (s.isMaker && s.state < csCreatedA) || (!s.isMaker && s.state < csCreatedB)
+			depositSent := false
+			if o := s.order(); o != nil {
+				depositSent = o.DepositSent
+			}
+			if !rolePreCreated || depositSent {
+				continue
+			}
+			if s.depositRetryAt == 0 || s.depositRetryAt > now {
+				continue
+			}
+			n.adoptOrRepostDeposit(s, now)
+			continue
+		}
+		if s.ourDepositTxID != "" {
+			// Built intent without hex (pre-upgrade record): neither rebuild
+			// (would double-deposit) nor repost (nothing to send) — hub
+			// redelivery owns it, as before.
+			continue
+		}
+		var task workTask
+		switch {
+		case s.isMaker && s.state < csCreatedA && s.theirPub != [33]byte{}:
+			task = makerDepositBuildTask(s, s.snapshot())
+		case !s.isMaker && s.state < csCreatedB && s.theirDepositTxID != "":
+			task = takerDepositBuildTask(s, s.snapshot())
+		default:
+			continue
+		}
+		if s.depositRetryAt == 0 {
+			// Adoption: a complete pre-deposit session with no schedule can
+			// only exist if its build died pre-fix (or the node restarted
+			// mid-flight) — and only if it has been silent past one base
+			// delay, so a just-created session never double-posts with its
+			// in-flight hub packet.
+			if s.lastProgress != 0 && s.lastProgress+claimRetryBaseMicro > now {
+				continue
+			}
+		} else if s.depositRetryAt > now {
+			continue
+		}
+		s.depositRetryAt = 0 // consumed; the next failure reschedules
+		s.holdAwait()
+		s.lastProgress = now
+		xlog.Info("deposit rebuild: retrying failed deposit build", "order", orderID,
+			"state", s.state.String(), "attempt", s.depositRetries+1)
+		if !n.postSwapTask(orderID, task) {
+			// Engine busy and the task was dropped (postSwapTask cleared
+			// await): try again next tick instead of losing the retry.
+			s.releaseAwait()
+			s.depositRetryAt = now + claimRetryBaseMicro
+		}
 	}
 }
 
