@@ -103,7 +103,7 @@ func TestRestartRecoversCreatedA(t *testing.T) {
 	}
 
 	// On disk: exactly one persisted swap, already at csCreatedA with its txid.
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 		t.Fatalf("claim broadcast %d times, want 1", len(got))
 	}
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestRestartRecoversPreDeposit(t *testing.T) {
 	// (no deposit task was started, so the session is at csMaker with no txid).
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		ps, _, perr := loadSwaps(swapStatePath(dir))
+		ps, _, _, perr := loadSwaps(swapStatePath(dir))
 		if perr == nil && len(ps) == 1 && ps[0].State < csCreatedA && ps[0].OurDepositTxID == "" {
 			break
 		}

@@ -168,15 +168,21 @@ type persistedBroadcast struct {
 // orders.dat with a fixed RecordChecksum in SerializeFileDB; we instead hash
 // the actual data.
 //
-// Broadcasts ride in the same envelope (omitted when empty). The checksum
-// covers swaps AND broadcasts; files written before broadcasts existed verify
-// through the legacy swaps-only fallback in parseSwapFile. Downgrade note: an
-// older binary reading a file WITH broadcasts fails closed (checksum
-// mismatch) — upgrade is one-way for the state file, back it up first.
+// Broadcasts ride in the same envelope (omitted when empty), split by watch
+// tier: "broadcasts" holds the ACTIVE confirmation-watch entries, "settled"
+// the archived ones (deep-confirmed, sessionless — api/reconcile.go). The
+// checksum covers swaps AND both broadcast sections; files written before
+// broadcasts existed verify through the legacy swaps-only fallback in
+// parseSwapFile, and pre-settled files (broadcasts only) verify through the
+// primary path unchanged (an empty omitted section hashes identically).
+// Downgrade note: an older binary reading a file with any broadcast section
+// fails closed (checksum mismatch) — upgrade is one-way for the state file,
+// back it up first.
 type swapFile struct {
 	Sum        string               `json:"sum"`
 	Swaps      []persistedSwap      `json:"swaps"`
 	Broadcasts []persistedBroadcast `json:"broadcasts,omitempty"`
+	Settled    []persistedBroadcast `json:"settled,omitempty"`
 }
 
 // swapStatePath returns the local swap-state file path inside dir (the
@@ -221,38 +227,43 @@ func snapshotSwaps(n *Node) []persistedSwap {
 }
 
 // snapshotBroadcasts flattens the confirmation-watch table for the swap-file
-// envelope. Mutex-guarded (record sites are not engine-confined); the marshal
-// runs on the background persistLoop like swaps.
-func snapshotBroadcasts(n *Node) []persistedBroadcast {
+// envelope, split by watch tier: active entries under "broadcasts", settled
+// (archived) ones under "settled". Mutex-guarded (record sites are not
+// engine-confined); the marshal runs on the background persistLoop like swaps.
+func snapshotBroadcasts(n *Node) (active, settled []persistedBroadcast) {
 	n.trackedMu.Lock()
 	defer n.trackedMu.Unlock()
-	out := make([]persistedBroadcast, 0, len(n.tracked))
 	for _, tb := range n.tracked {
-		out = append(out, persistedBroadcast{
+		pb := persistedBroadcast{
 			OrderID: tb.OrderID, Kind: tb.Kind, Coin: tb.Coin,
 			TxID: tb.TxID, Hex: tb.Hex, Seq: tb.Seq, Confs: tb.Confs,
 			FirstSeenMicro: tb.FirstSeenMicro, Attempts: tb.Attempts,
-		})
+		}
+		if tb.Settled {
+			settled = append(settled, pb)
+		} else {
+			active = append(active, pb)
+		}
 	}
-	return out
+	return active, settled
 }
 
 // runs on the background persistLoop goroutine, never the engine. A var so
 // marshalSwapFile builds the swap-file envelope (sha256 checksum over swaps
-// plus broadcasts) from flattened snapshots. Pure CPU over the slices, so it
-// runs on the background persistLoop goroutine, never the engine. A var so
-// tests can instrument (count/block) the marshal boundary without touching the
-// engine-owned flatten.
-var marshalSwapFile = func(swaps []persistedSwap, broadcasts []persistedBroadcast) ([]byte, error) {
+// plus both broadcast sections) from flattened snapshots. Pure CPU over the
+// slices, so it runs on the background persistLoop goroutine, never the
+// engine. A var so tests can instrument (count/block) the marshal boundary
+// without touching the engine-owned flatten.
+var marshalSwapFile = func(swaps []persistedSwap, broadcasts, settled []persistedBroadcast) ([]byte, error) {
 	if broadcasts == nil {
 		broadcasts = []persistedBroadcast{}
 	}
-	blob, err := json.Marshal(swapEnvelope{Swaps: swaps, Broadcasts: broadcasts})
+	blob, err := json.Marshal(swapEnvelope{Swaps: swaps, Broadcasts: broadcasts, Settled: settled})
 	if err != nil {
 		return nil, fmt.Errorf("api: marshal swaps: %w", err)
 	}
 	sum := sha256.Sum256(blob)
-	env := swapFile{Sum: hex.EncodeToString(sum[:]), Swaps: swaps, Broadcasts: broadcasts}
+	env := swapFile{Sum: hex.EncodeToString(sum[:]), Swaps: swaps, Broadcasts: broadcasts, Settled: settled}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("api: marshal swap file: %w", err)
@@ -260,11 +271,13 @@ var marshalSwapFile = func(swaps []persistedSwap, broadcasts []persistedBroadcas
 	return data, nil
 }
 
-// swapEnvelope is the checksummed body: swaps plus broadcasts, with nil
-// normalized to [] so old-shape and empty-shape files hash deterministically.
+// swapEnvelope is the checksummed body: swaps plus both broadcast watch
+// sections, with nil normalized to [] so old-shape and empty-shape files hash
+// deterministically.
 type swapEnvelope struct {
 	Swaps      []persistedSwap      `json:"swaps"`
 	Broadcasts []persistedBroadcast `json:"broadcasts"`
+	Settled    []persistedBroadcast `json:"settled,omitempty"`
 }
 
 // writeSwaps durably writes a marshaled swap-file blob via temp-write, fsync
@@ -299,46 +312,50 @@ var writeSwaps = func(path string, data []byte) error {
 }
 
 // loadSwaps reads the swap-state file. A missing file is not an error (returns
-// (nil, nil)); a present but unparseable/corrupt file returns an error so the
-// caller can decide whether to start fresh rather than silently lose state.
-func loadSwaps(path string) ([]persistedSwap, []persistedBroadcast, error) {
+// (nil, nil, nil)); a present but unparseable/corrupt file returns an error so
+// the caller can decide whether to start fresh rather than silently lose
+// state.
+func loadSwaps(path string) ([]persistedSwap, []persistedBroadcast, []persistedBroadcast, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
-		return nil, nil, fmt.Errorf("api: read swap file: %w", err)
+		return nil, nil, nil, fmt.Errorf("api: read swap file: %w", err)
 	}
 	return parseSwapFile(data, path)
 }
 
 // parseSwapFile verifies and splits a swap-file blob. The checksum covers
-// swaps AND broadcasts (nil normalized to [] for determinism); files written
-// before broadcasts existed verify through the legacy swaps-only checksum.
-func parseSwapFile(data []byte, path string) ([]persistedSwap, []persistedBroadcast, error) {
+// swaps AND both broadcast sections (nil normalized to [] for determinism);
+// files written before broadcasts existed verify through the legacy
+// swaps-only checksum, and pre-settled files (broadcasts only) verify through
+// the primary path unchanged — an empty omitted Settled section hashes
+// identically to the old two-section envelope.
+func parseSwapFile(data []byte, path string) ([]persistedSwap, []persistedBroadcast, []persistedBroadcast, error) {
 	var env swapFile
 	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, nil, fmt.Errorf("api: parse swap file %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("api: parse swap file %s: %w", path, err)
 	}
 	bc := env.Broadcasts
 	if bc == nil {
 		bc = []persistedBroadcast{}
 	}
-	if blob, err := json.Marshal(swapEnvelope{Swaps: env.Swaps, Broadcasts: bc}); err == nil {
+	if blob, err := json.Marshal(swapEnvelope{Swaps: env.Swaps, Broadcasts: bc, Settled: env.Settled}); err == nil {
 		sum := sha256.Sum256(blob)
 		if hex.EncodeToString(sum[:]) == env.Sum {
-			return env.Swaps, bc, nil
+			return env.Swaps, bc, env.Settled, nil
 		}
 	}
-	if len(env.Broadcasts) == 0 {
+	if len(env.Broadcasts) == 0 && len(env.Settled) == 0 {
 		if blob, err := json.Marshal(env.Swaps); err == nil {
 			sum := sha256.Sum256(blob)
 			if hex.EncodeToString(sum[:]) == env.Sum {
-				return env.Swaps, nil, nil
+				return env.Swaps, nil, nil, nil
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
+	return nil, nil, nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
 }
 
 // errSwapEnvelopeUnusable marks a swap-state file whose envelope cannot even
@@ -412,9 +429,10 @@ func quarantineSwapFile(path string) (string, error) {
 // persistLoop goroutine, so the engine never does the O(orders) JSON reflection
 // work nor blocks on fsync.
 type persistJob struct {
-	path  string
-	swaps []persistedSwap
-	bc    []persistedBroadcast
+	path    string
+	swaps   []persistedSwap
+	bc      []persistedBroadcast
+	settled []persistedBroadcast
 }
 
 // persistNow durably writes the current swap snapshot to disk synchronously
@@ -442,8 +460,8 @@ func (n *Node) persistNow() error {
 	n.persistWriteMu.Lock()
 	defer n.persistWriteMu.Unlock()
 	swaps := snapshotSwaps(n)
-	bc := snapshotBroadcasts(n)
-	data, err := marshalSwapFile(swaps, bc)
+	bc, settled := snapshotBroadcasts(n)
+	data, err := marshalSwapFile(swaps, bc, settled)
 	if err != nil {
 		xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
 		n.persistFailures.Add(1)
@@ -474,9 +492,9 @@ func (n *Node) persist() {
 	}
 	path := swapStatePath(cfg.DataDir)
 	swaps := snapshotSwaps(n)
-	bc := snapshotBroadcasts(n)
+	bc, settled := snapshotBroadcasts(n)
 	if !n.persistUp.Load() {
-		data, err := marshalSwapFile(swaps, bc)
+		data, err := marshalSwapFile(swaps, bc, settled)
 		if err != nil {
 			xlog.Error("swap persist failed", "dir", cfg.DataDir, "err", err)
 			n.persistFailures.Add(1)
@@ -488,7 +506,7 @@ func (n *Node) persist() {
 		}
 		return
 	}
-	n.publishLatest(&persistJob{path: path, swaps: swaps, bc: bc})
+	n.publishLatest(&persistJob{path: path, swaps: swaps, bc: bc, settled: settled})
 }
 
 // publishLatest records the newest swap-file write job and wakes the background

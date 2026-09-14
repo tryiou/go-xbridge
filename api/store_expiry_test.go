@@ -260,10 +260,14 @@ func TestPruneExpiredInSwapGuard(t *testing.T) {
 	}
 }
 
-// TestPruneExpiredNoHistoryEntry locks in C++ parity: eraseExpiredTransactions
-// erases from m_pendingTransactions without moveTransactionToHistory, so a
-// pruned order leaves the live book AND does not appear in Store.history.
-func TestPruneExpiredNoHistoryEntry(t *testing.T) {
+// TestPruneExpiredWritesHistory locks in the durability rule: every expiry
+// records a terminal history entry (status "expired", reason crTimeout) so a
+// pruned order stays answerable (HasOrder/HistoryOrder) and survives a
+// restart — a finished or stranded order must never silently vanish. This
+// deliberately diverges from C++ eraseExpiredTransactions, which erases
+// without moveTransactionToHistory; the port keeps the audit trail like its
+// finished/cancelled records.
+func TestPruneExpiredWritesHistory(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
 	nowSec := uint64(now.Unix())
@@ -276,8 +280,18 @@ func TestPruneExpiredNoHistoryEntry(t *testing.T) {
 	if s.Get(key) != nil {
 		t.Fatal("pruned order must leave the live book")
 	}
-	if len(s.History()) != 0 {
-		t.Fatalf("history = %v, want empty (C++ eraseExpiredTransactions never moves to history)", s.History())
+	hist := s.History()
+	if len(hist) != 1 {
+		t.Fatalf("history = %v, want exactly one expired record", hist)
+	}
+	if hist[0].ID != key || hist[0].Status != "expired" || hist[0].Reason != uint32(crTimeout) {
+		t.Fatalf("history entry = %+v, want id %s status expired reason crTimeout", hist[0], key)
+	}
+	if hist[0].Order == nil {
+		t.Fatal("history entry lost the order snapshot")
+	}
+	if !s.HasOrder(key) {
+		t.Fatal("expired order must remain answerable via history (anti-re-entry guard)")
 	}
 }
 

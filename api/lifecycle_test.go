@@ -190,7 +190,7 @@ func TestPersistFinishedRoutesToHistory(t *testing.T) {
 	n.store.AddToHistory(o, "finished", 0, NowMicro())
 	n.persist()
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestPersistOrderOnlyRestoresLive(t *testing.T) {
 	n.store.Add(o)
 	n.persist()
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}

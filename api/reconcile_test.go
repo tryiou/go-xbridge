@@ -26,11 +26,11 @@ func TestBroadcastPersistRoundTrip(t *testing.T) {
 		TxID: "0c3f4d70", Hex: "deadbeef", Seq: 7, Confs: 3,
 		FirstSeenMicro: 123456789, Attempts: 2,
 	}}
-	data, err := marshalSwapFile(swaps, bc)
+	data, err := marshalSwapFile(swaps, bc, nil)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	gotSwaps, gotBc, err := parseSwapFile(data, "test")
+	gotSwaps, gotBc, _, err := parseSwapFile(data, "test")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestBroadcastLegacyFileLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotSwaps, gotBc, err := parseSwapFile(data, "test")
+	gotSwaps, gotBc, _, err := parseSwapFile(data, "test")
 	if err != nil {
 		t.Fatalf("legacy load: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestCorruptBroadcastsQuarantined(t *testing.T) {
 	// closed (whole file rejected), never silently drop tracking state.
 	env := map[string]any{"sum": "00", "swaps": []persistedSwap{}, "broadcasts": "garbage"}
 	data, _ := json.Marshal(env)
-	if _, _, err := parseSwapFile(data, "test"); err == nil {
+	if _, _, _, err := parseSwapFile(data, "test"); err == nil {
 		t.Fatal("corrupt file must error, not load")
 	}
 }

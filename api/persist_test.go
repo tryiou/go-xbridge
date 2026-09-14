@@ -68,7 +68,7 @@ func TestPersistRoundTrip(t *testing.T) {
 
 	n.persist()
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestCancelAfterRestart(t *testing.T) {
 
 	// --- "after restart": fresh node, reload from disk, then cancel ---
 	n2 := newPersistNode(t, dir)
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestPersistOnlyLocal(t *testing.T) {
 
 	n.persist()
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestPersistSecretsAlwaysOnDisk(t *testing.T) {
 
 	n.persist()
 
-	ps, _, err := loadSwaps(swapStatePath(dir))
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestCorruptSwapFileSalvagesAndQuarantines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := loadSwaps(path); err == nil {
+	if _, _, _, err := loadSwaps(path); err == nil {
 		t.Fatal("corrupt swap file: strict loadSwaps must return an error")
 	}
 

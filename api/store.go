@@ -384,6 +384,13 @@ func (s *Store) PruneUnconnected(kept map[string]bool) {
 // unknown — block-height expiry is skipped). A BlockNumber of 0 (unknown,
 // legacy persisted records) also skips block-height expiry. Returns the hex ids
 // removed, in ascending id order (callers log them deterministically).
+//
+// Every expiry records a terminal history entry (status "expired", C++
+// TxCancelReason::crTimeout) before the live record is dropped: a finished or
+// stranded order must stay answerable (HasOrder/HistoryOrder) and visible
+// after restart, never silently vanish — the C++ client erases expired
+// transactions (xbridgeapp.cpp:3624) but this port keeps the audit trail like
+// its finished/cancelled records.
 func (s *Store) PruneExpired(now time.Time, currentBlock uint32, inSwap map[string]bool) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -415,6 +422,7 @@ func (s *Store) PruneExpired(now time.Time, currentBlock uint32, inSwap map[stri
 			expired = updated > swap.PendingTTL || created > swap.DeadlineTTL
 		}
 		if expired {
+			s.historyLocked(key, "expired", uint32(crTimeout), nowUs, o)
 			delete(s.orders, key)
 			pruned = append(pruned, key)
 		}

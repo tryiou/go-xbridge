@@ -358,7 +358,7 @@ func (n *Node) writeLatestPersist() {
 	if job == nil {
 		return
 	}
-	data, err := marshalSwapFile(job.swaps, job.bc)
+	data, err := marshalSwapFile(job.swaps, job.bc, job.settled)
 	if err != nil {
 		xlog.Error("swap persist failed", "dir", filepath.Dir(job.path), "err", err)
 		n.persistFailures.Add(1)
