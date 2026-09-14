@@ -206,14 +206,34 @@ func (o *Order) Copy() *Order {
 	return &c
 }
 
+// localSense reports the currency pair as the LOCAL node experiences it, the
+// frame every C++ order renderer emits (rpcxbridge.cpp:795-798 renders the
+// descriptor's fromCurrency/toCurrency verbatim). C++ achieves the local frame
+// by destructively swapping the descriptor at take time (rpcxbridge.cpp:
+// 1262-1264 std::swap(fromCurrency, toCurrency) with the orig* restore on
+// reject, xbridgesession.cpp:3473-3476), so a TAKEN order renders from the
+// taker's perspective: maker = the currency the taker sends, taker = the
+// currency the taker receives. This port keeps the stored Order in the
+// maker-facing pair (Role marks the local taker, Orig* the maker pair) and
+// applies the same frame here at render time: Role 'B' (local taker) renders
+// the swapped pair, every other role (maker 'A', observed, rejected) renders
+// the stored maker-facing pair unchanged.
+func (o *Order) localSense() (maker string, makerSize uint64, taker string, takerSize uint64) {
+	if o.Role == 'B' {
+		return o.ToCurrency, o.ToAmount, o.FromCurrency, o.FromAmount
+	}
+	return o.FromCurrency, o.FromAmount, o.ToCurrency, o.ToAmount
+}
+
 // toOrderBase renders the fields common to all order responses.
 func (o *Order) toOrderBase() orderBase {
+	maker, makerSize, taker, takerSize := o.localSense()
 	return orderBase{
 		ID:                   orderIDString(o.ID),
-		Maker:                o.FromCurrency,
-		MakerSize:            formatXAmount(o.FromAmount),
-		Taker:                o.ToCurrency,
-		TakerSize:            formatXAmount(o.ToAmount),
+		Maker:                maker,
+		MakerSize:            formatXAmount(makerSize),
+		Taker:                taker,
+		TakerSize:            formatXAmount(takerSize),
 		UpdatedAt:            iso8601(o.Updated),
 		CreatedAt:            iso8601(o.Created),
 		OrderType:            orderTypeString(o.PartialAllowed),
@@ -261,13 +281,14 @@ func (o *Order) toTakeDryrunResult(fromSize, toSize uint64) orderListResult {
 func (o *Order) toDetailResult() orderDetailResult {
 	// Field order mirrors the C++ writer (addresses at 3/6), so this builds
 	// orderDetailResult directly rather than embedding orderBase first.
+	maker, makerSize, taker, takerSize := o.localSense()
 	return orderDetailResult{
 		ID:                   orderIDString(o.ID),
-		Maker:                o.FromCurrency,
-		MakerSize:            formatXAmount(o.FromAmount),
+		Maker:                maker,
+		MakerSize:            formatXAmount(makerSize),
 		MakerAddress:         o.MakerAddress,
-		Taker:                o.ToCurrency,
-		TakerSize:            formatXAmount(o.ToAmount),
+		Taker:                taker,
+		TakerSize:            formatXAmount(takerSize),
 		TakerAddress:         o.TakerAddress,
 		UpdatedAt:            iso8601(o.Updated),
 		CreatedAt:            iso8601(o.Created),
@@ -377,13 +398,14 @@ func (o *Order) dryrunMakePartialOrderResponse(repost bool) dryrunMakeOrderResul
 }
 
 func (o *Order) toCancelResult() cancelOrderResult {
+	maker, makerSize, taker, takerSize := o.localSense()
 	return cancelOrderResult{
 		ID:           orderIDString(o.ID),
-		Maker:        o.FromCurrency,
-		MakerSize:    formatXAmount(o.FromAmount),
+		Maker:        maker,
+		MakerSize:    formatXAmount(makerSize),
 		MakerAddress: o.MakerAddress,
-		Taker:        o.ToCurrency,
-		TakerSize:    formatXAmount(o.ToAmount),
+		Taker:        taker,
+		TakerSize:    formatXAmount(takerSize),
 		TakerAddress: o.TakerAddress,
 		RefundTx:     o.RefundTx,
 		UpdatedAt:    iso8601(o.Updated),
@@ -392,11 +414,17 @@ func (o *Order) toCancelResult() cancelOrderResult {
 	}
 }
 
-// clearUsedCoins mirrors C++ TransactionDescr::clearUsedCoins() (called on a
-// reject, xbridgesession.cpp:3467): it resets the swap-role state so the order
-// drops back to a fresh pending order. The Orig* currencies are preserved so the
-// order still renders correctly; the wallet-side coin/fee unlocking is delegated
-// to the connected wallet connector (out of go-xbridge's scope as a thin client).
+// clearUsedCoins restores the order to a fresh pending state after a TAKER
+// reject. It mirrors two C++ sites folded into one Go method: C++
+// TransactionDescr::clearUsedCoins() (xbridgetransactiondescr.h:582-587,
+// clears usedCoins/feeUtxos) plus the address/role/orig* restore that C++
+// performs inline in processTransactionReject (xbridgesession.cpp:3464-3476:
+// fromAddr/from/toAddr/to cleared, role reset, orig* currencies and amounts
+// restored). The fold is safe because this method's ONLY caller is the taker
+// reject path (handleRemoteReject, gated on Role 'B'): C++'s other
+// clearUsedCoins call sites (xbridgeapp.cpp:1848/2382) are not reject paths
+// and are not routed here. The wallet-side coin/fee unlocking is delegated to
+// the connected wallet connector (out of go-xbridge's scope as a thin client).
 func (o *Order) clearUsedCoins() {
 	o.Role = 0
 	o.MakerKey = ""
@@ -406,6 +434,8 @@ func (o *Order) clearUsedCoins() {
 	o.ToCurrency = o.OrigToCurrency
 	o.FromAmount = o.OrigFromAmount
 	o.ToAmount = o.OrigToAmount
+	o.MakerAddress = ""
+	o.TakerAddress = ""
 	o.UsedCoins = nil
 	o.FeeUtxos = nil
 }

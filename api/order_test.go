@@ -48,6 +48,125 @@ func TestTakeDryrunResult(t *testing.T) {
 	}
 }
 
+// takerSenseFixture returns an order as it is stored after a take: the record
+// keeps the MAKER-facing currency pair (From = maker's sending asset, To =
+// maker's receiving asset) with Role 'B' marking the local node as the taker
+// (commitTake). C++ models the same position by destructively swapping the
+// descriptor at take time (rpcxbridge.cpp:1262-1264), so every renderer that
+// emits maker=fromCurrency/taker=toCurrency (rpcxbridge.cpp:795-798) reports
+// the swap from the TAKER's own perspective on a taken order.
+func takerSenseFixture() *Order {
+	return &Order{
+		ID:           [32]byte{0xab},
+		FromCurrency: "BLOCK",
+		FromAmount:   1000000,
+		ToCurrency:   "PIVX",
+		ToAmount:     2000000,
+		Status:       "accepting",
+		Mine:         true,
+		Role:         'B',
+		MakerAddress: "takerSendAddr",
+		TakerAddress: "takerRecvAddr",
+	}
+}
+
+// TestTakerOrderRendersLocalSense proves the order renderers report the LOCAL
+// node's perspective: a taken order (Role 'B') renders maker = the currency the
+// taker sends (the order's toCurrency) and taker = the currency the taker
+// receives (the order's fromCurrency), mirroring C++'s post-swap descriptor.
+func TestTakerOrderRendersLocalSense(t *testing.T) {
+	o := takerSenseFixture()
+	lr := o.toListResult()
+	if lr.Maker != "PIVX" || lr.Taker != "BLOCK" {
+		t.Errorf("taken order list sense: maker=%q taker=%q, want PIVX/BLOCK (taker perspective)", lr.Maker, lr.Taker)
+	}
+	if lr.MakerSize != "2.000000" || lr.TakerSize != "1.000000" {
+		t.Errorf("taken order list sizes: maker_size=%q taker_size=%q, want 2.000000/1.000000", lr.MakerSize, lr.TakerSize)
+	}
+
+	dr := o.toDetailResult()
+	if dr.Maker != "PIVX" || dr.Taker != "BLOCK" {
+		t.Errorf("taken order detail sense: maker=%q taker=%q, want PIVX/BLOCK", dr.Maker, dr.Taker)
+	}
+	if dr.MakerAddress != "takerSendAddr" || dr.TakerAddress != "takerRecvAddr" {
+		t.Errorf("taken order detail addresses: maker=%q taker=%q, want takerSendAddr/takerRecvAddr", dr.MakerAddress, dr.TakerAddress)
+	}
+
+	cr := o.toCancelResult()
+	if cr.Maker != "PIVX" || cr.Taker != "BLOCK" {
+		t.Errorf("taken order cancel sense: maker=%q taker=%q, want PIVX/BLOCK", cr.Maker, cr.Taker)
+	}
+}
+
+// TestMakerOrderSenseUnchanged proves maker and observed orders (Role 'A'/0)
+// keep rendering the maker-facing pair, matching C++ where only the TAKER's
+// descriptor is swapped at take time (rpcxbridge.cpp:1262-1264).
+func TestMakerOrderSenseUnchanged(t *testing.T) {
+	for _, role := range []byte{'A', 0} {
+		o := &Order{
+			ID:           [32]byte{0xac},
+			FromCurrency: "BLOCK",
+			FromAmount:   1000000,
+			ToCurrency:   "PIVX",
+			ToAmount:     2000000,
+			Status:       "open",
+			Role:         role,
+			MakerAddress: "makerSendAddr",
+			TakerAddress: "makerRecvAddr",
+		}
+		lr := o.toListResult()
+		if lr.Maker != "BLOCK" || lr.Taker != "PIVX" {
+			t.Errorf("role %q list sense: maker=%q taker=%q, want BLOCK/PIVX (maker perspective)", role, lr.Maker, lr.Taker)
+		}
+		dr := o.toDetailResult()
+		if dr.MakerAddress != "makerSendAddr" || dr.TakerAddress != "makerRecvAddr" {
+			t.Errorf("role %q detail addresses: maker=%q taker=%q", role, dr.MakerAddress, dr.TakerAddress)
+		}
+	}
+}
+
+// TestTakerRejectRestoresMakerSense proves a rejected take renders the
+// maker-facing pair again, mirroring C++ processTransactionReject's restore
+// from orig* currencies and its address clear (xbridgesession.cpp:3464-3476).
+func TestTakerRejectRestoresMakerSense(t *testing.T) {
+	o := takerSenseFixture()
+	o.OrigFromCurrency = "BLOCK"
+	o.OrigToCurrency = "PIVX"
+	o.clearUsedCoins()
+	if o.Role != 0 {
+		t.Errorf("clearUsedCoins role = %q, want 0", o.Role)
+	}
+	lr := o.toListResult()
+	if lr.Maker != "BLOCK" || lr.Taker != "PIVX" {
+		t.Errorf("rejected take sense: maker=%q taker=%q, want BLOCK/PIVX (restored maker pair)", lr.Maker, lr.Taker)
+	}
+	dr := o.toDetailResult()
+	if dr.MakerAddress != "" || dr.TakerAddress != "" {
+		t.Errorf("rejected take addresses = %q/%q, want cleared", dr.MakerAddress, dr.TakerAddress)
+	}
+}
+
+// TestTakeResultUnaffectedByLocalSense pins the interaction between the
+// render-time local-sense swap and the take renderers: toTakeResult /
+// toTakeDryrunResult set Maker/Taker explicitly and must NOT compose with
+// localSense (a Role-'B' order passed to toTakeResult — the committed take
+// response path, node.go TakeOrder → result.toTakeResult — must render the
+// SAME single swap as before, never a double swap).
+func TestTakeResultUnaffectedByLocalSense(t *testing.T) {
+	o := takerSenseFixture()
+	res := o.toTakeResult(o.ToAmount, o.FromAmount)
+	if res.Maker != "PIVX" || res.Taker != "BLOCK" {
+		t.Errorf("take result on Role-'B' order: maker=%q taker=%q, want single swap PIVX/BLOCK", res.Maker, res.Taker)
+	}
+	if res.MakerSize != "2.000000" || res.TakerSize != "1.000000" {
+		t.Errorf("take result sizes: maker_size=%q taker_size=%q, want 2.000000/1.000000", res.MakerSize, res.TakerSize)
+	}
+	dry := o.toTakeDryrunResult(o.ToAmount, o.FromAmount)
+	if dry.Maker != "BLOCK" || dry.Taker != "PIVX" {
+		t.Errorf("take dryrun on Role-'B' order: maker=%q taker=%q, want pre-swap BLOCK/PIVX", dry.Maker, dry.Taker)
+	}
+}
+
 // TestXBridgeValidCoin locks in the C++ 6-decimal precision gate used by
 // dxMakeOrder.
 func TestXBridgeValidCoin(t *testing.T) {

@@ -2522,6 +2522,15 @@ func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPri
 		stored.MakerKey = makerKey
 		stored.OrigFromCurrency = prevOrder.FromCurrency
 		stored.OrigToCurrency = prevOrder.ToCurrency
+		// Taker addresses on the local frame (C++ acceptXBridgeTransaction
+		// stamps ptr->fromAddr/from = the taker's send address and
+		// ptr->toAddr/to = the taker's receive address, xbridgeapp.cpp:
+		// 2386-2389). MakerAddress/TakerAddress render under those roles via
+		// toDetailResult (dxGetMyOrders); the taker-reject path clears them
+		// (C++ processTransactionReject xbridgesession.cpp:3464-3467 — folded
+		// into Go's clearUsedCoins, whose only caller is handleRemoteReject).
+		stored.MakerAddress = p.FromAddress
+		stored.TakerAddress = p.ToAddress
 		stored.Utxos = proofs
 		stored.UsedCoins = usedCoins
 		stored.FeeUtxos = feeInputs
