@@ -723,3 +723,133 @@ func TestPersistWriteRetrySucceeds(t *testing.T) {
 		t.Fatalf("swap file must exist after retry succeeds; stat err = %v", err)
 	}
 }
+
+// TestFinishedSwapSurvivesRestart pins the persistence contract for terminal
+// trades: a finished local order that moved to Store.history (the real finish
+// path, swap.go applyFinished → MoveToHistory, mirroring C++
+// moveTransactionToHistory, xbridgesession.cpp:3385) is written to the swap
+// file as a historical record, restored back into history by a fresh node
+// (restoreSwap's terminal branch routes it via AddToHistory, never the live
+// book), and stays resolvable — dxGetOrder via the HistoryOrder fallback
+// (C++ App::transaction consults m_historicTransactions,
+// xbridgeapp.cpp:1273-1292) and dxGetMyOrders via the live+history merge
+// (rpcxbridge.cpp:2110-2121) — across REPEATED restarts with no record loss,
+// no duplication, and no field drift. Regression guard for a runtime
+// finished-history wipe once observed under a pre-refactor build: the exact
+// wipe mechanism could not be reproduced (its log window rotated away), so
+// this double-restart round-trip plus the snapshot count-change log in
+// noteSnapshotCount are the standing detectors.
+func TestFinishedSwapSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	var id [32]byte
+	copy(id[:], []byte("finished-swap-restart-id00000000")) // 32 bytes
+	idHex := hexEncode(id[:])
+	const now = uint64(1726310000000000)
+
+	// Mirrors a live maker-side trade record: maker-order frame with the
+	// maker/taker addresses from the original book side (Role 'A').
+	mk := func() *Order {
+		return &Order{
+			ID:           id,
+			FromCurrency: "BLOCK",
+			ToCurrency:   "PIVX",
+			FromAmount:   10000, // 0.01 COIN at the 1e6 XBridge scale
+			ToAmount:     10000,
+			Created:      now,
+			Updated:      now,
+			Mine:         true,
+			Role:         'A',
+			MakerAddress: "BWS8Vt58uk4gzJmZ17H6cBrcXUuJ1fccZZ",
+			TakerAddress: "DFosJqyKADvh9qsePrYQtqefS74TtJe2gF",
+		}
+	}
+
+	n1 := newPersistNode(t, dir)
+	n1.store.Add(mk())
+	n1.store.MoveToHistory(idHex, "finished", 0, now)
+
+	n1.persist()
+
+	ps, _, _, err := loadSwaps(swapStatePath(dir))
+	if err != nil {
+		t.Fatalf("loadSwaps: %v", err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("persisted %d swap records, want 1", len(ps))
+	}
+	if !ps[0].Historical || ps[0].Status != "finished" {
+		t.Fatalf("persisted record: historical=%v status=%q, want historical=true status=finished", ps[0].Historical, ps[0].Status)
+	}
+
+	// Restart #1: the fresh node must restore the terminal record into
+	// history — never the live book — with identity, role and addresses intact.
+	n2 := newPersistNode(t, dir)
+	n2.restoreLocalSwaps(dir)
+	if o := n2.store.Get(idHex); o != nil {
+		t.Fatal("terminal record was re-registered as a live order")
+	}
+	ho := n2.store.HistoryOrder(idHex)
+	if ho == nil {
+		t.Fatal("finished order missing from history after restart")
+	}
+	if ho.Status != "finished" || !ho.Mine || ho.Role != 'A' {
+		t.Fatalf("restored history order: status=%q mine=%v role=%q", ho.Status, ho.Mine, ho.Role)
+	}
+	if ho.MakerAddress != "BWS8Vt58uk4gzJmZ17H6cBrcXUuJ1fccZZ" || ho.TakerAddress != "DFosJqyKADvh9qsePrYQtqefS74TtJe2gF" {
+		t.Fatalf("restored history order lost its addresses: maker=%q taker=%q", ho.MakerAddress, ho.TakerAddress)
+	}
+	if got := n2.store.History(); len(got) != 1 {
+		t.Fatalf("history holds %d entries after restart, want 1", len(got))
+	}
+
+	// Restart #2 — the real-world failure mode was a LATER run dropping the
+	// history, so re-persist from the restored state and restore once more.
+	n2.persist()
+	ps2, _, _, err := loadSwaps(swapStatePath(dir))
+	if err != nil {
+		t.Fatalf("loadSwaps #2: %v", err)
+	}
+	if len(ps2) != 1 {
+		t.Fatalf("second persist wrote %d swap records, want 1 (no duplication, no loss)", len(ps2))
+	}
+	if ps2[0].ID != id || !ps2[0].Historical || ps2[0].Status != "finished" {
+		t.Fatalf("second persist record drifted: id-match=%v historical=%v status=%q", ps2[0].ID == id, ps2[0].Historical, ps2[0].Status)
+	}
+
+	n3 := newPersistNode(t, dir)
+	n3.restoreLocalSwaps(dir)
+	if ho := n3.store.HistoryOrder(idHex); ho == nil || ho.Status != "finished" || !ho.Mine {
+		t.Fatalf("finished order did not survive the second restart: %+v", ho)
+	}
+}
+
+// TestNoteSnapshotCountPinsTheGate pins noteSnapshotCount's counter logic:
+// the first observation establishes the baseline without logging a spurious
+// 0→N transition (swapCountSeen gate), repeated equal counts are steady, and
+// the tracked value always reflects the latest snapshot — so a decrease can
+// only ever WARN against a real previously-seen count, never against a zero
+// value. The log emissions themselves are exercised by every persist test.
+func TestNoteSnapshotCountPinsTheGate(t *testing.T) {
+	n := newPersistNode(t, t.TempDir())
+	if n.swapCountSeen.Load() {
+		t.Fatal("swapCountSeen must start false (first-shot gate armed)")
+	}
+	n.noteSnapshotCount(3)
+	if !n.swapCountSeen.Load() || n.lastSwapCount.Load() != 3 {
+		t.Fatalf("first observation: seen=%v count=%d, want seen=true count=3",
+			n.swapCountSeen.Load(), n.lastSwapCount.Load())
+	}
+	n.noteSnapshotCount(3)
+	if n.lastSwapCount.Load() != 3 {
+		t.Fatalf("steady count drifted: %d", n.lastSwapCount.Load())
+	}
+	n.noteSnapshotCount(1)
+	if n.lastSwapCount.Load() != 1 {
+		t.Fatalf("decrease not tracked: %d", n.lastSwapCount.Load())
+	}
+	n.noteSnapshotCount(5)
+	if n.lastSwapCount.Load() != 5 {
+		t.Fatalf("increase not tracked: %d", n.lastSwapCount.Load())
+	}
+}

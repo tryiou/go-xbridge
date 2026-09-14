@@ -460,6 +460,7 @@ func (n *Node) persistNow() error {
 	n.persistWriteMu.Lock()
 	defer n.persistWriteMu.Unlock()
 	swaps := snapshotSwaps(n)
+	n.noteSnapshotCount(len(swaps))
 	bc, settled := snapshotBroadcasts(n)
 	data, err := marshalSwapFile(swaps, bc, settled)
 	if err != nil {
@@ -473,6 +474,36 @@ func (n *Node) persistNow() error {
 		return err
 	}
 	return nil
+}
+
+// noteSnapshotCount tracks the swap-record count of each freshly built
+// snapshot and logs every transition, so local swap history can never be
+// silently erased: a past build wiped finished-swap history at runtime with
+// no trace in the surviving logs precisely because nothing logged snapshot
+// counts. A decrease is WARNed: the only legitimate shrink paths are
+// dxFlushCancelledOrders (operator RPC, trCancelled records only) and the
+// 1000-entry history cap; any other drop is finished-swap history loss. An
+// increase is INFO (normal: a new order, a finished trade moving to
+// history). The count is observed at snapshot time, before the marshal/write
+// boundary — a failed disk write is a separate, already-counted failure
+// (persistFailures), not a history loss. Both call sites (persist,
+// persistNow) snapshot on the engine goroutine, so plain atomics suffice —
+// no lock held.
+func (n *Node) noteSnapshotCount(m int) {
+	if !n.swapCountSeen.CompareAndSwap(false, true) {
+		prev := n.lastSwapCount.Swap(int64(m))
+		switch {
+		case prev == int64(m):
+			// Steady state: the overwhelmingly common case stays silent.
+		case int64(m) < prev:
+			xlog.Warn("swap snapshot record count shrank", "from", prev, "to", m,
+				"note", "legitimate only via dxFlushCancelledOrders or the history cap; any other decrease is silent history loss")
+		default:
+			xlog.Info("swap snapshot record count grew", "from", prev, "to", m)
+		}
+		return
+	}
+	n.lastSwapCount.Store(int64(m))
 }
 
 // persist flushes local swap state to disk without blocking the engine on
@@ -492,6 +523,7 @@ func (n *Node) persist() {
 	}
 	path := swapStatePath(cfg.DataDir)
 	swaps := snapshotSwaps(n)
+	n.noteSnapshotCount(len(swaps))
 	bc, settled := snapshotBroadcasts(n)
 	if !n.persistUp.Load() {
 		data, err := marshalSwapFile(swaps, bc, settled)

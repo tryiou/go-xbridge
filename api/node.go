@@ -251,6 +251,16 @@ type Node struct {
 	// persistUp is true once start() has launched persistLoop. persist() writes
 	// synchronously when it is false (inline/test mode, no loop to hand to).
 	persistUp atomic.Bool
+	// Swap-file observability: the swap-record count of the most recently
+	// snapshotted persist job, with a first-shot gate so startup never logs a
+	// spurious 0→N transition. A decreasing count is WARNed by
+	// noteSnapshotCount (persist.go) — the only legitimate shrink paths are
+	// dxFlushCancelledOrders and the bounded history cap, so any other drop
+	// is silent local-history loss and must be loud (a past build wiped
+	// finished-swap history at runtime with no trace in the surviving logs
+	// because nothing logged snapshot counts).
+	lastSwapCount atomic.Int64
+	swapCountSeen atomic.Bool
 	// persistFailures counts durable swap-state persist operations (marshal or
 	// disk write) that failed. A non-zero value means the on-disk state may be
 	// behind the in-memory state, so a restart could be unable to refund/claim
@@ -2529,7 +2539,7 @@ func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPri
 		stored.OrigToCurrency = prevOrder.ToCurrency
 		// Taker addresses on the local frame (C++ acceptXBridgeTransaction
 		// stamps ptr->fromAddr/from = the taker's send address and
-		// ptr->toAddr/to = the taker's receive address, xbridgeapp.cpp:
+		// ptr->toAddr/to = the taker's receive address — xbridgeapp.cpp
 		// 2386-2389). MakerAddress/TakerAddress render under those roles via
 		// toDetailResult (dxGetMyOrders); the taker-reject path clears them
 		// (C++ processTransactionReject xbridgesession.cpp:3464-3467 — folded
