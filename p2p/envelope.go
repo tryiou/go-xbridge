@@ -43,7 +43,7 @@ func encodeXBridgePayload(packet []byte, dest [20]byte) []byte {
 	env = append(env, ts[:]...)
 	env = append(env, packet...)
 	out := writeVarInt(len(env))
-	xlog.Debug("encode xbridge payload", "packetLen", len(packet), "envLen", len(out))
+	xlog.With("p2p", true).Debug("encode xbridge payload", "packetLen", len(packet), "envLen", len(out))
 	return append(out, env...)
 }
 

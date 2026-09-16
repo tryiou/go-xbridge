@@ -170,6 +170,12 @@ func (s *conformanceStubConn) GetRawTransactionVerbose(string) (wallet.VerboseTx
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
 }
 
+func (s *conformanceStubConn) GetRawMempool() ([]string, error) {
+	// Hermetic fixture: an empty mempool keeps the own-deposit spend watch
+	// inert (no entries to scan) without touching the wire fixtures.
+	return nil, nil
+}
+
 // conformanceXConn is a stub api.XConn whose ReadPacket blocks forever (returns
 // io.EOF) so a fixture cannot accidentally consume real input; WritePacket
 // succeeds so the write-command paths (requireWrite + broadcast) are reachable.
@@ -333,12 +339,27 @@ func conformanceSeedPartialOrder(store *Store) *Order {
 	return o
 }
 
-// conformanceSeedFill adds a BTC/SYS fill the read history methods aggregate.
+// conformanceSeedFill adds a finished BTC/SYS history record the read history
+// methods aggregate (fills are projected from history, never seeded directly).
 func conformanceSeedFill(store *Store) {
-	store.AddFill(fillEntry{
-		ID: "aaa", Time: 1600000000000000, Maker: "BTC", MakerSize: "1.500000",
-		Taker: "SYS", TakerSize: "0.300000",
-	})
+	store.AddToHistory(&Order{
+		ID:             [32]byte{0xaa},
+		Type:           OrderTypeMaker,
+		FromCurrency:   "BTC",
+		FromAmount:     1500000,
+		ToCurrency:     "SYS",
+		ToAmount:       300000,
+		Created:        1600000000000000,
+		Updated:        1600000000000000,
+		Status:         "finished",
+		Mine:           true,
+		PartialAllowed: true,
+		MinFromAmount:  1000000,
+		OrigFromAmount: 1500000,
+		OrigToAmount:   300000,
+		MakerAddress:   conformanceAddr,
+		TakerAddress:   conformanceAddr,
+	}, "finished", 0, 1600000000000000)
 }
 
 // conformanceSeedCancelled adds a cancelled order old enough to flush.

@@ -26,6 +26,16 @@ import (
 // canceled: far beyond a healthy swap (minutes) and hub redelivery (~45s).
 const sessionStallMicro = 30 * 60 * 1000000
 
+// sessionStallWarnMicro is the early-visibility threshold: a live session with
+// no observable progress for this long gets a "no hub progress" WARN naming
+// the hub — long before the 30-minute cancel. Between "swap session created"
+// and the stall cancel the operator otherwise sees NOTHING from a hub that
+// silently dropped the handshake (a hub rejects a take on its side and
+// addresses the reject to the taker only, so the maker never learns why
+// nothing arrives). Progress resets the warning; the cancel threshold is
+// untouched (observation only, no behavior change).
+const sessionStallWarnMicro = 5 * 60 * 1000000
+
 // mineOrderTTLMicro is the age past which a Mine limbo order (no session, no
 // deposit, nothing tracked) is dropped.
 const mineOrderTTLMicro = 24 * 60 * 60 * 1000000
@@ -37,6 +47,9 @@ const mineOrderTTLMicro = 24 * 60 * 60 * 1000000
 // claims (Phase-2 owns those).
 func (n *Node) watchStalledSessions() {
 	now := uint64(NowMicro())
+	if n.stallWarned == nil {
+		n.stallWarned = map[string]uint64{} // lazily built nodes (tests) never ran start()
+	}
 	for id, s := range n.sessions {
 		if s.state == csFinished || s.refundDone || s.await || s.claimHex != "" {
 			continue
@@ -44,7 +57,29 @@ func (n *Node) watchStalledSessions() {
 		if s.lastProgress == 0 {
 			continue // unstamped (test-built) session: never fire
 		}
-		if now < s.lastProgress || now-s.lastProgress <= sessionStallMicro {
+		silent := uint64(0)
+		if now >= s.lastProgress {
+			silent = now - s.lastProgress
+		}
+		// Early WARN, once per silent period (a new silence = a new
+		// lastProgress value). Progress resumed since the last warn drops the
+		// entry so a later stall warns again.
+		if silent > sessionStallWarnMicro {
+			if n.stallWarned[id] != s.lastProgress {
+				n.stallWarned[id] = s.lastProgress
+				status := ""
+				if o := n.store.Get(id); o != nil {
+					status = o.Status
+				}
+				xlog.Warn("swap session: no hub progress", "order", id,
+					"role", map[bool]string{true: "maker", false: "taker"}[s.isMaker],
+					"state", s.state.String(), "hub", hexEncode(s.hubKey[:]),
+					"silentSec", silent/1000000, "orderStatus", status)
+			}
+		} else {
+			delete(n.stallWarned, id)
+		}
+		if silent <= sessionStallMicro {
 			continue
 		}
 		// Already resolved or cooling down: an earlier fire rolled the

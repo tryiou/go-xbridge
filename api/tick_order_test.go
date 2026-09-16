@@ -36,7 +36,7 @@ func TestTickStageOrderRecoveryBeforeTermination(t *testing.T) {
 		"scanRefunds", "scanStoredRefunds",
 		"resendHoldApplies", "retryFailedClaimBuilds", "retryFailedDepositBuilds",
 		"recordSilentHubs", "watchStalledSessions", "gcStaleMineOrders",
-		"watchCounterpartyDeposits", "pollBroadcastConfirmations", "rebroadcastUnconfirmed",
+		"watchCounterpartyDeposits", "watchOwnDepositSpends", "pollBroadcastConfirmations", "rebroadcastUnconfirmed",
 		"pruneTracked", "pruneSessions", "persist",
 	}
 	if len(names) != len(want) {

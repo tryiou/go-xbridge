@@ -281,9 +281,23 @@ type Node struct {
 	refundAttempts map[string]int
 	refundRetryAt  map[string]uint64
 
+	// stallWarned is the engine-owned early-stall-watch state (stall_watch.go):
+	// per-session lastProgress value already covered by a "no hub progress"
+	// WARN, so the warning fires once per silent period instead of on every
+	// 60 s tick. An entry is dropped when the session advances or disappears.
+	stallWarned map[string]uint64
+
 	// pendingWatch is the engine-owned guard against double-enqueueing a
 	// counterparty-deposit watch probe for a session already being polled.
 	pendingWatch map[string]bool
+
+	// pendingOwnWatch guards double-enqueueing an own-deposit spend watch
+	// (C++ checkWatchesOnDepositSpends, xbridgeapp.cpp:3340) for a session.
+	pendingOwnWatch map[string]bool
+	// ownWatchSeen is the engine-owned per-session set of mempool txids this
+	// daemon already fetched and vin-scanned without a match (C++ rescan is
+	// incremental per watch tick; the set reproduces that incrementality).
+	ownWatchSeen map[string]map[string]struct{}
 
 	// blockMu guards the cached anti-replay blockHash stamped on outgoing
 	// orders. C++ uses chainActive.Tip()->pprev (BLOCK best block minus one);
@@ -1420,7 +1434,7 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 	if hub != ([20]byte{}) {
 		s.hub = hub
 	}
-	swlog.Info("swap packet received", "command", cmdName, "state", s.state.String())
+	xlog.With("p2p", true, "order", orderID).Info("swap packet received", "command", cmdName, "state", s.state.String())
 	// Any hub-verified packet proves the hub path is alive (even an
 	// await-dropped retransmit) — stamp watchdog progress here, past the
 	// signature gate, before any state-specific handling.
@@ -1453,7 +1467,7 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 	if err := n.send(s.hub, cmd, body, s.privKey[:]); err != nil {
 		swlog.Error("swap response send failed", "command", cmd.String(), "err", err)
 	} else {
-		swlog.Info("swap response sent", "command", cmd.String())
+		xlog.With("p2p", true, "order", orderID).Info("swap response sent", "command", cmd.String())
 		// Stamp the first HoldApply send so the resender
 		// (api/hold_resend.go) knows when the silence interval starts.
 		// Resends restamp themselves; nothing else writes this field.
@@ -1538,7 +1552,7 @@ func (n *Node) send(dest [20]byte, cmd proto.XBridgeCommand, body responseBody, 
 	// slog discards disabled-level args AFTER evaluating them, so an
 	// unconditional packetHex call would Marshal+hex-encode on every send.
 	if xlog.Level() <= slog.LevelDebug {
-		xlog.Debug("swap packet sent", "command", cmd.String(), "hex", packetHex(pkt))
+		xlog.With("p2p", true).Debug("swap packet sent", "command", cmd.String(), "hex", packetHex(pkt))
 	}
 	return nil
 }
@@ -2338,6 +2352,16 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if ferr != nil {
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", ferr.Error())
 	}
+	// The fee is real money leaving the wallet the moment the take is
+	// broadcast (and it is spent even when the swap later fails — the SN
+	// earned it for brokering the attempt). A take that burns the fee with
+	// zero log evidence is unauditable; log it with its destination.
+	feeSum := uint64(0)
+	for _, u := range feeInputs {
+		feeSum += u.Amount
+	}
+	xlog.Info("take: service-node fee prepared", "order", p.ID, "fee",
+		formatXAmount(feeSum), "dest", feeDest, "inputs", len(feeInputs))
 
 	// Taker funding (C++ :2269-2358): selectUtxos from the to-currency wallet,
 	// excluding both the per-token locked set (getAllLockedUtxos(o.ToCurrency),
@@ -2402,6 +2426,16 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if cerr != nil {
 		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", cerr.Error())
 	}
+	// The hub validates this take against ITS OWN wallets with a ±1-block
+	// height tolerance and a truncated-hash match (C++ processTransactionAccepting,
+	// xbridgesession.cpp:963-1020), rejecting with crNotAccepted on drift and
+	// addressing that reject to the taker only. Log exactly what we report so a
+	// hub-side rejection is diagnosable from this node alone (stale counterparty
+	// or hub wallets are the recurring cause).
+	xlog.Info("take: accepting prepared", "order", p.ID,
+		"fromCur", o.ToCurrency, "fromHeight", fromH, "fromHash", hex.EncodeToString(fromHash[:]),
+		"toCur", o.FromCurrency, "toHeight", toH, "toHash", hex.EncodeToString(toHash[:]),
+		"hub", o.SNodePubkey)
 
 	// Atomic input reservation (C++ state gate + lockFeeUtxos + lockCoins
 	// under m_utxosOrderLock, xbridgeapp.cpp:2122-2267). An order with an
@@ -2601,6 +2635,7 @@ func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPri
 		revertTake()
 		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
+	xlog.Info("take broadcast", "order", key, "hub", live.SNodePubkey)
 	return n.store.Get(key), nil
 }
 

@@ -226,3 +226,30 @@ func TestMakerDepositRetryRedrivesAndClears(t *testing.T) {
 		t.Fatalf("state = %s, want createdA", s.state.String())
 	}
 }
+
+// TestTakerDepositLocktimeZeroRetriesNotCanceled pins the taker-side mirror of
+// the S5 lesson (BLOCK/PIVX order 9698af09, 2026-09-14): a locktime
+// EXPECTATION that cannot be computed (our wallet outage on the counterparty
+// coin's height read) is TRANSIENT — the deposit build must schedule the
+// standard deposit retry instead of wire-cancelling with crBadALockTime.
+// The drift check itself still rejects genuinely-bad locktimes.
+func TestTakerDepositLocktimeZeroRetriesNotCanceled(t *testing.T) {
+	makerNode, takerNode, makerSession, takerSession, hub, orderID, createdA, mkBtcConn, tkBtcConn := blindDepositFixture(t)
+	// The taker's BTC-chain height read fails (outage) AFTER the maker's
+	// deposit exists: computeLockTimeFor("BTC") returns 0 in the drift check.
+	tkBtcConn.blockHeight = 0
+	_ = makerNode
+	_ = mkBtcConn
+	_, _, _ = takerSession.OnCreateB(&proto.CreateBBody{HubAddress: hub, ID: orderID,
+		APubKey: makerSession.pubkey(), ADepositTxID: createdA.ADepositTxID,
+		HashedSecret: createdA.HashedSecret, ALockTime: createdA.ALockTime})
+	if takerSession.depositRetryAt == 0 {
+		t.Fatal("locktime-zero build must schedule a deposit retry, not strand")
+	}
+	if got := takerNode.sessions[hexEncode(orderID[:])]; got == nil || got.state == csIdle {
+		t.Fatalf("healthy swap self-cancelled on a wallet outage: session=%v", got)
+	}
+	if o := takerNode.store.Get(hexEncode(orderID[:])); o == nil || isOrderTerminal(o.Status) {
+		t.Fatalf("order must stay live, got %+v", o)
+	}
+}

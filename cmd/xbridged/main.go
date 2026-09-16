@@ -155,6 +155,16 @@ func main() {
 		fatalf("txlog dir: %v", err)
 	}
 
+	// Dedicated packet log (<datadir>/log-p2p/xbridgep2p.log): every xbridge
+	// packet send/receive trace lands here instead of the general log. Same
+	// size-based rotation as the general log file.
+	var pktRw io.Closer
+	if pktR, err := xlog.SetP2PLogFile(filepath.Join(dataDir, "log-p2p", "xbridgep2p.log"), 10<<20, 2); err != nil {
+		fatalf("p2p log file: %v", err)
+	} else {
+		pktRw = pktR
+	}
+
 	var magic [4]byte
 	if *magicHex != "" {
 		if b, err := hex.DecodeString(*magicHex); err != nil || len(b) != 4 {
@@ -315,6 +325,11 @@ func main() {
 	if rw != nil {
 		if err := rw.Close(); err != nil {
 			xlog.Error("log close", "err", err)
+		}
+	}
+	if pktRw != nil {
+		if err := pktRw.Close(); err != nil {
+			xlog.Error("p2p log close", "err", err)
 		}
 	}
 	xlog.CloseTxLog()

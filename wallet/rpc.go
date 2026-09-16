@@ -634,6 +634,17 @@ func (c *RPCConnector) GetTxOut(txid string, vout uint32) (Utxo, bool, error) {
 	return u, true, nil
 }
 
+// GetRawMempool returns the mempool's transaction ids via getrawmempool
+// (C++ App::Impl::checkWatchesOnDepositSpends' mempool sweep,
+// xbridgeapp.cpp:3384-3413, drives the same RPC through its connector).
+func (c *RPCConnector) GetRawMempool() ([]string, error) {
+	var txids []string
+	if err := c.cli.Call("getrawmempool", []interface{}{}, &txids); err != nil {
+		return nil, err
+	}
+	return txids, nil
+}
+
 // CheckDepositTransaction validates a counterparty deposit against the expected
 // p2sh script and amount. It is a 1:1 port of
 // BtcWalletConnector::checkDepositTransaction (xbridgewalletconnectorbtc.cpp:

@@ -32,7 +32,6 @@ import (
 type Store struct {
 	mu      sync.RWMutex
 	orders  map[string]*Order
-	fills   []fillEntry // recent completed fills (session-scoped, like C++)
 	locked  map[string]*Order
 	history []historyEntry // removed/cancelled orders kept for dxGetOrderHistory fidelity
 	// reserved holds the "txid:vout" keys (display order) committed atomically
@@ -56,24 +55,12 @@ type reservedKeys struct {
 	fundCurrency string   // ticker of the funding wallet (the order's ToCurrency)
 }
 
-const (
-	maxStoreFills   = 1000 // bound on s.fills (bounded history)
-	maxStoreHistory = 1000 // bound on s.history (bounded history)
-)
-
-// trimOldest returns s with at most max elements, dropping the oldest entries
-// from the front.
-func trimOldest[S ~[]E, E any](s S, max int) S {
-	if len(s) > max {
-		return s[len(s)-max:]
-	}
-	return s
-}
-
 // historyEntry is a removed order's terminal record (C++ moveTransactionToHistory),
 // carrying a full snapshot of the order so finished/cancelled local orders stay
 // renderable via dxGetMyOrders / dxGetOrder (C++ m_historicTransactions holds
-// complete TransactionDescrPtrs, not thin records).
+// complete TransactionDescrPtrs, not thin records). History is unbounded like
+// C++: no cap, no TTL — only the explicit dxFlushCancelledOrders operator RPC
+// erases cancelled records.
 type historyEntry struct {
 	ID      string
 	Status  string // e.g. "canceled"
@@ -82,6 +69,10 @@ type historyEntry struct {
 	Order   *Order // snapshot of the order at removal time (nil when unavailable)
 }
 
+// fillEntry is one rendered fill row: the dxGetOrderFills 12-field object
+// (rpcxbridge.cpp:569-582). It is a pure projection, never stored — Fills()
+// derives it from the finished Mine history records on every call, so there
+// is no fills ledger to persist and nothing that can drift from history.
 type fillEntry struct {
 	ID        string
 	Time      uint64 // microseconds since epoch
@@ -90,7 +81,6 @@ type fillEntry struct {
 	Taker     string
 	TakerSize string
 	ParentID  string
-	PartialID string
 	// Partial-order fields, carried so dxGetOrderFills can echo C++'s full
 	// 12-field fill object.
 	OrderType            string
@@ -194,7 +184,8 @@ func (s *Store) Remove(idHex string) {
 
 // historyLocked appends a terminal history entry under the held lock. It is a
 // no-op when the id is already recorded (C++ moveTransactionToHistory returns
-// early on a duplicate) and trims to the bounded cap.
+// early on a duplicate). History is unbounded (C++ m_historicTransactions has
+// no cap): every terminal record is retained.
 func (s *Store) historyLocked(idHex, status string, reason uint32, updated uint64, o *Order) {
 	for _, e := range s.history {
 		if e.ID == idHex {
@@ -214,7 +205,6 @@ func (s *Store) historyLocked(idHex, status string, reason uint32, updated uint6
 		Updated: updated,
 		Order:   snap,
 	})
-	s.history = trimOldest(s.history, maxStoreHistory)
 }
 
 // MoveToHistory deletes the live order and appends a terminal history record,
@@ -444,23 +434,38 @@ func ageSec(nowUs, ts uint64) uint64 {
 	return (nowUs - ts) / 1000000
 }
 
-// AddFill records a completed fill (used by dxGetOrderFills / dxGetOrderHistory).
-func (s *Store) AddFill(f fillEntry) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fills = append(s.fills, f)
-	s.fills = trimOldest(s.fills, maxStoreFills)
-}
-
-// Fills returns recorded fills, most recent first.
+// Fills projects the completed-fill view over Store.history. C++
+// dxGetOrderFills reads m_historicTransactions with a trFinished-only gate
+// (rpcxbridge.cpp:538-550), so every finished Mine history record carrying
+// an order snapshot renders one fill in the local-sense frame (the same
+// frame every other renderer emits), newest first. Canceled, expired, and
+// non-Mine records are excluded exactly like C++; snapshot-less entries
+// cannot render a pair and are skipped.
 func (s *Store) Fills() []fillEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]fillEntry, len(s.fills))
-	copy(out, s.fills)
-	// newest first
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+	out := make([]fillEntry, 0, len(s.history))
+	for i := len(s.history) - 1; i >= 0; i-- {
+		e := s.history[i]
+		o := e.Order
+		if o == nil || !o.Mine || statusString(e.Status) != "finished" {
+			continue
+		}
+		maker, makerSize, taker, takerSize := o.localSense()
+		out = append(out, fillEntry{
+			ID:                   orderIDString(o.ID),
+			Time:                 e.Updated,
+			Maker:                maker,
+			MakerSize:            formatXAmount(makerSize),
+			Taker:                taker,
+			TakerSize:            formatXAmount(takerSize),
+			ParentID:             parentIDString(o.ParentID),
+			OrderType:            orderTypeString(o.PartialAllowed),
+			PartialMinimum:       formatXAmount(o.MinFromAmount),
+			PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
+			PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
+			PartialRepost:        o.PartialRepost,
+		})
 	}
 	return out
 }

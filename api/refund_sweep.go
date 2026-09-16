@@ -71,16 +71,26 @@ func (n *Node) scanStoredRefunds() {
 	dirty := false
 	for _, o := range n.store.List() {
 		idHex := hexEncode(o.ID[:])
-		if !o.Mine || o.RefundTx == "" || !o.DepositSent || isOrderTerminal(o.Status) {
+		if !o.Mine || o.RefundTx == "" || !o.DepositSent {
 			continue
 		}
-		if _, live := n.sessions[idHex]; live {
-			continue // the session sweep owns it
-		}
-		if o.Status == "rolled back" {
+		// "finished" never owes a refund: the deposit was claimed by the
+		// counterparty, and broadcasting our refund could only fail. Dropped /
+		// invalid orders died before any deposit existed. "canceled" MUST be
+		// swept: C++ refunds trCancelled transactions in its redeem scan, and
+		// the live 2026-09-15 stall-watchdog cancel (order a4198f2d…) left a
+		// canceled record with the deposit locked in the P2SH — skipping it
+		// stranded the funds.
+		switch statusString(o.Status) {
+		case "finished", "dropped", "invalid":
+			continue
+		case "rolled back":
 			continue // refund already went out; unconfirmed retries are
 			// owned by the rebroadcast sweep while the tx stays tracked
 			// (pruning only drops deep-confirmed entries)
+		}
+		if _, live := n.sessions[idHex]; live {
+			continue // the session sweep owns it
 		}
 		if n.refundBackoffActive(idHex) {
 			continue
@@ -108,9 +118,14 @@ func (n *Node) scanStoredRefunds() {
 			// cadence. Reconcile the state once confirmed.
 			if tb.Confs >= 1 && n.rollbackGate(idHex) {
 				if n.store.Update(idHex, func(u *Order) {
-					if !isOrderTerminal(u.Status) && u.Status != "rolled back" {
-						u.Status = "rolled back"
-						u.Updated = NowMicro()
+					// Canceled records flip to "rolled back" too: C++'s
+					// redeemOrderDeposit sets trRollback from trCancelled
+					// (:3911) — the refund just confirmed on-chain.
+					if !isOrderTerminal(u.Status) || u.Status == "canceled" {
+						if u.Status != "rolled back" {
+							u.Status = "rolled back"
+							u.Updated = NowMicro()
+						}
 					}
 				}) {
 					dirty = true

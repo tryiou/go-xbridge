@@ -282,8 +282,11 @@ func TestClaimIntentDurableBeforeBroadcast(t *testing.T) {
 	if len(ltcConn.broadcasts) != beforeClaims+1 {
 		t.Fatalf("claim broadcasts = %d, want %d after redelivery", len(ltcConn.broadcasts), beforeClaims+1)
 	}
-	if makerSession.state != csConfirmedA {
-		t.Fatal("claim state did not advance after confirmed broadcast")
+	// C++ trader parity (xbridgesession.cpp:3002): a successful claim
+	// broadcast IS the finish — the session goes terminal at the redeem, not
+	// at the hub's later Finished packet.
+	if makerSession.state != csFinished {
+		t.Fatalf("claim state = %s, want finished after confirmed broadcast", makerSession.state.String())
 	}
 }
 

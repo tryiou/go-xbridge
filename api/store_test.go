@@ -467,3 +467,61 @@ func TestPruneUnconnected(t *testing.T) {
 		t.Errorf("expected orders 0x01/0x02/0x03 kept, got %v", found)
 	}
 }
+
+// TestFillsDerivedFromHistory proves the fills view is projected from swap
+// history (C++ dxGetOrderFills reads m_historicTransactions with a
+// trFinished-only gate, rpcxbridge.cpp:538-550): a finished Mine record
+// renders one fill in the local-sense frame, newest first; canceled,
+// non-Mine, or snapshot-less records are excluded.
+func TestFillsDerivedFromHistory(t *testing.T) {
+	s := NewStore()
+	mkID := func(b byte) [32]byte { return [32]byte{b} }
+	// Finished maker record: stored maker-facing pair renders as-is (Role 0).
+	s.AddToHistory(&Order{ID: mkID(0xaa),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true},
+		"finished", 0, 1030*1e6)
+	// Finished taker record: Role 'B' renders the swapped local-sense pair
+	// (the C++ take-time descriptor swap, rpcxbridge.cpp:1262-1264).
+	s.AddToHistory(&Order{ID: mkID(0xbb),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 4000000, Mine: true, Role: 'B'},
+		"finished", 0, 1040*1e6)
+	// Excluded: canceled Mine record and finished non-Mine record.
+	s.AddToHistory(&Order{ID: mkID(0xcc),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 1000000, Mine: true},
+		"canceled", 0, 1050*1e6)
+	s.AddToHistory(&Order{ID: mkID(0xdd),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 1000000},
+		"finished", 0, 1060*1e6)
+
+	fills := s.Fills()
+	if len(fills) != 2 {
+		t.Fatalf("Fills() = %d entries, want 2 (finished Mine only)", len(fills))
+	}
+	// Newest first: the taker record (Updated 1040) before the maker one.
+	if fills[0].ID != orderIDString(mkID(0xbb)) {
+		t.Errorf("fills[0].ID = %s, want %s", fills[0].ID, orderIDString(mkID(0xbb)))
+	}
+	// Taker frame: maker = sent LTC, taker = received BTC.
+	if fills[0].Maker != "LTC" || fills[0].Taker != "BTC" {
+		t.Errorf("fills[0] pair = %s/%s, want LTC/BTC (local taker frame)", fills[0].Maker, fills[0].Taker)
+	}
+	if fills[0].MakerSize != "4.000000" || fills[0].TakerSize != "1.000000" {
+		t.Errorf("fills[0] sizes = %s/%s, want 4.000000/1.000000", fills[0].MakerSize, fills[0].TakerSize)
+	}
+	if fills[0].OrderType != "exact" {
+		t.Errorf("fills[0].OrderType = %q, want exact", fills[0].OrderType)
+	}
+	if fills[1].ID != orderIDString(mkID(0xaa)) {
+		t.Errorf("fills[1].ID = %s, want %s", fills[1].ID, orderIDString(mkID(0xaa)))
+	}
+	if fills[1].Maker != "BTC" || fills[1].Taker != "LTC" {
+		t.Errorf("fills[1] pair = %s/%s, want BTC/LTC (maker frame)", fills[1].Maker, fills[1].Taker)
+	}
+	if fills[1].MakerSize != "1.000000" || fills[1].TakerSize != "2.000000" {
+		t.Errorf("fills[1] sizes = %s/%s, want 1.000000/2.000000", fills[1].MakerSize, fills[1].TakerSize)
+	}
+}

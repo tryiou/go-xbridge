@@ -413,9 +413,9 @@ func (n *Node) updateSettled() bool {
 // ACTIVE tier: fully-confirmed entries (depth >= trackedRetainDepth) for
 // orders with no live session are dropped once over the cap, oldest first by
 // Seq. Live-session entries are never dropped here (Phase 1+ drivers may
-// still need them). maxSettledWatch bounds the SETTLED archive (mirroring the
-// order history cap, maxStoreHistory): the Store.history records remain the
-// durable trade audit trail; the archive is watch state only.
+// still need them). maxSettledWatch bounds the SETTLED archive: the
+// Store.history records remain the durable trade audit trail (uncapped, like
+// C++ m_historicTransactions); the archive is watch state only.
 const trackedCap = 500
 const trackedRetainDepth = 6
 const maxSettledWatch = 1000

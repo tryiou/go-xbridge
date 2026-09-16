@@ -181,8 +181,10 @@ func TestTakerClaimRetryRedrivesAndClears(t *testing.T) {
 	if takerSession.claimRetryAt != 0 {
 		t.Fatal("retry timestamp not cleared after successful rebuild")
 	}
-	if takerSession.state != csConfirmedB {
-		t.Fatalf("state = %s, want confirmedB", takerSession.state.String())
+	// C++ trader parity (xbridgesession.cpp:3185): the successful claim
+	// broadcast is the finish.
+	if takerSession.state != csFinished {
+		t.Fatalf("state = %s, want finished", takerSession.state.String())
 	}
 }
 
@@ -243,5 +245,67 @@ func TestMakerClaimRetryScheduledOnBuildFailure(t *testing.T) {
 	}
 	if s.claimRetryAt == 0 {
 		t.Fatal("claimRetryAt not scheduled after failed maker claim build")
+	}
+}
+
+// TestMakerClaimLocktimeZeroRetriesNotCanceled pins the S5 lesson (BLOCK/PIVX
+// order 9698af09, 2026-09-14): a locktime EXPECTATION that cannot be computed
+// (wallet outage: nil connector, failed/empty GetBlockCount) is a TRANSIENT
+// condition on OUR side, never a counterparty fault — the build must schedule
+// the standard claim retry instead of wire-cancelling with crBadBLockTime.
+// C++ cancels instantly on any non-VERIFY_ERROR redeem failure
+// (xbridgesession.cpp:2985-2995) and killed a healthy funded swap that way;
+// the drift check itself still rejects genuinely-bad locktimes.
+func TestMakerClaimLocktimeZeroRetriesNotCanceled(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Title: "Bitcoin", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Title: "Litecoin", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	btcFundingPriv, btcFundingPub := newKey(t)
+	btcFunding := wallet.Utxo{TxID: strings.Repeat("cc", 32), Vout: 0, Amount: 5e8,
+		ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(btcFundingPub)))}
+	btcConn := &fakeConnector{ticker: "BTC", funding: btcFunding, fundingPriv: btcFundingPriv,
+		fundingPub: btcFundingPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000,
+		rawTx: map[string]string{}}
+	// Maker-side LTC connector: healthy wallet, but its chain height read
+	// returns 0 (outage) — computeLockTimeFor therefore returns 0.
+	ltcConn := &fakeConnector{ticker: "LTC", funding: btcFunding, fundingPriv: btcFundingPriv,
+		fundingPub: btcFundingPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 0,
+		rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": btcConn, "LTC": ltcConn})
+	mkMPriv, mkMPub := newKey(t)
+	_, tkMPub := newKey(t)
+	var orderID [32]byte
+	moid := hash20("maker-lt0-order")
+	copy(orderID[:], moid[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{btcFunding}),
+		MakeOrderParams{MakerAddress: addrFor(0, "m"), TakerAddress: addrFor(48, "t")}, arr32(mkMPriv), toArr33(mkMPub))
+	s := makerNode.sessions[hexEncode(orderID[:])]
+	var hub [20]byte
+	hb := hash20("hub")
+	copy(hub[:], hb[:])
+	s.hub = hub
+	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkMPub)}); err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	// BLockTime 1030 is what a healthy height-1000 chain would produce; the
+	// expectation cannot be computed (height 0) — transient, not a drift fault.
+	_, _, _ = s.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID,
+		BDepositTxID: strings.Repeat("dd", 32), BLockTime: 1030})
+	if s.claimRetryAt == 0 {
+		t.Fatal("locktime-zero build must schedule a claim retry, not strand")
+	}
+	if got := makerNode.sessions[hexEncode(orderID[:])]; got == nil || got.state == csIdle {
+		t.Fatalf("healthy swap self-cancelled on a wallet outage: session=%v", got)
+	}
+	if o := makerNode.store.Get(hexEncode(orderID[:])); o == nil || isOrderTerminal(o.Status) {
+		t.Fatalf("order must stay live, got %+v", o)
 	}
 }

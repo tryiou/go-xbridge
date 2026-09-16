@@ -184,6 +184,13 @@ type Connector interface {
 	// cannot confirm, so proceeding is fund-safe); confirmation depth itself
 	// was established at deposit-validation time.
 	GetRawTransactionVerbose(txid string) (VerboseTx, error)
+	// GetRawMempool returns the mempool's transaction ids (getrawmempool).
+	// Mirrors C++ App::Impl::checkWatchesOnDepositSpends' mempool scan
+	// (xbridgeapp.cpp:3378-3413): the taker sweeps pending transactions for
+	// the spender of its own deposit to recover the HTLC secret when the
+	// hub's ConfirmB never arrives. Unsupported backends return an error
+	// (the watch degrades to the refund sweep, fund-safe).
+	GetRawMempool() ([]string, error)
 }
 
 // VerboseTxOut is one decoded transaction output: native base-unit value and

@@ -675,8 +675,17 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	// Terminal records are restored to history, never re-registered as live
 	// swaps: they would otherwise leak back into the live set on every restart.
 	// Refund-pending cancelled swaps are kept live so the sweep can still
-	// recover the deposit post-restart.
-	if ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA)) {
+	// recover the deposit post-restart. The refundPending override must NOT
+	// key on ps.State: an order-only persist (session already pruned) stores
+	// State=csIdle, which read as "State < csCreatedA" filed a canceled swap
+	// with the deposit locked in the P2SH into history — invisible to
+	// scanStoredRefunds forever (live 2026-09-15, order a4198f2d…). C++
+	// redeems trCancelled transactions in its redeem scan, so canceled +
+	// deposit-out + pre-signed refund always owes a recovery sweep. Key on
+	// RefundTx — the order-record refund bytes (set exactly when the deposit
+	// was built); the session-scoped RefundHex is empty on order-only records.
+	refundPending := ps.Status == "canceled" && ps.DepositSent && ps.RefundTx != "" && !ps.RefundDone
+	if (ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA))) && !refundPending {
 		n.store.AddToHistory(o, ps.Status, uint64(ps.Reason), ps.Updated)
 		return
 	}
@@ -742,6 +751,17 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	// clock restarts alongside the watchdog above.
 	if s.state == csHoldApplied && s.holdApplySentAt == 0 {
 		s.holdApplySentAt = uint64(NowMicro())
+	}
+	// Restore reconciliation: a session persisted after its claim broadcast
+	// (csConfirmedA/B, claimTxID set) whose claimRetryAt was consumed has no
+	// retry trigger left. Schedule one immediate adoption pass — the tick's
+	// adoption verifies the claim on-chain and drives the terminal finish
+	// (C++ trFinished, xbridgesession.cpp:3002/:3185); a hub Finished packet
+	// that may still arrive stays idempotent behind it.
+	if s.state == csConfirmedA || s.state == csConfirmedB {
+		if s.claimTxID != "" && s.claimHex != "" && s.claimRetryAt == 0 {
+			s.claimRetryAt = uint64(NowMicro())
+		}
 	}
 	n.sessions[hexEncode(ps.ID[:])] = s
 }

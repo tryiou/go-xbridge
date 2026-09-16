@@ -155,3 +155,9 @@ func (l *LocalConnector) GetTxOut(txid string, vout uint32) (Utxo, bool, error) 
 func (l *LocalConnector) GetRawTransactionVerbose(txid string) (VerboseTx, error) {
 	return VerboseTx{}, ErrNoChainSource
 }
+
+// GetRawMempool has no local chain source (see GetTxOut): the own-deposit
+// spend watch degrades to the refund sweep on this backend.
+func (l *LocalConnector) GetRawMempool() ([]string, error) {
+	return nil, ErrNoChainSource
+}

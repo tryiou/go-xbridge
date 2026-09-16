@@ -76,6 +76,20 @@ func seedOrder(ctx *HandlerCtx) *Order {
 	return o
 }
 
+// seedHistoryFill appends a finished Mine history record via the production
+// path (fills are projected from history, never seeded directly). Amounts
+// are XBridge base units (COIN=1e6); id is the order's first ID byte.
+func seedHistoryFill(ctx *HandlerCtx, id byte, maker string, makerAmt uint64, taker string, takerAmt uint64, updated uint64) {
+	ctx.Store.AddToHistory(&Order{
+		ID:           [32]byte{id},
+		FromCurrency: maker,
+		FromAmount:   makerAmt,
+		ToCurrency:   taker,
+		ToAmount:     takerAmt,
+		Mine:         true,
+	}, "finished", 0, updated)
+}
+
 func TestDxGetOrdersRead(t *testing.T) {
 	ctx := newWalletTestCtx()
 	seedOrder(ctx)
@@ -722,11 +736,14 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	const xEarly = int64(1519516800)
 	// Fill timestamps are relative to the XSeries earliest (1519516800); they
 	// must stay within the queried window [xEarly+1000, xEarly+1180).
-	ctx.Store.AddFill(fillEntry{ID: "aaa", Time: uint64(xEarly+1030) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
-	ctx.Store.AddFill(fillEntry{ID: "bbb", Time: uint64(xEarly+1040) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "4.0"})
-	ctx.Store.AddFill(fillEntry{ID: "ccc", Time: uint64(xEarly+1090) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "2.0", TakerSize: "2.0"})
+	seedHistoryFill(ctx, 0xaa, "BTC", 1000000, "LTC", 2000000, uint64(xEarly+1030)*1e6)
+	seedHistoryFill(ctx, 0xbb, "BTC", 1000000, "LTC", 4000000, uint64(xEarly+1040)*1e6)
+	seedHistoryFill(ctx, 0xcc, "BTC", 2000000, "LTC", 2000000, uint64(xEarly+1090)*1e6)
 	// A fill outside the pair (should be ignored).
-	ctx.Store.AddFill(fillEntry{ID: "zzz", Time: uint64(xEarly+1035) * 1e6, Maker: "SYS", Taker: "LTC", MakerSize: "1.0", TakerSize: "1.0"})
+	seedHistoryFill(ctx, 0xdd, "SYS", 1000000, "LTC", 1000000, uint64(xEarly+1035)*1e6)
+	// Seeded IDs render as display hex: 0xaa -> 62 zeros + "aa", etc.
+	aaID := "00000000000000000000000000000000000000000000000000000000000000aa"
+	bbID := "00000000000000000000000000000000000000000000000000000000000000bb"
 
 	// range [xEarly+1000, xEarly+1180) granularity 60.
 	// C++ aligns start down and end up to granularity boundaries:
@@ -763,8 +780,8 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 	}
 	// bucket1 trailing order-id array.
 	ids1 := b1[6].([]string)
-	if len(ids1) != 2 || ids1[0] != "aaa" || ids1[1] != "bbb" {
-		t.Errorf("bucket1 ids = %v, want [aaa,bbb]", ids1)
+	if len(ids1) != 2 || ids1[0] != aaID || ids1[1] != bbID {
+		t.Errorf("bucket1 ids = %v, want [%s,%s]", ids1, aaID, bbID)
 	}
 	// bucket2: price = 2.0/2.0 = 1.0 (open=high=low=close), volume=2.0
 	b2 := arr[2].([]interface{})
@@ -785,7 +802,7 @@ func TestDxGetOrderHistoryBuckets(t *testing.T) {
 // unavailable to the thin client).
 func TestDxGetTradingDataFills(t *testing.T) {
 	ctx := newWalletTestCtx()
-	ctx.Store.AddFill(fillEntry{ID: "fff", Time: 1234 * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.5", TakerSize: "0.5"})
+	seedHistoryFill(ctx, 0xff, "BTC", 1500000, "LTC", 500000, 1234*1e6)
 	res, err := ctx.dxGetTradingData(nil)
 	if err != nil {
 		t.Fatalf("dxGetTradingData: %v", err)
@@ -801,7 +818,7 @@ func TestDxGetTradingDataFills(t *testing.T) {
 	if rec["timestamp"] != int64(1234) {
 		t.Errorf("timestamp = %v, want 1234", rec["timestamp"])
 	}
-	if rec["id"] != "fff" || rec["maker"] != "BTC" || rec["taker"] != "LTC" {
+	if rec["id"] != "00000000000000000000000000000000000000000000000000000000000000ff" || rec["maker"] != "BTC" || rec["taker"] != "LTC" {
 		t.Errorf("id/maker/taker = %v/%v/%v", rec["id"], rec["maker"], rec["taker"])
 	}
 	if rec["maker_size"] != 1.5 || rec["taker_size"] != 0.5 {
@@ -1655,7 +1672,7 @@ func TestDxGetOrderHistoryInverse(t *testing.T) {
 	ctx := newWalletTestCtx()
 	const xEarly = int64(1519516800)
 	// Query maker=BTC taker=LTC. This fill is LTC->BTC (inverse).
-	ctx.Store.AddFill(fillEntry{ID: "inv", Time: uint64(xEarly+1030) * 1e6, Maker: "LTC", Taker: "BTC", MakerSize: "3.0", TakerSize: "1.0"})
+	seedHistoryFill(ctx, 0x11, "LTC", 3000000, "BTC", 1000000, uint64(xEarly+1030)*1e6)
 
 	withInverse, _ := json.Marshal(true)
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
@@ -1697,8 +1714,8 @@ func TestDxGetOrderHistoryInverse(t *testing.T) {
 func TestDxGetOrderHistoryLimitTail(t *testing.T) {
 	ctx := newWalletTestCtx()
 	const xEarly = int64(1519516800)
-	ctx.Store.AddFill(fillEntry{ID: "aaa", Time: uint64(xEarly+1030) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
-	ctx.Store.AddFill(fillEntry{ID: "ddd", Time: uint64(xEarly+1150) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "8.0"})
+	seedHistoryFill(ctx, 0xaa, "BTC", 1000000, "LTC", 2000000, uint64(xEarly+1030)*1e6)
+	seedHistoryFill(ctx, 0xdd, "BTC", 1000000, "LTC", 8000000, uint64(xEarly+1150)*1e6)
 
 	res, err := ctx.dxGetOrderHistory([]json.RawMessage{
 		jstr("BTC"), jstr("LTC"), jnum(xEarly + 1000), jnum(xEarly + 1180), jnum(60),
@@ -1771,7 +1788,7 @@ func TestDxGetOrderHistoryDefaultCap(t *testing.T) {
 	// A fill placed before the shifted window must be excluded (only the tail
 	// survives), mirroring TestDxGetOrderHistoryLimitTail's explicit-limit case.
 	// order_ids=true so the row carries the ids array at index 6.
-	ctx.Store.AddFill(fillEntry{ID: "old", Time: uint64(xEarly+1000) * 1e6, Maker: "BTC", Taker: "LTC", MakerSize: "1.0", TakerSize: "2.0"})
+	seedHistoryFill(ctx, 0xe1, "BTC", 1000000, "LTC", 2000000, uint64(xEarly+1000)*1e6)
 	resNoOld, err := ctx.dxGetOrderHistory([]json.RawMessage{
 		jstr("BTC"), jstr("LTC"), jnum(start), jnum(end), jnum(60),
 		json.RawMessage("true"),

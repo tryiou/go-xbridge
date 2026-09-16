@@ -365,15 +365,18 @@ func TestPruneKeepsSessionWithInFlightDepositTask(t *testing.T) {
 	}
 }
 
-// TestStoreHistoryBounded proves the history cap: exceeding maxStoreHistory
-// trims the oldest entries.
-func TestStoreHistoryBounded(t *testing.T) {
+// TestHistoryUnbounded proves finished swap history is never trimmed: C++
+// keeps every historic transaction (m_historicTransactions has no cap, only
+// the manual dxFlushCancelledOrders erases trCancelled), so appending past
+// the old 1000-entry bound must retain every record.
+func TestHistoryUnbounded(t *testing.T) {
 	ctx := newWalletTestCtx()
-	for i := 0; i < maxStoreHistory+50; i++ {
-		o := &Order{ID: [32]byte{byte(i % 256), byte(i / 256)}, Status: "canceled", Mine: true}
-		ctx.Store.AddToHistory(o, "canceled", 1, uint64(i))
+	const n = 1050
+	for i := 0; i < n; i++ {
+		o := &Order{ID: [32]byte{byte(i), byte(i >> 8), byte(i >> 16)}, Status: "finished", Mine: true}
+		ctx.Store.AddToHistory(o, "finished", 0, uint64(i))
 	}
-	if got := len(ctx.Store.History()); got != maxStoreHistory {
-		t.Fatalf("history len = %d, want %d", got, maxStoreHistory)
+	if got := len(ctx.Store.History()); got != n {
+		t.Fatalf("history len = %d, want %d (swap history must be unbounded)", got, n)
 	}
 }

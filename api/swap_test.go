@@ -127,6 +127,10 @@ type fakeConnector struct {
 	verboseErr error
 	// verboseCalls counts GetRawTransactionVerbose calls (precedence lock).
 	verboseCalls int
+	// mempoolTxids serves GetRawMempool (own-deposit spend watch tests);
+	// mempoolErr, when non-nil, makes it fail.
+	mempoolTxids []string
+	mempoolErr   error
 }
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
@@ -244,6 +248,16 @@ func (f *fakeConnector) GetRawTransactionVerbose(txid string) (wallet.VerboseTx,
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
+}
+
+// GetRawMempool serves mempoolTxids when set (own-deposit spend watch tests).
+func (f *fakeConnector) GetRawMempool() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mempoolErr != nil {
+		return nil, f.mempoolErr
+	}
+	return f.mempoolTxids, nil
 }
 
 // chainScale returns the coin's native base scale (10^Decimals), falling back
@@ -1533,6 +1547,21 @@ func TestSecretFromPayTxScansAllInputs(t *testing.T) {
 	}
 	if _, ok := secretFromPayTx(payHex, coins.KeyID([]byte("unrelated-preimage-material-that-matches-nothing")), false, hex.EncodeToString(depDisplay), 3); ok {
 		t.Error("secretFromPayTx adopted a push for an unrelated hash")
+	}
+}
+
+// TestSecretFromPayTxUnparseablePayloadNoPanic locks in a live-observed
+// panic: a mempool payload that fails deserialization made the failure log
+// evaluate len(tx.Inputs) on the nil tx, panicking the own-deposit watch
+// worker every round the payload was scanned (log: "own-deposit watch
+// unavailable ... api: worker panic: runtime error: invalid memory address
+// or nil pointer dereference"). Extraction must reject such a payload
+// without panicking.
+func TestSecretFromPayTxUnparseablePayloadNoPanic(t *testing.T) {
+	var hx [20]byte
+	got, ok := secretFromPayTx("abcd", hx, false, strings.Repeat("ab", 32), 0)
+	if ok {
+		t.Fatalf("unparseable payload adopted a secret: %x", got)
 	}
 }
 

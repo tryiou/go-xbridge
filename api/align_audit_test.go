@@ -237,6 +237,11 @@ func watchTakerFixture(t *testing.T, btc wallet.Connector) (*Node, *captureXConn
 	s.theirLockTime = 1030
 	s.theirSecretHash = hash20("align-secret")
 	s.refundHex = "deadbeef"
+	// The fixture docstring promises a VALIDATED counterparty deposit; the
+	// build path records validation via theirP2SHNative (checkCounterpartyDeposit
+	// → applyCreatedB/applyConfirmedA). The watch may only cancel sessions
+	// whose deposit validated at least once.
+	s.theirP2SHNative = 1
 	return n, cc, idHex
 }
 
@@ -510,5 +515,32 @@ func TestRebroadcastCancelsSpentFunding(t *testing.T) {
 	}
 	if cb.Reason != uint32(crBadAUtxo) {
 		t.Fatalf("cancel reason = %d, want crBadAUtxo (%d)", cb.Reason, crBadAUtxo)
+	}
+}
+
+// TestDepositWatchStandsDownUntilValidated pins the S5 lesson (BLOCK/PIVX
+// order 9698af09, 2026-09-14): a counterparty deposit that never validated in
+// our build (theirP2SHNative == 0) reading "unknown" from a chain-blind
+// backend is the 0-conf propagation race, NOT a proven vanish — the watch
+// must stand down and leave the session to the build/retry path (which never
+// cancels on blindness). Only a VALIDATED deposit that later vanishes
+// (double-spend/reorg) cancels — pinned by TestDepositWatchCancelsOnSpentDeposit.
+func TestDepositWatchStandsDownUntilValidated(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	// Undo the fixture's validation: the build has never succeeded for this
+	// session (the S5 race: the deposit is younger than our backend's view).
+	if s := n.sessions[idHex]; s != nil {
+		s.theirP2SHNative = 0
+	}
+
+	n.watchCounterpartyDeposits()
+
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("unvalidated deposit must not be watched to cancellation, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got == nil || got.Status != "created" {
+		t.Fatalf("order must stay live and unchanged, got %+v", got)
 	}
 }

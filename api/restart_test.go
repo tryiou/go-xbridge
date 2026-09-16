@@ -267,8 +267,14 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
 	}
-	if len(ps) != 1 || ps[0].State != csConfirmedB {
-		t.Fatalf("persisted = %d swaps state %v, want 1/csConfirmedB", len(ps), ps[0].State)
+	// C++ trader parity (xbridgesession.cpp:3185 + xbridgeapp.cpp saveOrders):
+	// the claim broadcast is the finish, so the session is terminal at
+	// snapshot time and the durable record is the ORDER-ONLY form with the
+	// terminal status (snapshotSwaps routes terminal sessions through
+	// persistFromOrder; restore routes it to history, never a live session).
+	if len(ps) != 1 || ps[0].State != csIdle || ps[0].Status != "finished" {
+		t.Fatalf("persisted = %d swaps state %v status %q, want 1 order-only record with finished status",
+			len(ps), ps[0].State, ps[0].Status)
 	}
 
 	_ = n.Close()
@@ -286,24 +292,27 @@ func TestRestartRecoversConfirmedB(t *testing.T) {
 	n2.start()
 	t.Cleanup(func() { _ = n2.Close() })
 
+	// C++ trader parity (xbridgesession.cpp:3824): a terminal (trFinished)
+	// descriptor is moved to history and is NOT re-registered as a live
+	// session (persist.go restore routes csFinished through AddToHistory).
+	// The order survives in history with the terminal status.
 	s2 := n2.sessions[hexEncode(orderID[:])]
-	if s2 == nil || readOnEngine(t, n2, func() clientState { return s2.state }) != csConfirmedB {
-		t.Fatal("csConfirmedB session not recovered from disk after restart")
+	if s2 != nil {
+		t.Fatal("finished session must not re-register as live after restart")
+	}
+	if got := n2.store.HistoryOrder(hexEncode(orderID[:])); got == nil || got.Status != "finished" {
+		t.Fatalf("history = %+v, want finished order", got)
 	}
 
-	// Retransmit ConfirmB: state guard drops it — no second claim.
-	drive(n2, s2)
+	// Retransmit safety post-restart: the swap is already terminal on-chain
+	// (the claim broadcast succeeded pre-restart) and its session is gone, so
+	// nothing can re-drive a second claim — the live book no longer holds the
+	// order and exactly one claim broadcast exists on the fake connector.
+	if o := n2.store.Get(hexEncode(orderID[:])); o != nil {
+		t.Fatalf("finished order still in live book: %+v", o)
+	}
 	if got := btcConn.broadcastSnapshot(); len(got) != 1 {
-		t.Fatalf("retransmit re-broadcast the claim: %d broadcasts, want 1", len(got))
-	}
-	var confirmedB int
-	for _, p := range cc2.snapshot() {
-		if p.Command == proto.XbcTransactionConfirmB {
-			confirmedB++
-		}
-	}
-	if confirmedB != 0 {
-		t.Fatalf("%d ConfirmedB responses sent after restart retransmit, want 0", confirmedB)
+		t.Fatalf("claim broadcast %d times after restart, want 1", len(got))
 	}
 }
 

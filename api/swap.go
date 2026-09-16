@@ -532,7 +532,8 @@ func (n *Node) newMakerSession(o *Order, p MakeOrderParams, priv [32]byte, pub [
 	s.hubKey = decodePub33(o.SNodePubkey)
 	n.sessions[hexEncode(o.ID[:])] = s
 	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "maker",
-		"srcCur", o.FromCurrency, "srcAmt", o.FromAmount, "dstCur", o.ToCurrency, "dstAmt", o.ToAmount)
+		"srcCur", o.FromCurrency, "srcAmt", o.FromAmount, "dstCur", o.ToCurrency, "dstAmt", o.ToAmount,
+		"hub", o.SNodePubkey)
 }
 
 // newTakerSession registers the client-side taker for a taken order. The secret
@@ -566,7 +567,7 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 	n.sessions[hexEncode(o.ID[:])] = s
 	xlog.Info("swap session created", "order", hexEncode(o.ID[:]), "role", "taker",
 		"srcCur", o.ToCurrency, "srcAmt", o.ToAmount, "dstCur", o.FromCurrency, "dstAmt", o.FromAmount,
-		"hubKeyPinned", s.hubKey != [33]byte{})
+		"hubKeyPinned", s.hubKey != [33]byte{}, "hub", o.SNodePubkey)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +579,20 @@ func (n *Node) newTakerSession(o *Order, p TakeOrderParams, priv [32]byte, pub [
 // OnHold (hub→both) → HoldApply (7): echo our source address as the client's own.
 func (s *SwapSession) OnHold(b *proto.HoldBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
+	// A Hold is only meaningful before the hold is applied. The hub keeps
+	// retransmitting the Hold for the session's whole lifetime, and C++ gates
+	// every handshake handler on the transaction's exact expected state
+	// ("wrong tx state, expecting joined state", xbridgesession.cpp:1244-1253),
+	// so a redelivery can never rewind a transaction that already advanced.
+	// Without this gate a redelivered Hold regressed a createdA session back
+	// to holdApplied (live 2026-09-15, order a4198f2d…): the next CreateA
+	// retransmit then re-ran the deposit build against the already-committed
+	// funding UTXO, and the wedged state starved the scheduled claim retry
+	// (retryFailedClaimBuilds matches the exact pre-claim state).
+	if s.state >= csHoldApplied {
+		xlog.Info("Hold ignored: swap already past hold", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
 	// Re-verify the hub-relayed give/take amounts against the order
 	// (C++ processTransactionHold, xbridgesession.cpp:1404-1471). Any mismatch
 	// is dropped with NO reply (C++ return true) — the hub retransmits.
@@ -747,6 +762,10 @@ func (s *SwapSession) setOrderStatus(status string) {
 	idHex := hexEncode(s.id[:])
 	s.n.store.Update(idHex, func(o *Order) {
 		o.Status = status
+		// C++ parity: a descriptor state change refreshes its timestamp, so
+		// dxGetOrder's updated_at tracks session progress instead of freezing
+		// at make-time.
+		o.Updated = NowMicro()
 	})
 }
 
@@ -774,8 +793,12 @@ func decodeAddrHash(cur, addrStr string) [20]byte {
 // applies the confirmed broadcast, sends the CreatedA response, and persists.
 func (s *SwapSession) OnCreateA(b *proto.CreateABody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
+	// C++ parity (xbridgesession.cpp:1937-1941): a wrong-role CreateA is an
+	// INFO-level silent drop (LogOrderMsg + return true) — never an error.
+	// C++ orders this gate BEFORE the state drop (:1943), so it stays first.
 	if !s.isMaker {
-		return 0, nil, fmt.Errorf("api: CreateA received by taker session %s", orderID)
+		xlog.Info("CreateA received for wrong role, expected maker", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
 	}
 	// C++ processTransactionCreateA drops a CreateA once the transaction
 	// already reached trCreated (xbridgesession.cpp:1947). A retransmit arriving
@@ -974,12 +997,15 @@ func (s *SwapSession) applyCreatedABroadcast(out depositOutcome, sentID string, 
 // persists.
 func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
-	if s.isMaker {
-		return 0, nil, fmt.Errorf("api: CreateB received by maker session %s", orderID)
-	}
-	// C++ processTransactionCreateB drops a CreateB once the transaction
-	// already reached trCreated (xbridgesession.cpp:2424). A post-completion
-	// retransmit must not re-broadcast a second deposit.
+	// C++ parity (xbridgesession.cpp:2420-2443): the state drop precedes the
+	// role gate, and a wrong-role packet is an INFO-level silent drop
+	// (LogOrderMsg + return true, :2434-2438) — never an error. One
+	// conscious ordering divergence: the empty-deposit self-cancel
+	// (C++ :2428-2433, fires BEFORE the role gate there) is gated behind the
+	// role check here — C++'s hub-side checkPacketAddress (:3033-3037) drops
+	// not-for-me packets before any handler, while go-xbridge routes by
+	// session, so an empty-deposit malformed gossiped packet must never
+	// cancel a foreign (wrong-role) swap.
 	if s.state >= csCreatedB {
 		xlog.Info("CreateB ignored: swap already past deposit", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
@@ -989,6 +1015,23 @@ func (s *SwapSession) OnCreateB(b *proto.CreateBBody) (proto.XBridgeCommand, res
 	// deposit. The in-flight worker will complete and send CreatedB.
 	if s.await {
 		xlog.Info("CreateB ignored: deposit worker in flight", "order", orderID)
+		return 0, nil, nil
+	}
+	if s.isMaker {
+		xlog.Info("CreateB received for wrong role, expected taker", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	// C++ :2428-2433 — a CreateB for the correct role with an empty maker
+	// deposit id is unprocessable: cancel with crBadADepositTx.
+	if b.ADepositTxID == "" {
+		xlog.Warn("CreateB missing maker deposit txid, canceling", "order", orderID)
+		s.sendSelfCancel(crBadADepositTx)
+		return 0, nil, nil
+	}
+	// C++ :2439-2443 — a CreateB retransmit after the counterparty key was
+	// already adopted is dropped (idempotency guard).
+	if s.theirPub != [33]byte{} {
+		xlog.Info("CreateB ignored: counterparty key already adopted", "order", orderID)
 		return 0, nil, nil
 	}
 	if b.APubKey == [33]byte{} {
@@ -1158,14 +1201,15 @@ func (s *SwapSession) applyCreatedBBroadcast(out createdBOutcome, sentID string,
 // applies the confirmed claim, sends the ConfirmedA response, and persists.
 func (s *SwapSession) OnConfirmA(b *proto.ConfirmABody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
-	if !s.isMaker {
-		return 0, nil, fmt.Errorf("api: ConfirmA received by taker session %s", orderID)
-	}
-	// C++ processTransactionConfirmA drops a ConfirmA once the transaction
-	// already reached trCommited (xbridgesession.cpp:2897). A retransmit AFTER
-	// we redeemed must not re-broadcast a second claim payTx.
+	// C++ parity (xbridgesession.cpp:2893-2905): the state drop precedes the
+	// role gate, and a wrong-role packet is an INFO-level silent drop
+	// (LogOrderMsg + return true) — never an error, no cancel, no penalty.
 	if s.state >= csConfirmedA {
 		xlog.Info("ConfirmA ignored: swap already past claim", "order", orderID, "state", s.state.String())
+		return 0, nil, nil
+	}
+	if !s.isMaker {
+		xlog.Info("ConfirmA received for wrong role, expected maker", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
 	}
 	// A retransmit arriving WHILE the claim worker is in flight (await set)
@@ -1285,7 +1329,15 @@ func (s *SwapSession) applyConfirmedABroadcast(out confirmOutcome, sentID string
 		xlog.Warn("ConfirmA: wallet reported a different sent txid", "order", orderID, "local", out.payTxID, "sent", sentID)
 	}
 	payTxID := out.payTxID
-	s.state = csConfirmedA
+	// C++ trader parity (xbridgesession.cpp:3002, maker ConfirmA): the
+	// redeem broadcast is the finish — the session state moves to trFinished
+	// immediately after the successful redeem broadcast, NOT at the hub's
+	// later Finished packet (xbridgesession.cpp:3805-3824, which re-sets the
+	// terminal state idempotently and moves the descriptor to history). The
+	// ConfirmedA receipt below still informs the hub. Note C++ does NOT move
+	// the transaction to history here — MoveToHistory stays in OnFinished.
+	s.state = csFinished
+	s.setOrderStatus("finished")
 	xlog.Info("ConfirmA: payTx broadcast", "order", orderID, "payTxID", payTxID)
 	// Swap transcript (dedicated log-tx file): only now that the broadcast is
 	// confirmed — the transcript must never claim an unconfirmed broadcast.
@@ -1321,12 +1373,13 @@ func (s *SwapSession) applyConfirmedABroadcast(out confirmOutcome, sentID string
 // and persists.
 func (s *SwapSession) OnConfirmB(b *proto.ConfirmBBody) (proto.XBridgeCommand, responseBody, error) {
 	orderID := hexEncode(s.id[:])
-	if s.isMaker {
-		return 0, nil, fmt.Errorf("api: ConfirmB received by maker session %s", orderID)
-	}
-	// C++ processTransactionConfirmB drops a ConfirmB once the transaction
-	// already reached trCommited (xbridgesession.cpp:3152). A retransmit AFTER
-	// we redeemed must not re-broadcast a second claim payTx.
+	// C++ parity (xbridgesession.cpp:3104-3199): processTransactionConfirmB
+	// has NO role gate — the state drop (:3152) is the only post-signature
+	// guard before the redeem. A maker receiving a ConfirmB retransmit after
+	// its own redeem is dropped here (state already csFinished >=
+	// csConfirmedB); a maker receiving one pre-claim harmless-fails the
+	// vin-bound secret extraction below, mirroring C++'s processLater
+	// requeue loop (:3934-3948).
 	if s.state >= csConfirmedB {
 		xlog.Info("ConfirmB ignored: swap already past claim", "order", orderID, "state", s.state.String())
 		return 0, nil, nil
@@ -1441,7 +1494,13 @@ func (s *SwapSession) applyConfirmedBBroadcast(out confirmOutcome, sentID string
 	if sentID != "" && sentID != out.payTxID {
 		xlog.Warn("ConfirmB: wallet reported a different sent txid", "order", orderID, "local", out.payTxID, "sent", sentID)
 	}
-	s.state = csConfirmedB
+	// C++ trader parity (xbridgesession.cpp:3185, taker ConfirmB): the
+	// redeem broadcast is the finish — same trFinished transition as the
+	// maker's ConfirmA path above; the hub's later Finished packet only
+	// re-sets the terminal state and moves the descriptor to history
+	// (xbridgesession.cpp:3805-3824).
+	s.state = csFinished
+	s.setOrderStatus("finished")
 	xlog.Info("ConfirmB: payTx broadcast", "order", orderID, "payTxID", out.payTxID)
 	// Swap transcript (dedicated log-tx file): only now that the broadcast is
 	// confirmed — the transcript must never claim an unconfirmed broadcast.
@@ -1497,7 +1556,25 @@ func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32
 			return "", nil // not yet refundable
 		}
 	}
-	return conn.SendRawTransaction(refundHex)
+	txid, err := conn.SendRawTransaction(refundHex)
+	if err == nil {
+		return txid, nil
+	}
+	// A broadcast failure can still mean the refund is already on chain: a
+	// prior run may have broadcast the identical pre-signed transaction, and
+	// the wallet then rejects the re-send (e.g. -25 "transaction already in
+	// block chain"). Classify against the chain before failing: when the
+	// wallet knows the locally-derived refund txid, the redeem DID succeed —
+	// the same outcome C++ redeemOrderDeposit's success path produces
+	// (trRollback, xbridgesession.cpp:3911-3913). A wallet that does not
+	// know the txid keeps the original failure (C++ :3976-3989).
+	if localID, lerr := txIDFromHex(refundHex); lerr == nil {
+		if _, gerr := conn.GetRawTransaction(localID); gerr == nil {
+			xlog.Info("refund already on chain", "coin", cur, "txid", localID)
+			return localID, nil
+		}
+	}
+	return "", err
 }
 
 // postRefundTask posts a refund broadcast to the worker pool (or runs it
@@ -1555,6 +1632,12 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 				return
 			}
 			if txid == "" {
+				// The sweep's locktime gate deferred the broadcast (the
+				// deposit CLTV has not released yet). Silent every 60 s tick
+				// is exactly the invisibility that hid stranded refunds —
+				// say so at Debug (the sweep re-posts; Info here would spam
+				// once per tick per pending refund).
+				xlog.Debug("refund deferred: deposit locktime not reached", "order", orderID)
 				return // not yet refundable; the next sweep retries
 			}
 			xlog.Info("refund broadcast", "order", orderID, "txid", txid)
@@ -1579,9 +1662,17 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 			// wrote "rollback failed" or the order was still mid-swap.
 			if n.rollbackGate(orderID) {
 				n.store.Update(orderID, func(o *Order) {
-					if !isOrderTerminal(o.Status) && o.Status != "rolled back" {
-						o.Status = "rolled back"
-						o.Updated = NowMicro()
+					// C++ redeemOrderDeposit flips the transaction to
+					// trRollback (:3911) from any prior state — including
+					// trCancelled (a stall-watchdog cancel with the deposit
+					// already out is exactly a redeem candidate). Only truly
+					// dead records (finished/dropped/invalid) keep their
+					// status.
+					if !isOrderTerminal(o.Status) || o.Status == "canceled" {
+						if o.Status != "rolled back" {
+							o.Status = "rolled back"
+							o.Updated = NowMicro()
+						}
 					}
 				})
 			}
@@ -1735,6 +1826,18 @@ func (n *Node) scanRefunds() {
 		if s.refundDone || s.refundHex == "" || s.state == csFinished {
 			continue
 		}
+		// C++ parity (xbridgeapp.cpp:3444): the locktime refund path runs
+		// only while the counterparty deposit is NOT yet redeemed. A session
+		// past its own claim broadcast has nothing to refund — its deposit
+		// was spent by the counterparty's redeeming claim (the refund's
+		// input is gone; broadcasting it can only produce a -25 reject and
+		// a bogus rollback-failed status).
+		if s.isMaker && s.state >= csConfirmedA {
+			continue
+		}
+		if !s.isMaker && s.state >= csConfirmedB {
+			continue
+		}
 		if n.refundBackoffActive(id) {
 			continue
 		}
@@ -1792,6 +1895,15 @@ func (n *Node) watchCounterpartyDeposits() {
 			if o := n.store.Get(id); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
 				continue
 			}
+		}
+		// Stand down until the deposit VALIDATED at least once in the build
+		// (theirP2SHNative set by checkCounterpartyDeposit): an unvalidated
+		// deposit reading "unknown" from a chain-blind backend is the 0-conf
+		// propagation race (S5, order 9698af09), not a proven vanish — the
+		// build/retry path owns it and never cancels on blindness. A validated
+		// deposit that vanishes is still watched to cancellation below.
+		if s.theirP2SHNative == 0 {
+			continue
 		}
 		if n.engineRunning.Load() {
 			// Started mode: guard against double-enqueue. Inline mode
@@ -1918,6 +2030,9 @@ func (n *Node) pruneSessions() {
 		if n.sessionIsTerminal(id, s) {
 			delete(n.pendingRefunds, id)
 			n.clearRefundBackoff(id)
+			delete(n.pendingOwnWatch, id)
+			delete(n.ownWatchSeen, id)
+			delete(n.stallWarned, id)
 			delete(n.sessions, id)
 			xlog.Info("swap session pruned", "order", id, "state", s.state.String())
 		}
@@ -2504,8 +2619,14 @@ func secretFromPayTx(payHex string, hx [20]byte, hasTime bool, depTxID string, d
 		return [33]byte{}, false
 	}
 	tx, err := coins.DeserializeWithTime(raw, hasTime)
-	if err != nil || len(tx.Inputs) == 0 {
-		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err, "inputs", len(tx.Inputs))
+	if err != nil {
+		// tx is nil here — logging len(tx.Inputs) would deref it (live
+		// worker panics on unparseable mempool payloads).
+		xlog.Debug("secretFromPayTx: cannot deserialize", "err", err)
+		return [33]byte{}, false
+	}
+	if len(tx.Inputs) == 0 {
+		xlog.Debug("secretFromPayTx: no inputs")
 		return [33]byte{}, false
 	}
 	var depHash [32]byte

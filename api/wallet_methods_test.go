@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,6 +143,12 @@ func (s *stubConn) GetRawTransactionVerbose(txid string) (wallet.VerboseTx, erro
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
+}
+
+// GetRawMempool is unsupported on the stub: the own-deposit watch must
+// degrade to the refund sweep, never panic.
+func (s *stubConn) GetRawMempool() ([]string, error) {
+	return nil, errors.New("unsupported")
 }
 
 // valid BTC P2PKH address (prefix 0x00), used as both destination and change.

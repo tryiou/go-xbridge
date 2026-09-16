@@ -126,8 +126,8 @@ func TestTakerClaimBroadcastFailureReposts(t *testing.T) {
 	if _, _, err := takerSession.OnConfirmB(&proto.ConfirmBBody{HubAddress: hub, ID: orderID, APayTxID: makerPayTxID}); err != nil {
 		t.Fatalf("ConfirmB build unexpectedly failed: %v", err)
 	}
-	if takerSession.state == csConfirmedB {
-		t.Fatal("state advanced despite failed broadcast")
+	if takerSession.state != csCreatedB {
+		t.Fatalf("state = %s, want createdB (failed broadcast must not advance)", takerSession.state.String())
 	}
 	if takerSession.claimTxID == "" {
 		t.Fatal("claimTxID not adopted despite successful build")
@@ -149,8 +149,10 @@ func TestTakerClaimBroadcastFailureReposts(t *testing.T) {
 	if tkBtcConn.broadcasts[len(tkBtcConn.broadcasts)-1] != takerSession.claimTxID {
 		t.Fatal("repost broadcast a different txid (must be identical bytes)")
 	}
-	if takerSession.state != csConfirmedB {
-		t.Fatalf("state = %s, want confirmedB", takerSession.state.String())
+	// C++ trader parity (xbridgesession.cpp:3185): the successful redeem
+	// broadcast is the finish — terminal at the repost, not at Finished.
+	if takerSession.state != csFinished {
+		t.Fatalf("state = %s, want finished after successful repost", takerSession.state.String())
 	}
 	if takerSession.claimRetryAt != 0 {
 		t.Fatal("retry timestamp not cleared after successful repost")
@@ -188,7 +190,9 @@ func TestBroadcastAdoptsConfirmedIntent(t *testing.T) {
 	if len(tkBtcConn.broadcasts) != nBroadcasts {
 		t.Fatal("sweep rebroadcast a confirmed claim (must adopt, not resend)")
 	}
-	if takerSession.state != csConfirmedB {
-		t.Fatalf("state = %s, want confirmedB", takerSession.state.String())
+	// C++ trader parity (xbridgesession.cpp:3185): adoption replays the
+	// successful-broadcast resume, which is the finish.
+	if takerSession.state != csFinished {
+		t.Fatalf("state = %s, want finished after confirmation adoption", takerSession.state.String())
 	}
 }

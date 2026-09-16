@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	xlog "go-xbridge/log"
@@ -129,6 +130,7 @@ func (n *Node) tickStages() []tickStage {
 		{"watchStalledSessions", func() { n.watchStalledSessions() }},
 		{"gcStaleMineOrders", func() { n.gcStaleMineOrders() }},
 		{"watchCounterpartyDeposits", func() { n.watchCounterpartyDeposits() }},
+		{"watchOwnDepositSpends", func() { n.watchOwnDepositSpends() }},
 		{"pollBroadcastConfirmations", func() { n.pollBroadcastConfirmations() }},
 		{"rebroadcastUnconfirmed", func() { n.rebroadcastUnconfirmed() }},
 		{"pruneTracked", func() { n.pruneTracked() }},
@@ -148,6 +150,9 @@ func (n *Node) start() {
 	n.results = make(chan workResult, engineWorkers)
 	n.pendingRefunds = map[string]bool{}
 	n.pendingWatch = map[string]bool{}
+	n.pendingOwnWatch = map[string]bool{}
+	n.ownWatchSeen = map[string]map[string]struct{}{}
+	n.stallWarned = map[string]uint64{}
 	n.persistSignal = make(chan struct{}, 1)
 	n.wg.Add(6) // reader, engine, blockLoop, statusLoop, wallet sweep, persist
 	go n.readerLoop()
@@ -230,7 +235,7 @@ func (n *Node) readerLoop() {
 			continue
 		}
 		in := inboundPacket{pkt: pkt, peer: peer, snode: hexEncode(pkt.Pubkey[:])}
-		xlog.Debug("packet received", "command", pkt.Command.String(), "snode", in.snode, "peer", peer)
+		xlog.With("p2p", true).Debug("packet received", "command", pkt.Command.String(), "snode", in.snode, "peer", peer)
 		// Backpressure, not drop: a full packets channel parks the reader
 		// until the engine drains, matching C++'s synchronous net thread
 		// (onMessageReceived/onBroadcastReceived process in place,
@@ -453,10 +458,13 @@ func (n *Node) startWorkers() {
 
 // safeTaskRun executes a worker task with panic recovery, turning any panic
 // into an error result so a single bad wallet response cannot kill a worker.
+// The recovered stack is logged: a panic value alone ("nil pointer
+// dereference") is not locatable, and the live incident that motivated this
+// took a full session to diagnose for lack of the stack.
 func safeTaskRun(t workTask) (v any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			xlog.Error("worker recovered panic", "panic", r)
+			xlog.Error("worker recovered panic", "panic", r, "stack", string(debug.Stack()))
 			err = fmt.Errorf("api: worker panic: %v", r)
 		}
 	}()

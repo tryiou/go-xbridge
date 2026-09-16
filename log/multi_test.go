@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -93,3 +94,120 @@ func contains(s, sub string) bool {
 type nopWriteCloser struct{ *bytes.Buffer }
 
 func (nopWriteCloser) Close() error { return nil }
+
+// TestSetP2PLogFile_SplitsDestinations verifies the file wiring: after
+// SetFileLogger + SetP2PLogFile, an untagged record lands in the general
+// file (and not the packet file), while a "p2p"-tagged record lands in the
+// packet file (and not the general file).
+func TestSetP2PLogFile_SplitsDestinations(t *testing.T) {
+	dir := t.TempDir()
+	genPath := dir + "/xbridged.log"
+	pktPath := dir + "/log-p2p/xbridgep2p.log"
+
+	genRw, err := SetFileLogger(genPath, 1<<20, 2)
+	if err != nil {
+		t.Fatalf("SetFileLogger: %v", err)
+	}
+	defer SetLogger(nil)
+	pktRw, err := SetP2PLogFile(pktPath, 1<<20, 2)
+	if err != nil {
+		t.Fatalf("SetP2PLogFile: %v", err)
+	}
+	defer SetLogger(nil)
+
+	Info("general message", "k", "v")
+	With("p2p", true).Info("packet message", "command", "HoldApply")
+
+	if err := genRw.Close(); err != nil {
+		t.Fatalf("close general: %v", err)
+	}
+	if err := pktRw.Close(); err != nil {
+		t.Fatalf("close packet: %v", err)
+	}
+
+	genData, err := os.ReadFile(genPath)
+	if err != nil {
+		t.Fatalf("ReadFile general: %v", err)
+	}
+	if !contains(string(genData), "general message") {
+		t.Fatalf("general file missing untagged record: %q", genData)
+	}
+	if contains(string(genData), "packet message") {
+		t.Fatalf("general file must not contain tagged record: %q", genData)
+	}
+
+	pktData, err := os.ReadFile(pktPath)
+	if err != nil {
+		t.Fatalf("ReadFile packet: %v", err)
+	}
+	if !contains(string(pktData), "packet message") {
+		t.Fatalf("packet file missing tagged record: %q", pktData)
+	}
+	if contains(string(pktData), "general message") {
+		t.Fatalf("packet file must not contain untagged record: %q", pktData)
+	}
+}
+
+// TestFilterHandler_RoutesByTag locks in the packet-log routing contract: a
+// record carrying the "p2p" marker passes a filterHandler with allowP2P=true
+// and is dropped by one with allowP2P=false; an untagged record does the
+// reverse. Both the WithAttrs path (xlog.With("p2p", true)) and the inline
+// record-attr path are covered, plus WithGroup flag preservation.
+func TestFilterHandler_RoutesByTag(t *testing.T) {
+	newPair := func() (*captureHandler, *captureHandler, *slog.Logger, *slog.Logger) {
+		genCap := &captureHandler{minLevel: slog.LevelDebug}
+		pktCap := &captureHandler{minLevel: slog.LevelDebug}
+		gen := slog.New(&filterHandler{allowP2P: false, inner: genCap})
+		pkt := slog.New(&filterHandler{allowP2P: true, inner: pktCap})
+		return genCap, pktCap, gen, pkt
+	}
+
+	// Tagged via With: packet handler passes, general handler drops.
+	genCap, pktCap, gen, pkt := newPair()
+	pkt.With("p2p", true).Info("encode xbridge payload", "packetLen", 129)
+	if pktCap.count() != 1 {
+		t.Fatalf("tagged record: packet handler got %d, want 1", pktCap.count())
+	}
+	gen.With("p2p", true).Info("encode xbridge payload", "packetLen", 129)
+	if genCap.count() != 0 {
+		t.Fatalf("tagged record: general handler got %d, want 0", genCap.count())
+	}
+
+	// Untagged: general handler passes, packet handler drops.
+	genCap, pktCap, gen, pkt = newPair()
+	gen.Info("peer connected", "peer", "1.2.3.4:41412")
+	if genCap.count() != 1 {
+		t.Fatalf("untagged record: general handler got %d, want 1", genCap.count())
+	}
+	pkt.Info("peer connected", "peer", "1.2.3.4:41412")
+	if pktCap.count() != 0 {
+		t.Fatalf("untagged record: packet handler got %d, want 0", pktCap.count())
+	}
+
+	// Inline record attr (no With): packet handler passes via the Handle
+	// fallback, general handler drops.
+	genCap, pktCap, gen, pkt = newPair()
+	pkt.Info("inline tagged", "p2p", true)
+	if pktCap.count() != 1 {
+		t.Fatalf("inline tagged record: packet handler got %d, want 1", pktCap.count())
+	}
+	gen.Info("inline tagged", "p2p", true)
+	if genCap.count() != 0 {
+		t.Fatalf("inline tagged record: general handler got %d, want 0", genCap.count())
+	}
+
+	// WithGroup preserves the marker flag in both orders.
+	genCap, pktCap, gen, pkt = newPair()
+	pkt.WithGroup("g").With("p2p", true).Info("group then tag")
+	if pktCap.count() != 1 {
+		t.Fatalf("group-then-tag: packet handler got %d, want 1", pktCap.count())
+	}
+	pkt.With("p2p", true).WithGroup("g").Info("tag then group")
+	if pktCap.count() != 2 {
+		t.Fatalf("tag-then-group: packet handler got %d, want 2", pktCap.count())
+	}
+	gen.With("p2p", true).WithGroup("g").Info("general group tagged")
+	if genCap.count() != 0 {
+		t.Fatalf("group tagged: general handler got %d, want 0", genCap.count())
+	}
+}

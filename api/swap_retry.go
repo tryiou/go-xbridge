@@ -138,6 +138,14 @@ func makerClaimBuildTask(s *SwapSession, c swapCtx) workTask {
 			// our own deposit is already broadcast); if it fails we must not
 			// proceed to redeem.
 			expLT := c.computeLockTimeFor(c.dstCur, false)
+			if expLT == 0 {
+				// Our own height read failed (wallet outage) — transient, never
+				// a counterparty fault. Retry owns it; a genuine drift fault
+				// still cancels below (S5 lesson: order 9698af09 died because
+				// C++ :2985-2995 cancels on any non-VERIFY_ERROR redeem
+				// failure instead of retrying).
+				return nil, fmt.Errorf("api: locktime unavailable for %s, awaiting redelivery", c.dstCur)
+			}
 			if !acceptableLockTimeDrift(expLT, c.theirLockTime, c.blockTimeFor(c.dstCur)) {
 				// C++ :2926-2935 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadBLockTime}
@@ -296,6 +304,11 @@ func takerDepositBuildTask(s *SwapSession, c swapCtx) workTask {
 			// (dstCur) — NOT against our B lockTime, which legitimately differs
 			// by ~90 blocks.
 			expLT := c.computeLockTimeFor(c.dstCur, true)
+			if expLT == 0 {
+				// Our own height read failed (wallet outage) — transient, never
+				// a counterparty fault (S5 lesson, mirrors the maker side).
+				return nil, fmt.Errorf("api: locktime unavailable for %s, awaiting redelivery", c.dstCur)
+			}
 			if !acceptableLockTimeDrift(expLT, c.theirLockTime, c.blockTimeFor(c.dstCur)) {
 				// C++ :2464-2472 — bad counterparty locktime → wire-Cancel.
 				return nil, &selfCancelErr{reason: crBadALockTime}
@@ -529,8 +542,14 @@ func (n *Node) retryFailedClaimBuilds(now uint64) {
 		// REPOST branch: intent built (txid + hex persisted) but broadcast
 		// never confirmed. Re-send the identical bytes or adopt the
 		// on-chain confirmation — never rebuild (which would double-claim).
+		// The confirmed states (csConfirmedA/B) are restore-reconciliation:
+		// a pre-finish session persisted after its claim broadcast (claim
+		// on-chain, hub Finished never observed — live S7 order fda21ce4)
+		// reconciles through the same adoption replay, which is the C++
+		// trFinished terminal state (xbridgesession.cpp:3002/:3185).
 		if s.claimTxID != "" && s.claimHex != "" {
-			rolePreConfirmed := (s.isMaker && s.state == csCreatedA) || (!s.isMaker && s.state == csCreatedB)
+			rolePreConfirmed := (s.isMaker && (s.state == csCreatedA || s.state == csConfirmedA)) ||
+				(!s.isMaker && (s.state == csCreatedB || s.state == csConfirmedB))
 			if !rolePreConfirmed {
 				// Stale schedule on an advanced session: tidy, don't spin.
 				s.claimRetryAt = 0

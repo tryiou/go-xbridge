@@ -152,19 +152,41 @@ func TestRefundFailureStateGate(t *testing.T) {
 
 	// A user-canceled order (dxCancelOrder sets "canceled", then broadcasts the
 	// refund) must NOT flip to "rollback failed" on a failed broadcast — C++
-	// never produces trRollbackFailed for trCancelled.
+	// never produces trRollbackFailed for trCancelled. Distinct refund bytes:
+	// an earlier sub-case successfully broadcast refundHexFixture(), and
+	// runRefundTask's already-on-chain reconcile turns a re-broadcast of known
+	// hex into SUCCESS — this sub-case pins the genuine failure, so it needs
+	// its own hex.
 	var canc [32]byte
 	copy(canc[:], []byte("refund-fail-canceled-00000"))
 	cancKey := hexEncode(canc[:])
 	n.store.Add(&Order{ID: canc, FromCurrency: "LTC", ToCurrency: "LTC", Status: "canceled"})
 	n.sessions[cancKey] = &SwapSession{n: n, id: canc, isMaker: false, srcCur: "LTC", dstCur: "LTC",
 		refundHex: refundHexFixture(), state: csCreatedA}
+	cancRefund := hex.EncodeToString(func() []byte {
+		rtx := &coins.Tx{Version: 1}
+		rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("ef", 32)), Index: 0}, Sequence: 0xfffffffe}}
+		rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+		return rtx.Serialize()
+	}())
 	ltc.sendErr = errors.New("simulated rpc failure")
-	if !n.postRefundTask(cancKey, "LTC", refundHexFixture(), 0, false, nil) {
+	if !n.postRefundTask(cancKey, "LTC", cancRefund, 0, false, nil) {
 		t.Fatal("postRefundTask dropped the task")
 	}
 	if got := n.store.Get(cancKey); got == nil || got.Status != "canceled" {
 		t.Fatalf("canceled order status after failed refund = %v, want canceled (unchanged)", got)
+	}
+
+	// A canceled order whose refund broadcast SUCCEEDS flips to "rolled back"
+	// (C++ redeemOrderDeposit sets trRollback from trCancelled, :3911) — the
+	// stall-watchdog cancel of a swap whose deposit already broadcast is
+	// exactly this path (live 2026-09-15, order a4198f2d…).
+	ltc.sendErr = nil
+	if !n.postRefundTask(cancKey, "LTC", refundHexFixture(), 0, false, nil) {
+		t.Fatal("postRefundTask dropped the canceled-order refund")
+	}
+	if got := n.store.Get(cancKey); got == nil || got.Status != "rolled back" {
+		t.Fatalf("canceled order status after successful refund = %v, want rolled back", got)
 	}
 
 	// Session-less fallback (stored-order escape hatch): rollbackGate keys on
@@ -186,13 +208,56 @@ func TestRefundFailureStateGate(t *testing.T) {
 	var sessless [32]byte
 	copy(sessless[:], []byte("refund-fail-sessless-000"))
 	sesslessKey := hexEncode(sessless[:])
+	// Distinct refund bytes: an earlier sub-case's successful retry broadcast
+	// refundHexFixture(), so the fake wallet already knows that txid — a
+	// known-on-chain refund now reconciles to "rolled back" (refund
+	// reconcile), not "rollback failed". This sub-case pins the
+	// unknown-to-wallet failure, so it needs its own hex.
+	sesslessRefund := hex.EncodeToString(func() []byte {
+		rtx := &coins.Tx{Version: 1}
+		rtx.Inputs = []coins.TxIn{{PrevOut: coins.OutPoint{Hash: mustHash(strings.Repeat("cd", 32)), Index: 0}, Sequence: 0xfffffffe}}
+		rtx.Outputs = []coins.TxOut{{Value: 1, ScriptPubKey: []byte{0x51}}}
+		return rtx.Serialize()
+	}())
 	n.store.Add(&Order{ID: sessless, FromCurrency: "LTC", ToCurrency: "LTC", Status: "accepting",
-		RefundTx: refundHexFixture(), DepositSent: true})
+		RefundTx: sesslessRefund, DepositSent: true})
 	ltc.sendErr = errors.New("simulated rpc failure")
-	if !n.postRefundTask(sesslessKey, "LTC", refundHexFixture(), 0, false, nil) {
+	if !n.postRefundTask(sesslessKey, "LTC", sesslessRefund, 0, false, nil) {
 		t.Fatal("postRefundTask dropped the task")
 	}
 	if got := n.store.Get(sesslessKey); got == nil || got.Status != "rollback failed" {
 		t.Fatalf("session-less taker (RefundTx set) after failure = %v, want rollback failed", got)
+	}
+}
+
+// TestStoredRefundSweepActsOnCanceledOrder pins the live #8 stranding
+// (2026-09-15, order a4198f2d…): the 30-min stall watchdog cancels a swap
+// whose deposit ALREADY broadcast, leaving a Mine store record with
+// status "canceled", DepositSent and a pre-signed refund. C++ refunds
+// trCancelled transactions in its redeem scan, so the stored-refund sweep
+// must act on canceled orders too — a terminal-status skip strands the
+// deposit in the P2SH forever (pre-fix behavior: never broadcast).
+func TestStoredRefundSweepActsOnCanceledOrder(t *testing.T) {
+	ltc := &fakeConnector{ticker: "LTC", blockHeight: 1000, rawTx: map[string]string{}}
+	n := rollbackFailedTestNode(t, ltc)
+
+	var id [32]byte
+	copy(id[:], []byte("canceled-refund-order-0001"))
+	idHex := hexEncode(id[:])
+	o := &Order{ID: id, FromCurrency: "LTC", ToCurrency: "BTC", Status: "canceled",
+		Mine: true, DepositSent: true, UtxoCurrency: "LTC", RefundTx: refundHexFixture()}
+	n.store.Add(o)
+
+	// No live session (the watchdog pruned it): only the stored sweep owns it.
+	n.scanStoredRefunds()
+
+	if len(ltc.broadcasts) == 0 {
+		t.Fatal("stored refund not broadcast for a canceled order with deposit out")
+	}
+	if got := n.store.Get(idHex); got == nil || got.Status != "rolled back" {
+		if got == nil {
+			t.Fatal("order vanished from store")
+		}
+		t.Fatalf("status after refund = %q, want rolled back", got.Status)
 	}
 }

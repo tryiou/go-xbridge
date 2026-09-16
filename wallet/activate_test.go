@@ -231,6 +231,9 @@ func (c *hangingProbeConnector) GetTxOut(string, uint32) (Utxo, bool, error) {
 func (c *hangingProbeConnector) GetRawTransactionVerbose(string) (VerboseTx, error) {
 	return VerboseTx{}, errors.New("unused")
 }
+func (c *hangingProbeConnector) GetRawMempool() ([]string, error) {
+	return nil, errors.New("unused")
+}
 
 // GetBlockCountContext blocks until ctx is done, then reports the context's
 // error and signals that the call exited.
