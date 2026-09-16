@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -28,6 +29,14 @@ import (
 	xlog "go-xbridge/log"
 	"go-xbridge/p2p"
 	"go-xbridge/wallet"
+)
+
+// Build-time version info — set via goreleaser ldflags (-X) on release builds;
+// "dev" when built from a plain `go build` checkout.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 // fatalf logs an error at ERROR level with the given structured fields and
@@ -111,16 +120,24 @@ func main() {
 	dxnowallets := flag.Bool("dxnowallets", false, "show all orders across the network for non-local wallets (C++ -dxnowallets; overrides Main.ShowAllOrders)")
 	// -enableexchange mirrors C++'s flag of the same name (init.cpp:569). It
 	// gates Exchange::isEnabled on a service node (settings.cpp:45); xbridged
-	// is not a service node and exchange mode is inherent to it, so the flag is
-	// accepted for blocknetd CLI parity and is a no-op.
+	// is not a service node and exchange mode is inherent to it, so the flag
+	// is accepted for blocknetd CLI parity and is a no-op.
 	enableExchange := flag.Bool("enableexchange", false, "accepted for blocknetd CLI parity; exchange mode is inherent for xbridged (no-op)")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("xbridged %s (commit=%s, date=%s)\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
 		fatalf("%v", err)
 	} else {
 		xlog.SetLevel(lvl)
 	}
+
+	xlog.Info("xbridged starting", "version", version, "commit", commit, "date", date)
 
 	// Ensure the data directory exists before logging to it (it is otherwise
 	// only created lazily on the first swap-state save).
