@@ -74,6 +74,27 @@ func resolveDataDir(dir string) string {
 	return filepath.Join(base, "xbridged")
 }
 
+// resolveCredentialFlag returns the effective credential: an explicit flag
+// value always wins; an empty flag resolves through the environment variable
+// (LookupEnv: an explicitly emptied variable yields "", identical to unset).
+func resolveCredentialFlag(flagVal, envKey string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if v, ok := os.LookupEnv(envKey); ok {
+		return v
+	}
+	return ""
+}
+
+// rpcCredentialsHalfConfigured reports whether exactly one of the RPC
+// credential pair is set. The daemon's both-required contract then leaves
+// auth disabled; warning surfaces env typos that would otherwise silently
+// open the RPC surface.
+func rpcCredentialsHalfConfigured(user, pass string) bool {
+	return (user == "") != (pass == "")
+}
+
 // isLoopbackAddr reports whether an addr host:port string binds to a loopback
 // interface (localhost, 127.0.0.0/8, or ::1). An empty host (":41414") binds
 // all interfaces and is treated as non-loopback.
@@ -125,6 +146,13 @@ func main() {
 	enableExchange := flag.Bool("enableexchange", false, "accepted for blocknetd CLI parity; exchange mode is inherent for xbridged (no-op)")
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	// Credential fallback: an explicit flag always wins; an empty flag falls
+	// back to the environment so secrets never have to appear in argv
+	// (ps-visible). Credential values are never logged. Silent: safe before
+	// the --version early exit below.
+	*rpcUser = resolveCredentialFlag(*rpcUser, "XBRIDGED_RPCUSER")
+	*rpcPass = resolveCredentialFlag(*rpcPass, "XBRIDGED_RPCPASSWORD")
 
 	if *versionFlag {
 		fmt.Printf("xbridged %s (commit=%s, date=%s)\n", version, commit, date)
@@ -273,6 +301,14 @@ func main() {
 		if e = strings.TrimSpace(e); e != "" {
 			rpcauthList = append(rpcauthList, e)
 		}
+	}
+	// Half-configured user/pass with no rpcauth entries leaves auth disabled
+	// via the both-required contract below; warn since env typos would
+	// otherwise silently open the RPC surface. Skipped when rpcauth entries
+	// exist (auth is enabled through them regardless).
+	if len(rpcauthList) == 0 && rpcCredentialsHalfConfigured(*rpcUser, *rpcPass) {
+		xlog.Warn("RPC credentials half-configured; authentication stays disabled",
+			"hint", "set both -rpcuser and -rpcpassword (or XBRIDGED_RPCUSER and XBRIDGED_RPCPASSWORD)")
 	}
 	authConfigured := (*rpcUser != "" && *rpcPass != "") || len(rpcauthList) > 0
 	if authConfigured {

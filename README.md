@@ -189,7 +189,7 @@ This table is the complete flag authority (`cmd/xbridged/main.go`).
 | `-conf` | `<home>/.blocknet/xbridge.conf` | Path to `xbridge.conf` (read-only; fatal if missing). |
 | `-magic` | `""` | Network magic (4-byte hex); derived from `-network` if empty. |
 | `-rpcbind` | `127.0.0.1:41414` | JSON-RPC listen address `host:port` for the `dx*` API. Defaults to **loopback only**; set explicitly to bind elsewhere. |
-| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth pair. Auth is enforced when the pair is set **or** any `-rpcauth` entry is configured; a non-loopback `-rpcbind` without auth logs a warning. With no credentials the daemon is open on its loopback bind (there is no cookie-auth fallback, unlike C++). |
+| `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth pair. Auth is enforced when the pair is set **or** any `-rpcauth` entry is configured; a non-loopback `-rpcbind` without auth logs a warning. With no credentials the daemon is open on its loopback bind (there is no cookie-auth fallback, unlike C++). Each flag falls back to the environment when empty — `XBRIDGED_RPCUSER` / `XBRIDGED_RPCPASSWORD` (explicit flags win) — so secrets never have to appear in `ps`-visible argv. |
 | `-rpcauth` | `""` | Comma-separated multi-user auth entries, `user:salt$hash` (HMAC-SHA256, the same credential path C++ offers). |
 | `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
 | `-walletversionstr` | `/Blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |

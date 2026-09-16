@@ -31,7 +31,10 @@ curl -s http://127.0.0.1:41414 \
 - **Auth:** HTTP Basic auth is enforced whenever **any** credential is
   configured — `-rpcuser`/`-rpcpassword` or one or more `-rpcauth`
   `user:salt$hash` entries (HMAC-SHA256, the same credential path C++ offers).
-  A request without valid credentials
+  An empty `-rpcuser`/`-rpcpassword` flag falls back to the environment
+  (`XBRIDGED_RPCUSER` / `XBRIDGED_RPCPASSWORD`; explicit flags win), so
+  launchers can keep secrets out of `ps`-visible argv. A request without
+  valid credentials
   answers `401` with an **empty body** and `WWW-Authenticate:
   Basic realm="jsonrpc"` (no JSON envelope). A presented bad credential waits
   250 ms before the 401 (C++ brute-force deterrence `MilliSleep(250)`,
