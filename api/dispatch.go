@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // HandlerCtx carries the dependencies each dx* handler needs.
@@ -63,8 +64,34 @@ var dispatch = map[string]Handler{
 }
 
 // Lookup returns the handler for a method name, or nil if unknown.
+// Method names match Blocknet Core's CRPCTable parity (server.cpp lowercases
+// on register and lookup): matching is case-insensitive so legacy callers
+// sending dxloadxbridgeconf/dxgetlocaltokens dispatch instead of 404.
 func Lookup(method string) Handler {
-	return dispatch[method]
+	if h, ok := dispatch[method]; ok {
+		return h
+	}
+	if canon, ok := canonicalMethod(method); ok {
+		return dispatch[canon]
+	}
+	return nil
+}
+
+// canonicalMethod returns the registered dispatch key for method under
+// case-insensitive (Core CRPCTable) matching, or false if unknown.
+// All registered keys are unique under lowercasing (25 keys), so the match is
+// unambiguous; a future registration colliding case-insensitively with an
+// existing key would be inherently invalid (Core would conflate them too).
+func canonicalMethod(method string) (string, bool) {
+	if _, ok := dispatch[method]; ok {
+		return method, true
+	}
+	for name := range dispatch {
+		if strings.EqualFold(name, method) {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +160,12 @@ var arity = map[string]aritySpec{
 
 // checkArity returns the C++ arity violation for method with n params, or nil
 // when the count is within bounds. Methods without a registry entry (and
-// unbounded maxima) are never gated.
+// unbounded maxima) are never gated. Method matching is case-insensitive
+// (Core parity); violations carry the canonical registered name.
 func checkArity(method string, n int) *rpcError {
+	if canon, ok := canonicalMethod(method); ok {
+		method = canon
+	}
 	spec, ok := arity[method]
 	if !ok {
 		return nil

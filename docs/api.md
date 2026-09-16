@@ -24,6 +24,10 @@ curl -s http://127.0.0.1:41414 \
 
 - Request: `{"method":"<name>","params":[<pos0>,<pos1>,…],"id":<any>}`.
 - Response: `{"result":…,"error":null,"id":<echo>}` (no `jsonrpc` field).
+- **Method names are case-insensitive**, matching Blocknet Core's `CRPCTable`
+  (which lowercases on register and lookup): `dxgetlocaltokens`,
+  `dxLoadXBridgeConf`, and `DXGETMYORDERS` all dispatch to the canonical
+  handler. Unknown names (including `gettradingdata`) still answer `-32601`.
 - **Auth:** HTTP Basic auth is enforced whenever **any** credential is
   configured — `-rpcuser`/`-rpcpassword` or one or more `-rpcauth`
   `user:salt$hash` entries (HMAC-SHA256, the same credential path C++ offers).

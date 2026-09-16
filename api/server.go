@@ -279,10 +279,16 @@ func (s *Server) execOne(el json.RawMessage) rpcResponse {
 }
 
 // dispatchOne validates the request envelope, finds the handler, and runs it.
+// Method matching is case-insensitive (Core CRPCTable parity); the canonical
+// registered name is used downstream so logs and business-error names stay
+// canonical regardless of request casing.
 func (s *Server) dispatchOne(raw rawRequest) rpcResponse {
 	method, params, id, perr := parseRequest(raw)
 	if perr != nil {
 		return envelopeResponse(perr, id)
+	}
+	if canon, ok := canonicalMethod(method); ok {
+		method = canon
 	}
 	handler := Lookup(method)
 	if handler == nil {
