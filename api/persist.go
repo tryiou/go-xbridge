@@ -90,6 +90,15 @@ type persistedSwap struct {
 	OurDepositTxID string `json:"ourDepositTxID"`
 	RefundHex      string `json:"refundHex"`
 	RefundDone     bool   `json:"refundDone"`
+	// SecretHunt re-arms taker-side secret recovery after a restart: a
+	// hunting session must keep hunting (mempool watch), never fail its
+	// first post-restart refund with "rollback failed". omitempty keeps
+	// pre-hunt snapshots decodable; absent means not hunting.
+	SecretHunt bool `json:"secretHunt,omitempty"`
+	// HuntSince stamps when the hunt armed (wall micros), feeding the
+	// hourly hunt WARN's elapsed time. omitempty like SecretHunt; restore
+	// backfills a zero stamp with the restore time (downtime unknown).
+	HuntSince uint64 `json:"huntSince,omitempty"`
 	// DepositHex is the signed deposit raw hex for tick-driven repost of a
 	// failed broadcast (swap_retry.go). omitempty: pre-upgrade records lack
 	// it and simply never repost.
@@ -640,6 +649,8 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.OurDepositTxID = s.ourDepositTxID
 	ps.RefundHex = s.refundHex
 	ps.RefundDone = s.refundDone
+	ps.SecretHunt = s.secretHunt
+	ps.HuntSince = s.huntSince
 	ps.DepositHex = s.depositHex
 	ps.TheirDepositTxID = s.theirDepositTxID
 	ps.TheirLockTime = s.theirLockTime
@@ -750,6 +761,8 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		ourDepositTxID:   ps.OurDepositTxID,
 		refundHex:        ps.RefundHex,
 		refundDone:       ps.RefundDone,
+		secretHunt:       ps.SecretHunt,
+		huntSince:        ps.HuntSince,
 		depositHex:       ps.DepositHex,
 		theirDepositTxID: ps.TheirDepositTxID,
 		theirLockTime:    ps.TheirLockTime,
@@ -785,6 +798,12 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	// clock restarts alongside the watchdog above.
 	if s.state == csHoldApplied && s.holdApplySentAt == 0 {
 		s.holdApplySentAt = uint64(NowMicro())
+	}
+	// A hunted record predating the hunt clock (zero stamp) restarts its
+	// visibility window at restore: the downtime itself is unknown, so the
+	// elapsed-hunting clock starts now rather than reporting a bogus age.
+	if s.secretHunt && s.huntSince == 0 {
+		s.huntSince = uint64(NowMicro())
 	}
 	// Restore reconciliation: a session persisted after its claim broadcast
 	// (csConfirmedA/B, claimTxID set) whose claimRetryAt was consumed has no

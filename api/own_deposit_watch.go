@@ -18,11 +18,14 @@ import (
 // payTxId), so the finish path, persistence, and the ConfirmedB hub receipt
 // are byte-identical to the normal flow.
 //
-// Known scope note: only UNCONFIRMED spends are discoverable here (mempool
-// scan). A spend that confirmed while the daemon was offline is invisible to
-// getrawmempool; such a session still recovers via the pre-signed refund at
-// locktime (scanRefunds). C++ closes that gap with a block-by-block rescan,
-// which a thin client cannot reproduce without block-fetch RPCs.
+// Known scope note: only UNCONFIRMED spends are discoverable in the mempool
+// scan. A spend that confirmed while the daemon was offline is invisible to
+// getrawmempool; such a session arms the secret hunt on the first failed
+// refund (the pre-signed refund's input is gone, so the refund is not a
+// fallback for a claimed deposit — only for one still out). The hunt
+// re-validates false positives away and stays dashboard-visible; automated
+// confirmed-spend discovery follows as the next change. C++ closes that gap
+// with a block-by-block rescan (xbridgeapp.cpp:3389-3413).
 
 // ownWatchFetchBudget caps the per-tick GetRawTransaction fetches per session.
 // C++ pays the same per-tx RPC cost (isUTXOSpentInTx per mempool entry,
@@ -40,9 +43,17 @@ func (n *Node) watchOwnDepositSpends() {
 		n.pendingOwnWatch = map[string]bool{}
 	}
 	for id, s := range n.sessions {
+		if s.isMaker || s.await {
+			continue
+		}
 		// C++ role-B scan gate (:3378): the mempool sweep is taker-only —
 		// the maker generates the secret itself and finishes via ConfirmA.
-		if s.isMaker || s.state != csCreatedB || s.await {
+		// The csCreatedB state is only a proxy for "deposit out": a hunting
+		// session already proved its deposit out (the spent verdict that
+		// armed it), including crash-recovered sessions parked below
+		// csCreatedB — excluding them would park the hunt with no watch.
+		depositOut := s.state == csCreatedB || (s.secretHunt && n.orderDepositSent(id))
+		if !depositOut {
 			continue
 		}
 		// Watch only while the redeem has not happened: our deposit is out
@@ -67,9 +78,14 @@ func (n *Node) watchOwnDepositSpends() {
 
 // ownWatchResult is the worker outcome: the discovered spender ("" when none
 // matched this round) plus every txid scanned, for the incremental seen-set.
+// rechecked reports the hunt re-validation below actually ran (hunted session
+// with a readable backend); depositLive is its affirmative verdict — the
+// deposit outpoint reads unspent again, so a false-positive hunt clears.
 type ownWatchResult struct {
-	spender string
-	scanned []string
+	spender     string
+	scanned     []string
+	rechecked   bool
+	depositLive bool
 }
 
 // runOwnWatchTask sweeps the source chain's mempool for the spender of our
@@ -133,6 +149,7 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 	// Capture plain values for the worker: the session is engine-owned and
 	// must never be read off the engine goroutine (race detector).
 	srcCur, depTxID := s.srcCur, s.ourDepositTxID
+	hunt := s.secretHunt
 	depVout := uint32(ownDepositVout)
 	hx := s.theirSecretHash
 	hasTime := false
@@ -152,23 +169,54 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 	task := workTask{
 		orderID: orderID,
 		run: func() (any, error) {
-			return runOwnWatchTask(conn, seen, hx, depTxID, depVout, hasTime)
+			var res ownWatchResult
+			// Hunt re-validation runs BEFORE and INDEPENDENT of the mempool
+			// scan: it rests on chain reads (verbose + gettxout), not the
+			// mempool, so a blind/dead mempool must not suppress a
+			// false-positive correction. Only affirmative evidence moves
+			// the flag (probe folds blindness into rechecked==false).
+			// Outside the mempool budget: hunted sessions are rare, and
+			// correctness outranks fetch economy.
+			if hunt {
+				if known, spent := probeOwnDeposit(conn, depTxID, depVout); known {
+					res.rechecked = true
+					res.depositLive = !spent
+				}
+			}
+			mem, merr := runOwnWatchTask(conn, seen, hx, depTxID, depVout, hasTime)
+			res.spender = mem.spender
+			res.scanned = mem.scanned
+			return res, merr
 		},
 		apply: func(v any, err error) {
 			delete(n.pendingOwnWatch, orderID)
-			if err != nil {
-				// Unsupported/transient backend (LocalConnector, wallet down):
-				// degrade to the refund sweep, never cancel (C++ :3937/:3948
-				// return-false semantics — the watch simply keeps looking).
-				xlog.Debug("own-deposit watch unavailable, skipping round", "order", orderID, "err", err)
-				return
-			}
 			res, _ := v.(ownWatchResult)
 			// Merge the scanned txids into the engine-owned seen set so the
 			// next sweep is incremental (C++ per-tick incremental rescan,
 			// xbridgeapp.cpp:3384-3413). A spender lands on top of the set.
 			for _, k := range res.scanned {
 				n.ownWatchSeen[orderID][k] = struct{}{}
+			}
+			// Hunt re-validation verdict stands even when the mempool leg
+			// failed above: a false positive corrected is a refund resumed,
+			// and the mempool's health says nothing about the outpoint.
+			// The spender path below owns recovery when a spend is actually
+			// found — a live spend and a live outpoint cannot both hold,
+			// and the claim beats the refund.
+			if res.spender == "" {
+				if s := n.sessions[orderID]; s != nil && s.secretHunt && res.rechecked && res.depositLive {
+					s.secretHunt = false
+					s.huntSince = 0
+					n.persist()
+					xlog.Info("hunt cleared: deposit unspent again, refund path resumed", "order", orderID)
+				}
+			}
+			if err != nil {
+				// Unsupported/transient backend (LocalConnector, wallet down):
+				// degrade to the refund sweep, never cancel (C++ :3937/:3948
+				// return-false semantics — the watch simply keeps looking).
+				xlog.Debug("own-deposit watch unavailable, skipping round", "order", orderID, "err", err)
+				return
 			}
 			if res.spender == "" {
 				return

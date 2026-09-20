@@ -117,6 +117,20 @@ type SwapSession struct {
 	ourDepositTxID string
 	refundHex      string // pre-signed IF-branch refund, for cancel/expiry
 	refundDone     bool   // guard so the watcher broadcasts the refund at most once
+	// secretHunt arms taker-side secret recovery after a proven-spent own
+	// deposit (H1): the counterparty claimed, the secret is public
+	// on-chain, and the pre-signed refund can never confirm. While set the
+	// refund sweep stands down and the mempool deposit watch owns recovery;
+	// the stall watchdog stands down with it (cancelling would
+	// force-broadcast the same impossible refund). Persisted: a restart
+	// re-arms the hunt instead of failing the first post-restart refund.
+	secretHunt bool
+	// huntSince stamps when the hunt armed (wall micros, 0 when never).
+	// The hourly hunt WARN reports elapsed hunting time from it; restore
+	// backfills a zero stamp (pre-huntSince records) with the restore time,
+	// mirroring the lastProgress re-stamp — downtime is unknown, the clock
+	// restarts.
+	huntSince uint64
 	// depositHex is the signed deposit raw hex, adopted at build success
 	// alongside ourDepositTxID. A tick-driven repost re-sends these IDENTICAL
 	// bytes when the first broadcast fails (swap_retry.go) — never a rebuild,
@@ -1581,6 +1595,48 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 	return 0, nil, nil
 }
 
+// probeOwnDeposit classifies our own deposit outpoint against the chain.
+// known reports the wallet sees the deposit tx (verbose fetch succeeds with
+// confirmations>=0); spent reports its outpoint absent from gettxout.
+// known==false covers backend blindness, pruned history, and conflicted
+// transactions — all of which must preserve current behavior, never decide.
+// Only affirmative evidence (known both ways) moves the hunt flag, in either
+// direction. Runs on a worker; self-contained inputs.
+func probeOwnDeposit(conn wallet.Connector, depTxID string, depVout uint32) (known, spent bool) {
+	if conn == nil || depTxID == "" {
+		return false, false
+	}
+	vtx, verr := conn.GetRawTransactionVerbose(depTxID)
+	if verr != nil || vtx.Confirmations < 0 {
+		return false, false
+	}
+	_, ok, gerr := conn.GetTxOut(depTxID, depVout)
+	if gerr != nil {
+		return false, false
+	}
+	return true, !ok
+}
+
+// refundOutcome is the worker-produced result of a refund broadcast attempt.
+// txid is the accepted refund id ("" when deferred or failed); depositSpent
+// reports the H1 discriminator: our own deposit outpoint is already spent,
+// so the counterparty claimed and the secret is public on-chain — the refund
+// is impossible and the session must hunt the secret, never fail.
+type refundOutcome struct {
+	txid         string
+	depositSpent bool
+	// sendErr is the broadcast failure the spent verdict overrode (nil on
+	// all other paths). The maker/sessionless fallbacks need the original
+	// error to stay loud on the legacy path.
+	sendErr error
+}
+
+// errRefundDepositSpent reports a refund attempt abandoned because our own
+// deposit was already spent (counterparty claim). Returned through done
+// callbacks so manual callers (BroadcastRefund) see the cause instead of a
+// wallet reject; sweep callers (done == nil) never see it.
+var errRefundDepositSpent = errors.New("api: own deposit already spent, hunting secret instead of refunding")
+
 // runRefundTask executes a refund broadcast for conn/refundHex. When checkLock
 // is set it only broadcasts once the chain is at/above lockTime (the sweep
 // path); otherwise it broadcasts immediately (the cancel/rollback/escape-hatch
@@ -1588,23 +1644,25 @@ func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, r
 // refund is not yet due — the sweep retries on the next tick. Runs on a worker
 // goroutine; self-contained (all inputs captured by value, including the
 // connector captured at enqueue time). cur names the coin for error
-// context only.
-func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32, checkLock bool) (string, error) {
+// context only. depTxID/depVout locate our own deposit outpoint and proveSpend
+// (the rollbackGate verdict: the deposit provably broadcast) authorizes the
+// spent-vs-unknown classification below.
+func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32, checkLock bool, depTxID string, depVout uint32, proveSpend bool) (refundOutcome, error) {
 	if conn == nil {
-		return "", fmt.Errorf("api: no connector for %s", cur)
+		return refundOutcome{}, fmt.Errorf("api: no connector for %s", cur)
 	}
 	if checkLock {
 		h, err := conn.GetBlockCount()
 		if err != nil || h < 1 {
-			return "", fmt.Errorf("api: getblockcount %s: %v", cur, err)
+			return refundOutcome{}, fmt.Errorf("api: getblockcount %s: %v", cur, err)
 		}
 		if uint32(h) < lockTime {
-			return "", nil // not yet refundable
+			return refundOutcome{}, nil // not yet refundable
 		}
 	}
 	txid, err := conn.SendRawTransaction(refundHex)
 	if err == nil {
-		return txid, nil
+		return refundOutcome{txid: txid}, nil
 	}
 	// A broadcast failure can still mean the refund is already on chain: a
 	// prior run may have broadcast the identical pre-signed transaction, and
@@ -1617,10 +1675,20 @@ func runRefundTask(conn wallet.Connector, cur, refundHex string, lockTime uint32
 	if localID, lerr := txIDFromHex(refundHex); lerr == nil {
 		if _, gerr := conn.GetRawTransaction(localID); gerr == nil {
 			xlog.Info("refund already on chain", "coin", cur, "txid", localID)
-			return localID, nil
+			return refundOutcome{txid: localID}, nil
 		}
 	}
-	return "", err
+	// H1 spent-vs-unknown discriminator (worker side: needs chain reads the
+	// engine must never block on). A failed refund with the deposit proven
+	// out can mean the counterparty already claimed it — the input the
+	// refund would spend is gone. Backend blindness therefore fails safe
+	// toward retry, never toward hunt.
+	if proveSpend {
+		if known, spent := probeOwnDeposit(conn, depTxID, depVout); known && spent {
+			return refundOutcome{depositSpent: true, sendErr: err}, nil
+		}
+	}
+	return refundOutcome{}, err
 }
 
 // postRefundTask posts a refund broadcast to the worker pool (or runs it
@@ -1636,14 +1704,71 @@ func (n *Node) postRefundTask(orderID, cur, refundHex string, lockTime uint32, c
 	// Capture the connector at enqueue time (engine side) so a mid-task reload
 	// cannot swap which wallet broadcasts the refund.
 	conn := n.cfg().Connectors[cur]
+	// Spent-vs-unknown classification context: our own deposit outpoint plus
+	// whether the deposit provably broadcast (rollbackGate). The session's
+	// deposit id is authoritative when present; the stored BinTxId covers
+	// the sessionless escape hatch (deposits always land on vout 0, both
+	// sides). Without a proven deposit the worker skips classification and
+	// preserves current behavior exactly.
+	depTxID, depVout, proveSpend := "", uint32(0), false
+	if s := n.sessions[orderID]; s != nil && s.ourDepositTxID != "" {
+		depTxID, depVout = s.ourDepositTxID, uint32(ownDepositVout)
+		proveSpend = n.rollbackGate(orderID)
+	} else if o := n.store.Get(orderID); o != nil && o.BinTxId != "" {
+		depTxID, depVout = o.BinTxId, uint32(ownDepositVout)
+		proveSpend = n.rollbackGate(orderID)
+	}
 	task := workTask{
 		orderID: orderID,
 		run: func() (any, error) {
-			return runRefundTask(conn, cur, refundHex, lockTime, checkLock)
+			return runRefundTask(conn, cur, refundHex, lockTime, checkLock, depTxID, depVout, proveSpend)
 		},
 		apply: func(v any, err error) {
 			delete(n.pendingRefunds, orderID)
-			txid, _ := v.(string)
+			out, _ := v.(refundOutcome)
+			if err == nil && out.depositSpent {
+				s := n.sessions[orderID]
+				if s != nil && !s.isMaker {
+					// Taker with a spent deposit: owned recovery exists
+					// (deposit watch, claim retry) — hunt instead of
+					// mislabeling "rollback failed". Manual callers learn
+					// the cause through done; sweep callers never see it.
+					n.enterSecretHunt(s, orderID, cur)
+					if done != nil {
+						done("", errRefundDepositSpent)
+					}
+					return
+				}
+				if s != nil {
+					// Maker with a spent deposit and no local finish
+					// contradicts the protocol (the taker can only spend
+					// after our claim, which finishes us): stay loud on
+					// the legacy path with the original broadcast error
+					// instead of parking where no recovery exists.
+					xlog.Error("maker deposit spent without local finish: protocol contradiction",
+						"order", orderID, "coin", cur, "deposit", s.ourDepositTxID)
+				} else {
+					// Sessionless: no keys, no watch — typed error to
+					// manual callers, retry spacing to sweeps, and an
+					// operator pointer for manual recovery (deduped: the
+					// backoff spacing re-fires this every cycle).
+					if huntWarnDedup.Event(orderID) {
+						xlog.Warn("own deposit spent with no live session: manual recovery required",
+							"order", orderID, "coin", cur)
+					}
+					if done == nil {
+						n.recordRefundFailure(orderID)
+					} else {
+						done("", errRefundDepositSpent)
+					}
+					return
+				}
+				err = out.sendErr
+				if err == nil {
+					err = errRefundDepositSpent
+				}
+			}
+			txid := out.txid
 			if done != nil {
 				done(txid, err)
 			}
@@ -1862,6 +1987,25 @@ func (n *Node) postBroadcastTask(orderID string, conn wallet.Connector, cur, hex
 	}
 }
 
+// enterSecretHunt arms secret recovery on a live taker session after the
+// worker proved our own deposit spent (counterparty claim: the secret is
+// public on-chain, the pre-signed refund can never confirm). The flag
+// redirects recovery to the mempool deposit watch — scanRefunds skips hunted
+// sessions, the stall watchdog stands down, and no "rollback failed" is ever
+// written for a spent input. Callers gate on role first: makers never hunt
+// (a spent maker deposit without local finish contradicts the protocol and
+// stays loud). Idempotent: re-arming a hunted session only re-reports.
+func (n *Node) enterSecretHunt(s *SwapSession, orderID, cur string) {
+	if !s.secretHunt {
+		s.secretHunt = true
+		s.huntSince = uint64(NowMicro())
+		n.clearRefundBackoff(orderID)
+		n.persist()
+		xlog.Warn("own deposit already spent by counterparty claim: refund impossible, hunting secret on the deposit watch",
+			"order", orderID, "coin", cur, "deposit", s.ourDepositTxID)
+	}
+}
+
 // scanRefunds sweeps all live sessions and auto-broadcasts any pre-signed
 // refund whose deposit lockTime has passed (the fund-safety safety net). Runs
 // on the engine goroutine; each eligible session posts a worker task guarded by
@@ -1870,6 +2014,21 @@ func (n *Node) postBroadcastTask(orderID string, conn wallet.Connector, cur, hex
 func (n *Node) scanRefunds() {
 	for id, s := range n.sessions {
 		if s.refundDone || s.refundHex == "" || s.state == csFinished {
+			continue
+		}
+		if s.secretHunt {
+			// Stood down, never silent: the refund is impossible (input
+			// spent) and the deposit watch owns recovery. Report hourly
+			// so a parked hunt never vanishes from dashboards; the
+			// re-validation in the watch round-trip bounds it.
+			if huntWarnDedup.Event(id) {
+				elapsed := "unknown age"
+				if s.huntSince != 0 && uint64(NowMicro()) >= s.huntSince {
+					elapsed = (time.Duration(uint64(NowMicro())-s.huntSince) * time.Microsecond).Round(time.Second).String()
+				}
+				xlog.Warn("secret hunt ongoing: refund stood down, deposit watch owns recovery",
+					"order", id, "coin", s.srcCur, "deposit", s.ourDepositTxID, "huntingFor", elapsed)
+			}
 			continue
 		}
 		// C++ parity (xbridgeapp.cpp:3444): the locktime refund path runs
@@ -2150,6 +2309,19 @@ func (n *Node) tryStoredRefund(orderID, refundHex string, cands []string, done f
 		if err == nil && txid != "" {
 			if done != nil {
 				done(txid, nil)
+			}
+			return
+		}
+		// A spent verdict is chain-independent (our deposit is gone — no
+		// candidate currency can refund it): stop chaining and surface the
+		// typed cause instead of burying it under a generic exhaustion
+		// error after burning broadcasts on every remaining chain. Without
+		// an awaiting caller, space out re-checks like any sweep failure.
+		if errors.Is(err, errRefundDepositSpent) {
+			if done == nil {
+				n.recordRefundFailure(orderID)
+			} else {
+				done("", err)
 			}
 			return
 		}

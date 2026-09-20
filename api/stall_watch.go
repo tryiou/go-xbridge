@@ -51,7 +51,10 @@ func (n *Node) watchStalledSessions() {
 		n.stallWarned = map[string]uint64{} // lazily built nodes (tests) never ran start()
 	}
 	for id, s := range n.sessions {
-		if s.state == csFinished || s.refundDone || s.await || s.claimHex != "" {
+		// A hunting session recovers through the deposit watch, not the
+		// hub: cancelling it would force-broadcast the same impossible
+		// refund the hunt was armed to avoid (the input is spent).
+		if s.state == csFinished || s.refundDone || s.await || s.claimHex != "" || s.secretHunt {
 			continue
 		}
 		if s.lastProgress == 0 {

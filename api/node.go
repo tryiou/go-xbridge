@@ -34,6 +34,15 @@ var earlyFinishedDedup = xlog.NewDedupe(60*time.Second, func(order string, total
 	xlog.Warn("early Finished deferred suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
 })
 
+// huntWarnDedup keeps a parked secret hunt visible without spamming: the
+// first sighting per order logs at WARN, repeats collapse into an hourly
+// summary. A hunt that never recovers must stay on dashboards until the
+// operator intervenes or the watch resolves it — silence here is how funds
+// get forgotten.
+var huntWarnDedup = xlog.NewDedupe(time.Hour, func(order string, total int, elapsed time.Duration) {
+	xlog.Warn("secret hunt ongoing suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+})
+
 // cancelDedup collapses repeated "cancel for an order we do not track"
 // events. The same order cancel is rebroadcast by every peer that relays it, so
 // without collapsing a single order would emit one line per peer. The first
