@@ -1522,14 +1522,60 @@ func (s *SwapSession) applyConfirmedBBroadcast(out confirmOutcome, sentID string
 	return body
 }
 
+// finishedMayTerminate reports whether a hub Finished packet may terminate
+// the session: safe when the session is already past claim, when the
+// counterparty redeemed our deposit, or when no deposit of ours is out
+// (nothing to strand — the DepositSent flag is the on-chain proof, covering
+// crash-recovered sessions whose state never advanced past the broadcast).
+// Otherwise the Finished is early (or hostile) and terminating would move
+// the order to history — invisible to both refund sweeps — and prune the
+// session owning the pre-signed refund, stranding the deposit until manual
+// recovery.
+//
+// The past-claim check is deliberately role-insensitive (state >=
+// csConfirmedA for both roles): takers can never reach csConfirmedA through
+// the handshake (OnConfirmA drops wrong-role), and neither role ever enters
+// csConfirmedA/B in production at all — only the claim broadcast advances
+// state, straight to csFinished — so for reachable states this clause means
+// exactly "already finished locally". The pre-deposit check errs toward
+// deferral for the same reason: a taker parked below csCreatedB with nothing
+// sent can only wait out one more sweep cycle, never lose funds.
+func (s *SwapSession) finishedMayTerminate(orderID string) bool {
+	if s.state >= csConfirmedA {
+		return true
+	}
+	if o := s.n.store.Get(orderID); o != nil && o.CounterpartyRedeemed {
+		return true
+	}
+	return s.state < csCreatedA && !s.n.orderDepositSent(orderID)
+}
+
 // OnFinished (hub→both): the swap is complete on the hub; mark the order
 // terminal (C++ trFinished) and move it out of the live book into history
 // (C++ moveTransactionToHistory), which releases its reserved UTXOs and drops
-// it from dxGetOrders, then prune the session.
+// it from dxGetOrders, then prune the session. A Finished arriving while our
+// deposit is still out and neither side has claimed is deferred instead of
+// applied — a deliberate client-local divergence from C++
+// processTransactionFinished (xbridgesession.cpp:3851-3904), which terminates
+// unconditionally. No wire change: honest-hub outcomes are identical, since
+// an honest hub only sends Finished after both claims.
 func (s *SwapSession) OnFinished(b *proto.FinishedBody) (proto.XBridgeCommand, responseBody, error) {
-	s.n.store.MoveToHistory(hexEncode(s.id[:]), "finished", 0, NowMicro())
+	orderID := hexEncode(s.id[:])
+	if !s.finishedMayTerminate(orderID) {
+		// Deferral is bounded, not a stall: the session keeps its
+		// lastProgress stamp (a premature Finished is not progress), so a
+		// truly dead hub still trips the 30-minute stall watchdog, which
+		// cancels into the same pre-signed refund. The sweeps own recovery
+		// before that; the watchdog owns it after.
+		if earlyFinishedDedup.Event(orderID) {
+			xlog.Warn("deferring early Finished: deposit out, no claim yet; session stays live for the refund sweep",
+				"order", orderID, "state", s.state.String())
+		}
+		return 0, nil, nil
+	}
+	s.n.store.MoveToHistory(orderID, "finished", 0, NowMicro())
 	s.state = csFinished
-	xlog.Info("swap finished", "order", hexEncode(s.id[:]), "state", s.state.String())
+	xlog.Info("swap finished", "order", orderID, "state", s.state.String())
 	s.n.persist()
 	s.n.pruneSessions()
 	return 0, nil, nil

@@ -26,6 +26,14 @@ import (
 	"go-xbridge/wallet"
 )
 
+// earlyFinishedDedup collapses repeated deferred-early-Finished warnings. A
+// hostile or confused hub may retransmit Finished for the same deposit-out
+// order indefinitely; the first sighting per order is logged, repeats are
+// summarized periodically so the condition stays visible without spamming.
+var earlyFinishedDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
+	xlog.Warn("early Finished deferred suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+})
+
 // cancelDedup collapses repeated "cancel for an order we do not track"
 // events. The same order cancel is rebroadcast by every peer that relays it, so
 // without collapsing a single order would emit one line per peer. The first

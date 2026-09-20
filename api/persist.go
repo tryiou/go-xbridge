@@ -685,9 +685,28 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	// RefundTx — the order-record refund bytes (set exactly when the deposit
 	// was built); the session-scoped RefundHex is empty on order-only records.
 	refundPending := ps.Status == "canceled" && ps.DepositSent && ps.RefundTx != "" && !ps.RefundDone
-	if (ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA))) && !refundPending {
+	// A "finished" record with the deposit out, a pre-signed refund, and no
+	// claim evidence on either side is a pre-gate early finish (OnFinished
+	// terminated unconditionally before the finishedMayTerminate gate): the
+	// deposit is still locked and still owes a recovery sweep. Key on the
+	// order-record RefundTx — set exactly when the deposit was built
+	// (applyCreatedA/B) — and require both no local claim (ClaimTxID) and
+	// no counterparty redeem, so genuinely finished records (claim tracked,
+	// counterparty redeemed) still route to history. Mirrors the
+	// refundPending override above.
+	finishedRefundPending := ps.Status == "finished" && ps.DepositSent && ps.RefundTx != "" && !ps.RefundDone && ps.ClaimTxID == "" && !ps.CounterpartyRedeemed
+	if (ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA))) && !refundPending && !finishedRefundPending {
 		n.store.AddToHistory(o, ps.Status, uint64(ps.Reason), ps.Updated)
 		return
+	}
+	// A rescued early finish kept its pre-gate "finished" status on the
+	// record, but the swap never completed: restore the deposit-broadcast
+	// status so the live book, the sweeps, and the watchdog see a
+	// pre-claim deposit-out order (which is what it is). The txlog and the
+	// pre-signed refund hex remain the audit trail of what happened.
+	if finishedRefundPending {
+		o.Status = "created"
+		o.Updated = uint64(NowMicro())
 	}
 	n.store.Add(o)
 
@@ -695,6 +714,21 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	// session was pruned, so there is nothing to resume.
 	if !hasSessionData(ps) {
 		return
+	}
+
+	// A rescued early finish recorded the pre-gate csFinished over the live
+	// state; restoring it verbatim would make sessionIsTerminal prune the
+	// session on the next tick and re-strand the refund. The deposit
+	// broadcast is proven by DepositSent, so restore the deposit-broadcast
+	// state by role — the exact state the session held when the early
+	// Finished arrived.
+	restoredState := ps.State
+	if finishedRefundPending {
+		if ps.IsMaker {
+			restoredState = csCreatedA
+		} else {
+			restoredState = csCreatedB
+		}
 	}
 
 	s := &SwapSession{
@@ -738,7 +772,7 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		claimCur:         ps.ClaimCur,
 		hub:              ps.Hub,
 		hubKey:           ps.HubKey,
-		state:            ps.State,
+		state:            restoredState,
 		holdApplySentAt:  ps.HoldApplySentAt,
 		// Watchdog clock restarts at restore: pre-upgrade records predate
 		// the stamp, and the downtime itself is not hub silence.
