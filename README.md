@@ -34,14 +34,35 @@ wallet via core RPC — BLOCK is just another coin through the wallet connector.
 
 ## Build
 
+Requires **Go 1.25+** (see `go.mod`; CI uses `1.25.x`).
+
 ```sh
-go build ./...      # builds all packages, incl. cmd/xbridged and cmd/liveprobe
+# From the repo root. -o names the output; the binary lands in the
+# current directory (here: ./xbridged):
+go build -o xbridged ./cmd/xbridged
+
+# Sanity check (no xbridge.conf or network needed):
+./xbridged -h
+./xbridged -version
+```
+
+Notes:
+
+- `go build ./...` only **checks that everything compiles** — it writes
+  no binaries. You always get a runnable daemon via `./cmd/xbridged`
+  as above (bare `go build ./cmd/xbridged` works too and also drops
+  `./xbridged` in the current directory; `-o` is just explicit).
+- A plain local build reports `xbridged dev (commit=none, date=unknown)`;
+  release builds stamp the real version via goreleaser ldflags.
+- `cmd/liveprobe` is the ad-hoc live-node check, built the same way
+  (`go build -o liveprobe ./cmd/liveprobe`), or run without building:
+  `go run ./cmd/liveprobe -addr coreproxy.airdns.org:42111 -magic a1a0a2a3`.
+
+```sh
 go vet ./...        # static checks
 go test ./...       # unit tests (hermetic, no live-network dials)
 ```
 
-The daemon binary is built from `./cmd/xbridged` (e.g.
-`go build ./cmd/xbridged`); `cmd/liveprobe` is the ad-hoc live-node check.
 Point a dapp's RPC URL at `xbridged`'s JSON-RPC listener to use the `dx*`
 surface unchanged. Full build/test/lint gates are in `AGENTS.md`.
 
@@ -218,7 +239,7 @@ A successful response is JSON-RPC 1.0 (`result`/`error`/`id`, no `jsonrpc`
 field); business errors ride in `result`, not the envelope `error`:
 
 ```json
-{"result":{"maker":"BTC","taker":"BLOCK","bids":[],"asks":[]},"error":null,"id":1}
+{"result":{"detail":1,"maker":"BTC","taker":"BLOCK","bids":[],"asks":[]},"error":null,"id":1}
 ```
 
 Steps (params shown positionally — wrap them in the `"params"` array as above):
