@@ -1,0 +1,9 @@
+# Local build outputs (see README "Build"). Binaries land in the repo
+# root via `go build -o <name> ./cmd/<name>` — never committed.
+# Anchored with a leading `/` so the `cmd/xbridged/` source dir is unaffected.
+/xbridged
+/xbridged.exe
+/xbridged-*
+/liveprobe
+/liveprobe.exe
+/dist/
