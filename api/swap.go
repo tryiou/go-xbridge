@@ -214,6 +214,20 @@ type SwapSession struct {
 	// like await itself: a restart starts unstamped, and hub redelivery plus
 	// the retry sweeps re-drive whatever was in flight.
 	awaitSince uint64
+	// vanishMisses counts consecutive sweeps that observed the validated
+	// counterparty deposit definitively missing (gettxout-empty, no error).
+	// The watch cancels only after depositWatchVanishThreshold consecutive
+	// missings, so a transient vanish (reorg, propagation lag) that resolves
+	// in between never kills a healthy swap. Any other completed observation
+	// — unspent, guard skip, or transient wallet error — resets it: the
+	// countdown measures consecutive actionable missings, and every reset
+	// errs toward patience (a delayed cancel only postpones a courtesy
+	// notification; refunds are CLTV-driven and independent). A dropped
+	// probe never ran, so it touches nothing either way. Memory-only like
+	// await: a restart restarts the countdown (extra patience, never a
+	// missed cancel), and the count dies with the session, so no cleanup
+	// path is needed. Engine-owned; never read off the engine goroutine.
+	vanishMisses int
 
 	// lastProgress is the wall-microsecond timestamp of the last observable
 	// forward motion: session creation, an accepted hub packet, or a broadcast
@@ -2076,22 +2090,31 @@ func (n *Node) scanRefunds() {
 }
 
 // watchCounterpartyDeposits polls the validated counterparty deposit of every
-// live pre-claim session and cancels when it disappears (spent or reorged).
-// It is the thin-client counterpart of C++ watchForSpentDeposit plus the
-// fund-safety deposit-spend sweep (xbridgeapp.cpp:3441): without a wallet-side
-// mempool watcher this port cannot extract the secret from an unknown
-// spending transaction, so a vanished deposit fails over to the safe path —
-// wire-Cancel with the role's deposit reason (crBadA/BDepositTx, the same
-// reasons the CreateB/ConfirmA validation uses) and rollback to our own
-// pre-signed refund — instead of stalling until our own locktime or
-// broadcasting a claim that can never confirm. A wallet error is transient
-// (skip the round); only a definitive gettxout-missing cancels. Runs on the
-// engine goroutine; each eligible session posts a worker task guarded by
-// pendingWatch so no session is ever double-polled. Inline mode (tests)
-// probes synchronously.
+// live pre-claim session and cancels only after a durable disappearance
+// (spent or reorged past the vanish countdown below). It is the thin-client
+// counterpart of C++ watchForSpentDeposit plus the fund-safety
+// deposit-spend sweep (xbridgeapp.cpp:3441): a durably vanished deposit
+// fails over to the safe path — wire-Cancel with the role's deposit reason
+// (crBadA/BDepositTx, the same reasons the CreateB/ConfirmA validation uses)
+// and rollback to our own pre-signed refund — instead of stalling until our
+// own locktime or broadcasting a claim that can never confirm. A single
+// missing reading is as likely a reorg or propagation lag as a genuine
+// vanish, so the countdown absorbs the transient case. A wallet error is
+// transient (skip the round, reset the countdown); only consecutive
+// definitive gettxout-missings cancel. Runs on the engine goroutine; each
+// eligible session posts a worker task guarded by pendingWatch so no session
+// is ever double-polled. Inline mode (tests) probes synchronously.
 func (n *Node) watchCounterpartyDeposits() {
 	for id, s := range n.sessions {
+		// Every guard skip below resets the vanish countdown: the countdown
+		// measures consecutive actionable missings, and a round in which
+		// this sweep does not act must not bank patience credit toward a
+		// later cancel (e.g. a session demoted back into the pre-claim
+		// window must earn a full fresh countdown). In-flight probes
+		// (pendingWatch hit) and dropped queue slots never ran, so they
+		// preserve the count either way.
 		if s.theirDepositTxID == "" || s.await {
+			s.vanishMisses = 0
 			continue
 		}
 		// A built claim owns the session now: the counterparty deposit
@@ -2099,6 +2122,7 @@ func (n *Node) watchCounterpartyDeposits() {
 		// apply-time guard below would skip it, so do not enqueue the
 		// wasted probe either (same stand-down as the stall watchdog).
 		if s.claimHex != "" || s.claimTxID != "" {
+			s.vanishMisses = 0
 			continue
 		}
 		// Watch only the pre-claim window (claim material above, plus the
@@ -2107,13 +2131,16 @@ func (n *Node) watchCounterpartyDeposits() {
 		// confirmed state records it).
 		if s.isMaker {
 			if s.state < csCreatedA || s.state >= csConfirmedA {
+				s.vanishMisses = 0
 				continue
 			}
 		} else if s.state < csCreatedB || s.state >= csConfirmedB {
+			s.vanishMisses = 0
 			continue
 		}
 		if n.store != nil {
 			if o := n.store.Get(id); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
+				s.vanishMisses = 0
 				continue
 			}
 		}
@@ -2124,6 +2151,7 @@ func (n *Node) watchCounterpartyDeposits() {
 		// build/retry path owns it and never cancels on blindness. A validated
 		// deposit that vanishes is still watched to cancellation below.
 		if s.theirP2SHNative == 0 {
+			s.vanishMisses = 0
 			continue
 		}
 		if n.engineRunning.Load() {
@@ -2136,6 +2164,25 @@ func (n *Node) watchCounterpartyDeposits() {
 		}
 		n.postDepositWatchTask(id)
 	}
+}
+
+// depositWatchVanishThreshold scales the vanish countdown to the watched
+// chain: at least two blocks of patience (a shallow reorg resolves within
+// it), floored at 3 sweeps and capped at 12 (~3-12 minutes at the 60s
+// engine tick). Unknown block time defaults to 6: patience is the safe
+// direction, and every countdown reset errs the same way.
+func depositWatchVanishThreshold(blockTimeSec int) int {
+	if blockTimeSec <= 0 {
+		return 6
+	}
+	n := (2*blockTimeSec+59)/60 + 1 // ceil(2 blocks in ticks) + 1 spare
+	if n < 3 {
+		return 3
+	}
+	if n > 12 {
+		return 12
+	}
+	return n
 }
 
 // runDepositWatchTask probes whether the watched counterparty deposit output
@@ -2155,9 +2202,10 @@ func runDepositWatchTask(conn wallet.Connector, cur, txid string, vout uint32) (
 
 // postDepositWatchTask posts one counterparty-deposit probe to the worker pool
 // (or runs it synchronously in inline mode). The apply runs on the engine: a
-// vanished deposit self-cancels with the role's deposit reason; any other
-// outcome leaves the session untouched for the next sweep. A full task queue
-// drops the probe (the next sweep re-enqueues; nothing was broadcast).
+// deposit missing past the vanish countdown self-cancels with the role's
+// deposit reason; any other outcome leaves the session untouched for the
+// next sweep. A full task queue drops the probe (the next sweep re-enqueues;
+// nothing was broadcast).
 func (n *Node) postDepositWatchTask(orderID string) bool {
 	s := n.sessions[orderID]
 	if s == nil {
@@ -2174,16 +2222,27 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 		},
 		apply: func(v any, err error) {
 			delete(n.pendingWatch, orderID)
+			// Re-resolve the session first: counter resets need it even
+			// when the probe outcome is not actionable. It may have
+			// finished, been cancelled, or been pruned while the probe
+			// was in flight.
+			s := n.sessions[orderID]
 			if err != nil {
+				// Transient blindness is no evidence either way: reset
+				// toward patience (a stalled backend is owned by the
+				// stall watchdog, never by this watch).
+				if s != nil {
+					s.vanishMisses = 0
+				}
 				xlog.Debug("deposit watch probe unavailable, skipping round", "order", orderID, "err", err)
 				return
 			}
 			if unspent, _ := v.(bool); unspent {
+				if s != nil {
+					s.vanishMisses = 0
+				}
 				return
 			}
-			// Re-resolve the session: it may have finished, been
-			// cancelled, or been pruned while the probe was in flight.
-			s := n.sessions[orderID]
 			if s == nil {
 				return
 			}
@@ -2194,22 +2253,53 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 			// (CounterpartyRedeemed/terminal/confirmed state) would kill
 			// a live claim or spam a spurious Cancel for a finished swap —
 			// so the enqueue-time guards are re-checked here to cover the
-			// in-flight window.
+			// in-flight window. A skip breaks the vanish consecutiveness
+			// below (the round was not an actionable missing).
 			if s.await || s.claimHex != "" || s.claimTxID != "" {
+				s.vanishMisses = 0
 				return
 			}
 			if s.isMaker {
 				if s.state < csCreatedA || s.state >= csConfirmedA {
+					s.vanishMisses = 0
 					return
 				}
 			} else if s.state < csCreatedB || s.state >= csConfirmedB {
+				s.vanishMisses = 0
 				return
 			}
 			if n.store != nil {
 				if o := n.store.Get(orderID); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
+					s.vanishMisses = 0
 					return
 				}
 			}
+			// Actionable missing: count it and cancel only once the
+			// vanish proves durable. A single missing reading is as
+			// likely a reorg or propagation lag as a genuine vanish;
+			// the countdown (chain-scaled, ~2 blocks) absorbs the
+			// transient case while a truly gone deposit still cancels
+			// within minutes.
+			s.vanishMisses++
+			// Chain-scaled patience: the conf BlockTime is mandatory
+			// for admitted coins (admit.go); an unconfigured currency
+			// passes 0 through so the helper's patient default owns it.
+			blockTime := 0
+			if cc := n.cfg().Confs[s.dstCur]; cc != nil && cc.BlockTime > 0 {
+				blockTime = cc.BlockTime
+			}
+			threshold := depositWatchVanishThreshold(blockTime)
+			if s.vanishMisses < threshold {
+				xlog.Debug("deposit watch: vanish unconfirmed, awaiting durable absence",
+					"order", orderID, "missing", s.vanishMisses, "threshold", threshold)
+				return
+			}
+			s.vanishMisses = 0
+			// Reset before the cancel attempt, not after: sendSelfCancel
+			// reports nothing, and its early returns (nil connector,
+			// sign failure) mean node-level breakage where re-attempting
+			// every K sweeps beats per-sweep error spam. Local state is
+			// untouched in both cases.
 			xlog.Warn("deposit watch: counterparty deposit gone, cancelling", "order", orderID,
 				"deposit", s.theirDepositTxID, "vout", s.theirDepositVout)
 			reason := crBadADepositTx // taker watches the maker A-deposit

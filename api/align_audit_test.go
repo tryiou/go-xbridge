@@ -247,15 +247,17 @@ func watchTakerFixture(t *testing.T, btc wallet.Connector) (*Node, *captureXConn
 
 // TestDepositWatchCancelsOnSpentDeposit pins the fund-safety watch (C++
 // watchForSpentDeposit / xbridgeapp.cpp:3441): a validated counterparty
-// deposit that vanishes is wire-cancelled with the taker's deposit reason
-// (crBadADepositTx) and rolled back, instead of stalling or claiming into
-// the void.
+// deposit that stays vanished past the countdown is wire-cancelled with the
+// taker's deposit reason (crBadADepositTx) and rolled back, instead of
+// stalling or claiming into the void.
 func TestDepositWatchCancelsOnSpentDeposit(t *testing.T) {
 	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
 		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
 	n, cc, idHex := watchTakerFixture(t, btc)
 
-	n.watchCounterpartyDeposits()
+	for i := 0; i < vanishThreshold(t); i++ {
+		n.watchCounterpartyDeposits()
+	}
 
 	pkts := cc.snapshot()
 	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
@@ -409,15 +411,164 @@ func TestDepositWatchNoRecancelAfterRollback(t *testing.T) {
 		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
 	n, cc, idHex := watchTakerFixture(t, btc)
 
-	n.watchCounterpartyDeposits()
+	for i := 0; i < vanishThreshold(t); i++ {
+		n.watchCounterpartyDeposits()
+	}
 	if got := n.store.Get(idHex); got.Status != "rolled back" {
-		t.Fatalf("order status = %q, want rolled back after first sweep", got.Status)
+		t.Fatalf("order status = %q, want rolled back after countdown", got.Status)
 	}
 
 	n.watchCounterpartyDeposits()
 
 	if pkts := cc.snapshot(); len(pkts) != 1 {
 		t.Fatalf("second sweep must not re-cancel, want exactly 1 Cancel total, got %v", pkts)
+	}
+}
+
+// vanishThreshold returns the countdown length for the watch fixtures
+// (taker watches the BTC deposit; alignConfs sets BTC BlockTime=60).
+func vanishThreshold(t *testing.T) int {
+	t.Helper()
+	k := depositWatchVanishThreshold(60)
+	if k < 2 {
+		t.Fatalf("threshold = %d, want >= 2 for a meaningful countdown", k)
+	}
+	return k
+}
+
+// unvanishDeposit re-serves the fixture's counterparty deposit on-chain
+// (the QuietWhenUnspent pattern); vanishDeposit drops it again. The fake
+// has no unsetter, so the test performs the map surgery under the lock,
+// exactly as setRawTx does for seeding.
+func unvanishDeposit(btc *fakeConnector, txid string) {
+	dep := &coins.Tx{Version: 1}
+	dep.Inputs = append(dep.Inputs, coins.TxIn{Sequence: 0xffffffff})
+	dep.Outputs = append(dep.Outputs, coins.TxOut{Value: 2.5e8, ScriptPubKey: []byte{0x51}})
+	btc.setRawTx(txid, hex.EncodeToString(dep.Serialize()))
+}
+
+func vanishDeposit(btc *fakeConnector, txid string) {
+	btc.mu.Lock()
+	defer btc.mu.Unlock()
+	delete(btc.rawTx, txid)
+}
+
+// TestDepositWatchFlapSurvivesTransientVanish pins the countdown's reason
+// to exist: a single missing reading (reorg, propagation lag) must not
+// cancel, and a reappeared deposit resets the countdown — cancelling
+// again requires a full fresh run of consecutive missings.
+func TestDepositWatchFlapSurvivesTransientVanish(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	depID := strings.Repeat("cc", 32)
+	k := vanishThreshold(t)
+
+	n.watchCounterpartyDeposits() // miss 1: silent
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("first missing must not cancel, got %v", pkts)
+	}
+
+	unvanishDeposit(btc, depID)
+	n.watchCounterpartyDeposits() // reappeared: silent + reset
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("reappeared deposit must not cancel, got %v", pkts)
+	}
+
+	// Fresh vanish run: silence for k-1, cancel exactly on the kth. If the
+	// reappearance had not reset the countdown, the cancel would land one
+	// sweep early.
+	vanishDeposit(btc, depID)
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("kth consecutive missing must cancel once, got %v", pkts)
+	}
+	var cb proto.CancelBody
+	if err := cb.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("Cancel body decode: %v", err)
+	}
+	if cb.Reason != uint32(crBadADepositTx) {
+		t.Fatalf("cancel reason = %d, want crBadADepositTx (%d)", cb.Reason, crBadADepositTx)
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
+
+// TestDepositWatchCancelsAfterPersistentVanish pins the countdown's other
+// half: a vanish that never resolves still cancels — patience is bounded.
+func TestDepositWatchCancelsAfterPersistentVanish(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	k := vanishThreshold(t)
+
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("kth consecutive missing must cancel once, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
+
+// TestDepositWatchVanishThreshold pins the chain-scaled countdown table:
+// ~2 blocks of patience bounded to [3,12] sweeps; unknown speed defaults
+// to the patient middle.
+func TestDepositWatchVanishThreshold(t *testing.T) {
+	for _, tc := range []struct {
+		blockTime, want int
+	}{
+		{-1, 6}, {0, 6}, {15, 3}, {30, 3}, {60, 3}, {150, 6}, {300, 11}, {600, 12}, {7200, 12},
+	} {
+		if got := depositWatchVanishThreshold(tc.blockTime); got != tc.want {
+			t.Errorf("depositWatchVanishThreshold(%d) = %d, want %d", tc.blockTime, got, tc.want)
+		}
+	}
+}
+
+// TestDepositWatchWatchdogWinsTiebreak pins exactly-one-Cancel when the
+// stall watchdog fires first: its crTimeout cancel rolls back and prunes,
+// so the deposit watch stays silent afterwards.
+func TestDepositWatchWatchdogWinsTiebreak(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	// Silence past the stall threshold, derived from it so a threshold
+	// bump cannot silently turn this into a no-op.
+	n.sessions[idHex].lastProgress = uint64(NowMicro()) - uint64(sessionStallMicro) - uint64(60*1000000)
+
+	n.watchStalledSessions()
+
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("watchdog must cancel once, got %v", pkts)
+	}
+	var cb proto.CancelBody
+	if err := cb.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("Cancel body decode: %v", err)
+	}
+	if cb.Reason != uint32(crTimeout) {
+		t.Fatalf("cancel reason = %d, want crTimeout (%d)", cb.Reason, crTimeout)
+	}
+
+	n.watchCounterpartyDeposits()
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("deposit watch must stay silent after watchdog cancel, want 1 Cancel total, got %v", pkts)
 	}
 }
 
