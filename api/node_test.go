@@ -393,6 +393,62 @@ func TestRemoteCancelAlreadyCanceled(t *testing.T) {
 	}
 }
 
+// TestRemoteCancelAfterRolledBackIgnored characterizes the preserved C++
+// re-drive boundary: an inbound Cancel for a rolled-back order keeps its
+// status and history (the handler is verbatim C++, re-drive included) —
+// the duplicate-suppression fix lives at the emission decision points,
+// never here.
+func TestRemoteCancelAfterRolledBackIgnored(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x44
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "rolled back", DepositSent: true, RefundTx: "refundhex", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+	before := len(n.store.History())
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if len(n.store.History()) != before {
+		t.Fatal("rolled-back order must not produce a new history entry")
+	}
+	if got := n.store.Get(idHex); got == nil || got.Status != "rolled back" {
+		t.Fatal("rolled-back order must stay 'rolled back'")
+	}
+}
+
+// TestRemoteCancelAfterRollbackFailedIgnored pins the C++ re-drive
+// boundary on the failed side: an inbound Cancel for a "rollback failed"
+// order re-drives the rollback (status returns to "rolled back", refund
+// re-enqueued — xbridgesession.cpp:3511-3517) without touching history.
+// Like its rolled-back twin, this handler stays verbatim.
+func TestRemoteCancelAfterRollbackFailedIgnored(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x44
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "rollback failed", DepositSent: true, RefundTx: "refundhex", SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+	before := len(n.store.History())
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+
+	if len(n.store.History()) != before {
+		t.Fatal("rollback-failed order must not produce a new history entry")
+	}
+	if got := n.store.Get(idHex); got == nil || got.Status != "rolled back" {
+		t.Fatal("rollback-failed order must re-drive to 'rolled back'")
+	}
+}
+
 // TestRemoteCancelOpenNoDeposit verifies that a remote cancel on an un-taken
 // (open / trPending) maker order is NOT cancelled but marked stale so it is
 // re-broadcast on another servicenode (C++ xbridgeapp.cpp:3379-3383). "open" is

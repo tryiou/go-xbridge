@@ -87,12 +87,14 @@ func (n *Node) watchStalledSessions() {
 		}
 		// Already resolved or cooling down: an earlier fire rolled the
 		// order back (re-firing would re-cancel + re-enqueue every tick,
-		// bypassing the refund backoff), the counterparty already redeemed
+		// bypassing the refund backoff), a failed refund is owned by the
+		// sweep's backoff-spaced retry (re-cancelling would fork a second
+		// Cancel for one dead swap), the counterparty already redeemed
 		// (cancel is locally ignored but still broadcasts every tick), or
 		// a failed refund is inside its backoff window.
 		if o := n.store.Get(id); o != nil &&
 			(isOrderTerminal(o.Status) || o.Status == "rolled back" ||
-				o.Status == "canceled" || o.CounterpartyRedeemed) {
+				o.Status == "rollback failed" || o.Status == "canceled" || o.CounterpartyRedeemed) {
 			continue
 		}
 		if n.refundBackoffActive(id) {

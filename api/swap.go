@@ -2146,8 +2146,15 @@ func (n *Node) watchCounterpartyDeposits() {
 			s.vanishMisses = 0
 			continue
 		}
+		// A cancel already processed (rolled back) or a refund already
+		// attempted and failing (rollback failed) must never summon a
+		// second Cancel: the counterparty was notified (or never needed
+		// it — their flows are CLTV-local), and retry belongs to the
+		// refund sweep's backoff, not to re-emission. This converges to
+		// C++, which never emits Cancel past the first transition.
 		if n.store != nil {
-			if o := n.store.Get(id); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
+			if o := n.store.Get(id); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed ||
+				o.Status == "rolled back" || o.Status == "rollback failed") {
 				s.vanishMisses = 0
 				continue
 			}
@@ -2327,7 +2334,8 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 				return
 			}
 			if n.store != nil {
-				if o := n.store.Get(orderID); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
+				if o := n.store.Get(orderID); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed ||
+					o.Status == "rolled back" || o.Status == "rollback failed") {
 					s.vanishMisses = 0
 					return
 				}

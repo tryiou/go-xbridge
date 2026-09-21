@@ -863,6 +863,29 @@ func TestStallNoRefire(t *testing.T) {
 	}
 }
 
+// TestStallNoRefireAfterRollbackFailed pins the watchdog half of the
+// duplicate-cancel fix: a stall cancel whose refund failed ("rollback
+// failed", session live) must not re-cancel once the backoff window
+// elapses — retry belongs to scanRefunds, not to a second Cancel.
+func TestStallNoRefireAfterRollbackFailed(t *testing.T) {
+	n, sc, idHex, conn := stallSetup(t, csCreatedA, func(s *SwapSession, _ *Order) {
+		s.lastProgress = uint64(NowMicro()) - sessionStallMicro - 1
+	})
+	conn.sendErr = errors.New("simulated rpc failure")
+	n.watchStalledSessions()
+	if sc.sent != 1 {
+		t.Fatalf("cancel packets sent = %d, want 1", sc.sent)
+	}
+	if o := n.store.Get(idHex); o.Status != "rollback failed" {
+		t.Fatalf("status = %q, want rollback failed", o.Status)
+	}
+	n.clearRefundBackoff(idHex) // emulate the elapsed backoff window
+	n.watchStalledSessions()
+	if sc.sent != 1 {
+		t.Fatalf("cancel packets sent = %d, want still 1", sc.sent)
+	}
+}
+
 // TestStallSkipsRedeemed proves the watchdog never cancels a swap the
 // counterparty already redeemed (cancel would be locally ignored yet still
 // broadcast every tick).

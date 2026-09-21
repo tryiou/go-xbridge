@@ -5,6 +5,7 @@ package api
 // live hub, no network.
 import (
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -641,5 +642,133 @@ func TestCounterpartyVanishOwnBlindCancels(t *testing.T) {
 	}
 	if got := n.store.Get(idHex); got.Status != "rolled back" {
 		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
+
+// TestDepositWatchNoRecancelWhenSessionSurvivesRollback stages the
+// started-mode async window the success path normally closes by pruning:
+// cancel #1 sent, refund still in flight, session live, status already
+// "rolled back". A second countdown must not re-cancel.
+func TestDepositWatchNoRecancelWhenSessionSurvivesRollback(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	s := n.sessions[idHex]
+	k := vanishThreshold(t)
+
+	for i := 0; i < k; i++ {
+		n.watchCounterpartyDeposits()
+	}
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("first countdown must cancel once, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+	// The success path prunes the session; re-insert the retained object
+	// to model a refund still in flight when the next sweep fires.
+	n.sessions[idHex] = s
+	for i := 0; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 1 {
+			t.Fatalf("surviving session must not re-cancel, want 1 total, got %v", pkts)
+		}
+	}
+}
+
+// TestDepositWatchNoRecancelAfterRollbackFailed pins the failed-refund
+// window: cancel #1 sent, refund broadcast failed ("rollback failed",
+// backoff owned by the sweep), session live. The next countdown must not
+// re-cancel — retry belongs to scanRefunds, not to a second Cancel.
+func TestDepositWatchNoRecancelAfterRollbackFailed(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	n.cfg().Connectors["LTC"].(*fakeConnector).sendErr = errors.New("simulated rpc failure")
+	k := vanishThreshold(t)
+
+	for i := 0; i < k; i++ {
+		n.watchCounterpartyDeposits()
+	}
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("first countdown must cancel once, got %v", pkts)
+	}
+	got := n.store.Get(idHex)
+	if got.Status != "rollback failed" {
+		t.Fatalf("order status = %q, want rollback failed", got.Status)
+	}
+	if got.Reason != uint32(crBadADepositTx) {
+		t.Fatalf("reason = %d, want crBadADepositTx (%d) preserved", got.Reason, crBadADepositTx)
+	}
+	if !n.refundBackoffActive(idHex) {
+		t.Fatal("failed refund must own the retry via backoff")
+	}
+	if _, live := n.sessions[idHex]; !live {
+		t.Fatal("failed refund must keep the session live")
+	}
+	for i := 0; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 1 {
+			t.Fatalf("failed-refund session must not re-cancel, want 1 total, got %v", pkts)
+		}
+	}
+}
+
+// TestDepositWatchSilentAfterUncancelledRefundFailure pins the absorbed
+// first-notify: a refund that failed via scanRefunds (never cancelled,
+// Reason 0) must not summon a first Cancel from the watch — the order
+// stays in backoff-spaced retry, converging to C++ (no post-rollback
+// cancel emission).
+func TestDepositWatchSilentAfterUncancelledRefundFailure(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	ltc := n.cfg().Connectors["LTC"].(*fakeConnector)
+	ltc.sendErr = errors.New("simulated rpc failure")
+
+	n.scanRefunds()
+	got := n.store.Get(idHex)
+	if got.Status != "rollback failed" {
+		t.Fatalf("order status = %q, want rollback failed", got.Status)
+	}
+	if got.Reason != 0 {
+		t.Fatalf("reason = %d, want 0 (never cancelled)", got.Reason)
+	}
+
+	for i := 0; i < vanishThreshold(t); i++ {
+		n.watchCounterpartyDeposits()
+	}
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("uncancelled failed refund must stay silent, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "rollback failed" {
+		t.Fatalf("order status = %q, want unchanged rollback failed", got.Status)
+	}
+}
+
+// TestWatchdogSilentAfterLiveWatchCancel pins the reverse tiebreak: after
+// a watch cancel whose refund failed (live "rollback failed" session),
+// an elapsed backoff window must not summon a watchdog re-cancel.
+func TestWatchdogSilentAfterLiveWatchCancel(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	n.cfg().Connectors["LTC"].(*fakeConnector).sendErr = errors.New("simulated rpc failure")
+	k := vanishThreshold(t)
+
+	for i := 0; i < k; i++ {
+		n.watchCounterpartyDeposits()
+	}
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("first countdown must cancel once, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "rollback failed" {
+		t.Fatalf("order status = %q, want rollback failed", got.Status)
+	}
+	n.sessions[idHex].lastProgress = uint64(NowMicro()) - uint64(sessionStallMicro) - uint64(60*1000000)
+	n.clearRefundBackoff(idHex) // emulate the elapsed backoff window
+	n.watchStalledSessions()
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("watchdog must stay silent on failed refund, want 1 total, got %v", pkts)
 	}
 }
