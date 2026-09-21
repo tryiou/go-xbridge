@@ -139,6 +139,18 @@ type Connector interface {
 	// orders' anti-replay blockHash (C++ uses the BLOCK chain's
 	// chainActive.Tip()->pprev).
 	GetBlockHash(height int64) ([32]byte, error)
+	// GetBlockTxs returns a block's decoded transactions via verbose getblock
+	// (verbosity 2 requested explicitly — stock Core defaults bare hashes
+	// to verbosity 1 — with one bare-hash probe before giving up),
+	// mirroring C++ getTransactionsInBlock + isUTXOSpentInTx
+	// (xbridgewalletconnectorbtc.cpp:1838-1869,1760-1798): the
+	// confirmed-spend leg of the deposit watch pages block bodies hunting
+	// the spender of our own deposit when the hub is dead. blockHash is the
+	// internal (little-endian) form GetBlockHash returns; the wallet
+	// converts to display order for the wire. Backends without decoded
+	// output fail here (callers hold their cursor, mempool leg only) —
+	// never a silent empty list, never per-tx fan-out.
+	GetBlockTxs(blockHash [32]byte) ([]BlockTx, error)
 	// GetRawTransaction returns the full serialized (hex) transaction for txid.
 	// The taker uses it to read the maker's payTx and recover the HTLC secret
 	// preimage (C++ getSecretFromPaymentTransaction → getrawtransaction).
@@ -193,6 +205,21 @@ type Connector interface {
 	GetRawMempool() ([]string, error)
 }
 
+// BlockTx is one decoded transaction in a verbose-getblock response: only
+// the fields the spend scan needs (identity + spent outpoints). Vin entries
+// without a prevout (coinbase) carry zero values and never match a real
+// deposit outpoint.
+type BlockTx struct {
+	TxID string
+	Vin  []BlockVin
+}
+
+// BlockVin is one transaction input's spent outpoint (display txid + vout).
+type BlockVin struct {
+	TxID string
+	Vout uint32
+}
+
 // VerboseTxOut is one decoded transaction output: native base-unit value and
 // raw script hex, keyed by output index in VerboseTx.Outputs.
 type VerboseTxOut struct {
@@ -204,5 +231,10 @@ type VerboseTxOut struct {
 type VerboseTx struct {
 	TxID          string
 	Confirmations int
-	Outputs       map[uint32]VerboseTxOut
+	// HasConfirmations reports the backend actually asserted a depth.
+	// Backends omit the field for mempool/unknown transactions; readers
+	// that must distinguish "0-conf" from "no data" (spend classifiers,
+	// scan seeds) gate on this — never on Confirmations alone.
+	HasConfirmations bool
+	Outputs          map[uint32]VerboseTxOut
 }

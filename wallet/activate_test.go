@@ -213,6 +213,9 @@ func (c *hangingProbeConnector) GetBlockCount() (int64, error) {
 func (c *hangingProbeConnector) GetBlockHash(int64) ([32]byte, error) {
 	return [32]byte{}, errors.New("unused")
 }
+func (c *hangingProbeConnector) GetBlockTxs([32]byte) ([]BlockTx, error) {
+	return nil, errors.New("unused")
+}
 func (c *hangingProbeConnector) GetRawTransaction(string) (string, error) {
 	return "", errors.New("unused")
 }

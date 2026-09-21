@@ -72,6 +72,16 @@ func mockRPC(t *testing.T) *httptest.Server {
 			// (little-endian) order by revHashHex, so the internal form has
 			// 0xff in its last byte.
 			res(`"ff00000000000000000000000000000000000000000000000000000000000000"`)
+		case "getblock":
+			// Faithful Core shape contract: verbosity 2 (explicit [hash,2])
+			// serves decoded tx objects; a bare [hash] serves the default
+			// verbosity-1 id list. The mock enforces the distinction so the
+			// suite catches wire-contract drift.
+			if len(req.Params) == 2 {
+				res(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vin":[{"txid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","vout":0}]}]}`)
+			} else {
+				res(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}`)
+			}
 		case "signmessage":
 			res(`"` + mockMsgSigB64 + `"`)
 		case "verifymessage":
@@ -190,6 +200,29 @@ func TestRPCConnector(t *testing.T) {
 		}
 		if h != want {
 			t.Fatalf("hash = %x, want %x", h, want)
+		}
+	})
+	t.Run("GetBlock", func(t *testing.T) {
+		// Verbosity-2 must be requested EXPLICITLY as [hash, 2]: stock
+		// Core defaults a bare hash to verbosity 1 (id list), which cannot
+		// serve vins. The mock above proves the distinction.
+		var internal [32]byte
+		internal[31] = 0xff
+		txs, err := c.GetBlockTxs(internal)
+		if err != nil {
+			t.Fatalf("GetBlockTxs: %v", err)
+		}
+		if len(txs) != 1 || txs[0].TxID != strings.Repeat("a", 64) {
+			t.Fatalf("txs = %+v", txs)
+		}
+		if len(txs[0].Vin) != 1 || txs[0].Vin[0].TxID != strings.Repeat("b", 64) || txs[0].Vin[0].Vout != 0 {
+			t.Fatalf("vin = %+v", txs[0].Vin)
+		}
+		if lastReq.Method != "getblock" {
+			t.Fatalf("method = %q, want getblock", lastReq.Method)
+		}
+		if len(lastReq.Params) != 2 || lastReq.Params[0] != "ff00000000000000000000000000000000000000000000000000000000000000" || lastReq.Params[1] != float64(2) {
+			t.Fatalf("getblock params = %v, want [display hash, 2]", lastReq.Params)
 		}
 	})
 }
@@ -1240,5 +1273,196 @@ func TestGetRawTransactionVerbose(t *testing.T) {
 	}
 	if _, ok := vtx.Outputs[1]; !ok {
 		t.Fatalf("vout 1 missing: %+v", vtx.Outputs)
+	}
+}
+
+// TestRPCConnectorGetBlockRejectsNonObject pins the shape contract: a
+// verbosity-0 raw-hex string is not a block object and must fail closed,
+// never parse as an empty page the rescan would skip.
+func TestRPCConnectorGetBlockRejectsNonObject(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`"deadbeef"`), ID: "xbg-0"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	if _, err := c.GetBlockTxs([32]byte{0x01}); err == nil {
+		t.Fatal("GetBlockTxs accepted a non-object block response")
+	}
+}
+
+// TestRPCConnectorGetBlockTxsRejectsIdList pins the no-fan-out contract: a
+// verbosity-1 id list fails closed (callers hold their cursor and degrade
+// visibly) instead of resolving each txid through per-tx fetches —
+// thousands of getrawtransaction calls per block would break the per-tick
+// backend-load bound the rescan promises.
+func TestRPCConnectorGetBlockTxsRejectsIdList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		switch req.Method {
+		case "getblock":
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}`), ID: req.ID})
+		default:
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`null`), ID: req.ID})
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	var zero [32]byte
+	if txs, err := c.GetBlockTxs(zero); err == nil {
+		t.Fatalf("GetBlockTxs accepted an id list: %+v", txs)
+	}
+}
+
+// TestRPCConnectorGetBlockTxsRejectsVinlessEntry pins fail-closed pages: a
+// tx object without a vin set — missing key or empty array (no real
+// transaction has zero inputs, coinbase included) — is undecidable (a
+// stripped shape could hide the spender). The page errors so the caller
+// holds its cursor instead of advancing past it.
+func TestRPCConnectorGetBlockTxsRejectsVinlessEntry(t *testing.T) {
+	for _, txJSON := range []string{
+		`{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vin":[]}`,
+	} {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":[` + txJSON + `]}`), ID: "xbg-0"})
+		})
+		srv := httptest.NewServer(mux)
+		c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+		var zero [32]byte
+		if txs, err := c.GetBlockTxs(zero); err == nil {
+			srv.Close()
+			t.Fatalf("GetBlockTxs accepted entry %s: %+v", txJSON, txs)
+		}
+		srv.Close()
+	}
+}
+
+// TestRPCConnectorGetBlockTxsRejectsEmptyList pins fail-closed pages: every
+// real block carries coinbase, so an empty list is a facade lying about
+// availability.
+func TestRPCConnectorGetBlockTxsRejectsEmptyList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":[]}`), ID: "xbg-0"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	var zero [32]byte
+	if txs, err := c.GetBlockTxs(zero); err == nil {
+		t.Fatalf("GetBlockTxs accepted an empty tx list: %+v", txs)
+	}
+}
+
+// TestVerboseConfirmationsPresence pins the HasConfirmations contract: a
+// present field asserts depth (even 0), an absent field asserts nothing —
+// readers distinguishing "0-conf" from "no data" (spend classifiers, scan
+// seeds) gate on presence, never the value.
+func TestVerboseConfirmationsPresence(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		var params []string
+		_ = json.Unmarshal(mustMarshal(t, req.Params), &params)
+		switch params[0] {
+		case "withconfs":
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"txid":"withconfs","confirmations":0,"vout":[]}`), ID: req.ID})
+		default:
+			_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"txid":"noconfs","vout":[]}`), ID: req.ID})
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	v, err := c.GetRawTransactionVerbose("withconfs")
+	if err != nil {
+		t.Fatalf("verbose with confs: %v", err)
+	}
+	if !v.HasConfirmations || v.Confirmations != 0 {
+		t.Fatalf("got %+v, want asserted 0-conf", v)
+	}
+	v, err = c.GetRawTransactionVerbose("noconfs")
+	if err != nil {
+		t.Fatalf("verbose without confs: %v", err)
+	}
+	if v.HasConfirmations {
+		t.Fatalf("got %+v, want unasserted depth", v)
+	}
+}
+
+func mustMarshal(t *testing.T, v interface{}) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestRPCConnectorGetBlockTxsProbesBareHash pins the strict-facade path: a
+// backend rejecting the verbosity arg still serves when its bare-hash form
+// carries decoded objects — the probe, not the primary, finds them.
+func TestRPCConnectorGetBlockTxsProbesBareHash(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		if len(req.Params) == 2 {
+			_ = enc.Encode(rpcResponse{Error: &rpcError{Code: -8, Message: "verbosity must be 0 or 1"}, ID: req.ID})
+			return
+		}
+		_ = enc.Encode(rpcResponse{Result: json.RawMessage(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vin":[{"txid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","vout":0}]}]}`), ID: req.ID})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	var internal [32]byte
+	internal[31] = 0xff
+	txs, err := c.GetBlockTxs(internal)
+	if err != nil {
+		t.Fatalf("GetBlockTxs via bare probe: %v", err)
+	}
+	if len(txs) != 1 || txs[0].TxID != strings.Repeat("a", 64) {
+		t.Fatalf("txs = %+v", txs)
+	}
+}
+
+// TestRPCConnectorGetBlockTxsDegradesOnIdList pins visible degradation: when
+// neither form serves decoded objects (stock v1-only backend), the call
+// fails — callers hold their cursor — instead of fanning out per-tx fetches.
+func TestRPCConnectorGetBlockTxsDegradesOnIdList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(`{"hash":"ff00000000000000000000000000000000000000000000000000000000000000","height":100,"tx":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}`), ID: "xbg-0"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	var zero [32]byte
+	if txs, err := c.GetBlockTxs(zero); err == nil {
+		t.Fatalf("GetBlockTxs fanned out or accepted id list: %+v", txs)
 	}
 }

@@ -91,6 +91,12 @@ func (s *stubConn) GetBlockHash(height int64) ([32]byte, error) {
 	h[0] = 0xab
 	return h, nil
 }
+
+// GetBlockTxs is unsupported on the stub (chain-poor by design, like the
+// mempool): the confirmed-spend rescan holds its cursor, never skips.
+func (s *stubConn) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error) {
+	return nil, errors.New("unsupported")
+}
 func (s *stubConn) GetRawTransaction(txid string) (string, error) {
 	return "", errStub
 }
@@ -140,6 +146,9 @@ func (s *stubConn) GetRawTransactionVerbose(txid string) (wallet.VerboseTx, erro
 		return wallet.VerboseTx{}, s.verboseErr
 	}
 	if v, ok := s.verboseTx[txid]; ok {
+		// A canned entry is knowledge (see fakeConnector: a served entry
+		// asserts its depth).
+		v.HasConfirmations = true
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}

@@ -131,6 +131,12 @@ type SwapSession struct {
 	// mirroring the lastProgress re-stamp — downtime is unknown, the clock
 	// restarts.
 	huntSince uint64
+	// scanCursor is the next chain height the confirmed-spend rescan reads
+	// (C++ watchCurrentBlock analog, xbridgeapp.cpp:3406). 0 means unseeded:
+	// the first rescan round derives it from the deposit's confirmation
+	// depth (seedRescanStart). Advances only past fully-scanned pages and
+	// persists with the session, so each block is read once ever per hunt.
+	scanCursor uint32
 	// depositHex is the signed deposit raw hex, adopted at build success
 	// alongside ourDepositTxID. A tick-driven repost re-sends these IDENTICAL
 	// bytes when the first broadcast fails (swap_retry.go) — never a rebuild,
@@ -1607,7 +1613,9 @@ func probeOwnDeposit(conn wallet.Connector, depTxID string, depVout uint32) (kno
 		return false, false
 	}
 	vtx, verr := conn.GetRawTransactionVerbose(depTxID)
-	if verr != nil || vtx.Confirmations < 0 {
+	// Presence-gated: a backend omitting the confirmations field asserts
+	// nothing (mempool/unknown), so only an asserted depth counts as known.
+	if verr != nil || !vtx.HasConfirmations || vtx.Confirmations < 0 {
 		return false, false
 	}
 	_, ok, gerr := conn.GetTxOut(depTxID, depVout)
@@ -2615,6 +2623,14 @@ func (c *swapCtx) buildRefundTx(spec *swap.DepositSpec, cur string) (string, err
 func confirmDepositKnownByRawTx(conn wallet.Connector, txid string, vout uint32, scriptHex string, value uint64, minConf int) bool {
 	vtx, verr := conn.GetRawTransactionVerbose(txid)
 	if verr != nil {
+		return false
+	}
+	// Depth must be asserted, not defaulted: a backend omitting the field
+	// proves nothing about confirmations, and this gate feeds a claim
+	// broadcast — waiting on missing evidence is strictly safer than
+	// matching script/value at an assumed depth. Core backends always
+	// include the field, so this changes nothing for them.
+	if !vtx.HasConfirmations {
 		return false
 	}
 	if vtx.Confirmations < minConf {

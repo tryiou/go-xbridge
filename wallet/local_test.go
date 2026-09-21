@@ -190,3 +190,13 @@ func TestLocalConnectorSignAfterRegistryFlip(t *testing.T) {
 		t.Fatalf("scriptSig changed after registry flip:\n got %s\nwant %s", got, golden)
 	}
 }
+
+// TestLocalConnectorGetBlockTxsHasNoBlockSource pins the rescan degradation:
+// LocalConnector must fail block-body reads (never an empty list, which the
+// rescan would misread as a skippable empty block).
+func TestLocalConnectorGetBlockTxsHasNoBlockSource(t *testing.T) {
+	lc := &LocalConnector{}
+	if _, err := lc.GetBlockTxs([32]byte{0x01}); err == nil {
+		t.Fatal("GetBlock succeeded without a block source")
+	}
+}

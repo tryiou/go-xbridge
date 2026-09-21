@@ -119,6 +119,12 @@ func (l *LocalConnector) GetBlockHash(height int64) ([32]byte, error) {
 	return [32]byte{}, errors.New("wallet: LocalConnector has no block source")
 }
 
+// GetBlockTxs has no local blockchain source: the confirmed-spend rescan holds
+// its cursor on this backend (mempool leg only).
+func (l *LocalConnector) GetBlockTxs(blockHash [32]byte) ([]BlockTx, error) {
+	return nil, errors.New("wallet: LocalConnector has no block source")
+}
+
 // GetRawTransaction has no local blockchain source.
 func (l *LocalConnector) GetRawTransaction(txid string) (string, error) {
 	return "", errors.New("wallet: LocalConnector has no block source")

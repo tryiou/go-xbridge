@@ -99,6 +99,9 @@ type persistedSwap struct {
 	// hourly hunt WARN's elapsed time. omitempty like SecretHunt; restore
 	// backfills a zero stamp with the restore time (downtime unknown).
 	HuntSince uint64 `json:"huntSince,omitempty"`
+	// ScanCursor is the confirmed-spend rescan's next height (0 = unseeded;
+	// the first rescan round derives it). omitempty like the hunt flags.
+	ScanCursor uint32 `json:"scanCursor,omitempty"`
 	// DepositHex is the signed deposit raw hex for tick-driven repost of a
 	// failed broadcast (swap_retry.go). omitempty: pre-upgrade records lack
 	// it and simply never repost.
@@ -651,6 +654,7 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.RefundDone = s.refundDone
 	ps.SecretHunt = s.secretHunt
 	ps.HuntSince = s.huntSince
+	ps.ScanCursor = s.scanCursor
 	ps.DepositHex = s.depositHex
 	ps.TheirDepositTxID = s.theirDepositTxID
 	ps.TheirLockTime = s.theirLockTime
@@ -763,6 +767,7 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		refundDone:       ps.RefundDone,
 		secretHunt:       ps.SecretHunt,
 		huntSince:        ps.HuntSince,
+		scanCursor:       ps.ScanCursor,
 		depositHex:       ps.DepositHex,
 		theirDepositTxID: ps.TheirDepositTxID,
 		theirLockTime:    ps.TheirLockTime,

@@ -137,6 +137,11 @@ func (s *conformanceStubConn) GetBlockHash(height int64) ([32]byte, error) {
 	h[0] = 0xab
 	return h, nil
 }
+
+// GetBlockTxs is unsupported on the conformance stub (chain-poor by design).
+func (s *conformanceStubConn) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error) {
+	return nil, fmt.Errorf("conformance stub: getblock not supported")
+}
 func (s *conformanceStubConn) GetRawTransaction(txid string) (string, error) {
 	return "", fmt.Errorf("conformance stub: getrawtransaction not supported")
 }

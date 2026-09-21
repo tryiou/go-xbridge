@@ -298,6 +298,16 @@ type Node struct {
 	refundAttempts map[string]int
 	refundRetryAt  map[string]uint64
 
+	// rescanAttempts/rescanRetryAt are the engine-owned confirmed-leg
+	// backoff: failed block pages (pruned history, blind backend) re-try on
+	// an escalating delay instead of every tick — retrying a permanently
+	// missing page each round would be the burst the rescan exists to
+	// avoid. Same shape and windows as the refund backoff, separate domain
+	// (a refund-failing order and a page-failing hunt must not share a
+	// clock). Lazily initialized; in-memory only like its sibling.
+	rescanAttempts map[string]int
+	rescanRetryAt  map[string]uint64
+
 	// stallWarned is the engine-owned early-stall-watch state (stall_watch.go):
 	// per-session lastProgress value already covered by a "no hub progress"
 	// WARN, so the warning fires once per silent period instead of on every

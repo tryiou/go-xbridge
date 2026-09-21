@@ -18,20 +18,208 @@ import (
 // payTxId), so the finish path, persistence, and the ConfirmedB hub receipt
 // are byte-identical to the normal flow.
 //
-// Known scope note: only UNCONFIRMED spends are discoverable in the mempool
-// scan. A spend that confirmed while the daemon was offline is invisible to
-// getrawmempool; such a session arms the secret hunt on the first failed
-// refund (the pre-signed refund's input is gone, so the refund is not a
-// fallback for a claimed deposit — only for one still out). The hunt
-// re-validates false positives away and stays dashboard-visible; automated
-// confirmed-spend discovery follows as the next change. C++ closes that gap
-// with a block-by-block rescan (xbridgeapp.cpp:3389-3413).
+// Known scope note: UNCONFIRMED spends surface in the mempool scan;
+// spends that confirmed while the daemon was offline surface in the
+// confirmed leg (runRescanPages), which pages forward from the
+// deposit-time cursor. A confirmed-while-offline spend arms the secret
+// hunt on the first failed refund (the pre-signed refund's input is gone,
+// so the refund is not a fallback for a claimed deposit — only for one
+// still out); the hunt then recovers through either leg, re-validates
+// false positives away, and stays dashboard-visible until terminal. C++
+// closes the same gap with a block-by-block rescan
+// (xbridgeapp.cpp:3389-3413); this is its thin-client shape —
+// verbosity-2 pages instead of per-tx RPC fan-out.
 
 // ownWatchFetchBudget caps the per-tick GetRawTransaction fetches per session.
 // C++ pays the same per-tx RPC cost (isUTXOSpentInTx per mempool entry,
 // xbridgeapp.cpp:3419); the budget keeps a large mempool from monopolizing the
 // worker pool, while ownWatchSeen makes the sweep incremental across ticks.
 const ownWatchFetchBudget = 200
+
+// rescanPageBudget is the default per-round page bound (see
+// rescanPageBudgetFor). Worst case per hunted session per 60s tick: 1
+// getblockcount + budget × (getblockhash + getblock) + at most one
+// getrawtransaction per vin-matched candidate (matches are rare; our own
+// refund excluded without fetch) + the one-time seed reads. The mempool
+// leg's pre-existing 200-fetch budget is separate and unchanged.
+const rescanPageBudget = 3
+
+// rescanPageBudgetCap bounds the scaled budget: catch-up stretches instead
+// of bursting, no matter how fast the chain.
+const rescanPageBudgetCap = 12
+
+// rescanPageBudgetFor scales the per-round page bound to chain speed: the
+// bound covers double the chain's per-minute growth where scaled (sub-20s
+// chains), and the floor of 3 covers normal growth on 20s+ chains with
+// headroom (a sustained multi-block burst on a 20-40s chain would stretch
+// catch-up, never skip — the cursor persists). Pure function, pinned by
+// unit test.
+func rescanPageBudgetFor(blockTime int) int {
+	if blockTime > 0 && blockTime <= 20 {
+		if p := 120/blockTime + 1; p < rescanPageBudgetCap {
+			return p
+		}
+		return rescanPageBudgetCap
+	}
+	return rescanPageBudget
+}
+
+// rescanWindowBlocks seeds the cursor when the deposit's confirmation depth
+// is unknown (verbose blind): 144 blocks of history, scanned once within
+// the page budget, then owned by the advancing cursor. Wall-clock time this
+// covers varies by chain (a day on 10-minute chains, hours on fast ones) —
+// the unit is deliberately blocks, the chain's own coordinate.
+const rescanWindowBlocks = 144
+
+// rescanOutcome is the confirmed-leg worker result: the spender whose input
+// matches our outpoint ("" if none on the scanned pages), the cursor after
+// this round, whether any page fully scanned (persist the advance), and the
+// first page failure (cursor held — a skipped block is never marked done).
+type rescanOutcome struct {
+	spender    string
+	nextCursor uint32
+	advanced   bool
+	err        error
+}
+
+// seedRescanStart derives the first height to scan: the deposit's asserted
+// confirmation depth below tip (≈ broadcast height; off-by-reorg pages are
+// harmless), clamped at zero. Unasserted depth (verbose error, missing
+// field, conflicted) falls back to the one-day window below. One-time per
+// session; the advancing cursor owns it after.
+func seedRescanStart(conn wallet.Connector, depTxID string, tip int64) uint32 {
+	if vtx, err := conn.GetRawTransactionVerbose(depTxID); err == nil && vtx.HasConfirmations && vtx.Confirmations >= 0 {
+		if start := tip - int64(vtx.Confirmations); start > 0 {
+			return uint32(start)
+		}
+		return 0
+	}
+	if start := tip - rescanWindowBlocks; start > 0 {
+		return uint32(start)
+	}
+	return 0
+}
+
+// rescanQuery bundles one confirmed-leg round's inputs (all engine-captured
+// values; the worker never touches session state).
+type rescanQuery struct {
+	depTxID, excludeTxID string
+	depVout              uint32
+	cursor               uint32
+	hx                   [20]byte
+	hasTime              bool
+	pageBudget           int
+}
+
+// rescanBackoffActive reports whether orderID is inside a page-failure
+// backoff window. Engine-side (sweeps) and inline tests only.
+func (n *Node) rescanBackoffActive(idHex string) bool {
+	retryAt, ok := n.rescanRetryAt[idHex]
+	return ok && uint64(NowMicro()) < retryAt
+}
+
+// recordRescanFailure schedules the next confirmed-leg attempt with doubling
+// delay (10min, 20min, … capped at 24h — the refund backoff's windows).
+// Engine-side and inline tests only.
+func (n *Node) recordRescanFailure(idHex string) {
+	if n.rescanAttempts == nil {
+		n.rescanAttempts = map[string]int{}
+	}
+	if n.rescanRetryAt == nil {
+		n.rescanRetryAt = map[string]uint64{}
+	}
+	a := n.rescanAttempts[idHex] + 1
+	n.rescanAttempts[idHex] = a
+	delay := uint64(refundBackoffBaseMicro)
+	for i := 1; i < a && delay < refundBackoffCapMicro; i++ {
+		delay *= 2
+	}
+	if delay > refundBackoffCapMicro {
+		delay = refundBackoffCapMicro
+	}
+	n.rescanRetryAt[idHex] = uint64(NowMicro()) + delay
+}
+
+// clearRescanFailure drops the page-failure schedule after progress (pages
+// scanned or spender found). Engine-side and inline tests only.
+func (n *Node) clearRescanFailure(idHex string) {
+	delete(n.rescanAttempts, idHex)
+	delete(n.rescanRetryAt, idHex)
+}
+
+// runRescanPages walks [cursor, tip] hunting the spender of
+// (depTxID, depVout) — the C++ block leg
+// (App::checkWatchesOnDepositSpends, xbridgeapp.cpp:3389-3413) minus the
+// per-tx RPC fan-out: verbosity-2 blocks carry vins inline, so each page
+// costs two RPCs (hash + body) instead of thousands. Pure worker-side.
+// Runs hunted-only (caller's gate): the hub and the refund own every other
+// session, and backend load stays proportional to hunts, never swaps.
+//
+// Per-tick backend ceiling for one hunt (verify, don't trust): 1
+// getblockcount + budget × (getblockhash + getblock) + at most one
+// getrawtransaction per vin-matched candidate (matches are rare; our own
+// refund excluded without fetch) + the one-time seed reads (count already
+// counted, verbose). The mempool leg's pre-existing budget is separate.
+//
+// A vin match is necessary but not sufficient: the candidate is fetched and
+// secret-validated before declaring (the mempool leg's secretFromPayTx
+// rule). Our own refund txid is excluded outright (spends ours, carries no
+// secret). Anything undecidable — fetch failure, backend error, undecodable
+// page — holds the cursor: a skipped block is never marked done.
+func runRescanPages(conn wallet.Connector, q rescanQuery) rescanOutcome {
+	tip, err := conn.GetBlockCount()
+	if err != nil || tip < 1 {
+		return rescanOutcome{nextCursor: q.cursor, err: err}
+	}
+	cursor := q.cursor
+	if cursor == 0 {
+		cursor = seedRescanStart(conn, q.depTxID, tip)
+	}
+	budget := q.pageBudget
+	if budget < 1 {
+		budget = rescanPageBudget
+	}
+	start := cursor
+	next := cursor
+	for h := int64(cursor); h <= tip && h < int64(cursor)+int64(budget); h++ {
+		bh, err := conn.GetBlockHash(h)
+		if err != nil {
+			return rescanOutcome{nextCursor: next, advanced: next != start, err: err}
+		}
+		txs, err := conn.GetBlockTxs(bh)
+		if err != nil {
+			return rescanOutcome{nextCursor: next, advanced: next != start, err: err}
+		}
+		// The C++ isUTXOSpentInTx vin match
+		// (xbridgewalletconnectorbtc.cpp:1791-1794), minus its RPC: the
+		// vins are already in hand.
+		for _, tx := range txs {
+			if q.excludeTxID != "" && tx.TxID == q.excludeTxID {
+				continue // our own refund: spends ours, carries no secret
+			}
+			matched := false
+			for _, in := range tx.Vin {
+				if in.TxID == q.depTxID && in.Vout == q.depVout {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			payHex, ferr := conn.GetRawTransaction(tx.TxID)
+			if ferr != nil {
+				return rescanOutcome{nextCursor: next, advanced: next != start, err: ferr}
+			}
+			if _, ok := secretFromPayTx(payHex, q.hx, q.hasTime, q.depTxID, q.depVout); !ok {
+				continue // vin-matched but secretless: not our counterparty
+			}
+			return rescanOutcome{spender: tx.TxID, nextCursor: uint32(h) + 1, advanced: true}
+		}
+		next = uint32(h) + 1
+	}
+	return rescanOutcome{nextCursor: next, advanced: next != start}
+}
 
 // watchOwnDepositSpends sweeps live taker sessions whose own deposit is
 // broadcast but whose secret is still unknown, posting one mempool-scan task
@@ -81,11 +269,20 @@ func (n *Node) watchOwnDepositSpends() {
 // rechecked reports the hunt re-validation below actually ran (hunted session
 // with a readable backend); depositLive is its affirmative verdict — the
 // deposit outpoint reads unspent again, so a false-positive hunt clears.
+// nextCursor/cursorAdvanced carry the confirmed-leg page progress (persist
+// the advance); rescanErr is the first page failure (cursor held).
 type ownWatchResult struct {
-	spender     string
-	scanned     []string
-	rechecked   bool
-	depositLive bool
+	spender        string
+	scanned        []string
+	rechecked      bool
+	depositLive    bool
+	nextCursor     uint32
+	cursorAdvanced bool
+	rescanErr      error
+	// ranRescanLeg reports the confirmed leg executed this round (hunted,
+	// no mempool hit, no backoff): only then do rescanErr/cursorAdvanced
+	// mean anything.
+	ranRescanLeg bool
 }
 
 // runOwnWatchTask sweeps the source chain's mempool for the spender of our
@@ -150,12 +347,25 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 	// must never be read off the engine goroutine (race detector).
 	srcCur, depTxID := s.srcCur, s.ourDepositTxID
 	hunt := s.secretHunt
+	cursor := s.scanCursor
 	depVout := uint32(ownDepositVout)
 	hx := s.theirSecretHash
 	hasTime := false
+	blockTime := 0
 	if cc := n.cfg().Confs[srcCur]; cc != nil {
 		hasTime = cc.TxWithTimeField
+		blockTime = cc.BlockTime
 	}
+	// Our own refund txid is excluded from spender candidacy (it spends
+	// ours by construction and carries no secret); undecodable hex means
+	// no exclusion, never a mismatch.
+	excludeTxID := ""
+	if s.refundHex != "" {
+		if rid, rerr := txIDFromHex(s.refundHex); rerr == nil {
+			excludeTxID = rid
+		}
+	}
+	rescanDue := !n.rescanBackoffActive(orderID)
 	if n.ownWatchSeen == nil { // defensive: pre-start nodes (tests)
 		n.ownWatchSeen = map[string]map[string]struct{}{}
 	}
@@ -186,6 +396,24 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 			mem, merr := runOwnWatchTask(conn, seen, hx, depTxID, depVout, hasTime)
 			res.spender = mem.spender
 			res.scanned = mem.scanned
+			// Confirmed leg, hunted only: page forward hunting a confirmed
+			// spender the mempool never saw. Skipped when the mempool
+			// already found one (recovery owns the round), for every
+			// non-hunted session (the hub and the refund own them — backend
+			// load stays proportional to hunts, never swaps), and while a
+			// page-failure backoff is active (the cursor is held anyway).
+			if hunt && res.spender == "" && rescanDue {
+				res.ranRescanLeg = true
+				rsc := runRescanPages(conn, rescanQuery{
+					depTxID: depTxID, excludeTxID: excludeTxID, depVout: depVout,
+					cursor: cursor, hx: hx, hasTime: hasTime,
+					pageBudget: rescanPageBudgetFor(blockTime),
+				})
+				res.nextCursor, res.cursorAdvanced, res.rescanErr = rsc.nextCursor, rsc.advanced, rsc.err
+				if rsc.spender != "" {
+					res.spender = rsc.spender
+				}
+			}
 			return res, merr
 		},
 		apply: func(v any, err error) {
@@ -209,6 +437,24 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 					s.huntSince = 0
 					n.persist()
 					xlog.Info("hunt cleared: deposit unspent again, refund path resumed", "order", orderID)
+				}
+			}
+			// Confirmed-leg page progress persists even when the mempool
+			// leg failed: scanned pages stay scanned across ticks. A page
+			// failure spaces out re-tries with backoff (pruned backends
+			// fail permanently — retrying every tick would be the burst
+			// this design exists to avoid); progress clears it.
+			if s := n.sessions[orderID]; s != nil && res.cursorAdvanced {
+				s.scanCursor = res.nextCursor
+				n.clearRescanFailure(orderID)
+				n.persist()
+			}
+			if res.ranRescanLeg {
+				if res.rescanErr != nil {
+					n.recordRescanFailure(orderID)
+					xlog.Debug("rescan page failed, cursor held with backoff", "order", orderID, "err", res.rescanErr)
+				} else if res.spender != "" || res.cursorAdvanced {
+					n.clearRescanFailure(orderID)
 				}
 			}
 			if err != nil {

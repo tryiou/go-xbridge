@@ -251,8 +251,8 @@ func (n *Node) pollBroadcastConfirmations() {
 				if verr != nil {
 					continue // unknown/unreachable: keep last depth
 				}
-				if vtx.Confirmations < 0 {
-					continue // conflicted: keep watching, never regress
+				if !vtx.HasConfirmations || vtx.Confirmations < 0 {
+					continue // depth unasserted or conflicted: keep watching, never regress
 				}
 				depths[txid] = vtx.Confirmations
 			}

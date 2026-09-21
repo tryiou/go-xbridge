@@ -131,6 +131,16 @@ type fakeConnector struct {
 	// mempoolErr, when non-nil, makes it fail.
 	mempoolTxids []string
 	mempoolErr   error
+	// blocks serves GetBlockTxs (confirmed-spend rescan tests): internal
+	// block hash -> decoded transactions. blockErr, when non-nil, makes
+	// GetBlockTxs fail (pruned-history backend tests). Unknown hashes fail
+	// like a backend that cannot serve the block — the rescan holds its
+	// cursor, never skips. blockHashes maps heights to internal hashes for
+	// GetBlockHash; heights absent from it keep the legacy zero-hash
+	// behavior.
+	blocks      map[[32]byte][]wallet.BlockTx
+	blockErr    error
+	blockHashes map[int64][32]byte
 }
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
@@ -225,7 +235,25 @@ func (f *fakeConnector) setRawTx(txid, hexStr string) {
 
 func (f *fakeConnector) GetBlockCount() (int64, error) { return f.blockHeight, nil }
 
-func (f *fakeConnector) GetBlockHash(height int64) ([32]byte, error) { return [32]byte{}, nil }
+func (f *fakeConnector) GetBlockHash(height int64) ([32]byte, error) {
+	if h, ok := f.blockHashes[height]; ok {
+		return h, nil
+	}
+	return [32]byte{}, nil
+}
+
+// GetBlockTxs serves canned decoded block pages keyed by internal block
+// hash. Unknown hashes fail (pruned-backend behavior): the rescan holds its
+// cursor.
+func (f *fakeConnector) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error) {
+	if f.blockErr != nil {
+		return nil, f.blockErr
+	}
+	if txs, ok := f.blocks[blockHash]; ok {
+		return txs, nil
+	}
+	return nil, errNotFound
+}
 
 func (f *fakeConnector) GetRawTransaction(txid string) (string, error) {
 	f.mu.Lock()
@@ -245,6 +273,10 @@ func (f *fakeConnector) GetRawTransactionVerbose(txid string) (wallet.VerboseTx,
 		return wallet.VerboseTx{}, f.verboseErr
 	}
 	if v, ok := f.verboseTx[txid]; ok {
+		// A canned entry is knowledge: the fake backend asserts this
+		// depth (mirrors the RPC mapping setting HasConfirmations only
+		// on a present confirmations field).
+		v.HasConfirmations = true
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}

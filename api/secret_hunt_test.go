@@ -514,7 +514,7 @@ func TestStoredSpentShortCircuitsCandidates(t *testing.T) {
 		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
 		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
 	}
-	ltcConn := &stubConnForHunt{ticker: "LTC"}
+	ltcConn := &stubConnForHunt{ticker: "LTC", assertDepth: true}
 	btcConn := &stubConnForHunt{ticker: "BTC"}
 	n := newTestNode(t, confs, map[string]wallet.Connector{"LTC": ltcConn, "BTC": btcConn})
 	var id [32]byte
@@ -552,6 +552,11 @@ type stubConnForHunt struct {
 	sendErr   error
 	verboseTx map[string]wallet.VerboseTx
 	sends     int
+	// assertDepth makes served verbose entries assert their depth (like the
+	// production RPC mapping on a present confirmations field, and like the
+	// other fakes' serve paths). Unset, entries serve verbatim — the
+	// missing-field shape for presence-discipline tests.
+	assertDepth bool
 }
 
 func (s *stubConnForHunt) Ticker() string { return s.ticker }
@@ -579,6 +584,9 @@ func (s *stubConnForHunt) GetBlockCount() (int64, error) { return 1000, nil }
 func (s *stubConnForHunt) GetBlockHash(height int64) ([32]byte, error) {
 	return [32]byte{}, nil
 }
+func (s *stubConnForHunt) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error) {
+	return nil, errors.New("stubConnForHunt: unsupported")
+}
 func (s *stubConnForHunt) GetRawTransaction(txid string) (string, error) {
 	return "", errors.New("stubConnForHunt: unknown transaction")
 }
@@ -596,6 +604,12 @@ func (s *stubConnForHunt) GetTxOut(txid string, vout uint32) (wallet.Utxo, bool,
 }
 func (s *stubConnForHunt) GetRawTransactionVerbose(txid string) (wallet.VerboseTx, error) {
 	if v, ok := s.verboseTx[txid]; ok {
+		// Canned entries assert depth only when asked: the RPC mapping
+		// sets HasConfirmations solely on a present confirmations field,
+		// and presence tests need the unasserted shape.
+		if s.assertDepth {
+			v.HasConfirmations = true
+		}
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}
@@ -606,8 +620,8 @@ func (s *stubConnForHunt) GetRawMempool() ([]string, error) {
 
 // TestHuntFlagsFileRoundTrip proves the hunt survives the disk format, not
 // just the in-memory restoreSwap literal: persist → loadSwaps → restoreSwap
-// must carry SecretHunt and HuntSince, and the restored session must keep
-// hunting (sweep stood down, watch eligible).
+// must carry SecretHunt, HuntSince, and ScanCursor, and the restored session
+// must keep hunting (sweep stood down, watch eligible, rescan resumed).
 func TestHuntFlagsFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	n := newPersistNode(t, dir)
@@ -621,7 +635,7 @@ func TestHuntFlagsFileRoundTrip(t *testing.T) {
 	n.sessions[idHex] = &SwapSession{n: n, id: id, isMaker: false, state: csCreatedB,
 		srcCur: "LTC", ourDepositTxID: "dddeposit", ourLockTime: 900,
 		refundHex: "deadbeefrefund", theirSecretHash: hash20("secret-hash"),
-		secretHunt: true, huntSince: 123456789}
+		secretHunt: true, huntSince: 123456789, scanCursor: 998877}
 	n.persist()
 
 	ps, _, _, err := loadSwaps(swapStatePath(dir))
@@ -631,7 +645,7 @@ func TestHuntFlagsFileRoundTrip(t *testing.T) {
 	if len(ps) != 1 {
 		t.Fatalf("loaded %d swaps, want 1", len(ps))
 	}
-	if !ps[0].SecretHunt || ps[0].HuntSince != 123456789 {
+	if !ps[0].SecretHunt || ps[0].HuntSince != 123456789 || ps[0].ScanCursor != 998877 {
 		t.Fatalf("hunt flags did not round-trip: %+v", ps[0])
 	}
 
@@ -641,7 +655,442 @@ func TestHuntFlagsFileRoundTrip(t *testing.T) {
 	if s == nil {
 		t.Fatal("hunt record did not restore a live session")
 	}
-	if !s.secretHunt || s.huntSince != 123456789 {
-		t.Fatalf("restored hunt = %v/%d, want true/123456789", s.secretHunt, s.huntSince)
+	if !s.secretHunt || s.huntSince != 123456789 || s.scanCursor != 998877 {
+		t.Fatalf("restored hunt = %v/%d/%d, want true/123456789/998877", s.secretHunt, s.huntSince, s.scanCursor)
+	}
+}
+
+// rescanPage seeds one canned block page (height -> txs) on a fake connector,
+// returning the internal hash wired for that height.
+func rescanPage(t *testing.T, conn *fakeConnector, height int64, txs []wallet.BlockTx) [32]byte {
+	t.Helper()
+	var h [32]byte
+	h[0] = byte(height)
+	h[1] = byte(height >> 8)
+	if conn.blockHashes == nil {
+		conn.blockHashes = map[int64][32]byte{}
+	}
+	if conn.blocks == nil {
+		conn.blocks = map[[32]byte][]wallet.BlockTx{}
+	}
+	conn.blockHashes[height] = h
+	conn.blocks[h] = txs
+	return h
+}
+
+// TestRescanFindsConfirmedSpender proves the confirmed leg: with an empty
+// mempool (the mempool leg cannot fire), a hunted taker recovers the secret
+// from a block page carrying the vin-matched spender and finishes.
+func TestRescanFindsConfirmedSpender(t *testing.T) {
+	_, takerNode, _, takerSession, _, orderID, makerPayTxID, tkLtcConn, mkLtcConn := blindTakerFixture(t)
+	idHex := hexEncode(orderID[:])
+	takerSession.secretHunt = true
+	takerSession.huntSince = uint64(NowMicro())
+	hx, err := mkLtcConn.GetRawTransaction(makerPayTxID)
+	if err != nil {
+		t.Fatal("maker payTx missing from maker connector")
+	}
+	tkLtcConn.setRawTx(makerPayTxID, hx)
+	tkLtcConn.mempoolTxids = nil // confirmed case: mempool is empty
+	// Pages: 1000 empty, 1001 carries the spender, tip at 1001.
+	rescanPage(t, tkLtcConn, 1000, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 1}}}})
+	rescanPage(t, tkLtcConn, 1001, []wallet.BlockTx{{TxID: makerPayTxID, Vin: []wallet.BlockVin{{TxID: takerSession.ourDepositTxID, Vout: 0}}}})
+	tkLtcConn.blockHeight = 1001
+	takerSession.scanCursor = 1000
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.secret == [33]byte{} {
+		t.Fatal("rescan did not recover the secret from the confirmed spend")
+	}
+	if takerSession.state != csFinished {
+		t.Fatalf("state = %s, want csFinished", takerSession.state.String())
+	}
+	if o := takerNode.store.Get(idHex); o == nil || !o.CounterpartyRedeemed {
+		t.Fatalf("order = %+v, want counterparty redeemed", o)
+	}
+	if takerSession.scanCursor != 1002 {
+		t.Fatalf("cursor = %d, want 1002 (past both scanned pages)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanCursorAdvancesAndPersists proves each block is read once ever:
+// empty pages advance the cursor past them, and the advance persists with
+// the session for the next tick.
+func TestRescanCursorAdvancesAndPersists(t *testing.T) {
+	_, takerNode, _, takerSession, _, orderID, _, tkLtcConn, _ := blindTakerFixture(t)
+	idHex := hexEncode(orderID[:])
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 990
+	for h := int64(990); h <= 992; h++ {
+		rescanPage(t, tkLtcConn, h, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	}
+	tkLtcConn.blockHeight = 992
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 993 {
+		t.Fatalf("cursor = %d, want 993 (past all scanned pages)", takerSession.scanCursor)
+	}
+	if _, ok := takerNode.sessions[idHex]; !ok {
+		t.Fatal("scanning session was pruned")
+	}
+	if takerSession.secretHunt != true || takerSession.secret != [33]byte{} {
+		t.Fatal("empty scan disturbed the hunt")
+	}
+}
+
+// TestRescanSeedsFromConfirmationDepth proves legacy cursor seeding: a
+// cursorless session starts at tip minus the deposit's confirmation depth
+// (≈ broadcast height), not at genesis and not at tip.
+func TestRescanSeedsFromConfirmationDepth(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	// Deposit confirmed 5 deep at tip 1000 → first scanned page is 995.
+	tkLtcConn.verboseTx = map[string]wallet.VerboseTx{
+		takerSession.ourDepositTxID: {TxID: takerSession.ourDepositTxID, Confirmations: 5},
+	}
+	rescanPage(t, tkLtcConn, 995, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 996 {
+		t.Fatalf("cursor = %d, want 996 (seeded 995 + one page)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanSeedsWindowOnBlindDeposit proves the unknown-deposit fallback:
+// with no verbose view, the cursor seeds one window back — bounded,
+// budgeted, documented — instead of genesis or tip.
+func TestRescanSeedsWindowOnBlindDeposit(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	// No verboseTx entry: the backend cannot see the deposit tx.
+	rescanPage(t, tkLtcConn, 856, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 857 {
+		t.Fatalf("cursor = %d, want 857 (tip 1000 - window 144 + one page)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanPrunedHoldsCursor proves pruned-history degradation: a page
+// failure holds the cursor (never marks skips), keeps the hunt, and stays
+// silent at WARN level (Debug only — the hourly hunt WARN owns visibility).
+func TestRescanPrunedHoldsCursor(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 990
+	tkLtcConn.blockErr = errors.New("pruned history: block not available")
+	tkLtcConn.blockHeight = 995
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 990 {
+		t.Fatalf("cursor moved to %d on page failure — skipped blocks", takerSession.scanCursor)
+	}
+	if !takerSession.secretHunt {
+		t.Fatal("page failure dropped the hunt")
+	}
+}
+
+// TestRescanRespectsPageBudget proves the rate limit: with ten empty pages
+// ahead, one round advances exactly rescanPageBudget pages — bursts are
+// structurally impossible, catch-up stretches instead.
+func TestRescanRespectsPageBudget(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 900
+	for h := int64(900); h < 910; h++ {
+		rescanPage(t, tkLtcConn, h, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	}
+	tkLtcConn.blockHeight = 909
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 900+rescanPageBudget {
+		t.Fatalf("cursor = %d, want %d (exactly one budget)", takerSession.scanCursor, 900+rescanPageBudget)
+	}
+}
+
+// TestRescanSkipsOwnRefundTx proves the exclusion: our own refund spends our
+// deposit by construction but carries no secret — adopting it would poison
+// theirPayTxID and park the claim retry on a secretless tx. The page still
+// counts as scanned (fully decidable), so the cursor advances past it.
+func TestRescanSkipsOwnRefundTx(t *testing.T) {
+	_, takerNode, _, takerSession, _, orderID, _, tkLtcConn, _ := blindTakerFixture(t)
+	idHex := hexEncode(orderID[:])
+	takerSession.secretHunt = true
+	takerSession.huntSince = uint64(NowMicro())
+	takerSession.scanCursor = 1000
+	refundTxID, err := txIDFromHex(takerSession.refundHex)
+	if err != nil || refundTxID == "" {
+		t.Fatalf("no refund txid to exclude: %v", err)
+	}
+	rescanPage(t, tkLtcConn, 1000, []wallet.BlockTx{{
+		TxID: refundTxID,
+		Vin:  []wallet.BlockVin{{TxID: takerSession.ourDepositTxID, Vout: 0}},
+	}})
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.theirPayTxID != "" {
+		t.Fatalf("own refund adopted as counterparty payTx: %q", takerSession.theirPayTxID)
+	}
+	if takerSession.secret != [33]byte{} {
+		t.Fatal("secret adopted from a secretless refund")
+	}
+	if takerSession.scanCursor != 1001 {
+		t.Fatalf("cursor = %d, want 1001 (decidable page counts as scanned)", takerSession.scanCursor)
+	}
+	if !takerSession.secretHunt {
+		t.Fatal("excluded refund dropped the hunt")
+	}
+	if _, ok := takerNode.sessions[idHex]; !ok {
+		t.Fatal("session pruned on an excluded refund")
+	}
+}
+
+// TestRescanHoldsOnUnvalidatableMatch proves fail-closed validation: a
+// vin-matched candidate whose bytes cannot be fetched holds the cursor —
+// never declared, never skipped past.
+func TestRescanHoldsOnUnvalidatableMatch(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 1000
+	// Vin matches our deposit but the tx bytes are unavailable: undecidable.
+	rescanPage(t, tkLtcConn, 1000, []wallet.BlockTx{{
+		TxID: "unfetchable-spender",
+		Vin:  []wallet.BlockVin{{TxID: takerSession.ourDepositTxID, Vout: 0}},
+	}})
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 1000 {
+		t.Fatalf("cursor = %d, want 1000 (held on undecidable page)", takerSession.scanCursor)
+	}
+	if takerSession.theirPayTxID != "" {
+		t.Fatal("unfetchable candidate adopted as payTx")
+	}
+	if !takerSession.secretHunt {
+		t.Fatal("held page dropped the hunt")
+	}
+}
+
+// TestRescanBackoffSpacesPageFailures proves perpetual failure degrades to
+// backoff, not bursts: after a failed page the leg stands down for the
+// backoff window while the mempool leg keeps running.
+func TestRescanBackoffSpacesPageFailures(t *testing.T) {
+	_, takerNode, _, takerSession, _, orderID, _, tkLtcConn, _ := blindTakerFixture(t)
+	idHex := hexEncode(orderID[:])
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 990
+	tkLtcConn.blockErr = errors.New("pruned history: block not available")
+	tkLtcConn.blockHeight = 995
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+	if !takerNode.rescanBackoffActive(idHex) {
+		t.Fatal("page failure did not arm the rescan backoff")
+	}
+
+	// Second round inside the window: the leg must not fire again (no new
+	// RPC storm on a permanently missing page).
+	tkLtcConn.blockErr = errors.New("must not be called under backoff")
+	takerNode.watchOwnDepositSpends()
+	if takerSession.scanCursor != 990 {
+		t.Fatalf("cursor moved to %d under backoff", takerSession.scanCursor)
+	}
+}
+
+// TestRescanPageBudgetFor pins the dynamic bound: slow chains keep the
+// default, fast chains scale up (capped) instead of falling behind.
+func TestRescanPageBudgetFor(t *testing.T) {
+	if got := rescanPageBudgetFor(0); got != 3 {
+		t.Fatalf("budget(0) = %d, want 3 (default)", got)
+	}
+	if got := rescanPageBudgetFor(600); got != 3 {
+		t.Fatalf("budget(600) = %d, want 3", got)
+	}
+	if got := rescanPageBudgetFor(60); got != 3 {
+		t.Fatalf("budget(60) = %d, want 3", got)
+	}
+	if got := rescanPageBudgetFor(10); got != 12 {
+		t.Fatalf("budget(10) = %d, want 12 (cap)", got)
+	}
+	if got := rescanPageBudgetFor(30); got != 3 {
+		t.Fatalf("budget(30) = %d, want 3 (base covers 2/min growth)", got)
+	}
+	if got := rescanPageBudgetFor(20); got != 7 {
+		t.Fatalf("budget(20) = %d, want 7 (boundary inclusive: exactly double growth still gains)", got)
+	}
+	if got := rescanPageBudgetFor(15); got != 9 {
+		t.Fatalf("budget(15) = %d, want 9", got)
+	}
+}
+
+// TestOutsideWindowSpendParksVisible documents the bounded visible park: a
+// blind backend with a spend older than the seed window cannot find it —
+// the session stays hunted and alive (hourly WARN owns visibility) instead
+// of failing, cancelling, or stranding silently.
+func TestOutsideWindowSpendParksVisible(t *testing.T) {
+	_, takerNode, _, takerSession, _, orderID, _, tkLtcConn, _ := blindTakerFixture(t)
+	idHex := hexEncode(orderID[:])
+	takerSession.secretHunt = true
+	takerSession.huntSince = uint64(NowMicro())
+	// Blind backend (no verbose view) at tip 1000: seed lands at 856, three
+	// empty pages scan, nothing found — the older spend stays out of reach.
+	for h := int64(856); h <= 858; h++ {
+		rescanPage(t, tkLtcConn, h, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	}
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if !takerSession.secretHunt {
+		t.Fatal("visible park dropped the hunt")
+	}
+	if takerSession.scanCursor != 859 {
+		t.Fatalf("cursor = %d, want 859 (window scanned, nothing found)", takerSession.scanCursor)
+	}
+	if _, ok := takerNode.sessions[idHex]; !ok {
+		t.Fatal("parked session was pruned")
+	}
+	if o := takerNode.store.Get(idHex); o == nil {
+		t.Fatal("parked order left the live book")
+	}
+}
+
+// TestRescanNegativeConfFallsBackToWindow proves conflicted deposits seed
+// the window, not the depth math: negative confirmations are reorg evidence,
+// and tip-minus-negative would seed ABOVE the tip.
+func TestRescanNegativeConfFallsBackToWindow(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	tkLtcConn.verboseTx = map[string]wallet.VerboseTx{
+		takerSession.ourDepositTxID: {TxID: takerSession.ourDepositTxID, Confirmations: -1, HasConfirmations: true},
+	}
+	rescanPage(t, tkLtcConn, 856, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	tkLtcConn.blockHeight = 1000
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 857 {
+		t.Fatalf("cursor = %d, want 857 (window fallback, not tip+1)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanSeedsZeroOnYoungChain proves zero-backfill semantics: below the
+// window the cursor seeds at genesis and scans up — correct on young chains,
+// never a negative height.
+func TestRescanSeedsZeroOnYoungChain(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	for h := int64(0); h <= 2; h++ {
+		rescanPage(t, tkLtcConn, h, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	}
+	tkLtcConn.blockHeight = 100
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 3 {
+		t.Fatalf("cursor = %d, want 3 (genesis-seeded catch-up)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanPartialAdvancePersists proves a mid-budget failure keeps partial
+// progress: the fully-scanned page persists, the failed page holds.
+func TestRescanPartialAdvancePersists(t *testing.T) {
+	_, takerNode, _, takerSession, _, _, _, tkLtcConn, _ := blindTakerFixture(t)
+	takerSession.secretHunt = true
+	takerSession.scanCursor = 990
+	rescanPage(t, tkLtcConn, 990, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+	// 991 has a hash but no body: GetBlockTxs fails like a pruned page.
+	var h991 [32]byte
+	h991[0] = 0xdf
+	if tkLtcConn.blockHashes == nil {
+		tkLtcConn.blockHashes = map[int64][32]byte{}
+	}
+	tkLtcConn.blockHashes[991] = h991
+	tkLtcConn.blockHeight = 991
+	tkLtcConn.mempoolTxids = nil
+
+	takerNode.watchOwnDepositSpends()
+
+	if takerSession.scanCursor != 991 {
+		t.Fatalf("cursor = %d, want 991 (past the good page, held at the bad one)", takerSession.scanCursor)
+	}
+}
+
+// TestRescanMultiHuntBudgetsIndependent proves per-session bounds compose:
+// two hunts on one node each advance within budget — no shared counter, no
+// starvation, no multiplication beyond one bound each.
+func TestRescanMultiHuntBudgetsIndependent(t *testing.T) {
+	_, n1, _, s1, _, _, _, c1, _ := blindTakerFixture(t)
+	_, n2, _, s2, _, _, _, c2, _ := blindTakerFixture(t)
+	for _, tc := range []struct {
+		n *Node
+		s *SwapSession
+		c *fakeConnector
+	}{
+		{n1, s1, c1},
+		{n2, s2, c2},
+	} {
+		tc.s.secretHunt = true
+		tc.s.scanCursor = 900
+		for h := int64(900); h < 910; h++ {
+			rescanPage(t, tc.c, h, []wallet.BlockTx{{TxID: "unrelated", Vin: []wallet.BlockVin{{TxID: "other", Vout: 0}}}})
+		}
+		tc.c.blockHeight = 909
+		tc.c.mempoolTxids = nil
+		tc.n.watchOwnDepositSpends()
+		if tc.s.scanCursor != 903 {
+			t.Fatalf("cursor = %d, want 903 (one budget each)", tc.s.scanCursor)
+		}
+	}
+}
+
+// TestConfirmPollerMissingFieldKeepsDepth proves the presence discipline in
+// the confirmation poller: a verbose response without an asserted depth
+// keeps the last depth instead of recording zero.
+func TestConfirmPollerMissingFieldKeepsDepth(t *testing.T) {
+	bc := &stubConnForHunt{ticker: "BLOCK", verboseTx: map[string]wallet.VerboseTx{
+		"tx1": {TxID: "tx1", Confirmations: 4, Outputs: map[uint32]wallet.VerboseTxOut{}},
+	}}
+	n := newTestNode(t, map[string]*config.CoinConf{}, map[string]wallet.Connector{"BLOCK": bc})
+	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
+	n.pollBroadcastConfirmations()
+	got := n.trackedSnapshot()
+	if len(got) != 1 || got["tx1"].Confs != 0 {
+		t.Fatalf("tracked = %+v, want entry kept at last depth 0", got)
+	}
+}
+
+// TestConfirmDepositWaitsOnMissingField proves the validation gate requires
+// asserted depth: exact script/value match with no confirmations field
+// waits instead of proceeding — the field's absence proves nothing.
+func TestConfirmDepositWaitsOnMissingField(t *testing.T) {
+	conn := &stubConnForHunt{ticker: "BTC", verboseTx: map[string]wallet.VerboseTx{
+		"deptx": {TxID: "deptx", Outputs: map[uint32]wallet.VerboseTxOut{
+			0: {Value: 100000, ScriptHex: "deadbeef"},
+		}},
+	}}
+	if confirmDepositKnownByRawTx(conn, "deptx", 0, "deadbeef", 100000, 0) {
+		t.Fatal("deposit validation proceeded on unasserted depth")
 	}
 }

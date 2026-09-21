@@ -485,6 +485,83 @@ func revHashHex(s string) ([32]byte, error) {
 	return out, nil
 }
 
+// displayHashHex converts an internal (little-endian) block hash to display
+// (big-endian) hex for the RPC wire — the inverse of revHashHex.
+func displayHashHex(h [32]byte) string {
+	var be [32]byte
+	for i := 0; i < 32; i++ {
+		be[i] = h[31-i]
+	}
+	return hex.EncodeToString(be[:])
+}
+
+// rpcBlockTx is one decoded transaction in a verbosity-2 block: identity
+// plus spent outpoints. Entries lacking a prevout (coinbase) decode to zero
+// values that never match a real deposit outpoint.
+type rpcBlockTx struct {
+	TxID string `json:"txid"`
+	Vin  []struct {
+		TxID string `json:"txid"`
+		Vout uint32 `json:"vout"`
+	} `json:"vin"`
+}
+
+// GetBlockTxs returns a block's decoded transactions via verbose getblock
+// (verbosity 2: decoded txs with vins inline). Verbosity is requested
+// EXPLICITLY as [hash, 2]: stock Core defaults a bare hash to verbosity 1
+// (id list), which cannot serve vins — a bare-hash-only call would fail
+// closed on every real backend. If the explicit call errors (strict/old
+// facade rejecting the verbosity arg), one bare-[hash] probe follows: only
+// a decoded-object response is usable; an id list degrades (callers hold
+// their cursor, mempool leg only) instead of fanning out per-tx fetches —
+// thousands of getrawtransaction calls per block would break the per-tick
+// backend-load bound the rescan promises. Either way the caller, not this
+// function, budgets pages per tick.
+func (c *RPCConnector) GetBlockTxs(blockHash [32]byte) ([]BlockTx, error) {
+	disp := displayHashHex(blockHash)
+	var raw json.RawMessage
+	if err := c.cli.Call("getblock", []interface{}{disp, 2}, &raw); err != nil {
+		// Explicit verbosity rejected: probe the bare form once before
+		// giving up (C++ passes [hash]; some facades only speak that).
+		// Any error here reports the PRIMARY failure — the probe is best
+		// effort on an already-failing path, and it fires at most once
+		// per page failure (callers back off after).
+		if berr := c.cli.Call("getblock", []interface{}{disp}, &raw); berr != nil {
+			return nil, c.wrapErr("getblock", err)
+		}
+	}
+	var obj struct {
+		Tx []json.RawMessage `json:"tx"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil || obj.Tx == nil {
+		return nil, c.wrapErr("getblock", fmt.Errorf("wallet: getblock not a block object"))
+	}
+	if len(obj.Tx) == 0 {
+		// Every real block carries at least coinbase: an empty list is a
+		// facade lying about availability — fail closed so the caller
+		// holds its cursor instead of marking skips.
+		return nil, c.wrapErr("getblock", fmt.Errorf("wallet: getblock empty tx list"))
+	}
+	out := make([]BlockTx, 0, len(obj.Tx))
+	for _, entry := range obj.Tx {
+		var v2 rpcBlockTx
+		// Both halves required, and the vin set must be non-empty: every
+		// real transaction has at least one input (coinbase included), so
+		// a missing or empty vin set is undecidable — a stripped shape
+		// could hide the spender. Fail the page rather than advance past
+		// it.
+		if err := json.Unmarshal(entry, &v2); err != nil || v2.TxID == "" || len(v2.Vin) == 0 {
+			return nil, c.wrapErr("getblock", fmt.Errorf("wallet: getblock undecodable tx entry"))
+		}
+		tx := BlockTx{TxID: v2.TxID}
+		for _, in := range v2.Vin {
+			tx.Vin = append(tx.Vin, BlockVin{TxID: in.TxID, Vout: in.Vout})
+		}
+		out = append(out, tx)
+	}
+	return out, nil
+}
+
 // GetRawTransaction returns the full serialized (hex) transaction for txid via
 // getrawtransaction (verbosity 0). The taker reads the maker's payTx to recover
 // the HTLC secret preimage.
@@ -575,6 +652,7 @@ func (c *RPCConnector) GetRawTransactionVerbose(txid string) (VerboseTx, error) 
 	vtx := VerboseTx{TxID: txid, Outputs: make(map[uint32]VerboseTxOut, len(raw.Vout))}
 	if raw.Confirmations != nil {
 		vtx.Confirmations = *raw.Confirmations
+		vtx.HasConfirmations = true
 	}
 	for _, o := range raw.Vout {
 		amt, aerr := amountFloatToBase(c.chain.Decimals, o.Value)
