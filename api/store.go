@@ -441,32 +441,72 @@ func ageSec(nowUs, ts uint64) uint64 {
 // frame every other renderer emits), newest first. Canceled, expired, and
 // non-Mine records are excluded exactly like C++; snapshot-less entries
 // cannot render a pair and are skipped.
+//
+// Deliberate local improvement over C++: live orders finished locally (claim
+// broadcast, status finished) but never moved to history (no hub Finished
+// processed yet — live run-4 S2) also render. Settlement is untouched: the
+// history move still happens only in OnFinished, and the row migrates there
+// when it does (deduped by id below). Without this, fills/OHLC stay blind to
+// a correctly finished swap until the hub confirms it.
 func (s *Store) Fills() []fillEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]fillEntry, 0, len(s.history))
-	for i := len(s.history) - 1; i >= 0; i-- {
-		e := s.history[i]
-		o := e.Order
-		if o == nil || !o.Mine || statusString(e.Status) != "finished" {
-			continue
+	out := func() []fillEntry {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		out := make([]fillEntry, 0, len(s.history)+len(s.orders))
+		seen := make(map[string]bool, len(s.history)+len(s.orders))
+		render := func(o *Order, t uint64) {
+			maker, makerSize, taker, takerSize := o.localSense()
+			out = append(out, fillEntry{
+				ID:                   orderIDString(o.ID),
+				Time:                 t,
+				Maker:                maker,
+				MakerSize:            formatXAmount(makerSize),
+				Taker:                taker,
+				TakerSize:            formatXAmount(takerSize),
+				ParentID:             parentIDString(o.ParentID),
+				OrderType:            orderTypeString(o.PartialAllowed),
+				PartialMinimum:       formatXAmount(o.MinFromAmount),
+				PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
+				PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
+				PartialRepost:        o.PartialRepost,
+			})
+			// Mark by the order's own id (store-key encoding), never by the
+			// rendered display id: the mark always derives from the rendered
+			// order itself, so no caller can split them by passing a
+			// differently-encoded key.
+			seen[orderKey(o.ID)] = true
 		}
-		maker, makerSize, taker, takerSize := o.localSense()
-		out = append(out, fillEntry{
-			ID:                   orderIDString(o.ID),
-			Time:                 e.Updated,
-			Maker:                maker,
-			MakerSize:            formatXAmount(makerSize),
-			Taker:                taker,
-			TakerSize:            formatXAmount(takerSize),
-			ParentID:             parentIDString(o.ParentID),
-			OrderType:            orderTypeString(o.PartialAllowed),
-			PartialMinimum:       formatXAmount(o.MinFromAmount),
-			PartialOrigMakerSize: formatXAmount(o.OrigFromAmount),
-			PartialOrigTakerSize: formatXAmount(o.OrigToAmount),
-			PartialRepost:        o.PartialRepost,
-		})
-	}
+		for i := len(s.history) - 1; i >= 0; i-- {
+			e := s.history[i]
+			o := e.Order
+			if o == nil || !o.Mine || statusString(e.Status) != "finished" || seen[orderKey(o.ID)] {
+				continue
+			}
+			render(o, e.Updated)
+		}
+		// Live-finished Mine orders join the same newest-first order (by finish
+		// Time, id tiebreak for determinism — map iteration is random). A late
+		// hub Finished migrates the row into history, re-stamped at migration,
+		// so the merged view re-sorts by confirmation time. Same gates, same
+		// frame; ids already emitted win.
+		for _, o := range s.orders {
+			if o == nil || !o.Mine || statusString(o.Status) != "finished" || seen[orderKey(o.ID)] {
+				continue
+			}
+			render(o, o.Updated)
+		}
+		return out
+	}()
+	// Sort outside the book lock: fillEntry is all value types, so the
+	// materialized slice is safe to order after unlock, and writers never
+	// wait on the sort. The closure keeps defer-based unlock safety: no
+	// early return can leak the read lock.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Time != out[j].Time {
+			return out[i].Time > out[j].Time
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 

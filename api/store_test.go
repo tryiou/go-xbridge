@@ -525,3 +525,100 @@ func TestFillsDerivedFromHistory(t *testing.T) {
 		t.Errorf("fills[1] sizes = %s/%s, want 1.000000/2.000000", fills[1].MakerSize, fills[1].TakerSize)
 	}
 }
+
+// TestFillsIncludesLiveFinished pins the S2 run-4 lesson: an order finished
+// locally (live map, status finished) but never moved to history (no hub
+// Finished processed) must still render a fill. The hub's later Finished only
+// migrates the row to history; the swap, funds, and daemon state are finished
+// either way, so the fills/OHLC view must not wait for it.
+func TestFillsIncludesLiveFinished(t *testing.T) {
+	s := NewStore()
+	mkID := func(b byte) [32]byte { return [32]byte{b} }
+	// History record first (existing path, renders first).
+	s.AddToHistory(&Order{ID: mkID(0xaa),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true},
+		"finished", 0, 1030*1e6)
+	// Live locally-finished taker order: same shape as a swap that finished
+	// at claim broadcast with no hub Finished yet. Renders in the taker
+	// frame; newest-first puts it ahead of the older history record.
+	s.Add(&Order{ID: mkID(0xee),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 4000000, Mine: true, Role: 'B',
+		Status: "finished", Updated: 1070 * 1e6})
+
+	fills := s.Fills()
+	if len(fills) != 2 {
+		t.Fatalf("Fills() = %d entries, want 2 (history + live-finished)", len(fills))
+	}
+	live := fills[0]
+	if live.ID != orderIDString(mkID(0xee)) {
+		t.Fatalf("fills[0].ID = %s, want live-finished %s first (newest)", live.ID, orderIDString(mkID(0xee)))
+	}
+	// Taker frame: maker = sent LTC, taker = received BTC; sizes mirrored.
+	if live.Maker != "LTC" || live.Taker != "BTC" {
+		t.Errorf("live pair = %s/%s, want LTC/BTC (local taker frame)", live.Maker, live.Taker)
+	}
+	if live.MakerSize != "4.000000" || live.TakerSize != "1.000000" {
+		t.Errorf("live sizes = %s/%s, want 4.000000/1.000000", live.MakerSize, live.TakerSize)
+	}
+	if live.Time != 1070*1e6 {
+		t.Errorf("live Time = %d, want order Updated (finish time) %d", live.Time, uint64(1070*1e6))
+	}
+	if hist := fills[1]; hist.ID != orderIDString(mkID(0xaa)) {
+		t.Errorf("fills[1].ID = %s, want history record %s second", hist.ID, orderIDString(mkID(0xaa)))
+	}
+}
+
+// TestFillsNoDoubleRender guards the live+history overlap: an order present
+// finished in both maps (e.g. a hub Finished racing a live read) renders
+// exactly once — the history row wins, the live row is skipped by id.
+func TestFillsNoDoubleRender(t *testing.T) {
+	s := NewStore()
+	mkID := func(b byte) [32]byte { return [32]byte{b} }
+	s.AddToHistory(&Order{ID: mkID(0xaa),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true},
+		"finished", 0, 1030*1e6)
+	s.Add(&Order{ID: mkID(0xaa),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true,
+		Status: "finished", Updated: 1070 * 1e6})
+
+	fills := s.Fills()
+	if len(fills) != 1 {
+		t.Fatalf("Fills() = %d entries, want 1 (no double render)", len(fills))
+	}
+	if fills[0].ID != orderIDString(mkID(0xaa)) {
+		t.Errorf("fills[0].ID = %s, want %s", fills[0].ID, orderIDString(mkID(0xaa)))
+	}
+	// History row wins over the live row: Time is the history stamp (1030),
+	// not the live Updated (1070).
+	if fills[0].Time != 1030*1e6 {
+		t.Errorf("fills[0].Time = %d, want history stamp %d", fills[0].Time, uint64(1030*1e6))
+	}
+}
+
+// TestFillsExcludesLiveNonFinished pins the gate against over-broadening:
+// live open, canceled, or non-Mine orders never render, exactly like the
+// history path excludes non-finished records.
+func TestFillsExcludesLiveNonFinished(t *testing.T) {
+	s := NewStore()
+	mkID := func(b byte) [32]byte { return [32]byte{b} }
+	s.Add(&Order{ID: mkID(0xaa),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true,
+		Status: "open", Updated: 1030 * 1e6})
+	s.Add(&Order{ID: mkID(0xbb),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000, Mine: true,
+		Status: "canceled", Updated: 1040 * 1e6})
+	s.Add(&Order{ID: mkID(0xcc),
+		FromCurrency: "BTC", FromAmount: 1000000,
+		ToCurrency: "LTC", ToAmount: 2000000,
+		Status: "finished", Updated: 1050 * 1e6})
+
+	if fills := s.Fills(); len(fills) != 0 {
+		t.Fatalf("Fills() = %d entries, want 0 (no live-finished Mine)", len(fills))
+	}
+}
