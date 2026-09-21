@@ -2125,6 +2125,14 @@ func (n *Node) watchCounterpartyDeposits() {
 			s.vanishMisses = 0
 			continue
 		}
+		// A hunting session recovers through the own-deposit watch and
+		// rescan: cancelling it would broadcast a refund that can never
+		// confirm (the input is spent). Same stand-down as the stall
+		// watchdog and scanRefunds.
+		if s.secretHunt {
+			s.vanishMisses = 0
+			continue
+		}
 		// Watch only the pre-claim window (claim material above, plus the
 		// confirmed state below): once we claimed, the deposit is
 		// legitimately spent by our own payTx (CounterpartyRedeemed / the
@@ -2185,6 +2193,16 @@ func depositWatchVanishThreshold(blockTimeSec int) int {
 	return n
 }
 
+// depositWatchOutcome is the worker-produced result of one
+// counterparty-deposit probe: whether the deposit is still unspent, and —
+// on decisive rounds only — whether the own-deposit probe answered, and
+// whether it proved our own deposit spent.
+type depositWatchOutcome struct {
+	unspent  bool
+	ownKnown bool
+	ownSpent bool
+}
+
 // runDepositWatchTask probes whether the watched counterparty deposit output
 // is still unspent. It returns (true, nil) when unspent, (false, nil) when
 // definitively spent or missing (reorged/double-spent), and an error when the
@@ -2202,10 +2220,10 @@ func runDepositWatchTask(conn wallet.Connector, cur, txid string, vout uint32) (
 
 // postDepositWatchTask posts one counterparty-deposit probe to the worker pool
 // (or runs it synchronously in inline mode). The apply runs on the engine: a
-// deposit missing past the vanish countdown self-cancels with the role's
-// deposit reason; any other outcome leaves the session untouched for the
-// next sweep. A full task queue drops the probe (the next sweep re-enqueues;
-// nothing was broadcast).
+// deposit missing past the vanish countdown either hunts (taker with proven
+// spent own deposit) or self-cancels with the role's deposit reason; any
+// other outcome leaves the session untouched for the next sweep. A full task
+// queue drops the probe (the next sweep re-enqueues; nothing was broadcast).
 func (n *Node) postDepositWatchTask(orderID string) bool {
 	s := n.sessions[orderID]
 	if s == nil {
@@ -2215,10 +2233,39 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 	// Capture plain values for the worker: the session is engine-owned and
 	// must never be read off the engine goroutine (race detector).
 	dstCur, depTxID, depVout := s.dstCur, s.theirDepositTxID, s.theirDepositVout
+	// Chain-scaled patience: the conf BlockTime is mandatory
+	// for admitted coins (admit.go); an unconfigured currency
+	// passes 0 through so the helper's patient default owns it.
+	blockTime := 0
+	if cc := n.cfg().Confs[s.dstCur]; cc != nil && cc.BlockTime > 0 {
+		blockTime = cc.BlockTime
+	}
+	threshold := depositWatchVanishThreshold(blockTime)
+	// Decisive-round own probe: when this sweep can complete the
+	// countdown, also classify our own deposit in the same worker run, so
+	// a proven-spent own deposit hunts instead of cancelling. Steady
+	// rounds probe the counterparty deposit only (zero extra RPC); the
+	// own-probe needs a proven broadcast to mean anything, hence the
+	// rollbackGate (same pattern as the refund path).
+	proveSpend := s.ourDepositTxID != "" && n.rollbackGate(orderID)
+	decisiveOwnProbe := proveSpend && s.vanishMisses+1 >= threshold
+	ownConn := n.cfg().Connectors[s.srcCur]
+	ourDepTxID := s.ourDepositTxID
 	task := workTask{
 		orderID: orderID,
 		run: func() (any, error) {
-			return runDepositWatchTask(conn, dstCur, depTxID, depVout)
+			unspent, err := runDepositWatchTask(conn, dstCur, depTxID, depVout)
+			if err != nil || unspent || !decisiveOwnProbe {
+				// On error the outcome is meaningless (apply returns on
+				// err first); on unspent or steady rounds there is no
+				// own-probe to report.
+				if err != nil {
+					return depositWatchOutcome{}, err
+				}
+				return depositWatchOutcome{unspent: unspent}, nil
+			}
+			known, spent := probeOwnDeposit(ownConn, ourDepTxID, ownDepositVout)
+			return depositWatchOutcome{ownKnown: known, ownSpent: spent}, nil
 		},
 		apply: func(v any, err error) {
 			delete(n.pendingWatch, orderID)
@@ -2237,13 +2284,24 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 				xlog.Debug("deposit watch probe unavailable, skipping round", "order", orderID, "err", err)
 				return
 			}
-			if unspent, _ := v.(bool); unspent {
+			out, _ := v.(depositWatchOutcome)
+			if out.unspent {
 				if s != nil {
 					s.vanishMisses = 0
 				}
 				return
 			}
 			if s == nil {
+				return
+			}
+			// A hunting session is owned by the own-deposit watch and
+			// rescan: cancelling it would broadcast a refund that can
+			// never confirm. This mirrors the enqueue stand-down for a
+			// probe that lands after the hunt armed mid-flight (a refund
+			// task owns a separate guard and can arm between our enqueue
+			// and apply).
+			if s.secretHunt {
+				s.vanishMisses = 0
 				return
 			}
 			// Re-check the claim guards: the probe may have been enqueued
@@ -2274,32 +2332,34 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 					return
 				}
 			}
-			// Actionable missing: count it and cancel only once the
+			// Actionable missing: count it and act only once the
 			// vanish proves durable. A single missing reading is as
 			// likely a reorg or propagation lag as a genuine vanish;
 			// the countdown (chain-scaled, ~2 blocks) absorbs the
-			// transient case while a truly gone deposit still cancels
+			// transient case while a truly gone deposit still resolves
 			// within minutes.
 			s.vanishMisses++
-			// Chain-scaled patience: the conf BlockTime is mandatory
-			// for admitted coins (admit.go); an unconfigured currency
-			// passes 0 through so the helper's patient default owns it.
-			blockTime := 0
-			if cc := n.cfg().Confs[s.dstCur]; cc != nil && cc.BlockTime > 0 {
-				blockTime = cc.BlockTime
-			}
-			threshold := depositWatchVanishThreshold(blockTime)
 			if s.vanishMisses < threshold {
 				xlog.Debug("deposit watch: vanish unconfirmed, awaiting durable absence",
 					"order", orderID, "missing", s.vanishMisses, "threshold", threshold)
 				return
 			}
 			s.vanishMisses = 0
-			// Reset before the cancel attempt, not after: sendSelfCancel
-			// reports nothing, and its early returns (nil connector,
-			// sign failure) mean node-level breakage where re-attempting
-			// every K sweeps beats per-sweep error spam. Local state is
-			// untouched in both cases.
+			// Reset before acting, not after: neither branch below reports
+			// back, and the countdown must not bank credit across a hunt
+			// arming or a cancel attempt (same hygiene as the reset
+			// before sendSelfCancel).
+			// Hunt instead of cancel when our own deposit is proven spent
+			// and we are the taker: the counterparty already claimed, the
+			// secret is public on-chain, and the pre-signed refund can
+			// never confirm. Makers stay loud (a spent maker deposit
+			// without local finish contradicts the protocol); blindness
+			// or an unproven deposit preserves the cancel below — only
+			// affirmative evidence redirects recovery.
+			if out.ownKnown && out.ownSpent && !s.isMaker {
+				n.enterSecretHunt(s, orderID, s.srcCur)
+				return
+			}
 			xlog.Warn("deposit watch: counterparty deposit gone, cancelling", "order", orderID,
 				"deposit", s.theirDepositTxID, "vout", s.theirDepositVout)
 			reason := crBadADepositTx // taker watches the maker A-deposit

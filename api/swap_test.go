@@ -131,6 +131,9 @@ type fakeConnector struct {
 	// mempoolErr, when non-nil, makes it fail.
 	mempoolTxids []string
 	mempoolErr   error
+	// mempoolCalls counts GetRawMempool calls (load-contract tests: paths
+	// that must never touch the mempool assert zero).
+	mempoolCalls int
 	// blocks serves GetBlockTxs (confirmed-spend rescan tests): internal
 	// block hash -> decoded transactions. blockErr, when non-nil, makes
 	// GetBlockTxs fail (pruned-history backend tests). Unknown hashes fail
@@ -141,6 +144,9 @@ type fakeConnector struct {
 	blocks      map[[32]byte][]wallet.BlockTx
 	blockErr    error
 	blockHashes map[int64][32]byte
+	// blockTxsCalls counts GetBlockTxs calls (load-contract tests: paths
+	// that must never page blocks assert zero).
+	blockTxsCalls int
 }
 
 func (f *fakeConnector) Ticker() string { return f.ticker }
@@ -246,6 +252,9 @@ func (f *fakeConnector) GetBlockHash(height int64) ([32]byte, error) {
 // hash. Unknown hashes fail (pruned-backend behavior): the rescan holds its
 // cursor.
 func (f *fakeConnector) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error) {
+	f.mu.Lock()
+	f.blockTxsCalls++
+	f.mu.Unlock()
 	if f.blockErr != nil {
 		return nil, f.blockErr
 	}
@@ -286,6 +295,7 @@ func (f *fakeConnector) GetRawTransactionVerbose(txid string) (wallet.VerboseTx,
 func (f *fakeConnector) GetRawMempool() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.mempoolCalls++
 	if f.mempoolErr != nil {
 		return nil, f.mempoolErr
 	}

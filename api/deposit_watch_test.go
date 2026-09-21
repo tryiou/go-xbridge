@@ -416,3 +416,230 @@ func TestDepositWatchStandsDownUntilValidated(t *testing.T) {
 		t.Fatalf("order must stay live and unchanged, got %+v", got)
 	}
 }
+
+// stageOwnDeposit classifies the fixture taker's own (LTC) deposit for the
+// counterparty-vanish tests: known requires a verbose entry (the fake
+// asserts depth on serve); spent additionally requires gettxout-absence;
+// unspent additionally serves the outpoint via rawTx; blind stages neither.
+func stageOwnDeposit(ltc *fakeConnector, txid string, known, unspent bool) {
+	if known {
+		if ltc.verboseTx == nil {
+			ltc.verboseTx = map[string]wallet.VerboseTx{}
+		}
+		ltc.verboseTx[txid] = wallet.VerboseTx{Confirmations: 5}
+	}
+	if unspent {
+		unvanishDeposit(ltc, txid)
+	}
+}
+
+// TestCounterpartyVanishWithOwnSpentArmsHunt pins Commit 3's core: a taker
+// whose counterparty deposit is durably missing while its own deposit is
+// proven spent hunts the secret instead of cancelling — cancelling would
+// broadcast a refund that can never confirm. The first k-1 sweeps must
+// neither cancel nor hunt (the own-probe runs only on the decisive round);
+// the kth arms the hunt with zero packets. The load contract (no mempool
+// or block reads on this path) is pinned by call counters: any such call,
+// even a swallowed one, breaks the zero asserts at the end.
+func TestCounterpartyVanishWithOwnSpentArmsHunt(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	ltc := n.cfg().Connectors["LTC"].(*fakeConnector)
+	ownDep := strings.Repeat("dd", 32)
+	n.sessions[idHex].ourDepositTxID = ownDep
+	stageOwnDeposit(ltc, ownDep, true, false)
+	k := vanishThreshold(t)
+
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+		if n.sessions[idHex].secretHunt {
+			t.Fatalf("hunt must arm only on the decisive round, armed at missing %d/%d", i, k)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("own-spent vanish must hunt, not cancel, got %v", pkts)
+	}
+	s := n.sessions[idHex]
+	if !s.secretHunt {
+		t.Fatal("taker with spent own deposit must be hunting")
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+	for _, c := range []*fakeConnector{btc, ltc} {
+		if c.mempoolCalls != 0 || c.blockTxsCalls != 0 {
+			t.Fatalf("%s: mempool/block calls = %d/%d, want 0/0", c.ticker, c.mempoolCalls, c.blockTxsCalls)
+		}
+	}
+}
+
+// TestHuntedSessionSkipsCounterpartyWatch pins the companion stand-down: a
+// hunting session stays silent under persistent counterparty missing —
+// cancelling it would kill the hunt with an unconfirmable refund.
+func TestHuntedSessionSkipsCounterpartyWatch(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	n.sessions[idHex].secretHunt = true
+
+	for i := 0; i < vanishThreshold(t); i++ {
+		n.watchCounterpartyDeposits()
+	}
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("hunted session must stay silent, got %v", pkts)
+	}
+	if !n.sessions[idHex].secretHunt {
+		t.Fatal("hunt flag must survive the watch")
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestHuntedSessionApplySkipsLateProbe pins the apply-time hunt stand-down
+// for the mid-flight landing: a probe enqueued pre-hunt that applies after
+// the hunt armed must not count or cancel. Driven via postDepositWatchTask
+// directly (bypassing the enqueue stand-down) with the own deposit staged
+// blind, so the decisive round's own-probe cannot prove spent (which would
+// take the hunt branch and mask the new check) — only the apply-time hunt
+// check can silence it.
+func TestHuntedSessionApplySkipsLateProbe(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	s := n.sessions[idHex]
+	s.secretHunt = true
+	s.ourDepositTxID = strings.Repeat("dd", 32)
+
+	for i := 0; i < vanishThreshold(t); i++ {
+		n.postDepositWatchTask(idHex)
+	}
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("late probe on hunted session must stay silent, got %v", pkts)
+	}
+	if !s.secretHunt {
+		t.Fatal("hunt flag must survive the late probe")
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestCounterpartyVanishMakerOwnSpentStaysLoud pins the maker branch: a
+// spent maker deposit without local finish contradicts the protocol (the
+// taker can only spend after our claim, which finishes us), so the watch
+// cancels exactly as before and never hunts. Built on the taker fixture
+// with the role flipped: only the role-gated branch is under test, so the
+// mismatched currencies are documented, not hidden.
+func TestCounterpartyVanishMakerOwnSpentStaysLoud(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	s := n.sessions[idHex]
+	s.isMaker = true
+	s.state = csCreatedA
+	ltc := n.cfg().Connectors["LTC"].(*fakeConnector)
+	ownDep := strings.Repeat("dd", 32)
+	s.ourDepositTxID = ownDep
+	stageOwnDeposit(ltc, ownDep, true, false)
+	k := vanishThreshold(t)
+
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("maker own-spent vanish must cancel once, got %v", pkts)
+	}
+	var cb proto.CancelBody
+	if err := cb.Unmarshal(pkts[0].Body); err != nil {
+		t.Fatalf("Cancel body decode: %v", err)
+	}
+	if cb.Reason != uint32(crBadBDepositTx) {
+		t.Fatalf("cancel reason = %d, want crBadBDepositTx (%d)", cb.Reason, crBadBDepositTx)
+	}
+	// The cancel prunes the session after the refund broadcast; the
+	// retained pointer still proves no hunt was armed along the way.
+	if s.secretHunt {
+		t.Fatal("maker must never hunt")
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
+
+// TestCounterpartyVanishOwnUnspentCancels pins the genuine-vanish path: an
+// own deposit still unspent means nobody claimed, so the durable
+// counterparty vanish cancels exactly as before, with no hunt.
+func TestCounterpartyVanishOwnUnspentCancels(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	ltc := n.cfg().Connectors["LTC"].(*fakeConnector)
+	ownDep := strings.Repeat("dd", 32)
+	s := n.sessions[idHex]
+	s.ourDepositTxID = ownDep
+	stageOwnDeposit(ltc, ownDep, true, true)
+	k := vanishThreshold(t)
+
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("genuine vanish must cancel once, got %v", pkts)
+	}
+	// The cancel prunes the session after the refund broadcast; the
+	// retained pointer still proves no hunt was armed along the way.
+	if s.secretHunt {
+		t.Fatal("genuine vanish must not hunt")
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
+
+// TestCounterpartyVanishOwnBlindCancels pins the no-proof direction: a
+// blind own-deposit probe proves nothing, so the durable counterparty
+// vanish cancels exactly as before, with no hunt.
+func TestCounterpartyVanishOwnBlindCancels(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	s := n.sessions[idHex]
+	s.ourDepositTxID = strings.Repeat("dd", 32)
+	k := vanishThreshold(t)
+
+	for i := 1; i < k; i++ {
+		n.watchCounterpartyDeposits()
+		if pkts := cc.snapshot(); len(pkts) != 0 {
+			t.Fatalf("missing %d/%d must not cancel yet, got %v", i, k, pkts)
+		}
+	}
+	n.watchCounterpartyDeposits()
+	pkts := cc.snapshot()
+	if len(pkts) != 1 || pkts[0].Command != proto.XbcTransactionCancel {
+		t.Fatalf("blind own-probe vanish must cancel once, got %v", pkts)
+	}
+	// The cancel prunes the session after the refund broadcast; the
+	// retained pointer still proves no hunt was armed along the way.
+	if s.secretHunt {
+		t.Fatal("blind own-probe must not hunt")
+	}
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back", got.Status)
+	}
+}
