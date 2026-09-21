@@ -2094,7 +2094,15 @@ func (n *Node) watchCounterpartyDeposits() {
 		if s.theirDepositTxID == "" || s.await {
 			continue
 		}
-		// Watch only the pre-claim window: once we claimed, the deposit is
+		// A built claim owns the session now: the counterparty deposit
+		// reading missing is our own claim spend, never a vanish — the
+		// apply-time guard below would skip it, so do not enqueue the
+		// wasted probe either (same stand-down as the stall watchdog).
+		if s.claimHex != "" || s.claimTxID != "" {
+			continue
+		}
+		// Watch only the pre-claim window (claim material above, plus the
+		// confirmed state below): once we claimed, the deposit is
 		// legitimately spent by our own payTx (CounterpartyRedeemed / the
 		// confirmed state records it).
 		if s.isMaker {
@@ -2178,6 +2186,29 @@ func (n *Node) postDepositWatchTask(orderID string) bool {
 			s := n.sessions[orderID]
 			if s == nil {
 				return
+			}
+			// Re-check the claim guards: the probe may have been enqueued
+			// before a claim was built or broadcast, or a cancel may have
+			// raced it. Cancelling a session with a claim in flight
+			// (await/claim material) or already redeemed
+			// (CounterpartyRedeemed/terminal/confirmed state) would kill
+			// a live claim or spam a spurious Cancel for a finished swap —
+			// so the enqueue-time guards are re-checked here to cover the
+			// in-flight window.
+			if s.await || s.claimHex != "" || s.claimTxID != "" {
+				return
+			}
+			if s.isMaker {
+				if s.state < csCreatedA || s.state >= csConfirmedA {
+					return
+				}
+			} else if s.state < csCreatedB || s.state >= csConfirmedB {
+				return
+			}
+			if n.store != nil {
+				if o := n.store.Get(orderID); o != nil && (isOrderTerminal(o.Status) || o.CounterpartyRedeemed) {
+					return
+				}
 			}
 			xlog.Warn("deposit watch: counterparty deposit gone, cancelling", "order", orderID,
 				"deposit", s.theirDepositTxID, "vout", s.theirDepositVout)

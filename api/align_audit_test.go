@@ -311,6 +311,116 @@ func TestDepositWatchSkipsTransientErrors(t *testing.T) {
 	}
 }
 
+// TestDepositWatchApplySkipsClaimInFlight pins the late-landing apply: a
+// probe enqueued before the claim build that lands after claimHex exists
+// must not wire-cancel a claimable session.
+func TestDepositWatchApplySkipsClaimInFlight(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	// Simulate the claim built while the probe was in flight: the
+	// counterparty deposit reads missing because our own claim spent it.
+	s := n.sessions[idHex]
+	s.claimHex = "deadbeefclaim"
+	s.claimTxID = strings.Repeat("dd", 32)
+	s.claimCur = "BTC"
+
+	n.postDepositWatchTask(idHex)
+
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("claim-in-flight session must produce no packets, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestDepositWatchApplySkipsAfterBroadcast pins the post-broadcast landing:
+// a probe that lands after the claim broadcast (CounterpartyRedeemed
+// recorded) must not emit a spurious wire Cancel, even though the local
+// cancel handler would ignore it.
+func TestDepositWatchApplySkipsAfterBroadcast(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	// Simulate the claim broadcast racing the probe: redemption recorded on
+	// the order while the GetTxOut probe was in flight.
+	if !n.store.Update(idHex, func(o *Order) { o.CounterpartyRedeemed = true }) {
+		t.Fatal("store update failed")
+	}
+
+	n.postDepositWatchTask(idHex)
+
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("post-broadcast session must produce no packets, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestDepositWatchApplySkipsWhileAwait pins the build-in-flight landing: a
+// probe that lands while a deposit/claim task holds await must not cancel.
+func TestDepositWatchApplySkipsWhileAwait(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	n.sessions[idHex].holdAwait()
+
+	n.postDepositWatchTask(idHex)
+
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("await-held session must produce no packets, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestDepositWatchEnqueueSkipsClaimBuilt pins the enqueue half of the
+// claim stand-down: a session with claim material never enqueues a probe,
+// so no wasted gettxout fires while the claim awaits broadcast.
+func TestDepositWatchEnqueueSkipsClaimBuilt(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+	s := n.sessions[idHex]
+	s.claimHex = "deadbeefclaim"
+	s.claimTxID = strings.Repeat("dd", 32)
+	s.claimCur = "BTC"
+
+	n.watchCounterpartyDeposits()
+
+	if pkts := cc.snapshot(); len(pkts) != 0 {
+		t.Fatalf("claim-built session must enqueue no probe and produce no packets, got %v", pkts)
+	}
+	if got := n.store.Get(idHex); got.Status != "created" {
+		t.Fatalf("order status = %q, want unchanged created", got.Status)
+	}
+}
+
+// TestDepositWatchNoRecancelAfterRollback pins the success path: after a
+// watch-driven cancel whose refund broadcast succeeds, the session is
+// pruned (it stops being swept), so a second sweep emits no duplicate wire
+// Cancel. It does not cover refund-pending/failure windows, where the
+// session stays live by design (separate triage).
+func TestDepositWatchNoRecancelAfterRollback(t *testing.T) {
+	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Amount: 5e8},
+		changeAddr: addrFor(0, "c"), blockHeight: 1000, rawTx: map[string]string{}}
+	n, cc, idHex := watchTakerFixture(t, btc)
+
+	n.watchCounterpartyDeposits()
+	if got := n.store.Get(idHex); got.Status != "rolled back" {
+		t.Fatalf("order status = %q, want rolled back after first sweep", got.Status)
+	}
+
+	n.watchCounterpartyDeposits()
+
+	if pkts := cc.snapshot(); len(pkts) != 1 {
+		t.Fatalf("second sweep must not re-cancel, want exactly 1 Cancel total, got %v", pkts)
+	}
+}
+
 // TestBuildDepositFailsClosedOnLocktimeZero pins the C++ lockTime==0 cancel
 // guard (xbridgesession.cpp:2037-2043): no zero-lockTime (immediately
 // refundable) HTLC may be built.
