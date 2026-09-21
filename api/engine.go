@@ -34,6 +34,16 @@ const engineWorkers = 4
 // In discovery mode the PeerManager enforces its own per-peer penalties instead.
 const hubBanThreshold = 100
 
+// retryCheckInterval re-evaluates due claim/deposit rebuilds (swap_retry.go).
+// The retry sweeps are due-gated — a session whose retryAt is zero or in the
+// future is skipped with zero wallet RPC and zero writes — so checking them
+// more often than the 60 s fund-safety tick cannot add a single backend call:
+// attempts still fire exactly when the backoff allows, just without up to a
+// tick of quantization lag (live-proven ~174 s across four swaps). Recovery
+// only: termination order and the tick contract are untouched. Var (not const)
+// for test pacing, mirroring walletSweepInterval.
+var retryCheckInterval = 5 * time.Second
+
 // inboundPacket is a raw P2P packet plus the reader-computed values that
 // replace re-verifying on the engine goroutine.
 type inboundPacket struct {
@@ -264,6 +274,8 @@ func (n *Node) engineLoop() {
 	defer t.Stop()
 	te := time.NewTicker(expirySweepInterval)
 	defer te.Stop()
+	tr := time.NewTicker(retryCheckInterval)
+	defer tr.Stop()
 	for {
 		// Priority: a worker result already queued at iteration start is applied
 		// before any packet or ticker is judged, so a session's await guard is
@@ -305,6 +317,15 @@ func (n *Node) engineLoop() {
 			// survive the 6-min PendingTTL (C++ checkAndRelayPendingOrders,
 			// xbridgeapp.cpp:3241, every 240 s).
 			n.safeRun(func() { n.rebroadcastOpenOrders() })
+		case <-tr.C:
+			// Due-retry re-evaluation (claim before deposit, mirroring the
+			// tickStages relative order): fires rebuilds whose backoff has
+			// elapsed without waiting for the 60 s tick. Due-gated — nothing
+			// due means zero RPC — so this fast lane can never double-fire
+			// with the tick: firing consumes retryAt, the later evaluation
+			// finds nothing due and skips.
+			n.safeRun(func() { n.retryFailedClaimBuilds(NowMicro()) })
+			n.safeRun(func() { n.retryFailedDepositBuilds(NowMicro()) })
 		case <-n.stop:
 			return
 		}
