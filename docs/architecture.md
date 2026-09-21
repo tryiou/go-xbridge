@@ -468,6 +468,32 @@ external tooling outside this repo.
 - Run `gofmt` before committing; keep logic / style / refactor in separate
   commits.
 
+### Test file naming
+
+- **1:1 unit:** `<prod>.go` → `<prod>_test.go`, same internal package
+  (e.g. `store_test.go`, `deposit_test.go`). All unit tests stay internal —
+  the engine's unexported `submit`/`processSwap` paths cannot be driven
+  externally. The sole external `_test` package is `conformance/`
+  (also the sole build-tagged suite).
+- **Behavioral (spans N prod files):** `<domain>_<scenario>_test.go` with
+  `<domain>` ∈ `swap|order|rebroadcast|reconcile|persist|hub|deposit_watch|
+  `stall|engine|cxx_parity|locktime|partial` (e.g. `deposit_watch_test.go`,
+  `rebroadcast_test.go`, `swap_state_guards_test.go`,
+  `cxx_parity_pins_test.go`, `partial_order_test.go`). Never name a file
+  after audit provenance (`align_*`, `divergence_*`, `fundsafety_*`,
+  `confirm_parity_*`) — describe the behavior it pins.
+- **Vectors/goldens:** `*_kat_test.go` / `parity_*_test.go` only when asserting
+  against a C++/BIP/external oracle (python-hashlib, bitcoin-abc vectors,
+  live captures frozen as hex goldens). A test that calls the function under
+  test to compute its own expectation is a tautology, not a KAT — rebuild the
+  expectation from the spec (stdlib only) or check in an external golden.
+- **Shared fixtures:** `api/testsupport_test.go` holds cross-cutting helpers
+  (`testTxID`, `pollUntil`, `requireErrCode`, alignment confs); per-file
+  `fakeConnector`/`stubConn` clones are banned — extend the canonical stub in
+  place. `cmd/liveprobe` stays untested by design (live-network probe);
+  `BootstrapAddrs` (live DNS) likewise — pin the pure tables (`SeedList`,
+  `defaultPort`) instead.
+
 ## Status & open items
 
 Long-standing open work:

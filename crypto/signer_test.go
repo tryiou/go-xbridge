@@ -192,49 +192,65 @@ func hexPubkey(pub []byte) string {
 	return hex.EncodeToString(pub)
 }
 
-// TestSignDeterministicKAT pins the signing output for a known key + digest.
-// The C++ XBridge wire relies on two implementations agreeing byte-for-byte on
-// a signature; that agreement is only possible because both use RFC6979
-// deterministic ECDSA. We cannot fetch an external C++ vector from this sandbox,
-// so this test pins the property that matters for interop: the same key and
-// same digest always produce the identical 64-byte compact signature (a
-// tampered/flaky signer would diverge and fail here). TODO: validate this exact
-// signature against a live C++ node (e.g. the reachable
-// coreproxy.airdns.org:42111 XBridge hub) as the one remaining live
+// TestSignDeterministicKAT pins the signing output for a known key, digest,
+// and packet timestamp. The C++ XBridge wire relies on two implementations
+// agreeing byte-for-byte on a signature; that agreement is only possible
+// because both use RFC6979 deterministic ECDSA. The timestamp is pinned
+// because NewPacket stamps wall-clock time into the signed digest — without
+// the pin no cross-run golden is possible (and the old test could only assert
+// in-run equality, i.e. call prod twice). The golden below is stable across
+// runs and processes; it is cross-checked two independent ways: it verifies
+// via Verify (the btcec ecdsa-verify path, not the signing path), and a FRESH
+// signer instance must produce the identical bytes (catching hidden
+// global-state nondeterminism). The embedded pubkey is the secp256k1
+// generator point for private key 1 (0279be66…, independently well-known).
+// TODO: validate this exact signature against a live C++ node (e.g. the
+// reachable coreproxy.airdns.org:42111 XBridge hub) as the one remaining live
 // cross-check.
 func TestSignDeterministicKAT(t *testing.T) {
-	signer := NewBtcSigner()
-
-	// Fixed private key ("1") and a fixed digest.
+	// Fixed private key ("1"), fixed digest, fixed timestamp.
 	priv := make([]byte, 32)
 	priv[31] = 1
 	var digest [32]byte
 	copy(digest[:], []byte("0123456789abcdef0123456789abcdef")) // ascii digest, fixed
 
-	p1 := proto.NewPacket(proto.XbcTransaction, digest[:])
-	p2 := proto.NewPacket(proto.XbcTransaction, digest[:])
-	if err := signer.Sign(p1, priv); err != nil {
-		t.Fatalf("sign 1: %v", err)
-	}
-	if err := signer.Sign(p2, priv); err != nil {
-		t.Fatalf("sign 2: %v", err)
+	const wantSig = "d1a02f3e924605560787dbe1d9f1b031a9e6ee1f8b23e40477ce8d51a5bf96767e091855e8ac36e7997a69acf93593a32d15c38e79546a4fae8100aa62e7291a"
+	const wantPub = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
+	sign := func(signer *BtcSigner) *proto.Packet {
+		p := proto.NewPacket(proto.XbcTransaction, digest[:])
+		p.Timestamp = 1700000000
+		if err := signer.Sign(p, priv); err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return p
 	}
 
-	// Identical key+digest must yield identical 64-byte compact signatures.
-	if p1.Signature != p2.Signature {
-		t.Fatalf("signature not deterministic:\n  sig1=%x\n  sig2=%x", p1.Signature, p2.Signature)
+	p1 := sign(NewBtcSigner())
+	// Identical key+digest+timestamp must yield the pinned 64-byte compact
+	// signature over the generator-point pubkey.
+	if got := hex.EncodeToString(p1.Signature[:]); got != wantSig {
+		t.Fatalf("signature mismatch:\n  got =%s\n  want=%s", got, wantSig)
+	}
+	if got := hex.EncodeToString(p1.Pubkey[:]); got != wantPub {
+		t.Fatalf("pubkey = %s, want generator point %s", got, wantPub)
 	}
 	var zero [64]byte
 	if p1.Signature == zero {
 		t.Fatal("signature is all zeros")
 	}
+	// A fresh signer instance must agree byte-for-byte (no hidden state).
+	if p2 := sign(NewBtcSigner()); p2.Signature != p1.Signature {
+		t.Fatalf("fresh signer diverged:\n  sig1=%x\n  sig2=%x", p1.Signature, p2.Signature)
+	}
 
-	// And the deterministic signature must verify against the published pubkey.
-	ok, err := signer.Verify(p1)
+	// And the pinned signature must verify against the published pubkey via
+	// the independent verify path.
+	ok, err := NewBtcSigner().Verify(p1)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	if !ok {
-		t.Fatal("deterministic signature failed verification")
+		t.Fatal("pinned signature failed verification")
 	}
 }

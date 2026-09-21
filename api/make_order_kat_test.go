@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -43,6 +45,27 @@ func TestMakeOrderDeterministicID(t *testing.T) {
 	if o.ID != wantID {
 		t.Fatalf("order id = %x, want deterministic %x", o.ID, wantID)
 	}
+	// Independent wiring check: rebuild the id preimage with stdlib only
+	// (CompactSize varstr per the Bitcoin consensus encoding, little-endian
+	// u64s, double-SHA256) from the order's OBSERVED fields. TestSha256dOrderID
+	// already pins this layout against a python-hashlib golden, so a match
+	// here proves MakeOrder hashes the fields it stores — the same-function
+	// recompute above alone could not catch a wiring swap (e.g. hashing the
+	// pre-take amounts while storing post-take ones).
+	var pre []byte
+	pre = appendSpecVarStr(pre, fromID[:])
+	pre = appendSpecVarStr(pre, []byte("BTC"))
+	pre = binary.LittleEndian.AppendUint64(pre, 1500000)
+	pre = appendSpecVarStr(pre, toID[:])
+	pre = appendSpecVarStr(pre, []byte("SYS"))
+	pre = binary.LittleEndian.AppendUint64(pre, 300000)
+	pre = binary.LittleEndian.AppendUint64(pre, o.Created)
+	pre = append(pre, o.BlockHash[:]...)
+	pre = appendSpecVarStr(pre, o.Utxos[0].Signature[:])
+	h1 := sha256.Sum256(pre)
+	if want := sha256.Sum256(h1[:]); o.ID != want {
+		t.Fatalf("order id = %x, want spec-preimage hash %x", o.ID, want)
+	}
 	if o.Status != "open" {
 		t.Fatalf("status = %q, want open (trPending)", o.Status)
 	}
@@ -55,6 +78,23 @@ func TestMakeOrderDeterministicID(t *testing.T) {
 	if n.store.Get(hexEncode(o.ID[:])) != nil {
 		t.Fatal("dry-run must not add the order to the store")
 	}
+}
+
+// appendSpecVarStr appends a CompactSize-prefixed byte string per the Bitcoin
+// consensus encoding (independent spec, not via p2p.MarshalVarStr): single
+// byte for len < 0xfd, 0xfd+u16le below 0x10000, else 0xfe+u32le. The layout
+// it produces is cross-checked by TestSha256dOrderID's external golden.
+func appendSpecVarStr(b, s []byte) []byte {
+	n := len(s)
+	switch {
+	case n < 0xfd:
+		b = append(b, byte(n))
+	case n < 0x10000:
+		b = append(b, 0xfd, byte(n), byte(n>>8))
+	default:
+		b = append(b, 0xfe, byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+	}
+	return append(b, s...)
 }
 
 // TestMakeOrderAutoSplitPrepTx drives a non-dry autoSplit partial make (2.5 BTC

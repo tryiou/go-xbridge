@@ -144,19 +144,14 @@ func TestPersistCoalescesBurst(t *testing.T) {
 	persist()
 
 	unblock()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	// Exemplar pollUntil use: the condition (two writes landed) drives
+	// readiness with a fixed 2s budget, instead of a hand-rolled
+	// sleep/deadline loop.
+	pollUntil(t, 2*time.Second, 2*time.Millisecond, func() bool {
 		mu.Lock()
-		w := writes
-		mu.Unlock()
-		if w >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("write count = %d, want 2 (A + C; B coalesced)", w)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+		defer mu.Unlock()
+		return writes >= 2
+	}, "write count < 2 (want A + C; B coalesced)")
 	mu.Lock()
 	w := writes
 	mu.Unlock()

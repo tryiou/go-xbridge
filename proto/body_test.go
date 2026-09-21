@@ -372,43 +372,20 @@ func TestCancelRejectExact36(t *testing.T) {
 	}
 }
 
-// liveOrderPacket is the same real xbridge P2P payload captured from a live
-// Blocknet 4.4.1 node (coreproxy.airdns.org:42111) as in p2p/envelope_test.go,
-// here used to validate the xbcTransaction body decode end-to-end against the
-// real wire (command=3, size=279).
-const liveOrderPacket = "fdb4016894ff47163a031d3ac8bfce10dfa3fbe290a48a4d27edd3985606003700000003000000faa8566a780100001701000002c6d68e9a98bf4bc54ee9fa11429bde598d7aae4cb2b94fe99b534addcd31ceb7d265f986f41bed10f44a5d1cabb55481dcfb23a69eebc44118ec12c2f51a855b0a05905ecb036dc013993e447a3572d634fbd13c8aaab697668647cccd5c391e0000000000000000000000001e380c064ef996a30c44913c779be71b7121e6e9e5c28f2a06af3add363e1e91d8cf2f4e12873469a75d71c74778f3935c2d53b2444f474500000000115e1700000000001a11b75482580340dc4cc6bd349553e7767e1f94424c4f434b00000021d77501000000001c7238c59856060030bdbd7fe31bba634ebe9a567d79de601047d7f2cfbf81b43760d7f507e8c58300000000000000000000010000001c569806f0bd7a450eb49fbf6dcf5a0f3c3182a74978701f0204d1e948da798e02000000d8cf2f4e12873469a75d71c74778f3935c2d53b22076244bfe101207df00bb14ea647ea319599b0690014e6eb909cb6203190a5e2e2d82e48083df1e395c95f989741227452ebdcb0f1641d8ce9594031a69e1472b"
-
-// stripEnvelope mirrors p2p.DecodeXBridgePayload's envelope removal without
-// importing p2p (which would create an import cycle).
-func stripEnvelope(t *testing.T, rawHex string) []byte {
-	t.Helper()
-	raw, err := hex.DecodeString(rawHex)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	// CompactSize varint.
-	var n, off int
-	switch raw[0] {
-	case 0xfd:
-		n = int(raw[1]) | int(raw[2])<<8
-		off = 3
-	case 0xfe:
-		n = int(raw[1]) | int(raw[2])<<8 | int(raw[3])<<16 | int(raw[4])<<24
-		off = 5
-	default:
-		n = int(raw[0])
-		off = 1
-	}
-	start := off + 28 // skip 28-byte transport envelope
-	end := off + n    // n covers envelope + packet
-	if end > len(raw) {
-		t.Fatalf("envelope length %d exceeds payload %d", n, len(raw)-start)
-	}
-	return raw[start:end]
-}
+// liveOrderBody is a real xbridge packet captured from a live Blocknet 4.4.1
+// node (coreproxy.airdns.org:42111; same capture as p2p/envelope_test.go),
+// with the transport envelope (CompactSize length + 28 bytes) already removed
+// and frozen as a golden (command=3, size=279). Frozen bytes — not a runtime
+// re-implementation of p2p.DecodeXBridgePayload, which this package cannot
+// import without a cycle. p2p/envelope_test.go covers the envelope removal
+// itself against the same capture.
+const liveOrderBody = "3700000003000000faa8566a780100001701000002c6d68e9a98bf4bc54ee9fa11429bde598d7aae4cb2b94fe99b534addcd31ceb7d265f986f41bed10f44a5d1cabb55481dcfb23a69eebc44118ec12c2f51a855b0a05905ecb036dc013993e447a3572d634fbd13c8aaab697668647cccd5c391e0000000000000000000000001e380c064ef996a30c44913c779be71b7121e6e9e5c28f2a06af3add363e1e91d8cf2f4e12873469a75d71c74778f3935c2d53b2444f474500000000115e1700000000001a11b75482580340dc4cc6bd349553e7767e1f94424c4f434b00000021d77501000000001c7238c59856060030bdbd7fe31bba634ebe9a567d79de601047d7f2cfbf81b43760d7f507e8c58300000000000000000000010000001c569806f0bd7a450eb49fbf6dcf5a0f3c3182a74978701f0204d1e948da798e02000000d8cf2f4e12873469a75d71c74778f3935c2d53b22076244bfe101207df00bb14ea647ea319599b0690014e6eb909cb6203190a5e2e2d82e48083df1e395c95f989741227452ebdcb0f1641d8ce9594031a69e1472b"
 
 func TestLiveOrderBodyDecode(t *testing.T) {
-	pktBytes := stripEnvelope(t, liveOrderPacket)
+	pktBytes, err := hex.DecodeString(liveOrderBody)
+	if err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
 	p, err := Unmarshal(pktBytes)
 	if err != nil {
 		t.Fatalf("Unmarshal: %v", err)

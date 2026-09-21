@@ -48,16 +48,17 @@ func validReg(t *testing.T, pub [33]byte, priv [32]byte) ServiceNode {
 	return sn
 }
 
-// signRegistration signs sn's CreateSigHash with priv, mirroring
-// ServiceNode::sign (servicenode.h:376-380).
+// signRegistration signs sn via the production SignRegistration
+// (servicenode.h:376-380) and returns the signature. Delegating — not
+// re-implementing the hash+sign sequence — keeps this helper from drifting
+// from prod and covers SignRegistration on every call.
 func signRegistration(t *testing.T, sn ServiceNode, priv [32]byte) []byte {
 	t.Helper()
-	hash := crypto.DoubleSHA256(serializeSigHashFields(sn))
-	sig, err := crypto.SignCompact(priv[:], hash[:])
+	signed, err := SignRegistration(sn, priv[:])
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sig
+	return signed.Signature
 }
 
 // embeddedRegistrationBytes serializes the embedded ServiceNode of a ping

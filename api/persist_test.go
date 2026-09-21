@@ -853,3 +853,55 @@ func TestNoteSnapshotCountPinsTheGate(t *testing.T) {
 		t.Fatalf("increase not tracked: %d", n.lastSwapCount.Load())
 	}
 }
+
+// TestClaimIntentPersistRoundTrip pins the crash-safe claim intent: the built
+// claim (hex/id/chain) plus the validated deposit out-params survive a
+// save/load cycle, so a post-build crash resumes the broadcast.
+func TestClaimIntentPersistRoundTrip(t *testing.T) {
+	alignInitCoins(t)
+	n := newTestNode(t, alignConfs(), nil)
+
+	var id [32]byte
+	oid := hash20("align-claim-persist")
+	copy(id[:], oid[:])
+	var secret [33]byte
+	for i := range secret {
+		secret[i] = byte(i + 7)
+	}
+	s := &SwapSession{
+		n: n, isMaker: true, id: id,
+		srcCur: "BTC", dstCur: "LTC", srcAmt: 2.5e6, dstAmt: 2e6,
+		state:  csConfirmedA,
+		secret: secret, secretHash: coins.KeyID(secret[:]),
+		ourLockTime: 1100, ourDepositTxID: strings.Repeat("cd", 32),
+		refundHex: "0300", refundDone: false,
+		theirDepositTxID: strings.Repeat("ab", 32), theirLockTime: 1050,
+		theirDepositVout: 2, theirP2SHNative: 200045200, theirOverpayment: 11,
+		claimHex: "0400", claimTxID: strings.Repeat("ef", 32), claimCur: "LTC",
+	}
+	o := &Order{ID: id, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6,
+		ToAmount: 2e6, Status: "created", Mine: true,
+		// Phase-1 ordering: the order's OBinTx* copy is only updated at
+		// broadcast, so it is still zero here while the session already
+		// holds the validated out-params. Restore must use the session
+		// copy, not the stale order copy.
+		OOverpayment: 0}
+	n.store.Add(o)
+
+	n2 := newTestNode(t, alignConfs(), nil)
+	n2.restoreSwap(persistFromSession(s, o))
+	rs := n2.sessions[hexEncode(id[:])]
+	if rs == nil {
+		t.Fatal("restored session missing")
+	}
+	if rs.claimHex != "0400" || rs.claimTxID != strings.Repeat("ef", 32) || rs.claimCur != "LTC" {
+		t.Fatalf("claim intent lost: %+v", rs)
+	}
+	if rs.theirDepositVout != 2 || rs.theirP2SHNative != 200045200 || rs.theirOverpayment != 11 {
+		t.Fatalf("validated out-params lost: vout=%d p2sh=%d over=%d",
+			rs.theirDepositVout, rs.theirP2SHNative, rs.theirOverpayment)
+	}
+	if rs.secret != secret {
+		t.Fatal("secret lost across restore")
+	}
+}

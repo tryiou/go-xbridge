@@ -411,3 +411,44 @@ func TestSilentHubExpiryFixedAtFirstSight(t *testing.T) {
 		t.Fatalf("expiry slid to %d, want fixed %d", kept, first)
 	}
 }
+
+// TestVerifyHubPacketGraceAfterHold pins the mid-swap registry grace: once the
+// handshake is underway the pinned hub key alone authenticates (C++ re-checks
+// getSn only at intake, xbridgesession.cpp:1384), so a lapsed registration
+// cannot abort an in-flight trade.
+func TestVerifyHubPacketGraceAfterHold(t *testing.T) {
+	alignInitCoins(t)
+	n := newTestNode(t, alignConfs(), nil)
+
+	hubPriv, hubPub := newKey(t)
+	var hubKey [33]byte
+	copy(hubKey[:], hubPub)
+	s := &SwapSession{n: n, hubKey: hubKey, state: csHoldApplied}
+
+	var hub [20]byte
+	pkt := proto.NewPacket(proto.XbcTransactionHold,
+		(&proto.HoldBody{HubAddress: hub, FromAmount: 1, ToAmount: 1}).Marshal())
+	if err := n.signer.Sign(pkt, hubPriv); err != nil {
+		t.Fatal(err)
+	}
+	if !n.verifyHubPacket(pkt, s) {
+		t.Fatal("in-flight session with valid hub sig must verify despite empty registry")
+	}
+	s.state = csMaker
+	if n.verifyHubPacket(pkt, s) {
+		t.Fatal("pre-handshake session must require registry membership")
+	}
+	otherPriv, _ := newKey(t)
+	bad := proto.NewPacket(proto.XbcTransactionHold,
+		(&proto.HoldBody{HubAddress: hub, FromAmount: 1, ToAmount: 1}).Marshal())
+	if err := n.signer.Sign(bad, otherPriv); err != nil {
+		t.Fatal(err)
+	}
+	s.state = csHoldApplied
+	if n.verifyHubPacket(bad, s) {
+		t.Fatal("packet from a non-hub key must never verify")
+	}
+	if _, err := crypto.NewBtcSigner().Verify(pkt); err != nil {
+		t.Fatalf("test packet itself must verify: %v", err)
+	}
+}

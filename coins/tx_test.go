@@ -145,10 +145,12 @@ func TestKeyID(t *testing.T) {
 	if len(id) != 20 {
 		t.Fatalf("KeyID len = %d, want 20", len(id))
 	}
-	// Recompute independently.
-	exp := KeyID(genPub)
-	if id != exp {
-		t.Error("KeyID not deterministic")
+	// Independent oracle: HASH160 of the secp256k1 generator point, verified
+	// with python hashlib (sha256+ripemd160) outside this repo. This is the
+	// well-known identifier behind Bitcoin address 1BgGZ9tcN4rm9KBzDn7KprQzEPM8nQ265c.
+	const want = "751e76e8199196d454941c45d1b3a323f1433bd6"
+	if got := hex.EncodeToString(id[:]); got != want {
+		t.Errorf("KeyID(genPub) = %s, want %s", got, want)
 	}
 }
 
