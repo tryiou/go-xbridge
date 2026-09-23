@@ -43,24 +43,36 @@ var huntWarnDedup = xlog.NewDedupe(time.Hour, func(order string, total int, elap
 	xlog.Warn("secret hunt ongoing suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
 })
 
+// summarizeCancelLookup emits the collapsed "cancel for an order we do not
+// track" summary to the packet log: every counted event failed lookup, so by
+// construction none concerns an owned order.
+func summarizeCancelLookup(order string, total int, elapsed time.Duration) {
+	xlog.With("p2p", true).Debug("cancel: order lookup failures suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+}
+
 // cancelDedup collapses repeated "cancel for an order we do not track"
 // events. The same order cancel is rebroadcast by every peer that relays it, so
 // without collapsing a single order would emit one line per peer. The first
 // sighting per order is logged; repeats are suppressed and flushed as a
 // periodic summary so the underlying condition (orders we never held being
 // cancelled network-wide) stays visible without the per-peer spam.
-var cancelDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
-	xlog.Debug("cancel: order lookup failures suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
-})
+var cancelDedup = xlog.NewDedupe(60*time.Second, summarizeCancelLookup)
+
+// summarizeCancelBadSig emits the collapsed bad-signature summary to the
+// packet log. Forged cancels against OWNED orders bypass dedup entirely at
+// the call site (every occurrence stays in the main log as attack
+// visibility), so this summary only ever aggregates foreign repeats.
+func summarizeCancelBadSig(order string, total int, elapsed time.Duration) {
+	xlog.With("p2p", true).Info("cancel: bad packet signature suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
+}
 
 // cancelBadSigDedup collapses repeated "bad packet signature" cancel rejections.
 // The same malformed cancel is rebroadcast by every relaying servicenode, so a
 // single bad order would emit one line per peer. The first sighting (per order)
 // is logged; repeats are summarized periodically so the anomaly stays visible
 // without spamming. Keyed on the order id, never on any specific currency.
-var cancelBadSigDedup = xlog.NewDedupe(60*time.Second, func(order string, total int, elapsed time.Duration) {
-	xlog.Info("cancel: bad packet signature suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
-})
+// Owned orders bypass it at the call site (every forged cancel stays in main).
+var cancelBadSigDedup = xlog.NewDedupe(60*time.Second, summarizeCancelBadSig)
 
 // unknownSwapDedup collapses repeated "swap packet for unknown order" DEBUG lines.
 // A swap handshake for an order we are not a party to is relayed by every servicenode
@@ -71,14 +83,38 @@ var unknownSwapDedup = xlog.NewDedupe(60*time.Second, func(order string, total i
 	xlog.Debug("swap packet for unknown order suppressed", "order", order[:16], "count", total, "over", elapsed.Round(time.Second).String())
 })
 
+// summarizeCancelNoConnector emits the collapsed no-connector summary to
+// the packet log. Our own orders always have a connector (make/take requires
+// one), and their first-sighting line routes by o.Mine at the call site, so
+// this summary only ever aggregates foreign storms.
+func summarizeCancelNoConnector(currency string, total int, elapsed time.Duration) {
+	xlog.With("p2p", true).Warn("cancel: no connector suppressed", "currency", currency, "count", total, "over", elapsed.Round(time.Second).String())
+}
+
 // cancelNoConnectorDedup collapses repeated "no connector for currency" cancels.
 // Every order whose from-currency has no configured connector emits one line; the
 // currency (whatever it is, taken from the order at runtime) is the dedup key, so
 // distinct missing currencies are reported separately while a single missing
-// currency storm is summarized. No coin is hardcoded.
-var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, func(currency string, total int, elapsed time.Duration) {
-	xlog.Warn("cancel: no connector suppressed", "currency", currency, "count", total, "over", elapsed.Round(time.Second).String())
-})
+// currency storm is summarized. No coin is hardcoded. Owned orders bypass it
+// at the call site (every occurrence stays in main).
+var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, summarizeCancelNoConnector)
+
+// gossipLogger routes high-volume third-party cancel chatter (unknown
+// orders, foreign book orders: lookup failures, bad signatures, unserved
+// coins, pre-deposit counterparty requests) to the packet log (log-p2p, via
+// the "p2p" marker) instead of the main log. Our own orders (o.Mine) always
+// stay in the main log — including forged cancels against them, which are
+// attack visibility, not gossip. With the packet file uninstalled (tests,
+// library use) marked records reach the same destinations as before (carrying
+// one extra p2p=true attribute), so this changes no test behavior. Later
+// cancel-path lines (already-canceled, redeemed, rollback) stay in main:
+// they are low-volume state transitions, not gossip.
+func gossipLogger(o *Order) *slog.Logger {
+	if o != nil && o.Mine {
+		return xlog.L()
+	}
+	return xlog.With("p2p", true)
+}
 
 // walletSweepInterval is how often the background loop re-runs the C++
 // updateActiveWallets equivalent (admission + reachability re-probe),
@@ -2833,7 +2869,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	o := n.store.Get(idHex)
 	if o == nil {
 		if cancelDedup.Event(idHex) {
-			xlog.Debug("cancel: order lookup failed", "order", idHex)
+			gossipLogger(nil).Debug("cancel: order lookup failed", "order", idHex)
 		}
 		return
 	}
@@ -2875,8 +2911,15 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	snOK, _ := n.signer.VerifyAgainst(pkt, o.SNodePubkey)
 	othOK, _ := n.signer.VerifyAgainst(pkt, o.OtherPubkey)
 	if !snOK && !othOK && !iCanceled {
-		if cancelBadSigDedup.Event(idHex) {
+		// Owned orders bypass suppression: every forged cancel against our
+		// order stays in the main log as attack visibility. Foreign repeats
+		// collapse into the packet-log summary.
+		if o.Mine {
 			xlog.Info("cancel: bad packet signature for cancelation request on order, not canceling", "order", idHex)
+			return
+		}
+		if cancelBadSigDedup.Event(idHex) {
+			gossipLogger(o).Info("cancel: bad packet signature for cancelation request on order, not canceling", "order", idHex)
 		}
 		return
 	}
@@ -2884,8 +2927,15 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	// Connector gate (C++ :3359-3364). Thin client: if the from-currency has
 	// no configured connector we cannot proceed, mirroring the C++ bail-out.
 	if _, e := n.connector(o.FromCurrency); e != nil {
-		if cancelNoConnectorDedup.Event(o.FromCurrency) {
+		// Same Mine-bypass rule as bad signatures: our own order without a
+		// reachable connector (e.g. dropped mid-swap) reports every occurrence
+		// in main; foreign storms collapse into the packet-log summary.
+		if o.Mine {
 			xlog.Warn("cancel: no connector for currency, not canceling", "order", idHex, "currency", o.FromCurrency)
+			return
+		}
+		if cancelNoConnectorDedup.Event(o.FromCurrency) {
+			gossipLogger(o).Warn("cancel: no connector for currency, not canceling", "order", idHex, "currency", o.FromCurrency)
 		}
 		return
 	}
@@ -2898,7 +2948,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		return
 	} else if stateOrdinal(o.Status) < 6 { // no deposits yet (C++ :3384-3388)
 		n.store.MoveToHistoryU32(idHex, "canceled", b.Reason, NowMicro())
-		xlog.Info("cancel: counterparty cancel request", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
+		gossipLogger(o).Info("cancel: counterparty cancel request", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 		return
 	} else if o.Status == "canceled" { // already canceled (C++ :3389-3391)
 		xlog.Info("cancel: already canceled", "order", idHex)
@@ -2909,7 +2959,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 			o.Reason = b.Reason
 			o.Updated = NowMicro()
 		})
-		xlog.Info("cancel: counterparty cancel request", "order", idHex)
+		gossipLogger(o).Info("cancel: counterparty cancel request", "order", idHex)
 		n.persist()
 		return
 	} else if o.CounterpartyRedeemed { // ignore if counterparty already redeemed (C++ :3395-3397)
