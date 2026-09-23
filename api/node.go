@@ -2632,8 +2632,25 @@ func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPri
 		stored.Role = 'B'
 		stored.Mine = true // local taker swap — persisted by saveOrders (C++ isLocal, xbridgetransactiondescr.h:646)
 		stored.MakerKey = makerKey
+		// Currencies stamp unconditionally: tickers are invariant across
+		// partial fills (only amounts diverge), so no guard is needed here.
 		stored.OrigFromCurrency = prevOrder.FromCurrency
 		stored.OrigToCurrency = prevOrder.ToCurrency
+		// Stamp the orig* amounts too, but only when the record predates the
+		// ingest-time stamp (zeroed Orig*Amounts): the reject restore
+		// (clearUsedCoins) rebuilds FromAmount/ToAmount from Orig*Amounts,
+		// mirroring C++ processTransactionReject's fromAmount=origFromAmount /
+		// toAmount=origToAmount (xbridgesession.cpp:3592-3596). Backfill-only
+		// (never overwrite): a re-take of a partially-filled order whose live
+		// amounts have diverged from true-orig must not clobber it. Zero
+		// doubles as the unset sentinel (amounts are never legitimately zero,
+		// so a zeroed field always means a pre-stamp record).
+		if stored.OrigFromAmount == 0 {
+			stored.OrigFromAmount = prevOrder.FromAmount
+		}
+		if stored.OrigToAmount == 0 {
+			stored.OrigToAmount = prevOrder.ToAmount
+		}
 		// Taker addresses on the local frame (C++ acceptXBridgeTransaction
 		// stamps ptr->fromAddr/from = the taker's send address and
 		// ptr->toAddr/to = the taker's receive address — xbridgeapp.cpp

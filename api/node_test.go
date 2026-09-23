@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -611,7 +612,7 @@ func TestRemoteRejectRestoresToPending(t *testing.T) {
 	_, idHex := mustID(t)
 	o := &Order{FromCurrency: "LTC", ToCurrency: "BTC", FromAmount: 2e6, ToAmount: 1e6,
 		OrigFromCurrency: "BTC", OrigToCurrency: "LTC", OrigFromAmount: 1e6, OrigToAmount: 2e6,
-		Status: "accepting", Role: 'B', MakerKey: "ourMkey", OtherPubkey: "theirOkey",
+		Status: "accepting", Role: 'B', Mine: true, MakerKey: "ourMkey", OtherPubkey: "theirOkey",
 		SNodePubkey: hexPub(t, snodePriv)}
 	o.ID = decodeID(t, idHex)
 
@@ -631,8 +632,21 @@ func TestRemoteRejectRestoresToPending(t *testing.T) {
 	if got.Role != 0 {
 		t.Fatalf("role = %d, want 0", got.Role)
 	}
-	if got.MakerKey != "" || got.OtherPubkey != "" {
-		t.Fatal("MakerKey/OtherPubkey must be cleared on reject")
+	// C++ isLocal() derives from from/to (xbridgetransactiondescr.h:684-688)
+	// and the reject clears them (:3584-3587), so the rejected order becomes
+	// re-takeable; Mine is Go's persisted isLocal proxy and must follow.
+	if got.Mine {
+		t.Fatal("Mine = true after reject, want false (C++ isLocal() derives false once from/to are cleared)")
+	}
+	if got.MakerKey != "" {
+		t.Fatal("MakerKey must be cleared on reject (C++ mPubKey.clear, xbridgesession.cpp:3589)")
+	}
+	// OtherPubkey must SURVIVE a reject: C++ clears only mPubKey/mPrivKey
+	// (xbridgesession.cpp:3588-3590), keeping oPubKey so a later cancel signed
+	// by the counterparty still verifies (processTransactionCancel :3469).
+	// See TestRemoteRejectKeepsCounterpartyPubkey for the end-to-end proof.
+	if got.OtherPubkey != "theirOkey" {
+		t.Fatalf("OtherPubkey = %q, want preserved (C++ keeps oPubKey on reject)", got.OtherPubkey)
 	}
 	if got.Reason != 0 {
 		t.Fatalf("reason = %d, want 0", got.Reason)
@@ -660,6 +674,186 @@ func TestRemoteRejectIgnoredForMaker(t *testing.T) {
 	got := n.store.Get(idHex)
 	if got == nil || got.Status != "accepting" || got.Role != 'A' {
 		t.Fatal("role-'A' order must ignore reject")
+	}
+}
+
+// TestRemoteRejectReleasesFundingUtxos proves a rejected take's funding locks
+// are released: after handleRemoteReject the order (restored "open") must
+// contribute NO keys to LockedUtxoInfo. C++ unlocks the funding coins on
+// reject (xapp.unlockCoins + unlockFeeUtxos + clearUsedCoins,
+// xbridgesession.cpp:3581-3583) so a subsequent take may re-select them; the
+// Go lock model derives the locked set from the order's Utxos/FeeUtxos fields
+// (Store.lockedInfoLocked), so both must be cleared. Without this, a rejected
+// take keeps its funding UTXOs locked until the order goes terminal and the
+// next take fails with 1019 "cannot reuse utxo inputs" (live run13: n=17
+// reject on the same node → n=19 reserveKeyCollision).
+func TestRemoteRejectReleasesFundingUtxos(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x99
+	_, idHex := mustID(t)
+	// Funding proof entry: TxID is little-endian on the wire, so the raw bytes
+	// are the reverse of the display txid so utxoEntryKey renders the plain
+	// display "aaaa…:0" lock key (store.go utxoEntryKey).
+	var dispTx [32]byte
+	for i := range dispTx {
+		dispTx[i] = 0xaa
+	}
+	var fundTx [32]byte
+	for i := range fundTx {
+		fundTx[i] = dispTx[31-i]
+	}
+	o := &Order{FromCurrency: "LTC", ToCurrency: "BTC", FromAmount: 2e6, ToAmount: 1e6,
+		OrigFromCurrency: "BTC", OrigToCurrency: "LTC", OrigFromAmount: 1e6, OrigToAmount: 2e6,
+		Status: "accepting", Role: 'B',
+		Utxos:        []proto.UtxoEntry{{TxID: fundTx, Vout: 0}},
+		FeeUtxos:     []wallet.Utxo{{TxID: strings.Repeat("bb", 64), Vout: 1, Amount: 1000}},
+		UsedCoins:    []wallet.Utxo{{TxID: strings.Repeat("cc", 64), Vout: 2, Amount: 1000}},
+		UtxoCurrency: "BTC",
+		SNodePubkey:  hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	// Pre-state: the committed take's funding and fee inputs are locked via the
+	// live order (C++ lockCoins/lockFeeUtxos).
+	fundKey := utxoEntryKey(proto.UtxoEntry{TxID: fundTx, Vout: 0})
+	feeKey := strings.Repeat("bb", 64) + ":1"
+	keys, _ := n.store.LockedUtxoInfo()
+	if !keys[fundKey] || !keys[feeKey] {
+		t.Fatalf("pre-reject LockedUtxoInfo missing keys (fund=%v fee=%v)", keys[fundKey], keys[feeKey])
+	}
+
+	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 8}).Marshal(), snodePriv)
+	n.handleRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 8})
+
+	got := n.store.Get(idHex)
+	if got == nil || got.Status != "open" {
+		t.Fatalf("post-reject order = %+v, want live with status open", got)
+	}
+	// The rejected take must release its funding and fee locks: C++
+	// unlockCoins + unlockFeeUtxos + clearUsedCoins (xbridgesession.cpp
+	// 3581-3583, xbridgetransactiondescr.h:619-623) leave nothing contributing
+	// to the locked set, and the Go lock model derives from Utxos/FeeUtxos —
+	// so both fields must be cleared.
+	keys, _ = n.store.LockedUtxoInfo()
+	if keys[fundKey] {
+		t.Error("funding utxo still locked after reject: clearUsedCoins must clear Utxos (C++ clearUsedCoins clears usedCoins)")
+	}
+	if keys[feeKey] {
+		t.Error("fee utxo still locked after reject")
+	}
+	// UsedCoins never feeds LockedUtxoInfo, but the reject must still drop
+	// the spent-input record so a re-take re-selects instead of reusing.
+	if len(got.UsedCoins) != 0 {
+		t.Errorf("UsedCoins = %d entries after reject, want cleared", len(got.UsedCoins))
+	}
+	// A fresh take of another order must be able to reserve the same keys.
+	// o2 is a reservation holder only (ReserveForTake needs a live key, not
+	// a tradeable pair); a distinct pair keeps it from looking like one.
+	o2 := &Order{ID: [32]byte{0x21}, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "SYS",
+		FromAmount: 1e6, ToAmount: 1e6, Status: "open"}
+	n.store.Add(o2)
+	if got := n.store.ReserveForTake(hexEncode(o2.ID[:]), []string{feeKey}, []string{fundKey}, "BTC"); got != reserveOK {
+		t.Errorf("ReserveForTake with previously-locked keys = %v, want reserveOK", got)
+	}
+}
+
+// TestRemoteRejectKeepsCounterpartyPubkey pins C++ processTransactionReject's
+// key hygiene (xbridgesession.cpp:3588-3590): the taker's own M keypair is
+// cleared (mPubKey/mPrivKey) but the counterparty key oPubKey is NOT — it
+// stays set so a later cancel signed by the counterparty still verifies
+// (processTransactionCancel :3469 checks sPubKey/oPubKey/mPubKey). Clearing
+// OtherPubkey produced live "invalid packet signature" cancels after a
+// reject (hub xbridgep2p_20260923.log:190854, crTimeout, order 15e46ecc…).
+func TestRemoteRejectKeepsCounterpartyPubkey(t *testing.T) {
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x99
+	cpPriv := make([]byte, 32)
+	cpPriv[0] = 0x9a
+	ourPriv := make([]byte, 32)
+	ourPriv[0] = 0x9b
+	_, idHex := mustID(t)
+	o := &Order{FromCurrency: "LTC", ToCurrency: "BTC", FromAmount: 2e6, ToAmount: 1e6,
+		OrigFromCurrency: "BTC", OrigToCurrency: "LTC", OrigFromAmount: 1e6, OrigToAmount: 2e6,
+		Status: "accepting", Role: 'B', Mine: true,
+		MakerKey:    hexPub(t, ourPriv),
+		OtherPubkey: hexPub(t, cpPriv),
+		SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = decodeID(t, idHex)
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+
+	pkt := signBodyPacket(t, proto.XbcTransactionReject, (&proto.RejectBody{ID: o.ID, Reason: 8}).Marshal(), snodePriv)
+	n.handleRemoteReject(pkt, &proto.RejectBody{ID: o.ID, Reason: 8})
+
+	got := n.store.Get(idHex)
+	if got == nil {
+		t.Fatal("rejected order must remain in the live store")
+	}
+	if got.MakerKey != "" {
+		t.Errorf("MakerKey = %q, want cleared (C++ mPubKey.clear)", got.MakerKey)
+	}
+	if got.OtherPubkey == "" {
+		t.Fatal("OtherPubkey must survive a reject: C++ keeps oPubKey so the counterparty's later cancel still verifies")
+	}
+	// End-to-end: a cancel signed by the counterparty must now be ACCEPTED.
+	// Post-reject the order is non-local again (Mine reset with C++ isLocal),
+	// so the accepted cancel takes the state<6 history path (C++ :3384-3388)
+	// — the order moves to history as "canceled" instead of the
+	// "bad packet signature" dead end.
+	cpkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 16}).Marshal(), cpPriv)
+	n.handleRemoteCancel(cpkt, &proto.CancelBody{ID: o.ID, Reason: 16})
+	if after := n.store.Get(idHex); after != nil {
+		t.Fatalf("counterparty cancel after reject not accepted: order still live %+v", after)
+	}
+	h := n.store.History()
+	if len(h) != 1 || h[0].Status != "canceled" || h[0].Reason != 16 {
+		t.Fatalf("history after counterparty cancel = %+v, want one canceled entry with reason 16", h)
+	}
+}
+
+// TestCommitTakeStampsOrigAmountsForLegacyOrders pins the commitTake backfill
+// (node.go): the reject restore rebuilds From/ToAmount from Orig*Amounts, so
+// commitTake stamps them from the pre-take record — including legacy records
+// that predate the ingest-time stamp and carry zeroed Orig*Amounts. Without
+// the stamp, rejecting such a take would restore zero amounts (C++ restores
+// fromAmount=origFromAmount/toAmount=origToAmount, xbridgesession.cpp:3592-3596).
+func TestCommitTakeStampsOrigAmountsForLegacyOrders(t *testing.T) {
+	cc := &captureXConn{}
+	n := newTestNode(t, map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+	}, map[string]wallet.Connector{"BTC": &stubConn{ticker: "BTC", addr: btcAddr}})
+	n.conn = cc
+	n.config.DataDir = t.TempDir()
+
+	// Legacy record: open order with zeroed Orig* (predates ingest stamp).
+	o := &Order{
+		ID: [32]byte{0x0b}, Type: OrderTypeMaker, FromCurrency: "BTC", ToCurrency: "SYS",
+		FromAmount: 1000000, ToAmount: 2000000, Status: "open",
+	}
+	key := hexEncode(o.ID[:])
+	n.store.Add(o)
+
+	pkt := proto.NewPacket(proto.XbcTransactionAccepting, (&proto.AcceptingBody{ID: o.ID}).Marshal())
+	if err := crypto.NewBtcSigner().Sign(pkt, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var got *Order
+	var terr *rpcError
+	n.submit(func() {
+		got, terr = n.commitTake(key, TakeOrderParams{}, pkt, [32]byte{}, [33]byte{}, nil, nil, nil)
+	}, true)
+	if terr != nil {
+		t.Fatalf("commitTake errored: %v", terr)
+	}
+	if got == nil {
+		t.Fatal("commitTake returned nil on a live order")
+	}
+	if got.OrigFromAmount != 1000000 || got.OrigToAmount != 2000000 {
+		t.Errorf("Orig amounts = %v/%v, want pre-take 1000000/2000000 (backfill for legacy records)",
+			got.OrigFromAmount, got.OrigToAmount)
 	}
 }
 

@@ -92,9 +92,11 @@ type Order struct {
 	// ToCurrency (TakeOrder). It mirrors C++ m_utxosDict[token] so the lock
 	// exclusion is per-token (App::getAllLockedUtxos, xbridgeapp.cpp:2827),
 	// not store-wide. Unset (legacy persisted records that predate the tag)
-	// falls back to the Role-derived rule in Store.utxoCurrency. The tag is not
-	// cleared by clearUsedCoins: a rejected take's Utxos remain claimed on the
-	// same chain, so the tag stays correct.
+	// falls back to the Role-derived rule in Store.utxoCurrency. The tag is
+	// not cleared by clearUsedCoins (reject restore): it records which chain
+	// the order's (now-cleared) Utxos lived on, and an empty Utxos set locks
+	// nothing either way — the tag only keeps that provenance correct for the
+	// order's remaining lifetime in the book/history.
 	UtxoCurrency string
 
 	// --- cancel/reject + fidelity fields (mirror xbridge::TransactionDescr) ---
@@ -415,20 +417,37 @@ func (o *Order) toCancelResult() cancelOrderResult {
 }
 
 // clearUsedCoins restores the order to a fresh pending state after a TAKER
-// reject. It mirrors two C++ sites folded into one Go method: C++
-// TransactionDescr::clearUsedCoins() (xbridgetransactiondescr.h:582-587,
-// clears usedCoins/feeUtxos) plus the address/role/orig* restore that C++
-// performs inline in processTransactionReject (xbridgesession.cpp:3464-3476:
-// fromAddr/from/toAddr/to cleared, role reset, orig* currencies and amounts
-// restored). The fold is safe because this method's ONLY caller is the taker
+// reject. It mirrors the C++ reject restore (processTransactionReject,
+// xbridgesession.cpp:3578-3596) as folded into one Go method: the funding and
+// fee coin release (C++ xapp.unlockCoins + unlockFeeUtxos + TransactionDescr::
+// clearUsedCoins, xbridgesession.cpp:3581-3583 / xbridgetransactiondescr.h
+// 619-623, which clear usedCoins/feeUtxos — mapped here onto Utxos, UsedCoins,
+// and FeeUtxos; Store.lockedInfoLocked derives the locked-utxo set from
+// Utxos/FeeUtxos), plus the address/role/orig* restore C++ performs inline
+// (xbridgesession.cpp:3464-3476: fromAddr/from/toAddr/to cleared, role reset,
+// orig* currencies and amounts restored). On the C++ side, clearing from/to
+// makes isLocal() false again (xbridgetransactiondescr.h:684-688 derives
+// isLocal from from/to being non-empty), so the rejected order becomes
+// re-takeable; Go never populates From/To on the local frame, so it mirrors
+// the outcome explicitly by resetting Mine here (its persisted isLocal
+// proxy). The fold is safe because this method's ONLY caller is the taker
 // reject path (handleRemoteReject, gated on Role 'B'): C++'s other
 // clearUsedCoins call sites (xbridgeapp.cpp:1848/2382) are not reject paths
-// and are not routed here. The wallet-side coin/fee unlocking is delegated to
-// the connected wallet connector (out of go-xbridge's scope as a thin client).
+// and are not routed here. Key hygiene follows C++
+// :3588-3590 exactly: our own M keypair is cleared (mPubKey/mPrivKey), but the
+// counterparty key oPubKey is NOT — it must stay set so a later cancel signed
+// by the counterparty still verifies (processTransactionCancel :3469).
+// Clearing Utxos here is what releases the take's funding locks: the order
+// returns to "open" (non-terminal), and Store.lockedInfoLocked derives locks
+// from live orders' Utxos/FeeUtxos — an order restored "open" with its funding
+// proofs still set would keep those UTXOs locked until the order ends (live
+// run13: rejected take → next take failed 1019 "cannot reuse utxo inputs").
+// The wallet-side coin/fee unlocking is delegated to the connected wallet
+// connector (out of go-xbridge's scope as a thin client).
 func (o *Order) clearUsedCoins() {
 	o.Role = 0
+	o.Mine = false
 	o.MakerKey = ""
-	o.OtherPubkey = ""
 	o.Reason = 0
 	o.FromCurrency = o.OrigFromCurrency
 	o.ToCurrency = o.OrigToCurrency
@@ -438,4 +457,5 @@ func (o *Order) clearUsedCoins() {
 	o.TakerAddress = ""
 	o.UsedCoins = nil
 	o.FeeUtxos = nil
+	o.Utxos = nil
 }
