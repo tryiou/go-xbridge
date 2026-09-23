@@ -92,6 +92,7 @@ func TestCancelGossipRollupsGoToP2P(t *testing.T) {
 	summarizeCancelLookup("rollup-test-lookup", 3, 30*time.Second)
 	summarizeCancelBadSig("rollup-test-badsig", 5, 32*time.Second)
 	summarizeCancelNoConnector("ROLLUPTEST", 7, 30*time.Second)
+	summarizeCancelAlreadyCanceled("rollup-test-already", 9, 34*time.Second)
 
 	gen := readLogFile(t, genPath)
 	pkt := readLogFile(t, pktPath)
@@ -99,6 +100,7 @@ func TestCancelGossipRollupsGoToP2P(t *testing.T) {
 		"cancel: order lookup failures suppressed",
 		"cancel: bad packet signature suppressed",
 		"cancel: no connector suppressed",
+		"cancel: already-canceled duplicates suppressed",
 	} {
 		if strings.Contains(gen, want) {
 			t.Errorf("general file must not contain rollup %q: %q", want, gen)
@@ -141,6 +143,83 @@ func TestCancelGossipMineBypassesDedup(t *testing.T) {
 	}
 	if strings.Contains(pktData, "bad packet signature") {
 		t.Errorf("packet file must not contain own-order bad-sig lines: %q", pktData)
+	}
+}
+
+// TestCancelAlreadyCanceledDeduped: duplicate Cancel packets for an
+// already-canceled order log once (first sighting); repeats collapse into
+// the 60 s summary. Live: a hub redelivery storm emitted 591 identical
+// "cancel: already canceled" main-log lines in ~150 ms for one settled
+// order. Own orders confirm landing in main; foreign in the packet file.
+func TestCancelAlreadyCanceledDeduped(t *testing.T) {
+	genPath, pktPath := installSplitLogs(t)
+
+	snodePriv := make([]byte, 32)
+	snodePriv[0] = 0x9e
+	// Test-local IDs (not the shared mustID): cancelAlreadyCanceledDedup is
+	// a package-global 60 s bucket keyed on order id, so a constant id would
+	// collide with any other test hitting this branch in the window.
+	var ownID, foreignID [32]byte
+	ownID[0] = 0xC3
+	foreignID[0] = 0xC4
+	o := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "canceled", Mine: true, SNodePubkey: hexPub(t, snodePriv)}
+	o.ID = ownID
+	f := &Order{FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 1e6, ToAmount: 2e6,
+		Status: "canceled", Mine: false, SNodePubkey: hexPub(t, snodePriv)}
+	f.ID = foreignID
+
+	n := newCancelTestNode(nil)
+	n.store.Add(o)
+	n.store.Add(f)
+	// A pending retry entry must survive repeats on this branch: the branch
+	// changes nothing (no Update, no drop), so the entry stays armed.
+	n.takeRetriesMu.Lock()
+	n.takeRetries = map[string]*takeRetryState{hexEncode(ownID[:]): {}}
+	n.takeRetriesMu.Unlock()
+
+	pkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: o.ID, Reason: 1}).Marshal(), snodePriv)
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	n.handleRemoteCancel(pkt, &proto.CancelBody{ID: o.ID, Reason: 1})
+	fpkt := signBodyPacket(t, proto.XbcTransactionCancel, (&proto.CancelBody{ID: f.ID, Reason: 1}).Marshal(), snodePriv)
+	n.handleRemoteCancel(fpkt, &proto.CancelBody{ID: f.ID, Reason: 1})
+	n.handleRemoteCancel(fpkt, &proto.CancelBody{ID: f.ID, Reason: 1})
+
+	gen := readLogFile(t, genPath)
+	pktData := readLogFile(t, pktPath)
+	if got := strings.Count(gen, "cancel: already canceled"); got != 1 {
+		t.Errorf("main log already-canceled lines = %d, want 1 (own first sighting only)", got)
+	}
+	if got := strings.Count(pktData, "cancel: already canceled"); got != 1 {
+		t.Errorf("packet file already-canceled lines = %d, want 1 (foreign first sighting only)", got)
+	}
+	// Summary path: flushing emits one aggregate per order key, always to
+	// the packet file (the p2p marker) — including the own-order storm,
+	// whose landing was already confirmed once in main.
+	cancelAlreadyCanceledDedup.Flush()
+	gen = readLogFile(t, genPath)
+	pktData = readLogFile(t, pktPath)
+	if got := strings.Count(gen, "already-canceled duplicates suppressed"); got != 0 {
+		t.Errorf("main log summary lines = %d, want 0 (summaries aggregate in the packet file)", got)
+	}
+	if got := strings.Count(pktData, "already-canceled duplicates suppressed"); got != 2 {
+		t.Errorf("packet file summary lines = %d, want 2 (one per order key): %q", got, pktData)
+	}
+	// Side-effect freedom: repeats on this branch change nothing — both
+	// orders stay live-canceled in the store and the seeded retry entry
+	// stays armed (no Update, no drop on this path).
+	for _, id := range [][32]byte{ownID, foreignID} {
+		got := n.store.Get(hexEncode(id[:]))
+		if got == nil || got.Status != "canceled" {
+			t.Fatalf("order %x after repeats = %+v, want live canceled", id[:4], got)
+		}
+	}
+	n.takeRetriesMu.Lock()
+	_, ok := n.takeRetries[hexEncode(ownID[:])]
+	n.takeRetriesMu.Unlock()
+	if !ok {
+		t.Error("seeded retry entry missing after repeats: this branch must not disarm retries")
 	}
 }
 

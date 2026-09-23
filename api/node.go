@@ -99,6 +99,23 @@ func summarizeCancelNoConnector(currency string, total int, elapsed time.Duratio
 // at the call site (every occurrence stays in main).
 var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, summarizeCancelNoConnector)
 
+// summarizeCancelAlreadyCanceled emits the collapsed duplicate-cancel summary
+// to the packet log. The first sighting routes by order ownership at the call
+// site (main for own orders — it confirms the cancel landed network-wide;
+// packet file for foreign), so this summary only ever aggregates repeats.
+func summarizeCancelAlreadyCanceled(order string, total int, elapsed time.Duration) {
+	// Full order id (not truncated): the summary must join back to its
+	// first-sighting line, which carries the complete id.
+	xlog.With("p2p", true).Info("cancel: already-canceled duplicates suppressed", "order", order, "count", total, "over", elapsed.Round(time.Second).String())
+}
+
+// cancelAlreadyCanceledDedup collapses repeated Cancel packets for an order
+// that is already canceled. Hubs redeliver cancels in storm bursts (live:
+// 591 duplicate packets in ~150 ms for one settled order), and every copy
+// would otherwise emit one main-log line. The first sighting (per order) is
+// logged; repeats are summarized periodically. Keyed on the order id.
+var cancelAlreadyCanceledDedup = xlog.NewDedupe(60*time.Second, summarizeCancelAlreadyCanceled)
+
 // gossipLogger routes high-volume third-party cancel chatter (unknown
 // orders, foreign book orders: lookup failures, bad signatures, unserved
 // coins, pre-deposit counterparty requests) to the packet log (log-p2p, via
@@ -107,8 +124,12 @@ var cancelNoConnectorDedup = xlog.NewDedupe(60*time.Second, summarizeCancelNoCon
 // attack visibility, not gossip. With the packet file uninstalled (tests,
 // library use) marked records reach the same destinations as before (carrying
 // one extra p2p=true attribute), so this changes no test behavior. Later
-// cancel-path lines (already-canceled, redeemed, rollback) stay in main:
-// they are low-volume state transitions, not gossip.
+// cancel-path lines (redeemed, rollback) stay in main: they are low-volume
+// state transitions, not gossip. Already-canceled first sightings route by
+// ownership (main for own orders, packet file for foreign); the 60 s repeat
+// summary always lands in the packet file (the p2p marker), so an own-order
+// storm confirms landing once in main while its count aggregates in the
+// packet file.
 func gossipLogger(o *Order) *slog.Logger {
 	if o != nil && o.Mine {
 		return xlog.L()
@@ -3030,7 +3051,16 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		gossipLogger(o).Info("cancel: counterparty cancel request", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 		return
 	} else if o.Status == "canceled" { // already canceled (C++ :3389-3391)
-		xlog.Info("cancel: already canceled", "order", idHex)
+		// Duplicate Cancel packets for a settled order: hubs redeliver in
+		// storm bursts (live 591 copies in ~150 ms), so only the first
+		// sighting logs — main for own orders (confirms the cancel landed
+		// network-wide), packet file for foreign — and repeats collapse
+		// into the 60 s summary. Terminal state already; nothing to do.
+		// No retry disarm here: the first accepted cancel already dropped
+		// the entry, and this branch only logs repeats.
+		if cancelAlreadyCanceledDedup.Event(idHex) {
+			gossipLogger(o).Info("cancel: already canceled", "order", idHex)
+		}
 		return
 	} else if !o.DepositSent { // cancel if deposit not sent (C++ :3392-3394)
 		n.store.Update(idHex, func(o *Order) {
