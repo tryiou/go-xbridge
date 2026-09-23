@@ -37,7 +37,7 @@ func TestTickStageOrderRecoveryBeforeTermination(t *testing.T) {
 		"resendHoldApplies", "retryFailedClaimBuilds", "retryFailedDepositBuilds",
 		"recordSilentHubs", "watchStalledSessions", "gcStaleMineOrders",
 		"watchCounterpartyDeposits", "watchOwnDepositSpends", "pollBroadcastConfirmations", "rebroadcastUnconfirmed",
-		"pruneTracked", "pruneSessions", "persist",
+		"pruneTracked", "pruneSessions", "pruneTakeRetries", "persist",
 	}
 	if len(names) != len(want) {
 		t.Fatalf("tick stages = %v, want %v", names, want)

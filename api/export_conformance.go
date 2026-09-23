@@ -124,6 +124,9 @@ func (s *conformanceStubConn) GetNewAddress() (string, error) { return s.addr, n
 func (s *conformanceStubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 	return s.utxos, nil
 }
+func (s *conformanceStubConn) ListUnspentWithZeroConf() ([]wallet.Utxo, error) {
+	return s.utxos, nil
+}
 func (s *conformanceStubConn) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
 	return txHex, true, nil
 }

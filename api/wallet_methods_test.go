@@ -30,6 +30,9 @@ type stubConn struct {
 	ticker string
 	addr   string
 	utxos  []wallet.Utxo
+	// matureUtxos, when non-nil, splits ListUnspent by minConf (see the
+	// method): utxos are 0-conf change, matureUtxos confirmed funds.
+	matureUtxos []wallet.Utxo
 	// depositCheck / depositCheckErr canned the CheckDepositTransaction result
 	// (default IsGood:true when neither is set).
 	depositCheck    *wallet.DepositCheck
@@ -71,7 +74,26 @@ func (s *stubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 	if s.listUnspentErr != nil {
 		return nil, s.listUnspentErr
 	}
+	// matureUtxos, when non-nil, models confirmation depth: minConf >= 1
+	// reports only matureUtxos, minConf 0 reports utxos (0-conf change)
+	// plus matureUtxos — like a backend distinguishing confirmed from
+	// mempool. Unset = legacy (minConf ignored).
+	if s.matureUtxos != nil {
+		if minConf >= 1 {
+			return append([]wallet.Utxo(nil), s.matureUtxos...), nil
+		}
+		out := append([]wallet.Utxo(nil), s.utxos...)
+		return append(out, s.matureUtxos...), nil
+	}
 	return s.utxos, nil
+}
+
+// ListUnspentWithZeroConf returns the full stub set (confirmed plus 0-conf
+// change), mirroring AvailableCoins(fOnlySafe=true) for fee funding: the fee
+// path must see fresh change, not just mature funds.
+func (s *stubConn) ListUnspentWithZeroConf() ([]wallet.Utxo, error) {
+	out := append([]wallet.Utxo(nil), s.utxos...)
+	return append(out, s.matureUtxos...), nil
 }
 func (s *stubConn) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
 	return txHex, true, nil

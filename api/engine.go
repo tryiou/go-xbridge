@@ -145,6 +145,7 @@ func (n *Node) tickStages() []tickStage {
 		{"rebroadcastUnconfirmed", func() { n.rebroadcastUnconfirmed() }},
 		{"pruneTracked", func() { n.pruneTracked() }},
 		{"pruneSessions", func() { n.pruneSessions() }},
+		{"pruneTakeRetries", func() { n.pruneTakeRetries() }},
 		{"persist", func() { n.persist() }},
 	}
 }

@@ -194,10 +194,15 @@ type hangingProbeConnector struct {
 	returned chan struct{}
 }
 
-func (c *hangingProbeConnector) Ticker() string                  { return "HANG" }
-func (c *hangingProbeConnector) GetBalance() (uint64, error)     { return 0, errors.New("unused") }
-func (c *hangingProbeConnector) GetNewAddress() (string, error)  { return "", errors.New("unused") }
-func (c *hangingProbeConnector) ListUnspent(int) ([]Utxo, error) { return nil, errors.New("unused") }
+func (c *hangingProbeConnector) Ticker() string                 { return "HANG" }
+func (c *hangingProbeConnector) GetBalance() (uint64, error)    { return 0, errors.New("unused") }
+func (c *hangingProbeConnector) GetNewAddress() (string, error) { return "", errors.New("unused") }
+func (c *hangingProbeConnector) ListUnspent(int) ([]Utxo, error) {
+	return nil, errors.New("unused")
+}
+func (c *hangingProbeConnector) ListUnspentWithZeroConf() ([]Utxo, error) {
+	return nil, errors.New("unused")
+}
 func (c *hangingProbeConnector) SignRawTransaction(string, []PrevTx) (string, bool, error) {
 	return "", false, errors.New("unused")
 }

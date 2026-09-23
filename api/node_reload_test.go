@@ -81,6 +81,20 @@ func TestReloadAppliesEWKeying(t *testing.T) {
 	}
 }
 
+// TestReloadPreservesTakeRetry: TakeRetry is daemon-level (the -takeretry
+// flag), so a dxLoadXBridgeConf hot-reload must preserve it like
+// ForceShowAllOrders — otherwise any reload would silently disable retries.
+func TestReloadPreservesTakeRetry(t *testing.T) {
+	ctx := reloadTestCtx(t, ewKeyingConf)
+	ctx.Node.config.TakeRetry = 2
+	if res, err := ctx.dxLoadXBridgeConf(nil); err != nil || res != true {
+		t.Fatalf("dxLoadXBridgeConf = %v %v", res, err)
+	}
+	if got := ctx.Node.config.TakeRetry; got != 2 {
+		t.Fatalf("TakeRetry after reload = %d, want 2 (daemon-level knobs survive reload)", got)
+	}
+}
+
 // TestReloadPrunesUnconnectedOrders locks the order clearing: when
 // ShowAllOrders is false, non-local orders whose currency has no connector are
 // dropped; local orders always survive. With ShowAllOrders=true everything is

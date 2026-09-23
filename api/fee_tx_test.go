@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"testing"
 
 	"go-xbridge/coins"
 	"go-xbridge/config"
+	"go-xbridge/crypto"
 	"go-xbridge/wallet"
 )
 
@@ -185,4 +187,63 @@ func equalP2PKH(script []byte, dest [20]byte) bool {
 		return false
 	}
 	return bytes.Equal(script, coins.BuildP2PKHScript(dest))
+}
+
+// TestTakeFeeSpendsZeroConfChange: C++ funds the service-node fee from
+// in-wallet UTXOs including trusted 0-conf change (unspentP2PKH over
+// AvailableCoins(fOnlySafe=true): 0-conf own change qualifies,
+// bitcoinrpcconnector.cpp:276-278). A take whose only fee-covering UTXO is
+// 0-conf change must succeed — ListUnspent(1) refused it live (run6 S2:
+// 0.9338 change invisible 7 s after S1, INSUFFICIENT_FUNDS).
+func TestTakeFeeSpendsZeroConfChange(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	change := blkUtxo()
+	change.TxID = fmt.Sprintf("%064x", 0x900)
+	change.Amount = 93400000
+	change.Value = 0.934
+	mature := blkUtxo()
+	mature.TxID = fmt.Sprintf("%064x", 0x901)
+	mature.Amount = 990000
+	mature.Value = 0.0099
+	funding := wallet.Utxo{
+		TxID: fmt.Sprintf("%064x", 0x902), Vout: 0,
+		Amount: 500000000, Value: 5.0,
+		ScriptPubKey: "76a914000000000000000000000000000000000000000088ac",
+		Address:      btcAddr,
+	}
+	n, _ := newStartedNode(t, map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}, map[string]wallet.Connector{
+		"BTC":   &stubConn{ticker: "BTC", addr: btcAddr, utxos: []wallet.Utxo{funding}},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{change}, matureUtxos: []wallet.Utxo{mature}},
+	})
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 7
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerHub(t, n, hubPriv)
+	var oid [32]byte
+	copy(oid[:], []byte("take-zero-conf-fee-00000000000000"))
+	n.store.Add(&Order{
+		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	})
+	if _, rerr := n.TakeOrder(TakeOrderParams{
+		ID:          orderIDString(oid),
+		FromAddress: addrFor(0, "take-from-zc"),
+		ToAddress:   addrFor(0, "take-to-zc"),
+	}); rerr != nil {
+		t.Fatalf("take with only 0-conf fee funds failed: %v (want success)", rerr)
+	}
+	if got := n.store.Get(hexEncode(oid[:])); got == nil || got.Status != "accepting" {
+		t.Fatalf("order status = %v, want accepting", got)
+	}
 }

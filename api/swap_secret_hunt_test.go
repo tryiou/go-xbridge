@@ -569,6 +569,9 @@ func (s *stubConnForHunt) GetNewAddress() (string, error) {
 func (s *stubConnForHunt) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 	return nil, errors.New("stubConnForHunt: no UTXO source")
 }
+func (s *stubConnForHunt) ListUnspentWithZeroConf() ([]wallet.Utxo, error) {
+	return nil, errors.New("stubConnForHunt: no UTXO source")
+}
 func (s *stubConnForHunt) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
 	return "", false, errors.New("stubConnForHunt: cannot sign")
 }

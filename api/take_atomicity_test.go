@@ -388,3 +388,111 @@ func TestTakeOrderCancelRaceNoBroadcast(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// TestTakeFeeSelectionAvoidsOtherOrderFundingLock reproduces the live n=11
+// failure (run13 1019 "cannot reuse utxo inputs" on a fresh take of a
+// different order): an open BLOCK maker order (M0) locks its funding BLOCK
+// utxo u1 via LockedUtxoInfo; the fee-utxo selection for a take whose
+// funding currency is BTC must still exclude u1, because ReserveForTake
+// checks feeKeys against the ALL-token locked set (lockedInfoLocked — fee
+// utxos are the global BLOCK fee pool, C++ m_feeUtxos, checked for every
+// take). Selecting u1 therefore always collides: the fee selection filter
+// and the reservation check must see the same locked set. With the fix the
+// fee prep falls through to u2 and the take broadcasts; u1 stays locked by
+// M0 for M0's lifetime.
+func TestTakeFeeSelectionAvoidsOtherOrderFundingLock(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Two BLOCK fee-eligible funders: u1 (small) is locked by M0, u2 (large)
+	// is the only remaining candidate. selectFeeUtxos prefers the smallest
+	// sufficient single input, so the RED path picks u1 and collides.
+	u1 := blkUtxo()
+	u2 := blkUtxo()
+	u2.TxID = "0000000000000000000000000000000000000000000000000000000000000003"
+	u2.Vout = 1
+	n := newTestNode(t, map[string]*config.CoinConf{
+		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
+	}, map[string]wallet.Connector{
+		"BTC": &stubConn{ticker: "BTC", addr: btcAddr, utxos: []wallet.Utxo{
+			{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
+				Amount: 300000000, Value: 3.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+		}},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{u1, u2}},
+	})
+	cc := &captureXConn{}
+	n.conn = cc
+	n.config.DataDir = t.TempDir()
+	n.start()
+	t.Cleanup(func() { _ = n.Close() })
+
+	hubPriv := make([]byte, 32)
+	hubPriv[31] = 3
+	registerHub(t, n, hubPriv)
+	hubPub, err := crypto.CompressedPubKey(hubPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// M0: an observed maker order selling BLOCK whose funding proof is u1 —
+	// its Utxos lock u1 for M0's whole lifetime (lockedInfoLocked derives the
+	// locked set from live orders' Utxos).
+	var u1raw [32]byte
+	raw, err := hex.DecodeString(u1.TxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range raw {
+		u1raw[i] = raw[31-i]
+	}
+	m0 := &Order{
+		ID: [32]byte{0x31}, Type: OrderTypeMaker, FromCurrency: "BLOCK", ToCurrency: "BTC",
+		FromAmount: 1e8, ToAmount: 1e8, Status: "open", UtxoCurrency: "BLOCK",
+		Utxos: []proto.UtxoEntry{{TxID: u1raw, Vout: u1.Vout}},
+	}
+	n.store.Add(m0)
+	u1Key := u1.TxID + ":0"
+	keys, _ := n.store.LockedUtxoInfo()
+	if !keys[u1Key] {
+		t.Fatal("pre-take: M0's BLOCK funding utxo not reported locked")
+	}
+
+	// T: a plain BTC/BTC order for the take; its fee prep is BLOCK.
+	var oid [32]byte
+	copy(oid[:], []byte("fee-lock-order-00000000000000"))
+	takePub := mustPub(t, hubPriv)
+	take := &Order{
+		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
+		Status: "open", SNodePubkey: hexEncode(takePub[:]), HubAddress: coins.KeyID(hubPub[:]),
+	}
+	n.store.Add(take)
+
+	res, rerr := n.TakeOrder(TakeOrderParams{
+		ID: orderIDString(oid), FromAddress: btcAddr, ToAddress: btcAddr2,
+	})
+	if rerr != nil {
+		t.Fatalf("dxTakeOrder: %v (fee selection must avoid M0's locked u1 and fall through to u2)", rerr)
+	}
+	if res.Status != "accepting" {
+		t.Fatalf("take status = %q, want accepting", res.Status)
+	}
+	// The committed take's fee utxo must be u2 — u1 is M0's.
+	takeKey := hexEncode(oid[:])
+	got := n.store.Get(takeKey)
+	if got == nil {
+		t.Fatal("taken order missing from store")
+	}
+	if len(got.FeeUtxos) != 1 || got.FeeUtxos[0].TxID != u2.TxID {
+		t.Fatalf("take fee utxo = %+v, want exactly u2 (%s) — u1 is locked by M0", got.FeeUtxos, u2.TxID)
+	}
+	// u1 must still be locked — by M0, not by the take (byOrder reports the
+	// display id, Store.lockedInfoLocked's orderIDString).
+	keys, byOrder := n.store.LockedUtxoInfo()
+	if !keys[u1Key] || byOrder[u1Key] != orderIDString(m0.ID) {
+		t.Fatalf("M0's u1 lock vanished or was re-attributed: keys[%s]=%v byOrder=%v want %v", u1Key, keys[u1Key], byOrder[u1Key], orderIDString(m0.ID))
+	}
+}

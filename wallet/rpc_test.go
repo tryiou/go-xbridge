@@ -309,6 +309,42 @@ func TestListUnspentFiltering(t *testing.T) {
 	}
 }
 
+// TestListUnspentWithZeroConf verifies the fee-funding enumeration
+// (AvailableCoins(fOnlySafe=true) parity): unconfirmed outputs are kept,
+// conflicted ones (present negative confirmations) stay dropped, and the
+// confirmed-only ListUnspent contract is unchanged. Live run6 S2: a take
+// whose only fee-covering UTXO was 0-conf change failed INSUFFICIENT_FUNDS
+// because the fee path enumerated confirmed-only.
+func TestListUnspentWithZeroConf(t *testing.T) {
+	body := `[
+		{"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":6,"spendable":true},
+		{"txid":"4444444444444444444444444444444444444444444444444444444444444444","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":0,"spendable":true},
+		{"txid":"7777777777777777777777777777777777777777777777777777777777777777","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":-1,"spendable":true},
+		{"txid":"6666666666666666666666666666666666666666666666666666666666666666","vout":0,"amount":1.0,"scriptPubKey":"51","spendable":true}
+	]`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(rpcResponse{Result: json.RawMessage(body), ID: req.ID})
+	}))
+	defer srv.Close()
+
+	c := NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	utxos, err := c.ListUnspentWithZeroConf()
+	if err != nil {
+		t.Fatalf("ListUnspentWithZeroConf: %v", err)
+	}
+	// In body order: #1 (confirmed) kept, #4 (0-conf change) kept,
+	// #7 (conflicted, confirmations -1) dropped, #6 (field absent) kept.
+	got := map[string]bool{}
+	for _, u := range utxos {
+		got[u.TxID[:1]] = true
+	}
+	if len(utxos) != 3 || !got["1"] || !got["4"] || !got["6"] {
+		t.Fatalf("zero-conf utxos = %d %+v, want #1, #4 and #6 only", len(utxos), utxos)
+	}
+}
+
 // TestSignRawTransactionFallback verifies the C++ legacy-first behavior
 // (xbridgewalletconnectorbtc.cpp:1091-1100): "signrawtransaction" is tried
 // first, and when the wallet has removed it (error), the connector falls back

@@ -171,6 +171,12 @@ func (f *fakeConnector) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 	return []wallet.Utxo{f.funding}, nil
 }
 
+// ListUnspentWithZeroConf returns the same idealized set: the fake models a
+// wallet where every known output is visible, confirmed or not.
+func (f *fakeConnector) ListUnspentWithZeroConf() ([]wallet.Utxo, error) {
+	return f.ListUnspent(0)
+}
+
 func (f *fakeConnector) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
 	raw, err := hex.DecodeString(txHex)
 	if err != nil {

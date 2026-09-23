@@ -284,6 +284,18 @@ type rpcUtxo struct {
 // minConf is a Go-side caller contract (C++ has no per-call minconf here); a
 // UTXO with a known confirmation count below minConf is dropped.
 func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
+	return c.listUnspentFiltered(minConf, false)
+}
+
+// ListUnspentWithZeroConf implements wallet.Connector: same wire call, but
+// unconfirmed outputs are kept. This is wider than C++ fOnlySafe (it keeps
+// inbound receipts too, not just own change) — safe for dust-sized P2PKH fee
+// inputs under the ReserveForTake lock exclusion; see the interface doc.
+func (c *RPCConnector) ListUnspentWithZeroConf() ([]Utxo, error) {
+	return c.listUnspentFiltered(0, true)
+}
+
+func (c *RPCConnector) listUnspentFiltered(minConf int, includeZeroConf bool) ([]Utxo, error) {
 	var raw []rpcUtxo
 	// C++ parity: empty params (wallet default minconf/maxconf).
 	if err := c.cli.Call("listunspent", []interface{}{}, &raw); err != nil {
@@ -299,9 +311,16 @@ func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
 		if u.Amount <= 0 {
 			continue
 		}
-		// C++ confs guard: keep when the field is absent (confs==-1) or >0;
-		// drop when present and <=0 (unconfirmed/conflicted).
-		if u.Confirmations != nil && *u.Confirmations <= 0 {
+		// Conflicted outputs (present negative confirmations) are dropped in
+		// both modes; they are never spendable.
+		if u.Confirmations != nil && *u.Confirmations < 0 {
+			continue
+		}
+		// C++ confs guard for the listunspent-shape path: keep when the field
+		// is absent (confs==-1) or >0; drop when present and unconfirmed.
+		// Skipped when the caller explicitly wants the mempool set too
+		// (fee funding over AvailableCoins(fOnlySafe=true)).
+		if !includeZeroConf && u.Confirmations != nil && *u.Confirmations <= 0 {
 			continue
 		}
 		confs := 0

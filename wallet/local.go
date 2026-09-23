@@ -66,6 +66,10 @@ func (l *LocalConnector) ListUnspent(minConf int) ([]Utxo, error) {
 	return nil, errors.New("wallet: LocalConnector has no UTXO source")
 }
 
+func (l *LocalConnector) ListUnspentWithZeroConf() ([]Utxo, error) {
+	return nil, errors.New("wallet: LocalConnector has no UTXO source")
+}
+
 // SignRawTransaction parses txHex, signs each input via the LocalSigner, and
 // re-serializes. Returns the signed hex and complete=true (all inputs signed).
 func (l *LocalConnector) SignRawTransaction(txHex string, prevTxs []PrevTx) (string, bool, error) {

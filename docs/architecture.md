@@ -167,6 +167,7 @@ type Connector interface {
     Ticker() string
     GetNewAddress() (string, error)
     ListUnspent(minConf int) ([]Utxo, error)
+    ListUnspentWithZeroConf() ([]Utxo, error)
     SignRawTransaction(txHex string, prevTxs []PrevTx) (signedHex string, complete bool, err error)
     SendRawTransaction(txHex string) (txid string, err error)
     GetRelayFee() (float64, error)

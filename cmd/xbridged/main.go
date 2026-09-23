@@ -139,6 +139,7 @@ func main() {
 	// settings().showAllOrders()) (xbridgeapp.cpp:372): show all orders across
 	// the network regardless of local wallets, overriding Main.ShowAllOrders.
 	dxnowallets := flag.Bool("dxnowallets", false, "show all orders across the network for non-local wallets (C++ -dxnowallets; overrides Main.ShowAllOrders)")
+	takeRetry := flag.Int("takeretry", 2, "auto-retries for a locally-initiated take the hub rejects with crNotAccepted (transient block-height drift on fast-block coins like PIVX); 0 disables")
 	// -enableexchange mirrors C++'s flag of the same name (init.cpp:569). It
 	// gates Exchange::isEnabled on a service node (settings.cpp:45); xbridged
 	// is not a service node and exchange mode is inherent to it, so the flag
@@ -279,6 +280,11 @@ func main() {
 		// the daemon ignored Main.ShowAllOrders entirely until a reload.
 		ShowAllOrders:      conf.Main.ShowAllOrders || *dxnowallets,
 		ForceShowAllOrders: *dxnowallets,
+		// Bounded crNotAccepted take-retry (api/take_retry.go): a hub reject on
+		// block-height drift is transient; the retry re-fetches the block
+		// context and re-broadcasts a fresh Accepting. Rejected takes burn no
+		// service-node fee, so retries are fee-free up to the cap.
+		TakeRetry: *takeRetry,
 		// Reachability probe on (faithful updateActiveWallets); disabled in
 		// tests only. The startup Activator is shared so failed wallets stay
 		// "bad" for the 300s retry window across the 30s sweep.

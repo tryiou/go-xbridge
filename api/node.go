@@ -179,6 +179,13 @@ type Config struct {
 	// behaviour. Empty disables hot-reload: the RPC returns a false result
 	// (C++ uret(success), rpcxbridge.cpp:229-234).
 	ConfPath string
+	// TakeRetry is the number of auto-retries a locally-initiated take gets
+	// when the hub rejects it with crNotAccepted — a transient hub-wallet
+	// block-height race (see api/take_retry.go). 0 disables; the daemon
+	// default is 2 (~20s/40s backoff). A rejected take burns no service-node
+	// fee (the hub broadcasts the fee tx only after accepting), so retries
+	// are fee-free up to the cap.
+	TakeRetry int
 }
 
 // XConn is the connection surface the Node needs. Both *p2p.Conn (a single
@@ -232,6 +239,14 @@ type Node struct {
 	// (which may run off-engine), so silentHubsMu guards it.
 	silentHubsMu sync.Mutex
 	silentHubs   map[[33]byte]uint64
+
+	// takeRetries tracks locally-taken orders eligible for the bounded
+	// crNotAccepted auto-retry (api/take_retry.go): registered at commit
+	// (engine), armed by the reject handler (engine), and the retry goroutine
+	// re-runs TakeOrder off-engine — so unlike sessions this map is NOT
+	// engine-confined and takeRetriesMu guards it.
+	takeRetriesMu sync.Mutex
+	takeRetries   map[string]*takeRetryState
 
 	// startedAtMicro is the process-start wall clock. The silence recorder
 	// ignores HoldApply stamps predating it: pre-restart parked time is
@@ -619,7 +634,11 @@ func (n *Node) reloadConf() error {
 		ForceShowAllOrders: n.cfg().ForceShowAllOrders,
 		// C++ showAllOrders() = conf OR the -dxnowallets override, and the flag
 		// survives a reload (gArgs is process-global, xbridgeapp.cpp:372).
-		ShowAllOrders:     conf.Main.ShowAllOrders || n.cfg().ForceShowAllOrders,
+		ShowAllOrders: conf.Main.ShowAllOrders || n.cfg().ForceShowAllOrders,
+		// TakeRetry is daemon-level (the -takeretry flag): like
+		// ForceShowAllOrders it survives a reload — otherwise any
+		// dxLoadXBridgeConf would silently disable retries.
+		TakeRetry:         n.cfg().TakeRetry,
 		CheckReachability: n.cfg().CheckReachability,
 		Network:           n.cfg().Network,
 		AddNodes:          n.cfg().AddNodes,
@@ -2368,17 +2387,30 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", "")
 	}
 
-	// BLOCK service-node fee prep (C++ :2236-2267). Only 25-byte p2pkh UTXOs at
-	// minconf 1 fund the fee; locked UTXOs are excluded. Every fee-prep failure
-	// maps to INSUFFICIENT_FUNDS (C++ :2240-2264). blk is guaranteed non-nil
-	// here: a missing BLOCK connector was already rejected by the
-	// availableBalance pre-check above (INSUFFICIENT_FUNDS_DX, balance 0 < fee),
-	// and a connector whose GetBalance errors returns NO_SESSION — so the fee
-	// prep can only run with a live BLOCK wallet.
+	// BLOCK service-node fee prep (C++ :2236-2267). The fee draws on the
+	// wallet's spendable p2pkh set INCLUDING trusted 0-conf change: C++
+	// sources it from unspentP2PKH over in-wallet AvailableCoins(fOnlySafe
+	// = true) (bitcoinrpcconnector.cpp:276-278, :52-62), where fOnlySafe
+	// admits our own unconfirmed change (minDepth applies to others'
+	// outputs, not ours). ListUnspentWithZeroConf approximates that set
+	// (it keeps inbound receipts too — safe for dust-sized P2PKH fee inputs
+	// under the lock exclusion): the P2PKH filter below plus the
+	// ReserveForTake lock exclusion still prevent double-use, and a fee with
+	// an unconfirmed parent relays and confirms after it — exactly like
+	// core's own-change spend. (The taker-funding
+	// enumeration below stays minconf 1, mirroring C++ getUnspent's
+	// listUnspent with empty params; ListUnspent itself stays
+	// confirmed-only for the same reason.) Locked UTXOs are excluded. Every
+	// fee-prep failure maps to INSUFFICIENT_FUNDS (C++ :2240-2264). blk is
+	// guaranteed non-nil here: a missing BLOCK connector was already
+	// rejected by the availableBalance pre-check above
+	// (INSUFFICIENT_FUNDS_DX, balance 0 < fee), and a connector whose
+	// GetBalance errors returns NO_SESSION — so the fee prep can only run
+	// with a live BLOCK wallet.
 	blk := n.blockConnector()
 	blkCoin, _ := coins.Get("BLOCK")
 	blkConf := n.cfg().Confs["BLOCK"]
-	feeUtxoAvail, err := blk.ListUnspent(1)
+	feeUtxoAvail, err := blk.ListUnspentWithZeroConf()
 	if err != nil {
 		// C++ surfaces every fee-prep failure via makeError(statusCode,
 		// __FUNCTION__) with no argument (bare texts, xbridgeapp.cpp:2240-2264).
@@ -2389,12 +2421,26 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	// collides, but stay faithful per-token. The same snapshot feeds the
 	// funding exclusion below (:2270, same ticker).
 	lockedKeys := n.store.LockedUtxoInfoFor(o.ToCurrency)
+	// The fee exclusion must be WIDER than C++'s per-token snapshot: C++
+	// lockFeeUtxos (xbridgeapp.cpp:2819) records the fee inputs without any
+	// collision check and lockCoins checks only m_feeUtxos +
+	// m_utxosDict[token], so C++ would silently double-book a BLOCK utxo that
+	// is already locked as a BLOCK maker order's funding. Go's ReserveForTake
+	// checks feeKeys against the ALL-token locked set (lockedInfoLocked), so
+	// the fee selection filter must see the same set or every take whose only
+	// BLOCK fee candidate is another order's funding utxo dies with 1019
+	// "cannot reuse utxo inputs" (live run13 n=11). Fee selection therefore
+	// excludes LockedUtxoInfo() (fee utxos are the global BLOCK fee pool,
+	// C++ m_feeUtxos); the funding selection below keeps the per-token
+	// snapshot for C++ :2270 parity.
+	feeLocked, _ := n.store.LockedUtxoInfo()
 	feeUtxos := make([]wallet.Utxo, 0, len(feeUtxoAvail))
 	for _, u := range feeUtxoAvail {
 		if !isP2PKH25(u.ScriptPubKey) {
 			continue
 		}
-		if lockedKeys[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] {
+		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+		if lockedKeys[k] || feeLocked[k] {
 			continue
 		}
 		feeUtxos = append(feeUtxos, u)
@@ -2716,6 +2762,9 @@ func (n *Node) commitTake(key string, p TakeOrderParams, pkt *proto.Packet, tPri
 		return nil, makeError(errUnknown, "dxTakeOrder", err.Error())
 	}
 	xlog.Info("take broadcast", "order", key, "hub", live.SNodePubkey)
+	// The take left the wire: a crNotAccepted reject can now arrive — arm the
+	// bounded auto-retry (api/take_retry.go).
+	n.registerTakeRetry(key, p)
 	return n.store.Get(key), nil
 }
 
@@ -2793,6 +2842,9 @@ func (n *Node) CancelOrder(p CancelOrderParams) (*Order, *rpcError) {
 			stored.Status = "canceled"
 			stored.Updated = now
 		})
+		// Our own cancel ends the swap like an accepted remote one: disarm
+		// any pending crNotAccepted retry (api/take_retry.go).
+		n.dropTakeRetry(p.ID)
 		o.Status = "canceled"
 		o.Updated = now
 		// The cancelled order stays in the live book (status "canceled"); C++
@@ -2890,7 +2942,6 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		}
 		return
 	}
-
 	// --- Exchange branch (C++ :3316-3341) ---
 	if n.exchangeStarted.Load() {
 		s := n.sessionFor(idHex)
@@ -2908,6 +2959,10 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 			xlog.Error("cancel: send failed", "order", idHex, "err", err)
 			return
 		}
+		// The cancel is accepted: disarm any pending crNotAccepted retry
+		// (api/take_retry.go). Placed after verification — a forged cancel
+		// must never disarm the retry entry.
+		n.dropTakeRetry(idHex)
 		xlog.Info("cancel: counterparty requested cancel", "order", idHex)
 		return
 	}
@@ -2957,14 +3012,21 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		return
 	}
 
+	// From here on the cancel is verified (signature and connector gates
+	// passed; forged cancels and unknown orders returned above), so every
+	// honoring path below disarms any pending crNotAccepted retry
+	// (api/take_retry.go): the take already left the wire and must not fire
+	// again. The redeemed-ignore path stays armed (the cancel was refused).
 	// If local order is still open/pending and WE didn't initiate the cancel,
 	// mark stale so it rebroadcasts on another servicenode (C++ :3379-3383).
 	if o.Mine && stateOrdinal(o.Status) <= 2 && !iCanceled {
 		n.store.Update(idHex, n.markStale)
+		n.dropTakeRetry(idHex)
 		xlog.Info("cancel: cancel received, rebroadcasting order on another service node", "order", idHex)
 		return
 	} else if stateOrdinal(o.Status) < 6 { // no deposits yet (C++ :3384-3388)
 		n.store.MoveToHistoryU32(idHex, "canceled", b.Reason, NowMicro())
+		n.dropTakeRetry(idHex)
 		gossipLogger(o).Info("cancel: counterparty cancel request", "order", idHex, "reason", b.Reason, "reasonText", TxCancelReasonText(b.Reason))
 		return
 	} else if o.Status == "canceled" { // already canceled (C++ :3389-3391)
@@ -2976,6 +3038,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 			o.Reason = b.Reason
 			o.Updated = NowMicro()
 		})
+		n.dropTakeRetry(idHex)
 		gossipLogger(o).Info("cancel: counterparty cancel request", "order", idHex)
 		n.persist()
 		return
@@ -2991,6 +3054,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 			o.Reason = b.Reason
 			o.Updated = NowMicro()
 		})
+		n.dropTakeRetry(idHex)
 		xlog.Info("cancel: could not find a refund transaction for order", "order", idHex)
 		n.persist()
 		return
@@ -3003,6 +3067,7 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 		o.Reason = b.Reason
 		o.Updated = NowMicro()
 	})
+	n.dropTakeRetry(idHex)
 	if o.RefundTx != "" {
 		n.enqueueRefund(idHex, nil)
 		// C++ processLater; the background sweep retries on locktime.
@@ -3050,4 +3115,14 @@ func (n *Node) handleRemoteReject(pkt *proto.Packet, b *proto.RejectBody) {
 	n.store.RemovePendingPackets(idHex)
 	xlog.Info("reject: order restored to pending", "order", idHex)
 	n.persist()
+	// A crNotAccepted reject is a transient hub-side block-height race, not a
+	// deterministic refusal: schedule the bounded auto-retry with fresh block
+	// context (api/take_retry.go). Every other reason is deterministic (bad
+	// utxo, dust, bad fee tx, amount bounds) — retrying would repeat the same
+	// failure; drop any pending entry instead.
+	if b.Reason == uint32(crNotAccepted) {
+		n.scheduleTakeRetry(idHex)
+	} else {
+		n.dropTakeRetry(idHex)
+	}
 }

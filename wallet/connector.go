@@ -122,7 +122,21 @@ type Connector interface {
 	// GetNewAddress returns a fresh receive address.
 	GetNewAddress() (string, error)
 	// ListUnspent returns spendable UTXOs with at least minConf confirmations.
+	// It mirrors the listunspent-shape path (xbridgewalletconnectorbtc.cpp
+	// :536-577), which drops unconfirmed outputs even at minConf 0.
 	ListUnspent(minConf int) ([]Utxo, error)
+	// ListUnspentWithZeroConf returns the spendable set INCLUDING unconfirmed
+	// outputs, for service-node fee funding: a take whose only fee-covering
+	// UTXO is fresh change must succeed. It approximates C++
+	// AvailableCoins(fOnlySafe = true) (bitcoinrpcconnector.cpp:276-278,
+	// :52-62) — C++ admits only safe (own) unconfirmed outputs while this
+	// returns every wallet-owned 0-conf output including inbound receipts;
+	// for dust-sized P2PKH fee inputs under the ReserveForTake lock exclusion
+	// that approximation is safe. The two C++ paths deliberately differ, so
+	// the Go contract splits them too — ListUnspent stays confirmed-only,
+	// this one does not (conflicted outputs, confirmations < 0, stay dropped
+	// in both).
+	ListUnspentWithZeroConf() ([]Utxo, error)
 	// SignRawTransaction signs txHex with the wallet's keys. prevTxs supplies
 	// the previous outputs' scripts/amounts. It returns the signed hex and
 	// whether signing completed (every input signed).
