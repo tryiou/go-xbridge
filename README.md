@@ -216,7 +216,7 @@ This table is the complete flag authority (`cmd/xbridged/main.go`).
 | `-walletversionstr` | `/Blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
 | `-datadir` | OS config dir | Directory for local swap state. Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). Created `0700`. |
 | `-logfile` | `<datadir>/xbridged.log` | Log file path (stderr stays active). File logging is always on: an empty value selects the default file. Rotation: 10 MiB × 2 backups. |
-| `-loglevel` | `info` | Log verbosity: `debug`\|`info`\|`warn`\|`error`. |
+| `-loglevel` | `debug` | Log verbosity: `debug`\|`info`\|`warn`\|`error` (debug default while in beta). |
 | `-rpcservertimeout` | `30` | HTTP RPC timeout in seconds (C++ `DEFAULT_HTTP_SERVER_TIMEOUT` parity), applied to read/write; plus a 10 s header and 60 s idle timeout. |
 | `-dxnowallets` | `false` | Show all orders for non-local wallets (C++ `-dxnowallets`; overrides `Main.ShowAllOrders`). |
 | `-enableexchange` | `false` | Accepted for blocknetd CLI parity only; exchange mode is inherent to `xbridged` (no-op). |

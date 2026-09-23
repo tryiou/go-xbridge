@@ -1648,9 +1648,10 @@ func (n *Node) send(dest [20]byte, cmd proto.XBridgeCommand, body responseBody, 
 		return err
 	}
 	// Forensic transcript: the exact sent bytes at Debug (packets are small —
-	// a HoldApply is ~200 wire bytes — and Debug is off by default, so live
-	// logs stay quiet while a stall can still be replayed byte-for-byte from
-	// a debug run). packetHex output replays via proto.Unmarshal (pinned by
+	// a HoldApply is ~200 wire bytes — and Debug is the daemon default in
+	// beta, so the transcript is on unless -loglevel says otherwise; the
+	// p2p marker keeps it in the packet file, out of the general log).
+	// packetHex output replays via proto.Unmarshal (pinned by
 	// TestPacketHexReplays). The hex is rendered only when Debug is enabled:
 	// slog discards disabled-level args AFTER evaluating them, so an
 	// unconditional packetHex call would Marshal+hex-encode on every send.

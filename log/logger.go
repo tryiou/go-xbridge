@@ -17,9 +17,10 @@
 //
 //	log.Info("deposit broadcast", "session", id, "txid", txid, "cur", cur)
 //
-// The default logger writes text to stderr at INFO. Call SetLevel (or the
-// -loglevel flag in cmd/xbridged) to change verbosity; DEBUG shows everything,
-// WARN suppresses INFO+DEBUG, and so on.
+// The default logger writes text to stderr at DEBUG (beta stage: full
+// verbosity by default so field issues arrive with evidence). Call SetLevel
+// (or the -loglevel flag in cmd/xbridged) to change verbosity; INFO
+// suppresses DEBUG, WARN suppresses INFO+DEBUG, and so on.
 package log
 
 import (
@@ -39,7 +40,7 @@ var levelVar = new(slog.LevelVar)
 var logger atomic.Pointer[slog.Logger]
 
 func init() {
-	levelVar.Set(slog.LevelInfo)
+	levelVar.Set(slog.LevelDebug)
 	logger.Store(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: levelVar,
 	})))
