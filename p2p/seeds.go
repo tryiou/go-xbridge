@@ -12,27 +12,36 @@ import (
 // hardcoded" rule, which governs coin [TICKER] connectors (read from
 // xbridge.conf), not the network's own bootstrap infrastructure.
 //
-// The fixed IP seeds are the mainnet/testnet entries from src/chainparamsseeds.h
-// (pnSeed6_main / pnSeed6_test), all on their network's default P2P port. The
-// DNS hostnames are the DNS seeds from src/chainparams.cpp.
+// The testnet fixed seeds are the entries from src/chainparamsseeds.h
+// (pnSeed6_test) on the testnet default P2P port. The mainnet fixed seeds
+// were replaced with live-verified peers (see below); the DNS hostnames are
+// the DNS seeds from src/chainparams.cpp.
+
+// The fixed IP seeds below were verified live on 2026-09-23: each held
+// chain tip as a fully-synced /Blocknet:4.4.1/ peer with a sub-200ms TCP
+// handshake on the network's default P2P port (the previous
+// chainparamsseeds.h snapshot had rotted — all 11 refused connections).
+// Static IPs churn by nature; these are a bootstrap fallback behind the DNS
+// seeds and gossip discovery, not trusted parties. Re-verify before relying
+// on any entry older than a few months.
 
 var (
 	mainnetDNSSeeds = []string{"seednode1.blocknet.org", "seednode2.blocknet.org"}
 	testnetDNSSeeds = []string{"testnet-seednode1.blocknet.org", "testnet-seednode2.blocknet.org"}
 
-	// mainnet fixed seeds (pnSeed6_main), port 41412.
+	// mainnet fixed seeds, port 41412 (verified live 2026-09-23, fastest first).
 	mainnetFixedSeeds = []string{
-		"178.62.90.213:41412",
-		"138.197.73.214:41412",
-		"34.235.49.248:41412",
-		"35.157.52.158:41412",
-		"18.196.208.65:41412",
-		"13.251.15.150:41412",
-		"13.229.39.34:41412",
-		"52.56.35.74:41412",
-		"35.177.138.53:41412",
-		"35.178.142.231:41412",
-		"35.176.65.103:41412",
+		"5.189.179.250:41412",
+		"169.58.115.176:41412",
+		"157.90.75.76:41412",
+		"88.99.144.106:41412",
+		"199.241.137.81:41412",
+		"94.23.163.163:41412",
+		"135.181.141.137:41412",
+		"62.77.152.159:41412",
+		"134.195.198.209:41412",
+		"45.27.73.200:41412",
+		"64.31.61.150:41412",
 	}
 	// testnet fixed seeds (pnSeed6_test), port 41474.
 	testnetFixedSeeds = []string{
