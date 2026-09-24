@@ -756,7 +756,10 @@ func (c *RPCConnector) CheckDepositTransaction(depositTxID, expectedScriptHex st
 	rawHex, err := c.GetRawTransaction(depositTxID)
 	if err != nil {
 		xlog.Debug("checkDepositTransaction: no tx found ...waiting", "txid", depositTxID, "err", err)
-		return dc, fmt.Errorf("%w: %v", ErrDepositNotReady, err)
+		// The watched bytes were never observed (not merely shallow): the
+		// only unseen not-ready case. Every other ErrDepositNotReady below
+		// fires after the deposit tx was fetched and decoded, i.e. seen.
+		return dc, &NotReadyError{Seen: false, Err: fmt.Errorf("%w: %v", ErrDepositNotReady, err)}
 	}
 	raw, err := hex.DecodeString(rawHex)
 	if err != nil {

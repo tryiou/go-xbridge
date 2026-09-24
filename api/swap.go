@@ -184,6 +184,29 @@ type SwapSession struct {
 	depositRetryAt uint64
 	depositRetries uint32
 
+	// notReadySince stamps (wall micros) when a build first failed only
+	// because the counterparty deposit was not yet wallet-visible
+	// (ErrDepositNotReady). While the stamp is fresh the engine re-polls on
+	// the fast ticker instead of burning the failure backoff (swap_retry.go):
+	// backend index lag is minutes at worst, and every live slow swap to
+	// date was visibility, not failure. The stamp clears only on a
+	// successful build; past notReadyFastWindowMicro failures stay on the
+	// classic backoff until then. Shared by both slots: deposit and claim
+	// builds are state-sequential (a claim starts only after our deposit
+	// broadcast), and both clearers reset it, so the slots can never hold
+	// competing waits. Persisted like the retry slots, so a restart resumes
+	// the same window instead of restarting it.
+	notReadySince uint64
+
+	// notReadySeen is the visibility verdict of the latest fast-lane
+	// admission (wallet.NotReadySeen): true when the watched tx bytes were
+	// observed (seen, waiting on depth/prevouts — keep polling fast), false
+	// when never observed (past the taper age its polls slow: nothing
+	// observed means nothing to build yet). Set on every admission, cleared
+	// with the stamp; persisted alongside it so a restart resumes the same
+	// verdict instead of re-learning it.
+	notReadySeen bool
+
 	// Validated counterparty deposit: the C++
 	// checkDepositTransaction out-params recorded when we accept the
 	// counterparty's deposit (CreateB for the taker's A-check, ConfirmA for the
@@ -920,13 +943,26 @@ func (s *SwapSession) applyCreatedA(v any, terr error) responseBody {
 	}
 	if terr != nil {
 		s.releaseAwait()
-		xlog.Error("CreateA deposit task failed", "order", orderID, "err", terr)
+		// Honest severity: a not-ready wait is routine (fast re-poll owns
+		// it below), not a failure — reserve ERROR for genuine faults.
+		if errors.Is(terr, wallet.ErrDepositNotReady) {
+			xlog.Info("CreateA build not ready, fast re-poll", "order", orderID, "err", terr)
+		} else {
+			xlog.Error("CreateA deposit task failed", "order", orderID, "err", terr)
+		}
 		// Transient until proven otherwise (wallet offline, fee estimation):
 		// schedule a tick-driven rebuild instead of stranding pre-deposit
 		// when the hub stays quiet. Nothing was broadcast (ourDepositTxID is
 		// only set on success), so a retry can never double-broadcast.
+		// The not-ready branch is unreachable by construction today (maker
+		// buildDeposit spends recorded funding and never checks counterparty
+		// visibility), kept for uniformity with the other three build sites
+		// should a visibility-dependent step ever land here.
 		if s.ourDepositTxID == "" {
-			scheduleDepositRetry(s, NowMicro(), "maker", terr)
+			now := NowMicro()
+			if !s.scheduleNotReady(now, "maker", false, terr) {
+				scheduleDepositRetry(s, now, "maker", terr)
+			}
 		}
 		return nil
 	}
@@ -1116,14 +1152,24 @@ func (s *SwapSession) applyCreatedB(v any, terr error) responseBody {
 		if s.failSelfCancel(terr) {
 			return nil
 		}
-		xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
+		// Honest severity: a not-ready wait is routine (fast re-poll owns
+		// it below), not a failure — reserve ERROR for genuine faults.
+		if errors.Is(terr, wallet.ErrDepositNotReady) {
+			xlog.Info("CreateB build not ready, fast re-poll", "order", orderID, "err", terr)
+		} else {
+			xlog.Error("CreateB deposit task failed", "order", orderID, "err", terr)
+		}
 		// Transient until proven otherwise (backend lag, mempool blindness):
 		// schedule a tick-driven rebuild instead of stranding at initialized
 		// when the hub stays quiet (live-proven d4df334e). Nothing was
 		// broadcast (ourDepositTxID is only set on success), so a retry can
-		// never double-broadcast.
+		// never double-broadcast. A not-yet-visible maker deposit fast-polls
+		// instead of burning the failure backoff (not-ready fast lane).
 		if s.ourDepositTxID == "" {
-			scheduleDepositRetry(s, NowMicro(), "taker", terr)
+			now := NowMicro()
+			if !s.scheduleNotReady(now, "taker", false, terr) {
+				scheduleDepositRetry(s, now, "taker", terr)
+			}
 		}
 		return nil
 	}
@@ -1292,13 +1338,24 @@ func (s *SwapSession) applyConfirmedA(v any, terr error) responseBody {
 		if s.failSelfCancel(terr) {
 			return nil
 		}
-		xlog.Error("ConfirmA claim task failed", "order", orderID, "err", terr)
+		// Honest severity: a not-ready wait is routine (fast re-poll owns
+		// it below), not a failure — reserve ERROR for genuine faults.
+		if errors.Is(terr, wallet.ErrDepositNotReady) {
+			xlog.Info("ConfirmA build not ready, fast re-poll", "order", orderID, "err", terr)
+		} else {
+			xlog.Error("ConfirmA claim task failed", "order", orderID, "err", terr)
+		}
 		// Transient until proven otherwise (backend lag, mempool blindness):
 		// schedule a tick-driven rebuild instead of stranding at createdA
 		// when the hub stays quiet. A built claim (claimTxID set) never
-		// reaches here — only the no-broadcast case retries.
+		// reaches here — only the no-broadcast case retries. A not-yet-
+		// visible taker deposit fast-polls instead of burning the failure
+		// backoff (not-ready fast lane).
 		if s.claimTxID == "" {
-			scheduleClaimRetry(s, NowMicro(), "maker", terr)
+			now := NowMicro()
+			if !s.scheduleNotReady(now, "maker", true, terr) {
+				scheduleClaimRetry(s, now, "maker", terr)
+			}
 		}
 		return nil
 	}
@@ -1461,14 +1518,25 @@ func (s *SwapSession) applyConfirmedB(v any, terr error) responseBody {
 	}
 	if terr != nil {
 		s.releaseAwait()
-		xlog.Error("ConfirmB claim task failed", "order", orderID, "err", terr)
+		// Honest severity: a not-ready wait is routine (fast re-poll owns
+		// it below), not a failure — reserve ERROR for genuine faults.
+		if errors.Is(terr, wallet.ErrDepositNotReady) {
+			xlog.Info("ConfirmB build not ready, fast re-poll", "order", orderID, "err", terr)
+		} else {
+			xlog.Error("ConfirmB claim task failed", "order", orderID, "err", terr)
+		}
 		// Transient until proven otherwise (backend lag, mempool blindness):
 		// schedule a tick-driven rebuild instead of stranding at createdB
 		// when the hub stays quiet (live-proven e6730fe2). A built claim
 		// (claimTxID set) never reaches here — only the no-broadcast case
-		// retries, so a retry can never double-broadcast.
+		// retries, so a retry can never double-broadcast. A not-yet-visible
+		// maker payTx fast-polls instead of burning the failure backoff
+		// (not-ready fast lane).
 		if s.claimTxID == "" {
-			scheduleClaimRetry(s, NowMicro(), "taker", terr)
+			now := NowMicro()
+			if !s.scheduleNotReady(now, "taker", true, terr) {
+				scheduleClaimRetry(s, now, "taker", terr)
+			}
 		}
 		return nil
 	}
@@ -2814,15 +2882,27 @@ func confirmDepositKnownByRawTx(conn wallet.Connector, txid string, vout uint32,
 	if verr != nil {
 		return false
 	}
-	// Depth must be asserted, not defaulted: a backend omitting the field
-	// proves nothing about confirmations, and this gate feeds a claim
-	// broadcast — waiting on missing evidence is strictly safer than
-	// matching script/value at an assumed depth. Core backends always
+	// Depth must be asserted, not defaulted — EXCEPT under an explicit
+	// 0-conf policy: a backend that served the exact validated vout proves
+	// mempool presence, which IS the 0-conf proof (live cost of demanding
+	// the field unconditionally: ~147 s per claim waiting for the first
+	// confirmation despite Confirmations=0, while Core claims instantly off
+	// its mempool-visible gettxout). A backend omitting the field proves
+	// nothing about confirmations, and this gate feeds a claim broadcast —
+	// for minConf > 0, waiting on missing evidence stays strictly safer
+	// than matching script/value at an assumed depth. Core backends always
 	// include the field, so this changes nothing for them.
-	if !vtx.HasConfirmations {
-		return false
-	}
-	if vtx.Confirmations < minConf {
+	if minConf > 0 {
+		if !vtx.HasConfirmations {
+			return false
+		}
+		if vtx.Confirmations < minConf {
+			return false
+		}
+	} else if vtx.HasConfirmations && vtx.Confirmations < 0 {
+		// Affirmative conflict evidence (negative depth) rejects even at
+		// 0-conf: a missing field is mempool presence, but a negative one
+		// is a conflicted transaction.
 		return false
 	}
 	out, ok := vtx.Outputs[vout]
@@ -2886,22 +2966,38 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 	// Spent status stays opaque in that path, but a claim broadcast on a
 	// spent output cannot confirm — proceeding is fund-safe, stalling strands
 	// funds. A spent proof (ok=false, nil error) always waits, on any backend.
+	// Error split below: a GetTxOut FETCH error after visibility was proven
+	// is backend flakiness and fast-polls (not-ready fast lane); only a
+	// spent proof — reorg/double-spend ambiguity, never index lag — stays
+	// on the classic backoff. Hub redelivery re-validates from scratch.
 	if conn, ok := c.connectors[depositCur]; ok && conn != nil {
-		if _, unspent, gerr := conn.GetTxOut(c.theirDepositTxID, c.theirDepositVout); gerr != nil || !unspent {
+		_, unspent, gerr := conn.GetTxOut(c.theirDepositTxID, c.theirDepositVout)
+		if gerr != nil {
+			// Backend hiccup AFTER the deposit check already proved
+			// visibility: not a spent deposit, just an unreadable chain
+			// view. Degrade on -5 as before; any other fetch error is
+			// transient backend flakiness and fast-polls (not-ready fast
+			// lane) instead of burning the failure backoff.
 			degraded := false
 			if code, isRPC := wallet.RPCErrorCode(gerr); isRPC && code == -5 {
 				degraded = confirmDepositKnownByRawTx(conn, c.theirDepositTxID, c.theirDepositVout,
 					hex.EncodeToString(theirSpec.P2SHScript()), p2shNative, c.minConf(c.conf(depositCur)))
 			}
 			if !degraded {
-				if gerr != nil {
-					xlog.Debug("redeemCounterparty: deposit unspent check unavailable (transient)", "order", c.orderID, "err", gerr)
-				} else {
-					xlog.Debug("redeemCounterparty: counterparty deposit spent or missing (reorg?)", "order", c.orderID, "deposit", c.theirDepositTxID, "vout", c.theirDepositVout)
-				}
-				return "", "", fmt.Errorf("api: counterparty deposit %s:%d not unspent, awaiting redelivery", c.theirDepositTxID, c.theirDepositVout)
+				xlog.Debug("redeemCounterparty: deposit unspent check unavailable (transient)", "order", c.orderID, "err", gerr)
+				// Dual-%w: the RPC cause stays introspectable (RPCErrorCode)
+				// alongside the not-ready sentinel (scheduleNotReady checks
+				// errors.Is for the latter); rendered text is unchanged.
+				return "", "", fmt.Errorf("api: counterparty deposit %s:%d unspent check failed: %w: %w",
+					c.theirDepositTxID, c.theirDepositVout, gerr, wallet.ErrDepositNotReady)
 			}
 			xlog.Info("redeemCounterparty: gettxout-blind backend, proceeding on verbose raw-tx match", "order", c.orderID, "deposit", c.theirDepositTxID, "vout", c.theirDepositVout)
+		} else if !unspent {
+			// Spent proof (ok=false, nil error): reorg or double-spend —
+			// fund-safety-critical ambiguity, never index lag. Stays on the
+			// classic backoff; hub redelivery re-validates from scratch.
+			xlog.Debug("redeemCounterparty: counterparty deposit spent or missing (reorg?)", "order", c.orderID, "deposit", c.theirDepositTxID, "vout", c.theirDepositVout)
+			return "", "", fmt.Errorf("api: counterparty deposit %s:%d not unspent, awaiting redelivery", c.theirDepositTxID, c.theirDepositVout)
 		}
 	}
 	h, err := reverseTxidHex(c.theirDepositTxID)

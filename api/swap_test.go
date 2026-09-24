@@ -114,6 +114,11 @@ type fakeConnector struct {
 	broadcasts []string
 	rawTx      map[string]string // display txid -> hex
 
+	// payTxErr, when non-nil, makes GetRawTransaction fail with it — the
+	// taker-side -5 payTx fetch tests (production RPCError -5 shape for an
+	// unindexed maker payTx; the default errNotFound is test-only).
+	payTxErr error
+
 	// sendErr, when non-nil, makes SendRawTransaction fail with it — the
 	// refund/deposit broadcast-failure path tests.
 	sendErr error
@@ -125,6 +130,10 @@ type fakeConnector struct {
 	// verboseErr, when non-nil, makes it fail.
 	verboseTx  map[string]wallet.VerboseTx
 	verboseErr error
+	// verboseBareConfs, when true, serves canned entries WITHOUT the
+	// confirmations assertion (mempool shape: the backend omitted the
+	// depth field). Default serves them as confirmed knowledge.
+	verboseBareConfs bool
 	// verboseCalls counts GetRawTransactionVerbose calls (precedence lock).
 	verboseCalls int
 	// mempoolTxids serves GetRawMempool (own-deposit spend watch tests);
@@ -273,6 +282,9 @@ func (f *fakeConnector) GetBlockTxs(blockHash [32]byte) ([]wallet.BlockTx, error
 func (f *fakeConnector) GetRawTransaction(txid string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.payTxErr != nil {
+		return "", f.payTxErr
+	}
 	h, ok := f.rawTx[txid]
 	if !ok {
 		return "", errNotFound
@@ -290,8 +302,11 @@ func (f *fakeConnector) GetRawTransactionVerbose(txid string) (wallet.VerboseTx,
 	if v, ok := f.verboseTx[txid]; ok {
 		// A canned entry is knowledge: the fake backend asserts this
 		// depth (mirrors the RPC mapping setting HasConfirmations only
-		// on a present confirmations field).
-		v.HasConfirmations = true
+		// on a present confirmations field) — unless verboseBareConfs
+		// requests the mempool shape (field omitted).
+		if !f.verboseBareConfs {
+			v.HasConfirmations = true
+		}
 		return v, nil
 	}
 	return wallet.VerboseTx{}, &wallet.RPCError{Code: -5, Message: "No such transaction"}

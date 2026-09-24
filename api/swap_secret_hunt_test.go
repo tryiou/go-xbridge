@@ -1093,7 +1093,14 @@ func TestConfirmDepositWaitsOnMissingField(t *testing.T) {
 			0: {Value: 100000, ScriptHex: "deadbeef"},
 		}},
 	}}
-	if confirmDepositKnownByRawTx(conn, "deptx", 0, "deadbeef", 100000, 0) {
-		t.Fatal("deposit validation proceeded on unasserted depth")
+	// 0-conf policy: mempool presence (exact script/value match, no depth
+	// field) IS the proof — the strict gate cost ~147 s per live claim
+	// waiting for a first confirmation despite Confirmations=0.
+	if !confirmDepositKnownByRawTx(conn, "deptx", 0, "deadbeef", 100000, 0) {
+		t.Fatal("0-conf deposit validation must proceed on exact match with no depth field")
+	}
+	// 1-conf policy: the same depth-less evidence still waits.
+	if confirmDepositKnownByRawTx(conn, "deptx", 0, "deadbeef", 100000, 1) {
+		t.Fatal("1-conf deposit validation proceeded on unasserted depth")
 	}
 }

@@ -65,6 +65,14 @@ func TestPersistRoundTrip(t *testing.T) {
 	}
 	n.store.Add(o)
 	n.newMakerSession(o, MakeOrderParams{MakerAddress: btcAddr, TakerAddress: btcAddr}, arr32(mPriv), mPub)
+	// Retry scheduling (incl. the not-ready wait stamp) must survive the
+	// round-trip so a restart resumes the same window.
+	s := n.sessions[hexEncode(id[:])]
+	s.claimRetryAt = 123456789
+	s.claimRetries = 2
+	s.depositRetryAt = 987654321
+	s.notReadySince = 555555555
+	s.notReadySeen = true
 
 	n.persist()
 
@@ -101,7 +109,11 @@ func TestPersistRoundTrip(t *testing.T) {
 		t.Errorf("deposit out-params did not round-trip: got %d/%d/%d want %d/%d/%d",
 			got.OBinTxVout, got.OBinTxP2SHAmount, got.OOverpayment, o.OBinTxVout, o.OBinTxP2SHAmount, o.OOverpayment)
 	}
-
+	// Retry scheduling (incl. the not-ready wait stamp + verdict) round-trips.
+	if got.ClaimRetryAt != 123456789 || got.ClaimRetries != 2 || got.DepositRetryAt != 987654321 || got.NotReadySince != 555555555 || !got.NotReadySeen {
+		t.Errorf("retry schedule did not round-trip: got %d/%d/%d/%d/%v",
+			got.ClaimRetryAt, got.ClaimRetries, got.DepositRetryAt, got.NotReadySince, got.NotReadySeen)
+	}
 	// restoreSwap must reconstruct the order with the same hub anchor.
 	n2 := newPersistNode(t, dir)
 	n2.restoreSwap(got)
@@ -112,6 +124,14 @@ func TestPersistRoundTrip(t *testing.T) {
 	} else if ro.OBinTxVout != o.OBinTxVout || ro.OBinTxP2SHAmount != o.OBinTxP2SHAmount || ro.OOverpayment != o.OOverpayment {
 		t.Errorf("restored order deposit out-params lost: got %d/%d/%d",
 			ro.OBinTxVout, ro.OBinTxP2SHAmount, ro.OOverpayment)
+	}
+	// The restored session resumes the same wait verdict, not a re-learned one.
+	if rs := n2.sessions[hexEncode(id[:])]; rs == nil {
+		t.Fatal("restoreSwap did not re-create the session")
+	} else if !rs.notReadySeen {
+		t.Error("restored session lost notReadySeen verdict")
+	} else if rs.notReadySince != 555555555 {
+		t.Errorf("restored session notReadySince = %d, want 555555555", rs.notReadySince)
 	}
 }
 

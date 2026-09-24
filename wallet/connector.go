@@ -34,6 +34,45 @@ var (
 	ErrNoChainSource = errors.New("wallet: no chain data source")
 )
 
+// NotReadyError wraps ErrDepositNotReady with the visibility verdict: seen
+// reports whether the watched transaction's bytes were actually observed
+// (fetched and decoded) as opposed to merely absent. Callers that poll on
+// the fast lane use it to tell "nothing to see yet" (slow down) from
+// "seen, waiting on depth/prevouts" (keep polling fast). It unwraps to
+// ErrDepositNotReady, so every existing errors.Is gate keeps matching.
+type NotReadyError struct {
+	Seen bool
+	Err  error
+}
+
+// Error implements the error interface.
+func (e *NotReadyError) Error() string {
+	if e == nil || e.Err == nil {
+		return "wallet: deposit not ready"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap exposes ErrDepositNotReady (and any inner cause) to errors.Is/As.
+func (e *NotReadyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// NotReadySeen reports whether a not-ready failure observed the watched
+// transaction. A bare ErrDepositNotReady (or any non-not-ready error)
+// reports true — the fail-safe direction: callers only slow polls positively
+// proven progress-free, never ones they cannot classify.
+func NotReadySeen(err error) bool {
+	var nre *NotReadyError
+	if errors.As(err, &nre) {
+		return nre.Seen
+	}
+	return true
+}
+
 // Chain identifies a coin wallet endpoint: the connected SPV wallet (or full
 // node) exposing Blocknet-core-compatible RPC for that ticker. Every field is
 // derived from the coin's [TICKER] section in xbridge.conf (nothing hardcoded).

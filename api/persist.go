@@ -124,6 +124,15 @@ type persistedSwap struct {
 	// as the claim slot.
 	DepositRetryAt uint64 `json:"depositRetryAt,omitempty"`
 	DepositRetries uint32 `json:"depositRetries,omitempty"`
+	// NotReadySince stamps the not-ready fast-lane wait start (wall micros,
+	// swap_retry.go). Same omitempty upgrade rule as the retry slots.
+	NotReadySince uint64 `json:"notReadySince,omitempty"`
+	// NotReadySeen is the visibility verdict of the latest fast-lane
+	// admission (true = watched tx observed). Same omitempty upgrade rule
+	// (pre-upgrade snapshots predate the fields entirely): a restarted
+	// unseen wait slows immediately past the taper age, which is the
+	// correct posture for an already-degraded wait.
+	NotReadySeen bool `json:"notReadySeen,omitempty"`
 	// Validated counterparty-deposit out-params (C++ oBinTxVout /
 	// oBinTxP2SHAmount / oOverpayment): needed to rebuild a claim after a
 	// restart without re-running the deposit check. All three ride the
@@ -664,6 +673,8 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps.ClaimRetries = s.claimRetries
 	ps.DepositRetryAt = s.depositRetryAt
 	ps.DepositRetries = s.depositRetries
+	ps.NotReadySince = s.notReadySince
+	ps.NotReadySeen = s.notReadySeen
 	ps.TheirDepositVout = s.theirDepositVout
 	ps.TheirP2SHNative = s.theirP2SHNative
 	ps.TheirOverpayment = s.theirOverpayment
@@ -777,6 +788,8 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		claimRetries:     ps.ClaimRetries,
 		depositRetryAt:   ps.DepositRetryAt,
 		depositRetries:   ps.DepositRetries,
+		notReadySince:    ps.NotReadySince,
+		notReadySeen:     ps.NotReadySeen,
 		// Validated out-params ride the session record (adopted at
 		// claim-build, before the order record is updated) so a restarted
 		// claim rebuilds against the exact deposit output without

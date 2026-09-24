@@ -20,6 +20,7 @@ package api
 // never double-broadcast.
 
 import (
+	"errors"
 	"fmt"
 
 	xlog "go-xbridge/log"
@@ -28,6 +29,30 @@ import (
 )
 
 const (
+	// notReadyPollMicro is the re-poll delay for a build that failed only
+	// because the counterparty deposit is not yet wallet-visible: one fast
+	// tick (retryCheckInterval, 5 s), which already re-evaluates due
+	// claim/deposit rebuilds — no sweep change needed. Live-measured backend
+	// index lag is 10–40 s, so visibility typically arrives within a few
+	// fast polls instead of one 60 s backoff.
+	notReadyPollMicro = 5 * 1000000
+	// notReadyTaperAfterMicro / notReadyTaperPollMicro bound pathological
+	// volume: a watched tx still invisible past this age is an outage (or a
+	// never-sent deposit), never a healthy swap — 13/13 live swaps reach
+	// visibility in 10-40 s — and its polls cannot trigger progress, so they
+	// slow to one per 15 s. Anything seen (including every claim-side wait,
+	// which only runs after the deposit validated) keeps the 5 s cadence
+	// unconditionally: swap speed is bit-identical on the healthy path, and
+	// the worst case past 60 s gains at most ~5 s per check round (vs 60 s+
+	// backoff before the fast lane existed).
+	notReadyTaperAfterMicro = 60 * 1000000
+	notReadyTaperPollMicro  = 15 * 1000000
+	// notReadyFastWindowMicro bounds the fast lane: a deposit invisible
+	// longer than this is not backend lag but an outage (or a never-sent
+	// deposit), and the next failure falls back to the classic backoff with
+	// a loud log instead of polling forever.
+	notReadyFastWindowMicro = 10 * 60 * 1000000
+
 	// claimRetryBaseMicro is the delay before the first rebuild of a failed
 	// claim build (the tick itself runs every refundCheckInterval = 60 s, so
 	// the first retry lands one to two ticks after the failure — past the
@@ -96,6 +121,67 @@ func retryBackoff(retries uint32) uint64 {
 	return d
 }
 
+// scheduleNotReady fast-polls a build that failed ONLY because the
+// counterparty deposit is not yet wallet-visible (errors.Is(terr,
+// wallet.ErrDepositNotReady)). Engine-side, called from the phase-1 build
+// resumes instead of scheduleClaim/DepositRetry: the retry lands on the next
+// fast tick without consuming backoff budget, and the wait is stamped so a
+// deposit that stays invisible past notReadyFastWindowMicro falls back to
+// the classic backoff (an outage, not lag). Returns true when the fast lane
+// owns the error; false means the caller must take the backoff path.
+// lastProgress refreshes like the backoff schedulers: the session is
+// actively waiting on chain visibility, not silent.
+func (s *SwapSession) scheduleNotReady(now uint64, role string, isClaim bool, terr error) bool {
+	if !errors.Is(terr, wallet.ErrDepositNotReady) {
+		return false
+	}
+	orderID := hexEncode(s.id[:])
+	if s.notReadySince > now {
+		// Wall-clock jump backward (or a stamp persisted by an
+		// ahead-clocked run): a future stamp would skip the window expiry
+		// below and fast-poll indefinitely. Clamp to now — the window
+		// restarts instead of never lapsing.
+		s.notReadySince = now
+	}
+	if s.notReadySince != 0 && s.notReadySince <= now && now-s.notReadySince >= notReadyFastWindowMicro {
+		// Sustained outage (or a never-sent deposit), not lag: stay on the
+		// classic backoff. The stamp is deliberately KEPT (cleared only by
+		// a successful build) so every subsequent failure keeps backing
+		// off instead of oscillating fast→backoff→fast forever.
+		xlog.Warn("deposit not ready past fast window, staying on backoff", "order", orderID,
+			"role", role, "waitingSec", (now-s.notReadySince)/1000000)
+		return false
+	}
+	if s.notReadySince == 0 {
+		s.notReadySince = now
+	}
+	// Visibility verdict (wallet.NotReadyError): a seen wait keeps the fast
+	// cadence however old — its polls can still trigger progress (depth
+	// arrival). Only an unseen wait past the taper age slows: nothing
+	// observed means nothing to build yet. Unclassified errors default to
+	// seen (fail-safe: never slow what cannot be proven progress-free).
+	s.notReadySeen = wallet.NotReadySeen(terr)
+	poll := uint64(notReadyPollMicro)
+	if !s.notReadySeen && s.notReadySince <= now && now-s.notReadySince >= notReadyTaperAfterMicro {
+		poll = uint64(notReadyTaperPollMicro)
+		xlog.Info("deposit still invisible past taper age, slowing re-poll", "order", orderID,
+			"role", role, "waitingSec", (now-s.notReadySince)/1000000,
+			"retryInSec", poll/1000000)
+	}
+	if isClaim {
+		s.claimRetryAt = now + poll
+	} else {
+		s.depositRetryAt = now + poll
+	}
+	s.lastProgress = now
+	xlog.Info("deposit not ready, re-poll scheduled", "order", orderID, "role", role,
+		"retryInSec", poll/1000000)
+	if perr := s.n.persistNow(); perr != nil {
+		xlog.Error("not-ready re-poll persist failed, in-memory schedule kept", "order", orderID, "err", perr)
+	}
+	return true
+}
+
 // scheduleClaimRetry records a failed claim build for tick-driven rebuild.
 // Engine-side (called from the phase-1 resumes). selfCancel aborts must NOT
 // come here — failSelfCancel owns those. A persist failure keeps the
@@ -115,10 +201,13 @@ func scheduleClaimRetry(s *SwapSession, now uint64, role string, err error) {
 }
 
 // clearClaimRetry drops the retry schedule after a successful build.
-// Engine-side.
+// Engine-side. Also clears the not-ready wait stamp and verdict: a later
+// genuine failure starts a fresh window instead of inheriting a stale one.
 func clearClaimRetry(s *SwapSession) {
 	s.claimRetryAt = 0
 	s.claimRetries = 0
+	s.notReadySince = 0
+	s.notReadySeen = false
 }
 
 // makerClaimBuildTask returns the ConfirmA ELSE-branch claim BUILD task: it
@@ -202,6 +291,16 @@ func takerClaimBuildTask(s *SwapSession, c swapCtx, payTxID string) workTask {
 			}
 			payHex, err := conn.GetRawTransaction(payTxID)
 			if err != nil {
+				// A -5 here is backend index lag on a just-broadcast payTx, not
+				// a bad secret: map it to the not-ready sentinel so the apply
+				// path fast-polls instead of burning the failure backoff. Any
+				// other fetch error keeps today's surface (backoff path).
+				if code, ok := wallet.RPCErrorCode(err); ok && code == -5 {
+					// The maker's payTx bytes were never observed: unseen, so a
+					// sustained wait tapers (same outage logic as an invisible
+					// deposit) instead of fast-polling forever.
+					return nil, &wallet.NotReadyError{Seen: false, Err: fmt.Errorf("api: getrawtransaction %s not ready: %w", payTxID, wallet.ErrDepositNotReady)}
+				}
 				return nil, fmt.Errorf("api: getrawtransaction %s: %w", payTxID, err)
 			}
 			// The maker's payTx was serialized by the maker's XBridge connector;
@@ -267,10 +366,12 @@ func scheduleDepositRetry(s *SwapSession, now uint64, role string, err error) {
 }
 
 // clearDepositRetry drops the retry schedule after a successful build.
-// Engine-side.
+// Engine-side. Also clears the not-ready wait stamp (see clearClaimRetry).
 func clearDepositRetry(s *SwapSession) {
 	s.depositRetryAt = 0
 	s.depositRetries = 0
+	s.notReadySince = 0
+	s.notReadySeen = false
 }
 
 // makerDepositBuildTask returns the CreateA HTLC deposit BUILD task: it

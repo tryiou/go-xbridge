@@ -35,6 +35,24 @@ func awaitRetries(t *testing.T, n *Node, get func() uint32, want uint32, what st
 	}
 }
 
+// awaitRetryAtAfter polls an engine-owned retry timestamp until it moves
+// past `after` or the deadline passes. Used where the fast lane reschedules
+// without consuming backoff budget, so no counter marks the firing — the
+// schedule moving forward IS the signal.
+func awaitRetryAtAfter(t *testing.T, n *Node, get func() uint64, after uint64, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := readOnEngine(t, n, get); got > after {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s retryAt did not move past %d within 5s", what, after)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // startWithFastRetry boots the node's engine with the retry re-evaluation
 // interval shrunk so tests observe due-firings in milliseconds instead of
 // minutes. The production value is restored on cleanup.
@@ -52,6 +70,11 @@ func startWithFastRetry(t *testing.T, n *Node) {
 // elapsed must rebuild without any 60 s tick running — the fast re-evaluation
 // path fires it. The backend stays blind, so the rebuild fails again and
 // reschedules (retries 1 -> 2): the assertion counts attempts, not success.
+// NOTE: this fixture's blindness is the test-only errNotFound plain error,
+// which is NOT the production -5 (RPCError -5 maps to the not-ready fast
+// lane, not the backoff counter). This test therefore pins the backoff path
+// for unknown (non--5) failures; see notready_fastlane_test.go for the -5
+// fast-lane contract.
 func TestFastTickerFiresDueClaimRetry(t *testing.T) {
 	_, takerNode, _, takerSession, hub, orderID, makerPayTxID, _, _ := blindTakerFixture(t)
 	if _, _, err := takerSession.OnConfirmB(&proto.ConfirmBBody{HubAddress: hub, ID: orderID, APayTxID: makerPayTxID}); err == nil {
@@ -72,8 +95,13 @@ func TestFastTickerFiresDueClaimRetry(t *testing.T) {
 }
 
 // TestFastTickerFiresDueDepositRetry mirrors the claim half for the deposit
-// slot: a scheduled taker deposit rebuild whose backoff elapsed must rebuild
-// without any 60 s tick.
+// slot — under the not-ready fast lane (swap_retry.go): a blind-backend
+// deposit build (the maker's deposit is unknown → ErrDepositNotReady)
+// schedules a FAST re-poll consuming no backoff budget, and the fast ticker
+// fires the due rebuild without any 60 s tick. The backend stays blind, so
+// the rebuild fails again and fast-reschedules: the schedule moving forward
+// (not the backoff counter) is the firing signal, and our deposit stays
+// unbuilt.
 func TestFastTickerFiresDueDepositRetry(t *testing.T) {
 	_, _, makerSession, takerSession, hub, orderID, createdA, _, _ := blindDepositFixture(t)
 	_, _, err := takerSession.OnCreateB(&proto.CreateBBody{HubAddress: hub, ID: orderID,
@@ -83,12 +111,17 @@ func TestFastTickerFiresDueDepositRetry(t *testing.T) {
 		t.Fatal("blind-backend CreateB unexpectedly succeeded")
 	}
 	takerNode := takerSession.n
-	if got := takerSession.depositRetries; got != 1 {
-		t.Fatalf("depositRetries = %d, want 1 (scheduled once)", got)
+	if got := takerSession.depositRetries; got != 0 {
+		t.Fatalf("depositRetries = %d, want 0 (not-ready consumes no backoff)", got)
 	}
 	startWithFastRetry(t, takerNode)
 	takerNode.submit(func() { takerSession.depositRetryAt = NowMicro() + 200000 }, true)
-	awaitRetries(t, takerNode, func() uint32 { return takerSession.depositRetries }, 2, "deposit")
+	restamped := readOnEngine(t, takerNode, func() uint64 { return takerSession.depositRetryAt })
+	// No tickStages anywhere on this path: only the fast ticker may fire it.
+	awaitRetryAtAfter(t, takerNode, func() uint64 { return takerSession.depositRetryAt }, restamped+1000000, "deposit")
+	if got := readOnEngine(t, takerNode, func() uint32 { return takerSession.depositRetries }); got != 0 {
+		t.Fatalf("depositRetries = %d, want 0 (fast-lane refire consumes no backoff)", got)
+	}
 	if got := readOnEngine(t, takerNode, func() string { return takerSession.ourDepositTxID }); got != "" {
 		t.Fatalf("ourDepositTxID = %q, want empty (backend still blind: retry, not success)", got)
 	}
