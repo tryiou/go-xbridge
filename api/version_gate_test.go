@@ -8,6 +8,7 @@ import (
 	"go-xbridge/crypto"
 	"go-xbridge/p2p"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // TestReaderLoopDropsSignedWrongVersion locks in the inbound protocol-version
@@ -27,7 +28,7 @@ func TestReaderLoopDropsSignedWrongVersion(t *testing.T) {
 	// A decodable, validly-signed packet with a wrong protocol version: the
 	// version gate (not the body decoder) is the only thing that can drop it.
 	bad := proto.NewPacket(proto.XbcTransactionCancel, make([]byte, 36))
-	bad.Version = 54
+	bad.Version = version.DefaultXBridgeProtocolVersion - 1
 	if err := signer.Sign(bad, priv); err != nil {
 		t.Fatalf("sign wrong-version packet: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestReaderLoopDropsSignedWrongVersion(t *testing.T) {
 	// the engine sees is the conforming one.
 	select {
 	case in := <-n.packets:
-		if in.pkt.Version != proto.ProtocolVersion {
+		if in.pkt.Version != version.XBridgeProtocolVersion {
 			t.Fatalf("packet reached engine with version=%d cmd=%v; wrong-version packets must be dropped",
 				in.pkt.Version, in.pkt.Command)
 		}

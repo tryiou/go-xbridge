@@ -15,6 +15,7 @@ import (
 	"go-xbridge/config"
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -1158,21 +1159,21 @@ func TestGetNetworkInfo(t *testing.T) {
 	if !ok {
 		t.Fatalf("getNetworkInfo result = %T, want networkInfoResult", res)
 	}
-	if n.Version != 4040100 {
-		t.Errorf("version = %v, want 4040100", n.Version)
+	if n.Version != version.DefaultWalletVersion {
+		t.Errorf("version = %v, want version.DefaultWalletVersion", n.Version)
 	}
-	if n.Subversion != "/Blocknet:4.4.1/" {
-		t.Errorf("subversion = %v, want /Blocknet:4.4.1/", n.Subversion)
+	if n.Subversion != version.DefaultWalletVersionStr {
+		t.Errorf("subversion = %v, want version.DefaultWalletVersionStr", n.Subversion)
 	}
 	// Alignment with real blocknetd (rpc/net.cpp:495-527, version.h).
-	if n.ProtocolVersion != 70713 {
-		t.Errorf("protocolversion = %v, want 70713", n.ProtocolVersion)
+	if n.ProtocolVersion != version.BitcoinProtocolVersion {
+		t.Errorf("protocolversion = %v, want version.BitcoinProtocolVersion", n.ProtocolVersion)
 	}
-	if n.XBridgeProtocolVersion != 55 {
-		t.Errorf("xbridgeprotocolversion = %v, want 55", n.XBridgeProtocolVersion)
+	if n.XBridgeProtocolVersion != int(version.XBridgeProtocolVersion) {
+		t.Errorf("xbridgeprotocolversion = %v, want version.XBridgeProtocolVersion", n.XBridgeProtocolVersion)
 	}
-	if n.XRouterProtocolVersion != 50 {
-		t.Errorf("xrouterprotocolversion = %v, want 50", n.XRouterProtocolVersion)
+	if n.XRouterProtocolVersion != version.XRouterProtocolVersion {
+		t.Errorf("xrouterprotocolversion = %v, want version.XRouterProtocolVersion", n.XRouterProtocolVersion)
 	}
 	// Fees render as JSON numbers with 8 decimals (ValueFromAmount), exactly
 	// as blocknetd — not strings.

@@ -23,7 +23,7 @@ import (
 	"go-xbridge/crypto"
 	xlog "go-xbridge/log"
 	"go-xbridge/p2p"
-	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // walletServicesLog gates the per-poll "WalletServices" metric to at most once
@@ -712,7 +712,7 @@ func (r *Registry) Pick(need []string, exclude ...[33]byte) ([33]byte, bool) {
 		if banned[k] {
 			continue
 		}
-		if e.xbridgeVersion != proto.ProtocolVersion || !r.running(e) {
+		if e.xbridgeVersion != version.XBridgeProtocolVersion || !r.running(e) {
 			continue
 		}
 		// C++ searchCounter = requested_services.size() and a candidate is only

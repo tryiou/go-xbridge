@@ -6,6 +6,7 @@ import (
 
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // failWriteConn wraps a captureXConn but makes every outbound SEND fail, so the
@@ -29,7 +30,7 @@ func TestMakeOrderStoreAddSendFailureRollback(t *testing.T) {
 	reg := servicenode.NewRegistry()
 	_, hubPub, _, _ := hubKey(t, 0x53)
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n, cc := newHubNode(reg)
 	n.config.DataDir = t.TempDir()

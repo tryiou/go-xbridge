@@ -185,8 +185,9 @@ type Config struct {
 	// to discovered peers (the -addnode flag). Used only when NodeAddr is empty.
 	AddNodes []string
 	// WalletVersion / WalletVersionStr are advertised in the getnetworkinfo
-	// response. BLOCK-DX pings getnetworkinfo for its wallet-version gate; we
-	// advertise Blocknet 4.4.1 (CLIENT_VERSION 4040100) by default.
+	// response. BLOCK-DX pings getnetworkinfo for its wallet-version gate; the
+	// stock-Blocknet defaults come from version.DefaultWalletVersion and
+	// version.DefaultWalletVersionStr (version/version.go).
 	WalletVersion    int
 	WalletVersionStr string
 	// DataDir is the directory local swap state (incl. each trade's per-trade

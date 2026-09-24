@@ -18,6 +18,7 @@ import (
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -36,7 +37,7 @@ func resendFixture(t *testing.T) (*Node, *captureXConn, string, [32]byte, [33]by
 		reg.AddPing(servicenode.ServiceNode{
 			PubKey: hk, Tier: servicenode.TierSPV,
 			Services:       []string{"BTC", "LTC"},
-			XBridgeVersion: proto.ProtocolVersion,
+			XBridgeVersion: version.XBridgeProtocolVersion,
 		})
 	}
 	btc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32)},

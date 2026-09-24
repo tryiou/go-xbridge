@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+
+	"go-xbridge/version"
 )
 
 // TestVersionMarshalShape verifies the version payload structure and that the
@@ -17,14 +19,14 @@ func TestVersionMarshalShape(t *testing.T) {
 
 	// version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26)
 	// + nonce(8) + varstr(userAgent) + start_height(4) + relay(1) + fxrouter(1)
-	wantLen := 4 + 8 + 8 + 26 + 26 + 8 + (1 + len(UserAgent)) + 4 + 1 + 1
+	wantLen := 4 + 8 + 8 + 26 + 26 + 8 + (1 + len(version.UserAgent)) + 4 + 1 + 1
 	if len(payload) != wantLen {
 		t.Fatalf("version payload len = %d, want %d", len(payload), wantLen)
 	}
 
 	ver := int32(binary.LittleEndian.Uint32(payload[0:4]))
-	if ver != BitcoinProtocolVersion {
-		t.Errorf("version = %d, want %d", ver, BitcoinProtocolVersion)
+	if ver != version.BitcoinProtocolVersion {
+		t.Errorf("version = %d, want %d", ver, version.BitcoinProtocolVersion)
 	}
 	if m.Services != ServiceNodeNone {
 		t.Errorf("services = %d, want %d", m.Services, ServiceNodeNone)

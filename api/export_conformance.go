@@ -14,6 +14,7 @@ import (
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -296,7 +297,7 @@ func conformanceHubRegistry() *servicenode.Registry {
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
 		PubKey: pub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"},
-		XBridgeVersion: proto.ProtocolVersion,
+		XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	return reg
 }

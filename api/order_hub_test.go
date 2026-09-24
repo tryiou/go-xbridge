@@ -10,6 +10,7 @@ import (
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -162,7 +163,7 @@ func TestMakeOrderMissingMakerConnectorNoSession(t *testing.T) {
 	reg := servicenode.NewRegistry()
 	_, hubPub, _, _ := hubKey(t, 0x53)
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n, _ := newHubNode(reg)
 	// Drop the maker wallet: the connector gate must error, not deref a nil
@@ -194,7 +195,7 @@ func TestMakeOrderMissingTakerConnectorNoSession(t *testing.T) {
 	reg := servicenode.NewRegistry()
 	_, hubPub, _, _ := hubKey(t, 0x54)
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n, _ := newHubNode(reg)
 	delete(n.config.Connectors, "SYS")
@@ -336,7 +337,7 @@ func TestMakeOrderReturnsStoreCopy(t *testing.T) {
 	hubPriv, hubPub, _, _ := hubKey(t, 0x60)
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n, _ := newHubNode(reg)
 
@@ -411,7 +412,7 @@ func TestMakeOrderPicksHub(t *testing.T) {
 	hubPriv, hubPub, hubPubHex, hubAddr := hubKey(t, 0x51)
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n, cc := newHubNode(reg)
 
@@ -475,7 +476,7 @@ func TestTakeOrderPinnedAccepting(t *testing.T) {
 	_, hubPub, hubPubHex, hubAddr := hubKey(t, 0x52)
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 		PaymentAddress: hubAddr,
 	})
 	n, cc := newHubNode(reg)
@@ -703,7 +704,7 @@ func pinnedHub(t *testing.T, seed byte) (_ *servicenode.Registry, pubHex string,
 	_, hubPub, hubPubHex, hubAddr := hubKey(t, seed)
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 		PaymentAddress: hubAddr,
 	})
 	return reg, hubPubHex, hubAddr

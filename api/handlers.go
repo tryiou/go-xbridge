@@ -15,6 +15,7 @@ import (
 	"go-xbridge/coins"
 	"go-xbridge/config"
 	discovery "go-xbridge/p2p/discovery"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -2080,11 +2081,11 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 	}
 	ver := h.Config().WalletVersion
 	if ver == 0 {
-		ver = 4040100
+		ver = version.DefaultWalletVersion
 	}
 	sub := h.Config().WalletVersionStr
 	if sub == "" {
-		sub = "/Blocknet:4.4.1/"
+		sub = version.DefaultWalletVersionStr
 	}
 	conns := 0
 	if h.Node != nil && h.Node.conn != nil {
@@ -2100,14 +2101,16 @@ func (h *HandlerCtx) getNetworkInfo(params []json.RawMessage) (interface{}, *rpc
 		Version:    ver,
 		Subversion: sub,
 		// Alignment with real blocknetd (rpc/net.cpp:495-527): protocol
-		// version 70713 (version.h), XBridge 55 / XRouter 50 (xbridge,xrouter
-		// version.h), networks entries carrying proxy_randomize_credentials.
+		// version (version.BitcoinProtocolVersion), XBridge
+		// (version.XBridgeProtocolVersion, effective value under
+		// -xbridgeversion) / XRouter (version.XRouterProtocolVersion),
+		// networks entries carrying proxy_randomize_credentials.
 		// Fees are JSON numbers with 8 decimals (ValueFromAmount), not
 		// strings. localservices reports the thin client's own capability
 		// bits — deliberately not a full node's bits.
-		ProtocolVersion:        70713,
-		XBridgeProtocolVersion: 55,
-		XRouterProtocolVersion: 50,
+		ProtocolVersion:        version.BitcoinProtocolVersion,
+		XBridgeProtocolVersion: int(version.XBridgeProtocolVersion),
+		XRouterProtocolVersion: version.XRouterProtocolVersion,
 		LocalServices:          "000000000000000d",
 		LocalRelay:             true,
 		TimeOffset:             0,

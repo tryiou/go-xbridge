@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // handshakePeer drives the far end of a net.Pipe through the version/verack
@@ -18,7 +19,7 @@ func handshakePeer(t *testing.T, server net.Conn, release chan struct{}) {
 		if _, err := readFrame(server); err != nil { // our version
 			return
 		}
-		v := versionPayloadForTest(BitcoinProtocolVersion)
+		v := versionPayloadForTest(version.BitcoinProtocolVersion)
 		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
 		if _, err := readFrame(server); err != nil { // our verack
 			return

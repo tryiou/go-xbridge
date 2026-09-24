@@ -212,8 +212,9 @@ This table is the complete flag authority (`cmd/xbridged/main.go`).
 | `-rpcbind` | `127.0.0.1:41414` | JSON-RPC listen address `host:port` for the `dx*` API. Defaults to **loopback only**; set explicitly to bind elsewhere. |
 | `-rpcuser` / `-rpcpassword` | `""` / `""` | HTTP Basic auth pair. Auth is enforced when the pair is set **or** any `-rpcauth` entry is configured; a non-loopback `-rpcbind` without auth logs a warning. With no credentials the daemon is open on its loopback bind (there is no cookie-auth fallback, unlike C++). Each flag falls back to the environment when empty — `XBRIDGED_RPCUSER` / `XBRIDGED_RPCPASSWORD` (explicit flags win) — so secrets never have to appear in `ps`-visible argv. |
 | `-rpcauth` | `""` | Comma-separated multi-user auth entries, `user:salt$hash` (HMAC-SHA256, the same credential path C++ offers). |
-| `-walletversion` | `4040100` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
-| `-walletversionstr` | `/Blocknet:4.4.1/` | Subversion advertised in `getnetworkinfo`. |
+| `-walletversion` | `version.DefaultWalletVersion` | Blocknet `CLIENT_VERSION` advertised in `getnetworkinfo`. |
+| `-walletversionstr` | `version.DefaultWalletVersionStr` | Subversion advertised in `getnetworkinfo`. |
+| `-xbridgeversion` | `version.DefaultXBridgeProtocolVersion` | XBridge wire protocol version stamped on every packet and gated on receive (C++ `XBRIDGE_PROTOCOL_VERSION`). Override only for isolated testing against a hub fleet on a different version. |
 | `-datadir` | OS config dir | Directory for local swap state. Empty uses the OS config dir: `~/.config/xbridged` (Linux), `~/Library/Application Support/xbridged` (macOS), `%AppData%\xbridged` (Windows). Created `0700`. |
 | `-logfile` | `<datadir>/xbridged.log` | Log file path (stderr stays active). File logging is always on: an empty value selects the default file. Rotation: 10 MiB × 2 backups. |
 | `-loglevel` | `debug` | Log verbosity: `debug`\|`info`\|`warn`\|`error` (debug default while in beta). |

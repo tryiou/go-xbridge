@@ -14,6 +14,7 @@ import (
 
 	xlog "go-xbridge/log"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // maxSendBufferSize caps the per-connection outbound queue. C++ PushMessage
@@ -233,10 +234,10 @@ func (c *Conn) handshake() error {
 			if err != nil {
 				return err
 			}
-			if v.Version < MinPeerProtoVersion {
+			if v.Version < version.MinPeerProtoVersion {
 				// C++ disconnects peers below MIN_PEER_PROTO_VERSION
 				// (net_processing.cpp:1617-1626).
-				return fmt.Errorf("p2p: peer version %d below minimum %d", v.Version, MinPeerProtoVersion)
+				return fmt.Errorf("p2p: peer version %d below minimum %d", v.Version, version.MinPeerProtoVersion)
 			}
 			c.peerVersion = v
 			if err := c.writeVerack(); err != nil {

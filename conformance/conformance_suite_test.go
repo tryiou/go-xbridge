@@ -22,6 +22,7 @@ package conformance_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"net"
@@ -35,6 +36,7 @@ import (
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
 	"go-xbridge/swap"
+	"go-xbridge/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -709,20 +711,38 @@ func TestOHLCVEncodingVectors(t *testing.T) {
 //     net_addr, envelope, servicenode)
 // ---------------------------------------------------------------------------
 
+// xbridgeVersionHex renders the XBridge protocol version's little-endian wire
+// bytes (the packet header's first 4 bytes) from the single source
+// (version.DefaultXBridgeProtocolVersion). The KAT vectors pin structure —
+// layout, sizes, pubkey, signature, body — while the version bytes derive, so
+// a deliberate default bump regenerates them without touching the pinned
+// crypto material. The digest/signature literals below were computed under the
+// previous default; a bump invalidates them (bump procedure in
+// version/version.go).
+func xbridgeVersionHex() string {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], version.DefaultXBridgeProtocolVersion)
+	return hex.EncodeToString(b[:])
+}
+
 // TestWirePacketHeader asserts the 129-byte XBridge packet header for a known
 // body (cmd 22 xbcTransactionCancel, body = 32-byte id 0102..20 + reason
 // 0xfeedbeef, timestamp 0x178b6a56, deterministic key/sig).
 // VECTOR 1.1 — deterministic packet header.
 func TestWirePacketHeader(t *testing.T) {
 	const bodyHex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20efbeedfe"
-	const wantHex = "3700000016000000566a8b178500000024000000" +
+	wantHex := xbridgeVersionHex() +
+		"16000000" + // command 22 (xbcTransactionCancel), LE
+		"566a8b17" + // timestamp 0x178b6a56, LE
+		"85000000" + // oldSize 133 = 36+97, LE
+		"24000000" + // size 36, LE
 		"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
 		"a3dfdba8d803471627e9a70559e9e3c70e5e02b9a26f8e9988349e18f6824d9565" +
 		"d2fc6141951f6f8b8a5a9335b2a8a42d9dcd8b76099c0b137d91c1828060fe" +
 		"000000000000000000000000" + bodyHex
 
 	pk := &proto.Packet{
-		Version:   55,
+		Version:   version.DefaultXBridgeProtocolVersion,
 		Command:   proto.XbcTransactionCancel,
 		Timestamp: 0x178b6a56,
 		OldSize:   133, // 36 + 97 (headerDifference)
@@ -743,7 +763,7 @@ func TestWirePacketHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proto.Unmarshal: %v", err)
 	}
-	if back.Version != 55 || back.Command != proto.XbcTransactionCancel ||
+	if back.Version != version.DefaultXBridgeProtocolVersion || back.Command != proto.XbcTransactionCancel ||
 		back.Timestamp != 0x178b6a56 || back.OldSize != 133 || back.Size != 36 {
 		t.Errorf("unmarshal header fields: %+v", back)
 	}
@@ -774,7 +794,7 @@ func TestWireDigestAndSign(t *testing.T) {
 	const pubHex = "0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0"
 	body := hx("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20efbeedfe")
 	pk := &proto.Packet{
-		Version: 55, Command: proto.XbcTransactionCancel, Timestamp: 0x178b6a56,
+		Version: version.DefaultXBridgeProtocolVersion, Command: proto.XbcTransactionCancel, Timestamp: 0x178b6a56,
 		OldSize: 133, Size: 36,
 		Pubkey:    toPub(pubHex),
 		Signature: toSig(sigHex),
@@ -824,7 +844,7 @@ func TestWireSignKnownAnswer(t *testing.T) {
 		"7c0cf7d2913fb5882240c4ff8d4229975398ea5d8db885d64514cb1f094a0c33"
 
 	pk := &proto.Packet{
-		Version: 55, Command: proto.XbcTransaction, Timestamp: 1600000000,
+		Version: version.DefaultXBridgeProtocolVersion, Command: proto.XbcTransaction, Timestamp: 1600000000,
 		OldSize: uint32(len(body)) + 97, Size: uint32(len(body)),
 		Body: []byte(body),
 	}
@@ -1180,15 +1200,19 @@ func TestWireMarshalRoundTrip(t *testing.T) {
 // 1.1 packet: magic a1a0a2a3, command "xbridge", varint envelope, 20-byte dest,
 // 8-byte µs timestamp, packet. VECTOR 3.1 — mainnet frame.
 func TestWireMainnetFrame(t *testing.T) {
-	const envHex = "c1a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3" + "0000566a8b7b0100" +
-		"3700000016000000566a8b1785000000240000000284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
+	envHex := xbridgeVersionHex() +
+		"16000000566a8b178500000024000000" + // command/ts/oldSize/size (pinned, §2.1)
+		"0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0" +
 		"a3dfdba8d803471627e9a70559e9e3c70e5e02b9a26f8e9988349e18f6824d9565d2fc6141951f6f8b8a5a9335b2a8a42d9dcd8b76099c0b137d91c1828060fe" +
 		"0000000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20efbeedfe"
+	// Prepend the 20-byte destination + 8-byte envelope timestamp ahead of the
+	// packet bytes (envelope layout §1.2).
+	envHex = "c1a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3" + "0000566a8b7b0100" + envHex
 	// NOTE: the captured-frame card prints the length in display order
 	// ("000000c2"); the wire field is little-endian, so 194 decodes as
 	// c2000000. The checksum (863c174d) is over the payload only and matches
 	// either spelling.
-	const frameHex = "a1a0a2a3" + "786272696467650000000000" + "c2000000" + "863c174d" + envHex
+	frameHex := "a1a0a2a3" + "786272696467650000000000" + "c2000000" + "863c174d" + envHex
 
 	env := hx(envHex)
 	if len(env) != 194 {
@@ -1225,7 +1249,7 @@ func TestWireMainnetFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proto.Unmarshal: %v", err)
 	}
-	if p.Version != 55 || p.Command != proto.XbcTransactionCancel || p.Timestamp != 0x178b6a56 ||
+	if p.Version != version.DefaultXBridgeProtocolVersion || p.Command != proto.XbcTransactionCancel || p.Timestamp != 0x178b6a56 ||
 		p.OldSize != 133 || p.Size != 36 {
 		t.Errorf("decoded packet fields: %+v", p)
 	}
@@ -1289,7 +1313,7 @@ func TestWireVersionVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnmarshalVersion: %v", err)
 	}
-	if v.Version != 70713 || v.Services != 0 || v.Timestamp != 1618000000 {
+	if v.Version != version.BitcoinProtocolVersion || v.Services != 0 || v.Timestamp != 1618000000 {
 		t.Errorf("version fields: %+v", v)
 	}
 	if !v.AddrRecv.IP.Equal(net.ParseIP("1.2.3.4")) || v.AddrRecv.Port != 41412 {
@@ -1298,16 +1322,16 @@ func TestWireVersionVectors(t *testing.T) {
 	// NOTE: the captured-frame card labels the nonce "0x8877665544332211" — that is the
 	// wire-byte display; LittleEndian decode of 88 77 66 55 44 33 22 11 is
 	// 0x1122334455667788.
-	if v.Nonce != 0x1122334455667788 || v.UserAgent != "/go-xbridge:0.1.0/" ||
+	if v.Nonce != 0x1122334455667788 || v.UserAgent != version.UserAgent ||
 		v.StartHeight != 0 || v.Relay || v.FXRouter {
 		t.Errorf("version tail fields: %+v", v)
 	}
 	// Marshal round-trip is byte-identical.
 	built := &p2p.VersionMessage{
-		Version: 70713, Services: 0, Timestamp: 1618000000,
+		Version: version.BitcoinProtocolVersion, Services: 0, Timestamp: 1618000000,
 		AddrRecv: p2p.NetAddr{Services: 0, IP: net.ParseIP("1.2.3.4"), Port: 41412},
 		AddrFrom: p2p.NetAddr{},
-		Nonce:    0x1122334455667788, UserAgent: "/go-xbridge:0.1.0/",
+		Nonce:    0x1122334455667788, UserAgent: version.UserAgent,
 		StartHeight: 0, Relay: false, FXRouter: false,
 	}
 	if got := hex.EncodeToString(built.Marshal()); got != payloadHex {
@@ -1317,10 +1341,10 @@ func TestWireVersionVectors(t *testing.T) {
 	// VECTOR 3.1 — 26-byte net_addr: services 0x5, 1.2.3.4, port 8333.
 	const netaddrHex = "0500000000000000" + "00000000000000000000ffff01020304" + "208d"
 	m3 := &p2p.VersionMessage{
-		Version: 70713, Services: 0, Timestamp: 1618000000,
+		Version: version.BitcoinProtocolVersion, Services: 0, Timestamp: 1618000000,
 		AddrRecv: p2p.NetAddr{Services: 5, IP: net.ParseIP("1.2.3.4"), Port: 8333},
 		AddrFrom: p2p.NetAddr{},
-		Nonce:    0x1122334455667788, UserAgent: "/go-xbridge:0.1.0/",
+		Nonce:    0x1122334455667788, UserAgent: version.UserAgent,
 		StartHeight: 0, Relay: false, FXRouter: false,
 	}
 	got := m3.Marshal()
@@ -1388,6 +1412,9 @@ func TestWireEnvelopeVectors(t *testing.T) {
 
 	// VECTOR 4.3 — live captured envelope: varint fd b4 01 = 436, dest
 	// 6894ff…a48a, ts 4d27edd398560600, packet starts with version 55 / cmd 3.
+	// FROZEN live capture: the version bytes below are historical wire, never
+	// regenerated on a default bump (they predate version.DefaultXBridgeProtocolVersion
+	// as a symbol and stay byte-identical by design).
 	// The capture supplies only the packet PREFIX of the 408-byte packet; the
 	// full payload must come from the envelope_test.go fixture (FIXME fixture).
 	// The 4.3 vector continues into the packet ("37 00 00 00 03 00 00

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // versionPayloadForTest marshals a minimal version payload with the given
@@ -18,7 +19,7 @@ func versionPayloadForTest(ver int32) []byte {
 		Version:   ver,
 		Timestamp: 1,
 		Nonce:     1,
-		UserAgent: UserAgent,
+		UserAgent: version.UserAgent,
 	}).Marshal()
 }
 
@@ -53,8 +54,8 @@ func TestConnWrongMagicRejected(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    TestnetMagic, // wrong magic, valid payload checksum
 			Command:  "version",
-			Payload:  versionPayloadForTest(70713),
-			Checksum: Checksum(versionPayloadForTest(70713)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 	}()
 	if _, err := NewConn(client, MainnetMagic); err == nil {
@@ -75,14 +76,14 @@ func TestConnChecksumFrameDropped(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(70713),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
 			Checksum: [4]byte{0xde, 0xad, 0xbe, 0xef}, // bad checksum
 		})
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(70713),
-			Checksum: Checksum(versionPayloadForTest(70713)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 		if _, err := readFrame(server); err != nil { // our verack
 			return
@@ -126,8 +127,8 @@ func TestConnHandshakeOK(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
-			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 		if _, err := readFrame(server); err != nil { // our verack
 			return
@@ -138,8 +139,8 @@ func TestConnHandshakeOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshake failed: %v", err)
 	}
-	if c.PeerVersion() == nil || c.PeerVersion().Version != BitcoinProtocolVersion {
-		t.Fatalf("peerVersion = %+v, want version %d", c.PeerVersion(), BitcoinProtocolVersion)
+	if c.PeerVersion() == nil || c.PeerVersion().Version != version.BitcoinProtocolVersion {
+		t.Fatalf("peerVersion = %+v, want version %d", c.PeerVersion(), version.BitcoinProtocolVersion)
 	}
 	_ = c.Close()
 }
@@ -156,8 +157,8 @@ func TestConnVersionBelowMinimum(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(MinPeerProtoVersion - 1),
-			Checksum: Checksum(versionPayloadForTest(MinPeerProtoVersion - 1)),
+			Payload:  versionPayloadForTest(version.MinPeerProtoVersion - 1),
+			Checksum: Checksum(versionPayloadForTest(version.MinPeerProtoVersion - 1)),
 		})
 	}()
 	if _, err := NewConn(client, MainnetMagic); err == nil {
@@ -177,8 +178,8 @@ func TestConnDuplicateVersion(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
-			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 		if _, err := readFrame(server); err != nil { // our verack (after version 1)
 			return
@@ -186,8 +187,8 @@ func TestConnDuplicateVersion(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
-			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 	}()
 	if _, err := NewConn(client, MainnetMagic); err == nil {
@@ -228,7 +229,7 @@ func TestHandshakeStallTimesOut(t *testing.T) {
 		if _, err := readFrame(server); err != nil { // our version
 			return
 		}
-		v := versionPayloadForTest(BitcoinProtocolVersion)
+		v := versionPayloadForTest(version.BitcoinProtocolVersion)
 		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
 		// Read our verack so the client's write succeeds, then never send our
 		// own verack: the client blocks reading it until the handshake deadline
@@ -259,7 +260,7 @@ func TestConnReadPacketVersionGate(t *testing.T) {
 		if _, err := readFrame(server); err != nil { // our version
 			return
 		}
-		v := versionPayloadForTest(BitcoinProtocolVersion)
+		v := versionPayloadForTest(version.BitcoinProtocolVersion)
 		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
 		if _, err := readFrame(server); err != nil { // our verack
 			return
@@ -291,8 +292,8 @@ func TestConnReadPacketVersionGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("conforming packet after the dropped one: %v", err)
 	}
-	if pkt.Version != proto.ProtocolVersion {
-		t.Fatalf("packet version = %d, want %d", pkt.Version, proto.ProtocolVersion)
+	if pkt.Version != version.XBridgeProtocolVersion {
+		t.Fatalf("packet version = %d, want %d", pkt.Version, version.XBridgeProtocolVersion)
 	}
 }
 
@@ -313,7 +314,7 @@ func TestConnIdleReadTimeout(t *testing.T) {
 		if _, err := readFrame(server); err != nil { // our version
 			return
 		}
-		v := versionPayloadForTest(BitcoinProtocolVersion)
+		v := versionPayloadForTest(version.BitcoinProtocolVersion)
 		writeFrame(server, Message{Magic: MainnetMagic, Command: "version", Payload: v, Checksum: Checksum(v)})
 		if _, err := readFrame(server); err != nil { // our verack
 			return

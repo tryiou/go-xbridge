@@ -7,12 +7,10 @@ import (
 	"time"
 
 	xlog "go-xbridge/log"
+	"go-xbridge/version"
 )
 
 const (
-	// ProtocolVersion is XBRIDGE_PROTOCOL_VERSION (src/xbridge/version.h).
-	ProtocolVersion uint32 = 55
-
 	// Header layout matches src/xbridge/xbridgepacket.h (class XBridgePacket).
 	// 8 * uint32 header fields (little-endian) + 33-byte pubkey + 64-byte signature = 129 bytes.
 	// NOTE: the C++ "crc" field (field32<5>, offset 20) overlaps the start of the
@@ -60,7 +58,7 @@ type Packet struct {
 // the transport envelope adds its own 8-byte timestamp on send.
 func NewPacket(cmd XBridgeCommand, body []byte) *Packet {
 	return &Packet{
-		Version:   ProtocolVersion,
+		Version:   version.XBridgeProtocolVersion,
 		Command:   cmd,
 		Timestamp: uint32(time.Now().Unix()),
 		Size:      uint32(len(body)),
@@ -113,8 +111,8 @@ func Unmarshal(data []byte) (*Packet, error) {
 	// silent: no misbehaviour penalty is scored (the C++ state.DoS() is a
 	// TODO comment). Checking here covers every inbound path, since all wire
 	// bytes reach the engine through Unmarshal.
-	if p.Version != ProtocolVersion {
-		xlog.Debug("proto: packet unmarshal failed", "err", "unsupported protocol version", "version", p.Version, "want", ProtocolVersion)
+	if p.Version != version.XBridgeProtocolVersion {
+		xlog.Debug("proto: packet unmarshal failed", "err", "unsupported protocol version", "version", p.Version, "want", version.XBridgeProtocolVersion)
 		return nil, errors.New("xbridge: unsupported protocol version")
 	}
 	copy(p.Pubkey[:], data[PubkeyOffset:PubkeyOffset+PubkeySize])

@@ -8,6 +8,7 @@ import (
 
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -18,7 +19,7 @@ func runningHub(t *testing.T) (*servicenode.Registry, [33]byte) {
 	_, hubPub, _, _ := hubKey(t, 0x51)
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC", "SYS"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	return reg, hubPub
 }

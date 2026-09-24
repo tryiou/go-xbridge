@@ -10,6 +10,7 @@ import (
 	"go-xbridge/coins"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -43,7 +44,7 @@ func rotationFixture(t *testing.T) (*Node, *flakyWriteConn, string, [33]byte, [3
 		reg.AddPing(servicenode.ServiceNode{
 			PubKey: hk, Tier: servicenode.TierSPV,
 			Services:       []string{"BTC", "LTC"},
-			XBridgeVersion: proto.ProtocolVersion,
+			XBridgeVersion: version.XBridgeProtocolVersion,
 		})
 	}
 	funding := wallet.Utxo{TxID: testTxID("aa"), Vout: 0, Amount: 5e8}
@@ -105,7 +106,7 @@ func TestRebroadcastKeepsAnchorWithoutAlternative(t *testing.T) {
 	reg.AddPing(servicenode.ServiceNode{
 		PubKey: hubA, Tier: servicenode.TierSPV,
 		Services:       []string{"BTC", "LTC"},
-		XBridgeVersion: proto.ProtocolVersion,
+		XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n.snReg = reg
 

@@ -13,6 +13,7 @@ import (
 	"go-xbridge/crypto"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -161,7 +162,7 @@ func TestDispatchSwapSignsOutbound(t *testing.T) {
 	// servicenode or the honest Hold would be dropped.
 	reg := servicenode.NewRegistry()
 	reg.AddPing(servicenode.ServiceNode{
-		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion,
+		PubKey: hubPub, Tier: servicenode.TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion,
 	})
 	n.snReg = reg
 

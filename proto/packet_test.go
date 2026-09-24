@@ -3,6 +3,8 @@ package proto
 import (
 	"encoding/binary"
 	"testing"
+
+	"go-xbridge/version"
 )
 
 // TestUnmarshalTruncatedHeader rejects anything shorter than the 129-byte header.
@@ -16,7 +18,7 @@ func TestUnmarshalTruncatedHeader(t *testing.T) {
 // (the uint64 length check must not wrap and admit a truncated/oversized body).
 func TestUnmarshalBodySizeOverflow(t *testing.T) {
 	buf := make([]byte, HeaderSize)
-	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offVersion:], version.XBridgeProtocolVersion)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	binary.LittleEndian.PutUint32(buf[offSize:], 0xFFFFFF00)
 	if _, err := Unmarshal(buf); err == nil {
@@ -27,7 +29,7 @@ func TestUnmarshalBodySizeOverflow(t *testing.T) {
 // TestUnmarshalBodySizeCap ensures the MaxBodySize cap is enforced.
 func TestUnmarshalBodySizeCap(t *testing.T) {
 	buf := make([]byte, HeaderSize)
-	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offVersion:], version.XBridgeProtocolVersion)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	binary.LittleEndian.PutUint32(buf[offSize:], MaxBodySize+1)
 	if _, err := Unmarshal(buf); err == nil {
@@ -39,7 +41,7 @@ func TestUnmarshalBodySizeCap(t *testing.T) {
 // is rejected rather than slicing out of range.
 func TestUnmarshalBodyExceedsData(t *testing.T) {
 	buf := make([]byte, HeaderSize+10)
-	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offVersion:], version.XBridgeProtocolVersion)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	binary.LittleEndian.PutUint32(buf[offSize:], 100) // claims 100-byte body, only 10 follow
 	if _, err := Unmarshal(buf); err == nil {
@@ -52,7 +54,7 @@ func TestUnmarshalBodyExceedsData(t *testing.T) {
 func TestUnmarshalTrailingBytes(t *testing.T) {
 	body := []byte{0x01, 0x02, 0x03}
 	buf := make([]byte, HeaderSize+len(body)+4) // 4 stray trailing bytes
-	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offVersion:], version.XBridgeProtocolVersion)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	binary.LittleEndian.PutUint32(buf[offSize:], uint32(len(body)))
 	copy(buf[BodyOffset:], body)
@@ -100,9 +102,9 @@ func TestUnmarshalRejectsWrongVersion(t *testing.T) {
 
 	// Control: a matching-version packet still parses.
 	buf = make([]byte, HeaderSize)
-	binary.LittleEndian.PutUint32(buf[offVersion:], ProtocolVersion)
+	binary.LittleEndian.PutUint32(buf[offVersion:], version.XBridgeProtocolVersion)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	if _, err := Unmarshal(buf); err != nil {
-		t.Fatalf("protocol version %d: %v", ProtocolVersion, err)
+		t.Fatalf("protocol version %d: %v", version.XBridgeProtocolVersion, err)
 	}
 }

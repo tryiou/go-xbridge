@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go-xbridge/version"
 )
 
 // TestConnHandshakeAbortsOnCtxCancel closure. NewConnCtx must abort
@@ -52,8 +54,8 @@ func TestConnCtxUncancelledHandshakesOK(t *testing.T) {
 		writeFrame(server, Message{
 			Magic:    MainnetMagic,
 			Command:  "version",
-			Payload:  versionPayloadForTest(BitcoinProtocolVersion),
-			Checksum: Checksum(versionPayloadForTest(BitcoinProtocolVersion)),
+			Payload:  versionPayloadForTest(version.BitcoinProtocolVersion),
+			Checksum: Checksum(versionPayloadForTest(version.BitcoinProtocolVersion)),
 		})
 		if _, err := readFrame(server); err != nil { // our verack
 			return
@@ -64,8 +66,8 @@ func TestConnCtxUncancelledHandshakesOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnCtx: %v", err)
 	}
-	if c.PeerVersion() == nil || c.PeerVersion().Version != BitcoinProtocolVersion {
-		t.Fatalf("peerVersion = %+v, want version %d", c.PeerVersion(), BitcoinProtocolVersion)
+	if c.PeerVersion() == nil || c.PeerVersion().Version != version.BitcoinProtocolVersion {
+		t.Fatalf("peerVersion = %+v, want version %d", c.PeerVersion(), version.BitcoinProtocolVersion)
 	}
 	_ = c.Close()
 }

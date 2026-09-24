@@ -92,7 +92,7 @@ the varint + 28-byte envelope before handing the packet to `proto.Unmarshal`.
   declared body are an error, matching `XBridgePacket::copyFrom`
   (`xbridgepacket.h:489-493`).
 - **Inbound protocol-version gate** — a packet whose header `version` differs
-  from `XBRIDGE_PROTOCOL_VERSION` (55) is rejected before its body is parsed or
+  from `XBRIDGE_PROTOCOL_VERSION` (`version.DefaultXBridgeProtocolVersion`, runtime-overridable via `-xbridgeversion`) is rejected before its body is parsed or
   its signature verified, mirroring C++ `Session::checkXBridgePacketVersion`
   (`xbridgesession.cpp:343-368`), called at the top of
   `App::onMessageReceived` / `App::onBroadcastReceived`
@@ -120,7 +120,7 @@ user_agent(varstr) || start_height(4 LE) || relay(1) || fxrouter(1)
 
 Field values (`p2p/version.go`):
 
-- `version` = `70713` (`BitcoinProtocolVersion`, from `src/version.h:12`).
+- `version` = `version.BitcoinProtocolVersion` (from `src/version.h:12`).
 - `services` = `0` (thin client advertises no services).
 - `timestamp` = current unix seconds (`int64`). This is the message-level
   time; the embedded `addr_recv`/`addr_from` carry **no** per-addr `nTime`.
@@ -128,14 +128,14 @@ Field values (`p2p/version.go`):
   peer's IP/port (IPv4 mapped into `::ffff:/96`); `addr_from` is a CAddress with
   services=0 and IP/port left zeroed (thin client advertises no address of its own).
 - `nonce` = random `uint64`.
-- `user_agent` = `"/go-xbridge:0.1.0/"`.
+- `user_agent` = `version.UserAgent`.
 - `start_height` = `0` (thin client has no chain).
 - `relay` = `false`.
 - `fxrouter` = `false` (thin client is not an XRouter hub). Sent explicitly so
   address gossip/discovery works against stock service nodes.
 
 **Version gate:** the peer's advertised `version` must be at least
-`MinPeerProtoVersion` (70712, `src/version.h:27`); a lower version or a
+`version.MinPeerProtoVersion` (`src/version.h:27`); a lower version or a
 duplicate `version` message disconnects the peer (C++
 `net_processing.cpp:1617-1626,1574-1582`).
 
@@ -190,7 +190,7 @@ All multi-byte integers are **little-endian**.
 
 | Offset | Field        | Type        | Notes |
 |--------|--------------|-------------|-------|
-| 0      | version      | uint32 LE   | `XBRIDGE_PROTOCOL_VERSION = 55` (`src/xbridge/version.h`) |
+| 0      | version      | uint32 LE   | `XBRIDGE_PROTOCOL_VERSION` = `version.DefaultXBridgeProtocolVersion` (`src/xbridge/version.h`) |
 | 4      | command      | uint32 LE   | `XBridgeCommand` (section 3) |
 | 8      | timestamp    | uint32 LE   | seconds (C++ uses `time(0)`) |
 | 12     | oldSize      | uint32 LE   | backward-compat size = bodyLen + 97 |

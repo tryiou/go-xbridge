@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // liveXBridgePacket is a real `xbridge` P2P message payload captured from a
@@ -36,8 +37,8 @@ func TestDecodeLiveXBridgePacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proto.Unmarshal: %v", err)
 	}
-	if p.Version != proto.ProtocolVersion {
-		t.Errorf("version = %d, want %d", p.Version, proto.ProtocolVersion)
+	if p.Version != version.XBridgeProtocolVersion {
+		t.Errorf("version = %d, want %d", p.Version, version.XBridgeProtocolVersion)
 	}
 	if p.Command != proto.XbcTransaction {
 		t.Errorf("command = %d (%s), want %d (xbcTransaction)", p.Command, p.Command, proto.XbcTransaction)
@@ -54,7 +55,7 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	// A synthetic packet (129-byte header + 100-byte body) should survive an
 	// encode/decode through the transport envelope unchanged.
 	pkt := make([]byte, proto.HeaderSize+100)
-	pkt[0] = 55 // version
+	binary.LittleEndian.PutUint32(pkt[0:4], version.DefaultXBridgeProtocolVersion) // version
 	copy(pkt[proto.PubkeyOffset:proto.PubkeyOffset+33], []byte{0x02})
 	copy(pkt[proto.SigOffset:proto.SigOffset+64], []byte{0x03})
 

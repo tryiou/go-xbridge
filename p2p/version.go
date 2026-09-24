@@ -7,24 +7,16 @@ import (
 	"math/rand"
 	"net"
 	"time"
+
+	"go-xbridge/version"
 )
 
-// Bitcoin P2P version message field values used by go-xbridge.
+// Bitcoin P2P version message field values used by go-xbridge. The version
+// numbers themselves live in version/version.go (the single source of truth);
+// this package only consumes them.
 const (
-	// BitcoinProtocolVersion is Blocknet's PROTOCOL_VERSION (src/version.h:12).
-	// The node rejects peers advertising a lower version.
-	BitcoinProtocolVersion = 70713
-
-	// MinPeerProtoVersion is MIN_PEER_PROTO_VERSION (src/version.h:27). C++
-	// disconnects a peer advertising a lower version
-	// (net_processing.cpp:1617-1626); the Go handshake enforces the same gate.
-	MinPeerProtoVersion = 70712
-
 	// ServiceNodeNone — a thin client advertises no services.
 	ServiceNodeNone uint64 = 0
-
-	// UserAgent identifies this client in the version handshake.
-	UserAgent = "/go-xbridge:0.1.0/"
 )
 
 // VersionMessage is a Bitcoin P2P `version` payload.
@@ -153,13 +145,13 @@ func NewVersion(remote net.Addr) *VersionMessage {
 		}
 	}
 	return &VersionMessage{
-		Version:     BitcoinProtocolVersion,
+		Version:     version.BitcoinProtocolVersion,
 		Services:    ServiceNodeNone,
 		Timestamp:   time.Now().Unix(),
 		AddrRecv:    addrRecv,
 		AddrFrom:    NetAddr{},
 		Nonce:       rand.Uint64(),
-		UserAgent:   UserAgent,
+		UserAgent:   version.UserAgent,
 		StartHeight: 0, // thin client has no chain height
 		Relay:       false,
 		FXRouter:    false, // thin client is not an XRouter hub

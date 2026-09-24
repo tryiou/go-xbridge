@@ -8,7 +8,7 @@ import (
 
 	"go-xbridge/crypto"
 	"go-xbridge/p2p"
-	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // mustKeypair returns a fresh secp256k1 keypair (compressed pubkey, privkey).
@@ -261,7 +261,7 @@ func TestPickEmpty(t *testing.T) {
 // equal XBRIDGE_PROTOCOL_VERSION is never selected (xbridgeapp.cpp:2905).
 func TestPickVersionGate(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 1), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion - 1})
+	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 1), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion - 1})
 	if _, ok := reg.Pick([]string{"BTC"}); ok {
 		t.Fatal("version-mismatched node must not be picked")
 	}
@@ -270,7 +270,7 @@ func TestPickVersionGate(t *testing.T) {
 // TestPickRunningGate verifies a stale (not running) node is never selected.
 func TestPickRunningGate(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 2), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 2), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	reg.now = func() time.Time { return time.Now().Add(6 * time.Minute) }
 	if _, ok := reg.Pick([]string{"BTC"}); ok {
 		t.Fatal("stale node must not be picked")
@@ -281,7 +281,7 @@ func TestPickRunningGate(t *testing.T) {
 // is never selected (containsAll of findShuffledNodesWithService).
 func TestPickServicesGate(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 3), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 3), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	if _, ok := reg.Pick([]string{"BTC", "LTC"}); ok {
 		t.Fatal("node missing LTC must not be picked for BTC/LTC")
 	}
@@ -292,9 +292,9 @@ func TestPickServicesGate(t *testing.T) {
 func TestPickEligible(t *testing.T) {
 	reg := NewRegistry()
 	blocker := pickPubkey(t, 4)
-	reg.AddPing(ServiceNode{PubKey: blocker, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: blocker, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	hub := pickPubkey(t, 5)
-	reg.AddPing(ServiceNode{PubKey: hub, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: hub, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 
 	pk, ok := reg.Pick([]string{"BTC", "LTC"})
 	if !ok {
@@ -311,9 +311,9 @@ func TestPickEligible(t *testing.T) {
 func TestPickExcludesNotIn(t *testing.T) {
 	reg := NewRegistry()
 	bad := pickPubkey(t, 6)
-	reg.AddPing(ServiceNode{PubKey: bad, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: bad, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	good := pickPubkey(t, 7)
-	reg.AddPing(ServiceNode{PubKey: good, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: good, Tier: TierSPV, Services: []string{"BTC", "LTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 
 	pk, ok := reg.Pick([]string{"BTC", "LTC"}, bad)
 	if !ok {
@@ -331,6 +331,14 @@ func TestPickExcludesNotIn(t *testing.T) {
 	}
 }
 
+// NOTE on xbridgeversion literals in the ping-config JSON below (e.g.
+// {"xbridgeversion":55,...}): these are SIMULATED PEER-ADVERTISED values —
+// what another service node broadcasts — not this client's default, so they
+// stay literal and never derive from version.DefaultXBridgeProtocolVersion.
+// Tests that must stay independent of the local default use a non-default
+// value for the same reason (see
+// TestParseServiceNodePingRejectsFloatXrouterVersion).
+//
 // TestParseServiceNodePingRejectsFloatVersion verifies a float-formatted or
 // out-of-int32-range xbridgeversion is REJECTED like C++ UniValue::get_int()
 // (univalue_get.cpp:104-112): get_int() throws, parseConfig's catch
@@ -388,7 +396,7 @@ func TestParseServiceNodePingRejectsQuotedVersion(t *testing.T) {
 // xrouterversion is REJECTED like C++ (strict get_int() at servicenode.h:552):
 // no services are collected, but the already-assigned xbridgeversion is
 // retained (servicenode.h:546). 56 is used so the assertion is independent of
-// proto.ProtocolVersion.
+// version.XBridgeProtocolVersion.
 func TestParseServiceNodePingRejectsFloatXrouterVersion(t *testing.T) {
 	pk, priv := mustKeypair(t)
 	cfg := `{"xbridgeversion":56,"xrouterversion":55.0,"xbridge":["BTC"]}`
@@ -466,7 +474,7 @@ func TestAddPingNewerPingReplacesEntry(t *testing.T) {
 	reg := NewRegistry()
 	key := pickPubkey(t, 0x61)
 	base := uint32(time.Now().Unix()) - 200 // within the running() window
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base})
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base})
 	if _, ok := reg.Pick([]string{"BTC"}); !ok {
 		t.Fatal("fresh node should be eligible")
 	}
@@ -482,7 +490,7 @@ func TestAddPingNewerPingReplacesEntry(t *testing.T) {
 		t.Fatalf("WalletServices = %v, want [BTC] (no version gate on WalletServices)", reg.WalletServices())
 	}
 
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"LTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base + 100})
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"LTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base + 100})
 	if got := reg.WalletServices(); len(got) != 1 || got[0] != "LTC" {
 		t.Fatalf("newer ping must replace services wholesale (no merge); got %v", got)
 	}
@@ -495,13 +503,13 @@ func TestAddPingInvalidPingIgnored(t *testing.T) {
 	reg := NewRegistry()
 	key := pickPubkey(t, 0x64)
 	base := uint32(time.Now().Unix()) - 200 // within the running() window
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base})
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base})
 	if _, ok := reg.Pick([]string{"BTC"}); !ok {
 		t.Fatal("fresh node should be eligible")
 	}
 
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, PingTime: base + 50})                                                     // newer, but empty service list
-	reg.AddPing(ServiceNode{PubKey: key, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base + 100}) // newer, but non-SPV tier
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, PingTime: base + 50})                                                              // newer, but empty service list
+	reg.AddPing(ServiceNode{PubKey: key, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base + 100}) // newer, but non-SPV tier
 	if _, ok := reg.Pick([]string{"BTC"}); !ok {
 		t.Fatal("invalid pings must not clear a healthy node (C++ isValid gate)")
 	}
@@ -518,7 +526,7 @@ func TestAddPingIgnoresStalePing(t *testing.T) {
 	reg := NewRegistry()
 	key := pickPubkey(t, 0x63)
 	base := uint32(time.Now().Unix()) - 200 // within the running() window
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base})
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base})
 	if _, ok := reg.Pick([]string{"BTC"}); !ok {
 		t.Fatal("fresh node should be eligible")
 	}
@@ -538,16 +546,16 @@ func TestAddPingReturnsAccepted(t *testing.T) {
 	reg := NewRegistry()
 	key := pickPubkey(t, 0x64)
 	base := uint32(time.Now().Unix()) - 200
-	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base}) {
+	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base}) {
 		t.Fatal("first valid ping must be accepted")
 	}
-	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base}) {
+	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base}) {
 		t.Fatal("equal pingTime must be rejected (strict-newer gate)")
 	}
-	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base - 10}) {
+	if reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base - 10}) {
 		t.Fatal("stale ping must be rejected")
 	}
-	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"LTC"}, XBridgeVersion: proto.ProtocolVersion, PingTime: base + 100}) {
+	if !reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"LTC"}, XBridgeVersion: version.XBridgeProtocolVersion, PingTime: base + 100}) {
 		t.Fatal("newer ping must be accepted")
 	}
 }
@@ -613,7 +621,7 @@ func TestAcceptedRawPings(t *testing.T) {
 func TestAddRegistrationClearsNode(t *testing.T) {
 	reg := NewRegistry()
 	key := pickPubkey(t, 0x62)
-	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: key, Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	if _, ok := reg.Pick([]string{"BTC"}); !ok {
 		t.Fatal("pinged node should be eligible before registration")
 	}
@@ -631,7 +639,7 @@ func TestAddRegistrationClearsNode(t *testing.T) {
 // (xbridgeapp.cpp:2924-2930).
 func TestPickEmptyNeed(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 0x71), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: proto.ProtocolVersion})
+	reg.AddPing(ServiceNode{PubKey: pickPubkey(t, 0x71), Tier: TierSPV, Services: []string{"BTC"}, XBridgeVersion: version.XBridgeProtocolVersion})
 	if _, ok := reg.Pick(nil); ok {
 		t.Fatal("Pick(nil) must not return a hub (C++ never pushes for an empty request)")
 	}

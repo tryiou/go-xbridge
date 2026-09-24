@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"go-xbridge/config"
 	xlog "go-xbridge/log"
 	"go-xbridge/p2p"
+	xver "go-xbridge/version"
 	"go-xbridge/wallet"
 )
 
@@ -129,8 +131,14 @@ func main() {
 	addNode := flag.String("addnode", "", "comma-separated explicit peer addresses (host:port) to add to discovered peers")
 	confPath := flag.String("conf", defaultConfPath(), "path to xbridge.conf (read-only; never created)")
 	magicHex := flag.String("magic", "", "network magic (hex, 4 bytes); derived from -network if empty")
-	walletVersion := flag.Int("walletversion", 4040100, "Blocknet CLIENT_VERSION advertised in getnetworkinfo (default Blocknet 4.4.1)")
-	walletVersionStr := flag.String("walletversionstr", "/Blocknet:4.4.1/", "Blocknet subversion advertised in getnetworkinfo (default Blocknet 4.4.1)")
+	walletVersion := flag.Int("walletversion", xver.DefaultWalletVersion, "Blocknet CLIENT_VERSION advertised in getnetworkinfo")
+	walletVersionStr := flag.String("walletversionstr", xver.DefaultWalletVersionStr, "Blocknet subversion advertised in getnetworkinfo")
+	// -xbridgeversion overrides the effective XBridge wire protocol version
+	// (version.XBridgeProtocolVersion): the value stamped into every outbound
+	// packet, required on receive, and required of hubs by Registry.Pick.
+	// The default mirrors C++ XBRIDGE_PROTOCOL_VERSION; override ONLY for
+	// isolated testing against a hub fleet advertising a different version.
+	xbridgeVersion := flag.Int("xbridgeversion", int(xver.DefaultXBridgeProtocolVersion), "XBridge wire protocol version (default mirrors C++ XBRIDGE_PROTOCOL_VERSION; override only for isolated hub testing)")
 	logLevel := flag.String("loglevel", "debug", "log verbosity: debug|info|warn|error")
 	datadir := flag.String("datadir", "", "directory for xbridged local swap state (incl. per-trade keys); empty uses the OS config dir (~/.config/xbridged, ~/Library/Application Support/xbridged, %AppData%\\xbridged)")
 	logFile := flag.String("logfile", "", "log file path; empty defaults to <datadir>/xbridged.log (file logging is always on)")
@@ -160,13 +168,22 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Apply the XBridge wire version before any P2P activity. Daemon-level
+	// like ForceShowAllOrders: dxLoadXBridgeConf hot-reloads coin config only
+	// and never touches this (it lives outside api.Config by construction).
+	if *xbridgeVersion <= 0 || uint64(*xbridgeVersion) > math.MaxUint32 {
+		fatalf("invalid -xbridgeversion", "value", *xbridgeVersion, "want", "a positive protocol version")
+	}
+	xver.SetXBridgeProtocolVersion(uint32(*xbridgeVersion))
+
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
 		fatalf("%v", err)
 	} else {
 		xlog.SetLevel(lvl)
 	}
 
-	xlog.Info("xbridged starting", "version", version, "commit", commit, "date", date)
+	xlog.Info("xbridged starting", "version", version, "commit", commit, "date", date,
+		"xbridgeversion", xver.XBridgeProtocolVersion)
 
 	// Ensure the data directory exists before logging to it (it is otherwise
 	// only created lazily on the first swap-state save).

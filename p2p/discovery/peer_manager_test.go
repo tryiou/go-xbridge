@@ -13,6 +13,7 @@ import (
 	"go-xbridge/p2p"
 	"go-xbridge/p2p/servicenode"
 	"go-xbridge/proto"
+	"go-xbridge/version"
 )
 
 // fakePeer is a minimal hand-rolled XBridge peer on one end of an in-memory
@@ -86,7 +87,7 @@ type fakeVersion struct{}
 func (fakeVersion) bytes() []byte {
 	buf := new(bytes.Buffer)
 	var f [8]byte
-	binary.LittleEndian.PutUint32(f[:4], 70713)
+	binary.LittleEndian.PutUint32(f[:4], version.BitcoinProtocolVersion)
 	buf.Write(f[:4]) // version
 	binary.LittleEndian.PutUint64(f[:], 0)
 	buf.Write(f[:]) // services

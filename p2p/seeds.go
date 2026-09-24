@@ -18,9 +18,10 @@ import (
 // the DNS seeds from src/chainparams.cpp.
 
 // The fixed IP seeds below were verified live on 2026-09-23: each held
-// chain tip as a fully-synced /Blocknet:4.4.1/ peer with a sub-200ms TCP
-// handshake on the network's default P2P port (the previous
-// chainparamsseeds.h snapshot had rotted — all 11 refused connections).
+// chain tip as a fully-synced peer advertising the stock Blocknet subversion
+// (version.DefaultWalletVersionStr) with a sub-200ms TCP handshake on the
+// network's default P2P port (the previous chainparamsseeds.h snapshot had
+// rotted — all 11 refused connections).
 // Static IPs churn by nature; these are a bootstrap fallback behind the DNS
 // seeds and gossip discovery, not trusted parties. Re-verify before relying
 // on any entry older than a few months.
