@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -731,7 +732,11 @@ func (n *Node) sweepConnectors() {
 	}
 	conns, drops := n.walletActivator().Activate(c.Confs, c.ExchangeWallets, c.CheckReachability)
 	for _, d := range drops {
-		xlog.Warn("wallet not reachable", "coin", d.Ticker, "reason", d.Reason)
+		// Steady state, not a warning: a wallet that stays down re-drops
+		// every 30 s sweep. Daemon startup already Warned once ("wallet
+		// not activated"), and recovery is announced by "wallet sweep
+		// updated connectors" below.
+		xlog.Debug("wallet not reachable", "coin", d.Ticker, "reason", d.Reason)
 	}
 	n.cfgMu.Lock()
 	defer n.cfgMu.Unlock()
@@ -748,7 +753,29 @@ func (n *Node) sweepConnectors() {
 	fresh := *c // shallow copy; only Connectors differs
 	fresh.Connectors = conns
 	n.config = &fresh
-	xlog.Info("wallet sweep updated connectors", "connectors", len(conns))
+	// Transition attribution: survivors alone force differencing across
+	// lines, and the per-coin drops are Debug-only while steady-state
+	// re-drops would pollute a drop list. Record the movers explicitly as
+	// the set difference against the pre-sweep snapshot c.
+	tickers := make([]string, 0, len(conns))
+	for t := range conns {
+		tickers = append(tickers, t)
+	}
+	sort.Strings(tickers)
+	var added, removed []string
+	for t := range conns {
+		if _, ok := c.Connectors[t]; !ok {
+			added = append(added, t)
+		}
+	}
+	for t := range c.Connectors {
+		if _, ok := conns[t]; !ok {
+			removed = append(removed, t)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	xlog.Info("wallet sweep updated connectors", "connectors", len(conns), "tickers", strings.Join(tickers, ","), "added", strings.Join(added, ","), "removed", strings.Join(removed, ","))
 }
 
 // sameConnectorTickers reports whether two connector maps name the same tickers

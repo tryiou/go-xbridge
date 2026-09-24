@@ -278,6 +278,50 @@ func (s *Server) execOne(el json.RawMessage) rpcResponse {
 	return s.dispatchOne(raw)
 }
 
+// rpcPollMethods are the read-only methods attached GUIs poll at Hz rates
+// (live census: getnetworkinfo alone is ~3/4 of all access lines, with the
+// book/fills/orders/tokens/history quartet behind it). The set is
+// census-grounded, not exhaustive by design: anything unlisted stays
+// per-call (fail-open), so a new poll method self-reveals as lines until
+// it is listed here.
+var rpcPollMethods = map[string]bool{
+	"getnetworkinfo":     true,
+	"dxGetOrderBook":     true,
+	"dxGetOrderFills":    true,
+	"dxGetMyOrders":      true,
+	"dxGetOrderHistory":  true,
+	"dxGetNetworkTokens": true,
+	"dxGetLocalTokens":   true,
+	"dxGetTokenBalances": true,
+}
+
+// summarizeRpcPoll emits the collapsed poll summary to the main log, joining
+// its first-sighting access line. The count is repeats collapsed since the
+// last summary (first window: total sightings minus the already-logged
+// first one); Dedupe only invokes the callback when repeats exist, so this
+// never goes negative.
+func summarizeRpcPoll(method string, total int, over time.Duration) {
+	xlog.Debug("rpc polls collapsed", "method", method, "suppressed", total-1, "over", over.Round(time.Second).String())
+}
+
+// rpcPollDedup collapses repeat GUI-poll access lines per method: the first
+// sighting logs normally, repeats summarize periodically. Keyed on the
+// canonical method name.
+var rpcPollDedup = xlog.NewDedupe(60*time.Second, summarizeRpcPoll)
+
+// logRpcRequest records one RPC access line: full per-call detail for
+// state-changing and rare methods, first-sighting plus summaries for the
+// known GUI polls.
+func logRpcRequest(method string) {
+	if rpcPollMethods[method] {
+		if first := rpcPollDedup.Event(method); first {
+			xlog.Debug("rpc request", "method", method)
+		}
+		return
+	}
+	xlog.Debug("rpc request", "method", method)
+}
+
 // dispatchOne validates the request envelope, finds the handler, and runs it.
 // Method matching is case-insensitive (Core CRPCTable parity); the canonical
 // registered name is used downstream so logs and business-error names stay
@@ -303,7 +347,7 @@ func (s *Server) dispatchOne(raw rawRequest) rpcResponse {
 		}
 		return businessResponse(aerr, id)
 	}
-	xlog.Debug("rpc request", "method", method)
+	logRpcRequest(method)
 	result, rpcErr := s.call(handler, params, id)
 	if rpcErr != nil {
 		if rpcErr.envelope {
