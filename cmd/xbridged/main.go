@@ -115,6 +115,29 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// startupBannerArgs renders the in-file startup banner: binary identity
+// plus the P2P-affecting knobs, in a fixed order. Pure for testability;
+// main passes flag values through. Connection/config surface (bind address,
+// explicit node, conf path, coin set) is covered by the adjacent
+// "xbridged listening" line instead. No secrets: credential values must
+// never appear here (flags fall back to env precisely so they stay out of
+// argv/logs).
+func startupBannerArgs(binVersion, binCommit, date string, xbridgeVersion uint32, network, magicHex string, addNodes, takeRetry int, dataDir, logLevel string, dxNoWallets bool) []any {
+	return []any{
+		"version", binVersion,
+		"commit", binCommit,
+		"date", date,
+		"xbridgeversion", xbridgeVersion,
+		"network", network,
+		"magic", magicHex,
+		"addnodes", addNodes,
+		"takeretry", takeRetry,
+		"datadir", dataDir,
+		"loglevel", logLevel,
+		"dxnowallets", dxNoWallets,
+	}
+}
+
 func main() {
 	// RPC bind defaults to loopback only, mirroring blocknetd's
 	// httpserver.cpp:308 loopback default. An explicit -rpcbind (host:port) is
@@ -163,27 +186,26 @@ func main() {
 	*rpcUser = resolveCredentialFlag(*rpcUser, "XBRIDGED_RPCUSER")
 	*rpcPass = resolveCredentialFlag(*rpcPass, "XBRIDGED_RPCPASSWORD")
 
-	if *versionFlag {
-		fmt.Printf("xbridged %s (commit=%s, date=%s)\n", version, commit, date)
-		os.Exit(0)
-	}
-
-	// Apply the XBridge wire version before any P2P activity. Daemon-level
-	// like ForceShowAllOrders: dxLoadXBridgeConf hot-reloads coin config only
-	// and never touches this (it lives outside api.Config by construction).
+	// Apply the XBridge wire version before anything else (including the
+	// -version early exit below, so it reports the effective value).
+	// Daemon-level like ForceShowAllOrders: dxLoadXBridgeConf hot-reloads
+	// coin config only and never touches this (it lives outside api.Config
+	// by construction).
 	if *xbridgeVersion <= 0 || uint64(*xbridgeVersion) > math.MaxUint32 {
 		fatalf("invalid -xbridgeversion", "value", *xbridgeVersion, "want", "a positive protocol version")
 	}
 	xver.SetXBridgeProtocolVersion(uint32(*xbridgeVersion))
+
+	if *versionFlag {
+		fmt.Printf("xbridged %s (commit=%s, date=%s, xbridgeversion=%d)\n", version, commit, date, xver.XBridgeProtocolVersion)
+		os.Exit(0)
+	}
 
 	if lvl, err := xlog.ParseLevel(*logLevel); err != nil {
 		fatalf("%v", err)
 	} else {
 		xlog.SetLevel(lvl)
 	}
-
-	xlog.Info("xbridged starting", "version", version, "commit", commit, "date", date,
-		"xbridgeversion", xver.XBridgeProtocolVersion)
 
 	// Ensure the data directory exists before logging to it (it is otherwise
 	// only created lazily on the first swap-state save).
@@ -347,6 +369,14 @@ func main() {
 		xlog.Warn("RPC without authentication is not safe to expose",
 			"rpcbind", *rpcBind, "hint", "set -rpcuser/-rpcpassword or -rpcauth")
 	}
+
+	// In-file startup banner: the only pre-file-logger line reached stderr
+	// alone, so without this xbridged.log never records which binary is
+	// running or with which knobs. Emitted after both log files install, so
+	// it lands in the file (and on stderr via the fan-out).
+	xlog.Info("xbridged starting", startupBannerArgs(version, commit, date,
+		xver.XBridgeProtocolVersion, *network, hex.EncodeToString(magic[:]),
+		len(addNodes), *takeRetry, dataDir, *logLevel, *dxnowallets)...)
 
 	if *nodeAddr != "" {
 		xlog.Info("xbridged listening", "addr", *rpcBind, "mode", "explicit",
