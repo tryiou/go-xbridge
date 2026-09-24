@@ -4,9 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 
-	xlog "go-xbridge/log"
 	"go-xbridge/version"
 )
 
@@ -90,10 +90,16 @@ func (p *Packet) Digest() [32]byte {
 	return sha256.Sum256(b)
 }
 
+// ErrUnsupportedVersion classifies a wrong-version decode failure so the P2P
+// reader can separate expected version drift (minority fork: counted and
+// collapsed) from corrupt frames (attack signal) without string-matching.
+// The library never logs: the single reader-level line carries peer context
+// the library cannot know.
+var ErrUnsupportedVersion = errors.New("xbridge: unsupported protocol version")
+
 // Unmarshal parses a full packet from wire bytes.
 func Unmarshal(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize {
-		xlog.Debug("proto: packet unmarshal failed", "err", "short header", "len", len(data), "min", HeaderSize)
 		return nil, errors.New("xbridge: data shorter than packet header")
 	}
 	p := &Packet{
@@ -112,8 +118,7 @@ func Unmarshal(data []byte) (*Packet, error) {
 	// TODO comment). Checking here covers every inbound path, since all wire
 	// bytes reach the engine through Unmarshal.
 	if p.Version != version.XBridgeProtocolVersion {
-		xlog.Debug("proto: packet unmarshal failed", "err", "unsupported protocol version", "version", p.Version, "want", version.XBridgeProtocolVersion)
-		return nil, errors.New("xbridge: unsupported protocol version")
+		return nil, fmt.Errorf("%w (got %d, want %d)", ErrUnsupportedVersion, p.Version, version.XBridgeProtocolVersion)
 	}
 	copy(p.Pubkey[:], data[PubkeyOffset:PubkeyOffset+PubkeySize])
 	copy(p.Signature[:], data[SigOffset:SigOffset+SigSize])
@@ -121,11 +126,9 @@ func Unmarshal(data []byte) (*Packet, error) {
 	// fits the buffer using uint64 math so a near-max uint32 cannot wrap the
 	// comparison and slip a truncated/oversized body through.
 	if p.Size > MaxBodySize {
-		xlog.Debug("proto: packet unmarshal failed", "err", "declared body size too large", "size", p.Size, "max", MaxBodySize)
 		return nil, errors.New("xbridge: declared body size too large")
 	}
 	if uint64(len(data)) < uint64(HeaderSize)+uint64(p.Size) {
-		xlog.Debug("proto: packet unmarshal failed", "err", "body size exceeds data", "size", p.Size, "len", len(data))
 		return nil, errors.New("xbridge: declared body size exceeds data")
 	}
 	p.Body = make([]byte, p.Size)
@@ -134,7 +137,6 @@ func Unmarshal(data []byte) (*Packet, error) {
 		// C++ XBridgePacket::copyFrom rejects a size mismatch
 		// (xbridgepacket.h:489-493): the declared body must consume the whole
 		// buffer, so trailing bytes are an error, not silently ignored.
-		xlog.Debug("proto: packet unmarshal failed", "err", "trailing bytes after body", "size", p.Size, "len", len(data))
 		return nil, errors.New("xbridge: trailing bytes after packet body")
 	}
 	return p, nil

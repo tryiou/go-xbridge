@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"go-xbridge/version"
@@ -91,13 +92,16 @@ func TestUnmarshalRejectsWrongVersion(t *testing.T) {
 	}
 
 	// A wrong-version packet with an absurd declared body must report the
-	// version mismatch, not the body-size error: the gate runs first.
+	// version mismatch, not the body-size error: the gate runs first. The
+	// message carries both sides of the mismatch (derived, no literals).
+	wrong := version.XBridgeProtocolVersion - 1
 	buf := make([]byte, HeaderSize)
-	binary.LittleEndian.PutUint32(buf[offVersion:], 54)
+	binary.LittleEndian.PutUint32(buf[offVersion:], wrong)
 	binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))
 	binary.LittleEndian.PutUint32(buf[offSize:], MaxBodySize+1)
-	if _, err := Unmarshal(buf); err == nil || err.Error() != "xbridge: unsupported protocol version" {
-		t.Fatalf("wrong-version oversized-body: err = %v, want unsupported protocol version", err)
+	want := fmt.Sprintf("xbridge: unsupported protocol version (got %d, want %d)", wrong, version.XBridgeProtocolVersion)
+	if _, err := Unmarshal(buf); err == nil || err.Error() != want {
+		t.Fatalf("wrong-version oversized-body: err = %v, want %q", err, want)
 	}
 
 	// Control: a matching-version packet still parses.

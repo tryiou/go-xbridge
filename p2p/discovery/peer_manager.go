@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -84,6 +85,13 @@ type PeerManager struct {
 	// re-serializes from its registry (net_processing.cpp:2992-3001).
 	snReg *servicenode.Registry
 
+	// decodeDedup collapses repeat decode-failure lines per peer so a
+	// minority fork (every packet version-gated) emits first-sighting plus
+	// periodic summaries into the packet log instead of one main-log line
+	// per packet. It gates logging only: misbehaviour scoring in readLoop
+	// stays unconditional.
+	decodeDedup *xlog.Dedupe
+
 	// dialCooldown is how long a failed/used address is skipped before being
 	// re-candidated, so unreachable peers are not dialed every maintain tick.
 	dialCooldown time.Duration
@@ -152,6 +160,7 @@ func New(magic [4]byte, network string, opts Options) *PeerManager {
 		done:          make(chan struct{}),
 		peers:         make(map[string]*p2p.Conn),
 		snReg:         servicenode.NewRegistry(),
+		decodeDedup:   xlog.NewDedupe(60*time.Second, summarizeDecodeReject),
 		dialCooldown:  dialCooldown,
 		banThreshold:  banThreshold,
 		banDuration:   banDuration,
@@ -391,7 +400,9 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 			if derr != nil {
 				// Undersized/malformed xbridge envelope: C++ Misbehaves +10
 				// (net_processing.cpp:2874-2878, raw.size() < 28).
-				xlog.Debug("peer xbridge payload decode failed", "peer", addr, "err", derr)
+				if first := m.decodeDedup.Event(addr + "|corrupt"); first {
+					xlog.With("p2p", true).Debug("peer xbridge payload decode failed", "peer", addr, "err", derr)
+				}
 				m.misbehave(addr, 10)
 				continue
 			}
@@ -399,7 +410,13 @@ func (m *PeerManager) readLoop(addr string, conn *p2p.Conn) {
 			if perr != nil {
 				// Sized-but-undecodable body: C++ drops without a penalty (the
 				// session DoS is 0, xbridgesession.cpp:312).
-				xlog.Debug("peer xbridge packet unmarshal failed", "peer", addr, "err", perr)
+				kind := "corrupt"
+				if errors.Is(perr, proto.ErrUnsupportedVersion) {
+					kind = "version"
+				}
+				if first := m.decodeDedup.Event(addr + "|" + kind); first {
+					xlog.With("p2p", true).Debug("peer xbridge packet unmarshal failed", "peer", addr, "err", perr)
+				}
 				continue
 			}
 			select {
@@ -528,6 +545,13 @@ func (m *PeerManager) ServiceNodes() *servicenode.Registry {
 	return m.snReg
 }
 
+// summarizeDecodeReject emits the collapsed decode-failure summary to the
+// packet log. The key carries "addr|kind" (kind: version or corrupt) so a
+// corrupt-frame trickle cannot hide inside a version-flood summary.
+func summarizeDecodeReject(key string, total int, over time.Duration) {
+	xlog.With("p2p", true).Debug("peer xbridge decode failures suppressed", "key", key, "count", total, "over", over.Round(time.Second).String())
+}
+
 // misbehave adds score to a peer's misbehaviour tally and, at the ban
 // threshold (C++ -banscore), disconnects it and excludes it from
 // re-candidating for the ban window. Mirrors C++ Misbehaving
@@ -601,6 +625,9 @@ func (m *PeerManager) Close() error {
 		// readLoop selects against m.done and returns rather than sending to a
 		// closed channel, so we avoid a send-on-closed-channel panic.
 		m.wg.Wait()
+		// Flush pending decode-failure summaries and stop the sweep so a
+		// closed manager holds no goroutine.
+		m.decodeDedup.Flush()
 	})
 	return nil
 }

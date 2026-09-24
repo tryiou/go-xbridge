@@ -109,6 +109,20 @@ func summarizeCancelAlreadyCanceled(order string, total int, elapsed time.Durati
 	xlog.With("p2p", true).Info("cancel: already-canceled duplicates suppressed", "order", order, "count", total, "over", elapsed.Round(time.Second).String())
 }
 
+// summarizeHandshakeInflight emits the collapsed retransmit-drop summary to
+// the main log, joining its first-sighting line (own-swap retransmit drops
+// are swap evidence, not gossip, so both stay unmarked).
+func summarizeHandshakeInflight(order string, total int, over time.Duration) {
+	xlog.Debug("swap packet dropped: handshake retransmits suppressed", "order", order, "count", total, "over", over.Round(time.Second).String())
+}
+
+// handshakeInflightDedup collapses repeat in-flight drops per order: while a
+// deposit/claim task is in flight the hub retransmits each packet, and every
+// copy would otherwise emit one main-log line. The first sighting (per
+// order) is logged; repeats are summarized periodically. Keyed on the order
+// id.
+var handshakeInflightDedup = xlog.NewDedupe(60*time.Second, summarizeHandshakeInflight)
+
 // cancelAlreadyCanceledDedup collapses repeated Cancel packets for an order
 // that is already canceled. Hubs redeliver cancels in storm bursts (live:
 // 591 duplicate packets in ~150 ms for one settled order), and every copy
@@ -1548,7 +1562,9 @@ func (n *Node) processSwap(pkt *proto.Packet, id [32]byte, hub [20]byte, cmdName
 	// so any packet arriving now is a retransmit. Drop it rather than re-running
 	// stage 1, which would broadcast a second deposit.
 	if s.await {
-		swlog.Debug("swap packet dropped: handshake task in flight", "command", cmdName)
+		if first := handshakeInflightDedup.Event(orderID); first {
+			swlog.Debug("swap packet dropped: handshake task in flight", "command", cmdName)
+		}
 		return
 	}
 	// Defense in depth: a malformed/inbound packet must never crash the feed
