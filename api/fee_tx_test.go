@@ -189,13 +189,17 @@ func equalP2PKH(script []byte, dest [20]byte) bool {
 	return bytes.Equal(script, coins.BuildP2PKHScript(dest))
 }
 
-// TestTakeFeeSpendsZeroConfChange: C++ funds the service-node fee from
-// in-wallet UTXOs including trusted 0-conf change (unspentP2PKH over
-// AvailableCoins(fOnlySafe=true): 0-conf own change qualifies,
-// bitcoinrpcconnector.cpp:276-278). A take whose only fee-covering UTXO is
-// 0-conf change must succeed — ListUnspent(1) refused it live (run6 S2:
-// 0.9338 change invisible 7 s after S1, INSUFFICIENT_FUNDS).
-func TestTakeFeeSpendsZeroConfChange(t *testing.T) {
+// TestTakeFeeRequiresConfirmedCoins: C++ funds the service-node fee from
+// in-wallet UTXOs with at least 1 confirmation (unspentP2PKH over
+// availableCoins(true, 1): fOnlySafe admits own change, minDepth=1 still
+// excludes all 0-conf — bitcoinrpcconnector.cpp:276-278,
+// xbridgeapp.cpp:2897). A take whose only fee-covering UTXO is 0-conf
+// change must fail even though confirmed dust exists; a confirmed UTXO
+// covering the fee succeeds. (An earlier revision of this test pinned the
+// opposite contract from a misreading of fOnlySafe; the live crBadFeeTx of
+// 2026-09-24 — fee on a 26 s-old unconfirmed output, hub broadcast failed
+// — proved the floor.)
+func TestTakeFeeRequiresConfirmedCoins(t *testing.T) {
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
 		"BTC":   {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
 		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
@@ -206,10 +210,12 @@ func TestTakeFeeSpendsZeroConfChange(t *testing.T) {
 	change.TxID = fmt.Sprintf("%064x", 0x900)
 	change.Amount = 93400000
 	change.Value = 0.934
-	mature := blkUtxo()
-	mature.TxID = fmt.Sprintf("%064x", 0x901)
-	mature.Amount = 990000
-	mature.Value = 0.0099
+	// 0-conf change is ignored for fees even though it covers; the
+	// confirmed cover below carries the take.
+	cover := blkUtxo()
+	cover.TxID = fmt.Sprintf("%064x", 0x901)
+	cover.Amount = 2000000
+	cover.Value = 0.02
 	funding := wallet.Utxo{
 		TxID: fmt.Sprintf("%064x", 0x902), Vout: 0,
 		Amount: 500000000, Value: 5.0,
@@ -221,7 +227,7 @@ func TestTakeFeeSpendsZeroConfChange(t *testing.T) {
 		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
 	}, map[string]wallet.Connector{
 		"BTC":   &stubConn{ticker: "BTC", addr: btcAddr, utxos: []wallet.Utxo{funding}},
-		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{change}, matureUtxos: []wallet.Utxo{mature}},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{change}, matureUtxos: []wallet.Utxo{cover}},
 	})
 	hubPriv := make([]byte, 32)
 	hubPriv[31] = 7
@@ -231,17 +237,17 @@ func TestTakeFeeSpendsZeroConfChange(t *testing.T) {
 	}
 	registerHub(t, n, hubPriv)
 	var oid [32]byte
-	copy(oid[:], []byte("take-zero-conf-fee-00000000000000"))
+	copy(oid[:], []byte("take-confirmed-fee-00000000000000"))
 	n.store.Add(&Order{
 		ID: oid, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		Status: "open", SNodePubkey: hex.EncodeToString(hubPub[:]), HubAddress: coins.KeyID(hubPub[:]),
 	})
 	if _, rerr := n.TakeOrder(TakeOrderParams{
 		ID:          orderIDString(oid),
-		FromAddress: addrFor(0, "take-from-zc"),
-		ToAddress:   addrFor(0, "take-to-zc"),
+		FromAddress: addrFor(0, "take-from-cf"),
+		ToAddress:   addrFor(0, "take-to-cf"),
 	}); rerr != nil {
-		t.Fatalf("take with only 0-conf fee funds failed: %v (want success)", rerr)
+		t.Fatalf("take with confirmed fee cover failed: %v (want success)", rerr)
 	}
 	if got := n.store.Get(hexEncode(oid[:])); got == nil || got.Status != "accepting" {
 		t.Fatalf("order status = %v, want accepting", got)

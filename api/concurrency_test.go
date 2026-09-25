@@ -338,7 +338,7 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
 	}, map[string]wallet.Connector{
 		"BTC":   conn,
-		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: blkUtxos},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: blkUtxos},
 	})
 
 	hubPriv := make([]byte, 32)
@@ -461,7 +461,7 @@ func TestConcurrentTakeOrderDistinctOrdersExclusiveReservation(t *testing.T) {
 		"BLOCK": {Ticker: "BLOCK", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60, TxVersion: 1},
 	}, map[string]wallet.Connector{
 		"BTC":   conn,
-		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: blkUtxos},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: blkUtxos},
 	})
 
 	hubPriv := make([]byte, 32)

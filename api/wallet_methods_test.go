@@ -80,7 +80,13 @@ func (s *stubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 	// mempool. Unset = legacy (minConf ignored).
 	if s.matureUtxos != nil {
 		if minConf >= 1 {
-			return append([]wallet.Utxo(nil), s.matureUtxos...), nil
+			// Stamp like ListUnspentWithZeroConf below: a fixture 0-conf
+			// entry in the mature pool must not over-permit versus
+			// production (wallet/rpc.go drops known-confs below minConf).
+			// The minConf==0 union branch below stays raw on purpose:
+			// production reports a 0-conf output as 0 (or drops it), never
+			// as 6, so stamping there would reduce harness fidelity.
+			return stampMature(s.matureUtxos), nil
 		}
 		out := append([]wallet.Utxo(nil), s.utxos...)
 		return append(out, s.matureUtxos...), nil
@@ -89,11 +95,29 @@ func (s *stubConn) ListUnspent(minConf int) ([]wallet.Utxo, error) {
 }
 
 // ListUnspentWithZeroConf returns the full stub set (confirmed plus 0-conf
-// change), mirroring AvailableCoins(fOnlySafe=true) for fee funding: the fee
-// path must see fresh change, not just mature funds.
+// change). It mirrors the enumeration half of C++ AvailableCoins (the union
+// the wallet reports); confirmation filtering lives at the call sites —
+// notably the ≥1-conf floor in taker fee selection (C++ minDepth = 1),
+// which is why the mature pool carries Confirmations (mirroring the
+// production wire population in wallet/rpc.go) while the utxos pool reads
+// 0-conf unless a fixture sets the field explicitly.
+// stampMature copies the mature fixture pool with unknown-depth (0-conf)
+// entries stamped mature, mirroring the production wire population
+// (wallet/rpc.go). Loop copies by value: fixtures are never mutated.
+func stampMature(in []wallet.Utxo) []wallet.Utxo {
+	out := make([]wallet.Utxo, 0, len(in))
+	for _, u := range in {
+		if u.Confirmations == 0 {
+			u.Confirmations = 6
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
 func (s *stubConn) ListUnspentWithZeroConf() ([]wallet.Utxo, error) {
 	out := append([]wallet.Utxo(nil), s.utxos...)
-	return append(out, s.matureUtxos...), nil
+	return append(out, stampMature(s.matureUtxos)...), nil
 }
 func (s *stubConn) SignRawTransaction(txHex string, prevTxs []wallet.PrevTx) (string, bool, error) {
 	return txHex, true, nil

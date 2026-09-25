@@ -309,12 +309,13 @@ func TestListUnspentFiltering(t *testing.T) {
 	}
 }
 
-// TestListUnspentWithZeroConf verifies the fee-funding enumeration
-// (AvailableCoins(fOnlySafe=true) parity): unconfirmed outputs are kept,
-// conflicted ones (present negative confirmations) stay dropped, and the
-// confirmed-only ListUnspent contract is unchanged. Live run6 S2: a take
-// whose only fee-covering UTXO was 0-conf change failed INSUFFICIENT_FUNDS
-// because the fee path enumerated confirmed-only.
+// TestListUnspentWithZeroConf verifies the fee-funding enumeration:
+// unconfirmed outputs are kept, conflicted ones (present negative
+// confirmations) stay dropped, and the confirmed-only ListUnspent contract
+// is unchanged. (Live run6 S2 once motivated spending 0-conf change here;
+// C++ parity since proved that wrong — availableCoins(true, 1) excludes
+// every 0-conf output, so the ≥1-conf floor lives in taker fee selection
+// and this enumeration stays a union by design.)
 func TestListUnspentWithZeroConf(t *testing.T) {
 	body := `[
 		{"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"amount":1.0,"scriptPubKey":"51","confirmations":6,"spendable":true},

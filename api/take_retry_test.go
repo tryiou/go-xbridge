@@ -79,7 +79,7 @@ func newTakeRetryNode(t *testing.T, takeRetry int) (*Node, *captureXConn) {
 			{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
 				Amount: 300000000, Value: 3.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 		}},
-		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{blkUtxo()}},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: []wallet.Utxo{blkUtxo()}},
 	})
 	cc := &captureXConn{}
 	n.conn = cc

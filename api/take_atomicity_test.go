@@ -422,7 +422,7 @@ func TestTakeFeeSelectionAvoidsOtherOrderFundingLock(t *testing.T) {
 			{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
 				Amount: 300000000, Value: 3.0, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 		}},
-		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{u1, u2}},
+		"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: []wallet.Utxo{u1, u2}},
 	})
 	cc := &captureXConn{}
 	n.conn = cc

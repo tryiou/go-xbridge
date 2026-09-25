@@ -288,9 +288,8 @@ func (c *RPCConnector) ListUnspent(minConf int) ([]Utxo, error) {
 }
 
 // ListUnspentWithZeroConf implements wallet.Connector: same wire call, but
-// unconfirmed outputs are kept. This is wider than C++ fOnlySafe (it keeps
-// inbound receipts too, not just own change) — safe for dust-sized P2PKH fee
-// inputs under the ReserveForTake lock exclusion; see the interface doc.
+// unconfirmed outputs are kept. Enumeration only — selection-side parity
+// still floors at ≥1 conf (C++ minDepth = 1); see the interface doc.
 func (c *RPCConnector) ListUnspentWithZeroConf() ([]Utxo, error) {
 	return c.listUnspentFiltered(0, true)
 }
@@ -319,7 +318,8 @@ func (c *RPCConnector) listUnspentFiltered(minConf int, includeZeroConf bool) ([
 		// C++ confs guard for the listunspent-shape path: keep when the field
 		// is absent (confs==-1) or >0; drop when present and unconfirmed.
 		// Skipped when the caller explicitly wants the mempool set too
-		// (fee funding over AvailableCoins(fOnlySafe=true)).
+		// (union enumeration for fee funding; selection floors at ≥1 conf
+		// at the call site per C++ minDepth = 1).
 		if !includeZeroConf && u.Confirmations != nil && *u.Confirmations <= 0 {
 			continue
 		}

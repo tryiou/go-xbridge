@@ -2454,16 +2454,17 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	}
 
 	// BLOCK service-node fee prep (C++ :2236-2267). The fee draws on the
-	// wallet's spendable p2pkh set INCLUDING trusted 0-conf change: C++
-	// sources it from unspentP2PKH over in-wallet AvailableCoins(fOnlySafe
-	// = true) (bitcoinrpcconnector.cpp:276-278, :52-62), where fOnlySafe
-	// admits our own unconfirmed change (minDepth applies to others'
-	// outputs, not ours). ListUnspentWithZeroConf approximates that set
-	// (it keeps inbound receipts too — safe for dust-sized P2PKH fee inputs
-	// under the lock exclusion): the P2PKH filter below plus the
-	// ReserveForTake lock exclusion still prevent double-use, and a fee with
-	// an unconfirmed parent relays and confirms after it — exactly like
-	// core's own-change spend. (The taker-funding
+	// wallet's spendable p2pkh set with at least 1 confirmation: C++ sources
+	// it from unspentP2PKH over in-wallet AvailableCoins(fOnlySafe = true,
+	// minDepth = 1) (bitcoinrpcconnector.cpp:276-278, :52-62) — fOnlySafe
+	// admits own change, but minDepth = 1 still excludes every 0-conf
+	// output. A 0-conf fee parent the hub's mempool lacks fails hub
+	// broadcast with crBadFeeTx (live 2026-09-24), so the 1-conf floor
+	// below is C++ parity, not caution. (An earlier revision read fOnlySafe
+	// alone as license for 0-conf fee inputs; that misreading manufactured
+	// the reject.) ListUnspentWithZeroConf enumerates the union including
+	// 0-conf; the floor in the selection loop keeps inbound receipts and
+	// fresh change out of fee inputs. (The taker-funding
 	// enumeration below stays minconf 1, mirroring C++ getUnspent's
 	// listUnspent with empty params; ListUnspent itself stays
 	// confirmed-only for the same reason.) Locked UTXOs are excluded. Every
@@ -2502,6 +2503,14 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	feeLocked, _ := n.store.LockedUtxoInfo()
 	feeUtxos := make([]wallet.Utxo, 0, len(feeUtxoAvail))
 	for _, u := range feeUtxoAvail {
+		// C++ parity: fee inputs need ≥1 conf (unspentP2PKH via
+		// availableCoins(true,1)). A 0-conf fee parent the hub's mempool
+		// lacks fails hub broadcast with crBadFeeTx (live 2026-09-24:
+		// fee on a 26 s-old unconfirmed output). Unknown confirmations
+		// read as 0 (wallet/rpc.go) → excluded.
+		if u.Confirmations < 1 {
+			continue
+		}
 		if !isP2PKH25(u.ScriptPubKey) {
 			continue
 		}

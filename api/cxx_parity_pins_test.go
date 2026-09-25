@@ -138,11 +138,12 @@ func TestDxTakeOrderFullTake(t *testing.T) {
 	ctx.Node.config.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
 	// Two BLOCK funders: take #1 locks its fee utxo (LockedUtxoInfo reserves a
 	// live order's FeeUtxos, C++ lockFeeUtxos :2267), so take #2 needs a second.
+	// Both live in the mature pool: fee selection floors at ≥1 conf.
 	u1 := blkUtxo()
 	u2 := blkUtxo()
 	u2.TxID = "0000000000000000000000000000000000000000000000000000000000000003"
 	u2.Vout = 1
-	ctx.Node.config.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{u1, u2}}
+	ctx.Node.config.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: []wallet.Utxo{u1, u2}}
 	// A takeable order must have a hub that is a known servicenode;
 	// dxTakeOrder refuses unregistered hubs with NO_SERVICE_NODE (C++
 	// acceptXBridgeTransaction, getSn). Seed the registry with the hub.
@@ -252,7 +253,7 @@ func TestTakeOrderFundingRejectsNonP2PKH(t *testing.T) {
 			funders: []wallet.Utxo{p2sh, p2pkh}}
 		n, cc := newStartedNode(t, conf(), map[string]wallet.Connector{
 			"BTC":   btc,
-			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{blkUtxo()}},
+			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: []wallet.Utxo{blkUtxo()}},
 		})
 		registerHub(t, n, hubPriv)
 		var oid [32]byte
@@ -286,7 +287,7 @@ func TestTakeOrderFundingRejectsNonP2PKH(t *testing.T) {
 			funders: []wallet.Utxo{p2sh}}
 		n, cc := newStartedNode(t, conf(), map[string]wallet.Connector{
 			"BTC":   btc,
-			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: []wallet.Utxo{blkUtxo()}},
+			"BLOCK": &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: []wallet.Utxo{blkUtxo()}},
 		})
 		registerHub(t, n, hubPriv)
 		var oid [32]byte

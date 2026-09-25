@@ -165,16 +165,14 @@ type Connector interface {
 	// :536-577), which drops unconfirmed outputs even at minConf 0.
 	ListUnspent(minConf int) ([]Utxo, error)
 	// ListUnspentWithZeroConf returns the spendable set INCLUDING unconfirmed
-	// outputs, for service-node fee funding: a take whose only fee-covering
-	// UTXO is fresh change must succeed. It approximates C++
-	// AvailableCoins(fOnlySafe = true) (bitcoinrpcconnector.cpp:276-278,
-	// :52-62) — C++ admits only safe (own) unconfirmed outputs while this
-	// returns every wallet-owned 0-conf output including inbound receipts;
-	// for dust-sized P2PKH fee inputs under the ReserveForTake lock exclusion
-	// that approximation is safe. The two C++ paths deliberately differ, so
-	// the Go contract splits them too — ListUnspent stays confirmed-only,
-	// this one does not (conflicted outputs, confirmations < 0, stay dropped
-	// in both).
+	// outputs. It is the enumeration primitive only: C++ parity for
+	// SELECTION still requires ≥1 conf everywhere on the take path
+	// (AvailableCoins(true, 1): fOnlySafe admits own change, minDepth = 1
+	// excludes every 0-conf output — bitcoinrpcconnector.cpp:276-278,
+	// :52-62), so callers that fund fees or orders must floor on
+	// Utxo.Confirmations themselves. The union here keeps inbound receipts
+	// too (wider than C++ fOnlySafe); conflicted outputs
+	// (confirmations < 0) stay dropped in both contracts.
 	ListUnspentWithZeroConf() ([]Utxo, error)
 	// SignRawTransaction signs txHex with the wallet's keys. prevTxs supplies
 	// the previous outputs' scripts/amounts. It returns the signed hex and

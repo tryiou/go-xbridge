@@ -20,7 +20,9 @@ import (
 // session map, and the given service-node registry. The BTC connector is funded
 // with a single 3.0 BTC utxo so selection passes for the standard 1.5 BTC exact
 // make (C++ selectUtxos gt-single path) and the BLOCK connector holds a 1.0
-// BLOCK p2pkh utxo for the take's service-node fee tx.
+// BLOCK p2pkh utxo for the take's service-node fee tx. The BLOCK fee funds
+// live in the mature (confirmed) pool: taker fee selection floors at ≥1
+// conf (C++ minDepth = 1 parity), so the 0-conf pool would starve it.
 func newHubNode(reg *servicenode.Registry) (*Node, *captureXConn) {
 	return newHubNodeUtxos(reg, []wallet.Utxo{
 		{TxID: "0000000000000000000000000000000000000000000000000000000000000001", Vout: 0,
@@ -93,7 +95,7 @@ func buildHubNode(reg *servicenode.Registry, btc []wallet.Utxo, block []wallet.U
 	}
 	if block != nil {
 		cfg.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
-		cfg.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, utxos: block}
+		cfg.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: block}
 	}
 	n := &Node{
 		config:   cfg,
