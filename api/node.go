@@ -298,15 +298,11 @@ type Node struct {
 	// trackedSeq orders entries for cap pruning without chain I/O.
 	// pendingConfirm is the poll single-flight guard (a sweep never stacks).
 	// pendingRebroadcast is the rebroadcast single-flight guard.
-	// settledPollAt is the last completed hourly recheck of the settled
-	// (archive) tier — engine-confined like sessions: only the poll sweep's
-	// snapshot and its apply touch it.
 	trackedMu          sync.Mutex
 	tracked            map[string]*trackedBroadcast
 	trackedSeq         atomic.Uint64
 	pendingConfirm     atomic.Bool
 	pendingRebroadcast atomic.Bool
-	settledPollAt      uint64
 
 	// engineRunning is true once start() has launched the engine goroutine.
 	// Node.submit runs commands inline on the caller when it is false (tests,
@@ -534,7 +530,16 @@ func (n *Node) restoreLocalSwaps(dataDir string) {
 			xlog.Info("restored local swaps from disk", "count", len(ps), "dir", dataDir)
 		}
 		n.restoreTracked(bc)
-		n.restoreSettledTracked(settled)
+		if len(settled) > 0 {
+			// Pre-finalize files carry a settled archive section (deep
+			// entries polled hourly). Finalized entries are never polled
+			// now, so migrate the section: drop finalized entries, restore
+			// any entry that still needs watching (below the coin's
+			// finalize depth, live session, or unreconciled refund — e.g.
+			// the operator raised Confirmations since the file was
+			// written). History keeps the audit trail either way.
+			n.migrateSettledArchive(settled)
+		}
 		// Crash-window reconciliation (see reconcileUnconfirmedDeposits): a deposit
 		// broadcast whose confirmation never persisted is ambiguous on disk —
 		// resolve it against the chain before the engine starts, so the refund

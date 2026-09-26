@@ -1,19 +1,21 @@
 package api
 
 import (
+	"os"
 	"testing"
 
 	"go-xbridge/config"
 	"go-xbridge/wallet"
 )
 
-// Settle lifecycle (broadcast watch archive tier) tests: a deep-confirmed,
-// sessionless, refund-reconciled tracked broadcast settles out of the per-tick
-// poll into the archive (hourly recheck); any regression re-activates it.
+// Finalize lifecycle (broadcast watch) tests: a deep-confirmed, sessionless,
+// refund-reconciled tracked broadcast is dropped from the watch table outright
+// and never polled again. The durable trade record stays in Store.history, so
+// order visibility is unchanged. There is no archive tier and no recheck.
 
 // settleTestNode builds an inline node with a stub BLOCK connector serving
-// verboseTx, for the settle tests. confs feeds the node config so coin-aware
-// settle depths are exercisable; nil means the default (depth
+// verboseTx, for the finalize tests. confs feeds the node config so coin-aware
+// finalize depths are exercisable; nil means the default (depth
 // trackedRetainDepth).
 func settleTestNode(t *testing.T, confs map[string]*config.CoinConf, verbose map[string]wallet.VerboseTx) (*Node, *stubConn) {
 	t.Helper()
@@ -31,43 +33,37 @@ func verboseOut(confs int) map[string]wallet.VerboseTx {
 	}
 }
 
-// TestSettleArchivesDeepSessionless proves the core settle: a depth >= settle
-// entry with no live session settles on the poll's apply, stops the per-tick
-// poll, and moves to the persisted settled section.
-func TestSettleArchivesDeepSessionless(t *testing.T) {
+// TestFinalizeArchivesDeepSessionless proves the core finalize: a depth >=
+// finalize entry with no live session is dropped from the watch table on the
+// poll's apply and never polled again; the snapshot carries no settled
+// section.
+func TestFinalizeArchivesDeepSessionless(t *testing.T) {
 	n, bc := settleTestNode(t, nil, verboseOut(6))
 	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
 	n.pollBroadcastConfirmations()
-	got := n.trackedSnapshot()
-	tb, ok := got["tx1"]
-	if !ok {
-		t.Fatal("entry lost")
-	}
-	if !tb.Settled || tb.Confs != 6 {
-		t.Fatalf("settled = %v confs = %d, want settled at 6", tb.Settled, tb.Confs)
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("deep sessionless entry still watched, want dropped")
 	}
 	active, settled := snapshotBroadcasts(n)
-	if len(active) != 0 || len(settled) != 1 {
-		t.Fatalf("snapshot split = %d active %d settled, want 0/1", len(active), len(settled))
+	if len(active) != 0 || len(settled) != 0 {
+		t.Fatalf("snapshot split = %d active %d settled, want 0/0", len(active), len(settled))
 	}
-	// Next tick within the recheck window: the archived entry is not polled.
-	n.settledPollAt = uint64(NowMicro())
+	// Next tick: nothing to poll.
 	before := bc.verboseCalls
 	n.pollBroadcastConfirmations()
 	if bc.verboseCalls != before {
-		t.Fatalf("settled entry polled within recheck window (%d -> %d)", before, bc.verboseCalls)
+		t.Fatalf("dropped entry polled (%d -> %d), want zero", before, bc.verboseCalls)
 	}
 }
 
-// TestSettleSkipsShallow proves depth gating: below settleDepth the entry
-// stays active (per-tick watch), never archived.
-func TestSettleSkipsShallow(t *testing.T) {
+// TestFinalizeSkipsShallow proves depth gating: below finalize depth the entry
+// stays watched (per-tick), never dropped.
+func TestFinalizeSkipsShallow(t *testing.T) {
 	n, _ := settleTestNode(t, nil, verboseOut(5)) // default depth 6
 	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
 	n.pollBroadcastConfirmations()
-	got := n.trackedSnapshot()
-	if got["tx1"].Settled {
-		t.Fatal("shallow entry settled")
+	if _, ok := n.trackedSnapshot()["tx1"]; !ok {
+		t.Fatal("shallow entry dropped")
 	}
 	active, settled := snapshotBroadcasts(n)
 	if len(active) != 1 || len(settled) != 0 {
@@ -75,48 +71,48 @@ func TestSettleSkipsShallow(t *testing.T) {
 	}
 }
 
-// TestSettleCoinAwareDepth proves settleDepth honors the coin's required
-// Confirmations: a 6-conf entry on a 40-conf coin stays active.
-func TestSettleCoinAwareDepth(t *testing.T) {
+// TestFinalizeCoinAwareDepth proves settleDepth honors the coin's required
+// Confirmations: a 6-conf entry on a 40-conf coin stays watched.
+func TestFinalizeCoinAwareDepth(t *testing.T) {
 	confs := map[string]*config.CoinConf{
 		"BLOCK": {Ticker: "BLOCK", Confirmations: 40},
 	}
 	n, bc := settleTestNode(t, confs, verboseOut(6))
 	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
 	n.pollBroadcastConfirmations()
-	if n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("entry settled below the coin's required depth")
+	if _, ok := n.trackedSnapshot()["tx1"]; !ok {
+		t.Fatal("entry dropped below the coin's required depth")
 	}
-	// Depth reached: settle.
+	// Depth reached: finalize (drop).
 	bc.verboseTx = verboseOut(40)
 	n.pollBroadcastConfirmations()
-	if !n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("entry not settled at the coin's required depth")
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("entry not dropped at the coin's required depth")
 	}
 }
 
-// TestSettleSkipsLiveSession proves a live session keeps its entry active
-// regardless of depth, and that pruning the session releases it to settle.
-func TestSettleSkipsLiveSession(t *testing.T) {
+// TestFinalizeSkipsLiveSession proves a live session keeps its entry watched
+// regardless of depth, and that pruning the session releases it to finalize.
+func TestFinalizeSkipsLiveSession(t *testing.T) {
 	n, _ := settleTestNode(t, nil, verboseOut(6))
 	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
 	n.sessions["order1"] = &SwapSession{}
 	n.pollBroadcastConfirmations()
-	if n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("live-session entry settled")
+	if _, ok := n.trackedSnapshot()["tx1"]; !ok {
+		t.Fatal("live-session entry dropped")
 	}
 	delete(n.sessions, "order1")
 	n.pollBroadcastConfirmations()
-	if !n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("sessionless entry not settled after session prune")
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("sessionless entry not dropped after session prune")
 	}
 }
 
-// TestSettleGatesUnreconciledRefund proves the refund gate: a deep refund
-// entry for a live non-terminal order stays active (scanStoredRefunds would
+// TestFinalizeGatesUnreconciledRefund proves the refund gate: a deep refund
+// entry for a live non-terminal order stays watched (scanStoredRefunds would
 // re-post the refund if the entry vanished) until the order reconciles to
 // "rolled back" or a terminal status.
-func TestSettleGatesUnreconciledRefund(t *testing.T) {
+func TestFinalizeGatesUnreconciledRefund(t *testing.T) {
 	n, _ := settleTestNode(t, nil, verboseOut(6))
 	var oid [32]byte
 	oid[0] = 0x77
@@ -125,49 +121,43 @@ func TestSettleGatesUnreconciledRefund(t *testing.T) {
 		DepositSent: true, RefundTx: "abcd", Status: "open"})
 	n.recordBroadcast(idHex, broadcastRefund, "BLOCK", "tx1", "hex")
 	n.pollBroadcastConfirmations()
-	if n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("unreconciled refund entry settled")
+	if _, ok := n.trackedSnapshot()["tx1"]; !ok {
+		t.Fatal("unreconciled refund entry dropped")
 	}
 	n.store.Update(idHex, func(o *Order) { o.Status = "rolled back" })
 	n.pollBroadcastConfirmations()
-	if !n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("reconciled refund entry not settled")
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("reconciled refund entry not dropped")
 	}
 }
 
-// TestSettleDemoteOnRegression proves the hourly recheck safety net: a
-// recheck-observed regression below settle depth re-activates the entry, and
-// the rebroadcast sweep immediately regains ownership of a 0-conf regression.
-func TestSettleDemoteOnRegression(t *testing.T) {
+// TestFinalizeNeverRepolls proves there is no recheck: a dropped entry stays
+// dropped across ticks even if the chain would report a regression — the
+// entry is gone, so no wallet RPC fires for it.
+func TestFinalizeNeverRepolls(t *testing.T) {
 	n, bc := settleTestNode(t, nil, verboseOut(6))
 	n.recordBroadcast("order1", broadcastClaim, "BLOCK", "tx1", "hex")
-	n.pollBroadcastConfirmations() // settles at depth 6
-	if !n.trackedSnapshot()["tx1"].Settled {
-		t.Fatal("entry did not settle")
+	n.pollBroadcastConfirmations() // drops at depth 6
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("entry did not finalize")
 	}
-	// The chain lost the tx (SPV reset / deep reorg): the recheck observes 0.
 	bc.verboseTx = verboseOut(0)
-	n.settledPollAt = uint64(NowMicro()) - settleRecheckInterval - 1
+	before := bc.verboseCalls
 	n.pollBroadcastConfirmations()
-	got := n.trackedSnapshot()["tx1"]
-	if got.Settled || got.Confs != 0 {
-		t.Fatalf("demote = settled %v confs %d, want reactivated at 0", got.Settled, got.Confs)
+	n.pollBroadcastConfirmations()
+	if bc.verboseCalls != before {
+		t.Fatalf("finalized entry repolled (%d -> %d), want zero", before, bc.verboseCalls)
 	}
-	// Reactivated: the rebroadcast sweep owns the 0-conf entry again.
-	old := uint64(NowMicro()) - uint64(n.rebroadcastAfterMicro("BLOCK")+1)
-	n.tracked["tx1"].FirstSeenMicro = old
-	n.rebroadcastUnconfirmed()
-	if n.tracked["tx1"].Attempts != 1 {
-		t.Fatalf("rebroadcast attempts = %d after demote, want 1 (sweep regained ownership)",
-			n.tracked["tx1"].Attempts)
+	if _, ok := n.trackedSnapshot()["tx1"]; ok {
+		t.Fatal("finalized entry resurrected")
 	}
 }
 
-// TestSettledPersistRoundTrip proves the persisted split: active and settled
-// sections marshal, checksum, and parse independently, and a file written by
-// a pre-settled binary (no settled section — identical bytes to
-// marshalSwapFile with nil) still loads with an empty archive.
-func TestSettledPersistRoundTrip(t *testing.T) {
+// TestFinalizedPersistRoundTrip proves the persisted split: the active section
+// marshals, checksums, and parses; a file written by a pre-finalize binary
+// (with a settled section) still loads, and the settled section is dropped on
+// restore, never re-polled.
+func TestFinalizedPersistRoundTrip(t *testing.T) {
 	swaps := []persistedSwap{{ID: [32]byte{0x1}}}
 	active := []persistedBroadcast{{
 		OrderID: "oa", Kind: broadcastDeposit, Coin: "BLOCK", TxID: "txa", Hex: "aa", Seq: 1, Confs: 2,
@@ -190,71 +180,82 @@ func TestSettledPersistRoundTrip(t *testing.T) {
 	if gotSettled[0].TxID != "txs" || gotSettled[0].Confs != 800 {
 		t.Fatalf("settled mismatch: %+v", gotSettled[0])
 	}
-	// Pre-settled file (old two-section envelope): loads, archive empty.
-	oldData, err := marshalSwapFile(swaps, active, nil)
+	// New-shape file (no settled section): loads, archive empty.
+	newData, err := marshalSwapFile(swaps, active, nil)
+	if err != nil {
+		t.Fatalf("marshal new shape: %v", err)
+	}
+	_, gotActive2, gotSettled2, err := parseSwapFile(newData, "test")
+	if err != nil {
+		t.Fatalf("new-shape load: %v", err)
+	}
+	if len(gotActive2) != 1 || len(gotSettled2) != 0 {
+		t.Fatalf("new-shape = %d active %d settled, want 1/0", len(gotActive2), len(gotSettled2))
+	}
+}
+
+// TestRestoreDropsSettledArchive proves migration: a settled section in an
+// older file is dropped on restore (history keeps the audit trail), while the
+// active section restores with the same skip-invalid/dedup rules.
+func TestRestoreDropsSettledArchive(t *testing.T) {
+	dir := t.TempDir()
+	n := newPersistNode(t, dir)
+	var oid [32]byte
+	oid[0] = 0x61
+	idHex := hexEncode(oid[:])
+	n.store.Add(&Order{ID: oid, Mine: true, FromCurrency: "BLOCK", ToCurrency: "LTC",
+		Status: "created", DepositSent: true})
+	n.store.MoveToHistory(idHex, "finished", 0, uint64(NowMicro()))
+	n.recordBroadcast(idHex, broadcastClaim, "LTC", "claim-tx", "hex")
+	n.tracked["claim-tx"].Confs = 800
+	if n.finalizeWatchEntries() != true {
+		t.Fatal("deep sessionless claim entry did not finalize")
+	}
+	n.persist()
+
+	swaps, active, settled, err := loadSwaps(swapStatePath(dir))
+	if err != nil {
+		t.Fatalf("loadSwaps: %v", err)
+	}
+	if len(swaps) != 1 || !swaps[0].Historical || swaps[0].Status != "finished" {
+		t.Fatalf("persisted swaps = %+v, want one historical finished record", swaps)
+	}
+	if len(active) != 0 || len(settled) != 0 {
+		t.Fatalf("persisted watch = %d active %d settled, want 0/0", len(active), len(settled))
+	}
+
+	// Old file with a settled section: the finalized entry is dropped, a
+	// below-depth entry rejoins the watch (e.g. Confirmations was raised
+	// since the file was written), history is kept either way.
+	oldData, err := marshalSwapFile(swaps, nil, []persistedBroadcast{{
+		OrderID: idHex, Kind: broadcastClaim, Coin: "LTC", TxID: "claim-tx", Hex: "hex", Seq: 1, Confs: 800,
+	}, {
+		OrderID: idHex, Kind: broadcastClaim, Coin: "LTC", TxID: "shallow-tx", Hex: "hex", Seq: 2, Confs: 1,
+	}})
 	if err != nil {
 		t.Fatalf("marshal old shape: %v", err)
 	}
-	_, gotActive2, gotSettled2, err := parseSwapFile(oldData, "test")
-	if err != nil {
-		t.Fatalf("old-shape load: %v", err)
+	if err := os.WriteFile(swapStatePath(dir), oldData, 0o600); err != nil {
+		t.Fatalf("write old shape: %v", err)
 	}
-	if len(gotActive2) != 1 || len(gotSettled2) != 0 {
-		t.Fatalf("old-shape = %d active %d settled, want 1/0", len(gotActive2), len(gotSettled2))
+	n2 := newPersistNode(t, dir)
+	n2.restoreLocalSwaps(dir)
+	if h := n2.store.History(); len(h) != 1 || h[0].Status != "finished" || h[0].ID != idHex {
+		t.Fatalf("restored history = %+v, want the finished record", h)
 	}
-}
-
-// TestRestoreSettledTracked proves the archive section restores directly into
-// the settled tier, with the same skip-invalid/dedup rules as the active
-// section and a sequence that keeps new records sortable after it.
-func TestRestoreSettledTracked(t *testing.T) {
-	n, _ := settleTestNode(t, nil, nil)
-	n.restoreSettledTracked([]persistedBroadcast{
-		{OrderID: "o1", Kind: broadcastDeposit, Coin: "BLOCK", TxID: "tx1", Hex: "aa", Seq: 5, Confs: 700},
-		{OrderID: "o2", Kind: broadcastClaim, Coin: "BLOCK", TxID: "", Hex: "bb"},
-		{OrderID: "o1", Kind: broadcastDeposit, Coin: "BLOCK", TxID: "tx1", Hex: "aa", Seq: 5, Confs: 700},
-	})
-	got := n.trackedSnapshot()
-	if len(got) != 1 || !got["tx1"].Settled || got["tx1"].Confs != 700 {
-		t.Fatalf("restored = %+v, want one settled entry at confs 700", got)
+	if _, ok := n2.tracked["claim-tx"]; ok {
+		t.Fatal("settled archive entry restored, want dropped")
 	}
-	n.recordBroadcast("o9", broadcastClaim, "BLOCK", "tx9", "hex")
-	if got := n.trackedSnapshot(); got["tx9"].Seq <= 5 {
-		t.Fatalf("new seq = %d, want > 5 (after restored max)", got["tx9"].Seq)
-	}
-}
-
-// TestPruneSettledArchiveCap proves the archive bound: settled entries beyond
-// maxSettledWatch drop oldest (lowest Seq) first, and the active-cap rule
-// never touches settled entries (their bound is separate).
-func TestPruneSettledArchiveCap(t *testing.T) {
-	n, _ := settleTestNode(t, nil, nil)
-	const total = maxSettledWatch + 3
-	for i := 0; i < total; i++ {
-		n.recordBroadcast("order-arch", broadcastClaim, "BLOCK", "arch-tx-"+itoa(i), "hex")
-	}
-	n.trackedMu.Lock()
-	for _, tb := range n.tracked {
-		tb.Settled = true
-		tb.Confs = trackedRetainDepth
-	}
-	n.trackedMu.Unlock()
-	n.pruneTracked()
-	got := n.trackedSnapshot()
-	if len(got) != maxSettledWatch {
-		t.Fatalf("tracked = %d, want %d after archive prune", len(got), maxSettledWatch)
-	}
-	if _, ok := got["arch-tx-0"]; ok {
-		t.Fatal("oldest settled entry kept")
-	}
-	if _, ok := got["arch-tx-"+itoa(total-1)]; !ok {
-		t.Fatal("newest settled entry dropped")
+	if _, ok := n2.tracked["shallow-tx"]; !ok {
+		t.Fatal("below-depth archive entry not restored to watch, want kept")
 	}
 }
 
 // TestPruneKeepsUnreconciledRefundEntry proves the active-cap fallback keeps
 // a deep refund entry whose order is still live and unreconciled: deleting it
-// would let scanStoredRefunds re-post the refund every sweep.
+// would let scanStoredRefunds re-post the refund every sweep (tracked =>
+// never re-posted). Covers the pruneTracked cap path, distinct from
+// TestFinalizeGatesUnreconciledRefund (finalize path, coin-aware depth).
 func TestPruneKeepsUnreconciledRefundEntry(t *testing.T) {
 	n, _ := settleTestNode(t, nil, nil)
 	var oid [32]byte
@@ -280,10 +281,9 @@ func TestPruneKeepsUnreconciledRefundEntry(t *testing.T) {
 	}
 }
 
-// TestRestartPreservesHistoryAndArchive is the durability check for both
-// lifecycle rules: a finished order's history record and a settled broadcast
-// entry survive a persist → restore round trip, and the restored archive
-// entry comes back settled (no per-tick polling resumes for it).
+// TestRestartPreservesHistoryAndArchive is the durability check: a finished
+// order's history record survives a persist → restore round trip, and no watch
+// entry comes back for it (zero polling resumes).
 func TestRestartPreservesHistoryAndArchive(t *testing.T) {
 	dir := t.TempDir()
 	n := newPersistNode(t, dir)
@@ -296,13 +296,13 @@ func TestRestartPreservesHistoryAndArchive(t *testing.T) {
 	n.store.MoveToHistory(idHex, "finished", 0, uint64(NowMicro()))
 	n.recordBroadcast(idHex, broadcastClaim, "LTC", "claim-tx", "hex")
 	n.tracked["claim-tx"].Confs = 800
-	if n.updateSettled() != true {
-		t.Fatal("deep sessionless claim entry did not settle")
+	if n.finalizeWatchEntries() != true {
+		t.Fatal("deep sessionless claim entry did not finalize")
 	}
 	n.persist()
 
 	// On disk: the history record rides the swaps array as a Historical
-	// record; the settled entry rides the settled section.
+	// record; the watch table is empty.
 	swaps, active, settled, err := loadSwaps(swapStatePath(dir))
 	if err != nil {
 		t.Fatalf("loadSwaps: %v", err)
@@ -310,21 +310,17 @@ func TestRestartPreservesHistoryAndArchive(t *testing.T) {
 	if len(swaps) != 1 || !swaps[0].Historical || swaps[0].Status != "finished" {
 		t.Fatalf("persisted swaps = %+v, want one historical finished record", swaps)
 	}
-	if len(active) != 0 || len(settled) != 1 || settled[0].TxID != "claim-tx" {
-		t.Fatalf("persisted watch = %d active %d settled, want 0/1 claim-tx", len(active), len(settled))
+	if len(active) != 0 || len(settled) != 0 {
+		t.Fatalf("persisted watch = %d active %d settled, want 0/0", len(active), len(settled))
 	}
 
-	// Restore into a fresh node: history and settled archive both come back.
+	// Restore into a fresh node: history comes back, no watch entry.
 	n2 := newPersistNode(t, dir)
 	n2.restoreLocalSwaps(dir)
 	if h := n2.store.History(); len(h) != 1 || h[0].Status != "finished" || h[0].ID != idHex {
 		t.Fatalf("restored history = %+v, want the finished record", h)
 	}
-	tb, ok := n2.tracked["claim-tx"]
-	if !ok {
-		t.Fatal("settled archive entry not restored")
-	}
-	if !tb.Settled || tb.Confs != 800 {
-		t.Fatalf("restored archive entry = settled %v confs %d, want settled at 800", tb.Settled, tb.Confs)
+	if len(n2.trackedSnapshot()) != 0 {
+		t.Fatalf("restored watch = %+v, want empty", n2.trackedSnapshot())
 	}
 }

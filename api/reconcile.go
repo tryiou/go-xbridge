@@ -33,16 +33,10 @@ const (
 // entries for cap pruning without any chain I/O at record time.
 // FirstSeenMicro is the last (re)broadcast time (wall micros); Attempts counts
 // rebroadcast tries, capped by maxRebroadcasts (then alert-only).
-//
-// Settled is the archive tier: a deep-confirmed entry with no live session
-// whose refund obligations are reconciled (updateSettled). Every consumer —
-// rebroadcast, refund reconcile, limbo GC, per-tick polling — keys off
-// Confs==0/>=1 or liveness, none of which a settled entry can change, so
-// settled entries stop the per-tick poll and are re-probed only hourly
-// (settleRecheckInterval). The flag is DERIVED: it is persisted only as a
-// restore hint (an archived entry comes back settled) and re-derived on the
-// first poll — a conf reload (settleDepth), a re-registered session, or a
-// depth regression on the hourly recheck re-activates the entry.
+// A deep-confirmed entry with no live session whose refund obligations are
+// reconciled is finalized — dropped from this table outright, never polled
+// again. The durable trade record stays in Store.history (uncapped audit
+// trail); this table holds only in-flight broadcasts.
 type trackedBroadcast struct {
 	OrderID        string
 	Kind           broadcastKind
@@ -53,7 +47,6 @@ type trackedBroadcast struct {
 	Confs          int
 	FirstSeenMicro uint64
 	Attempts       int
-	Settled        bool
 }
 
 // trackedMu guards tracked: record sites run on worker/HTTP goroutines while
@@ -96,24 +89,12 @@ func (n *Node) restoreTracked(bc []persistedBroadcast) {
 	if len(bc) == 0 {
 		return
 	}
-	n.insertTracked(bc, false)
+	n.insertTracked(bc)
 }
 
-// restoreSettledTracked reloads the settled archive section at startup. The
-// entries come back as settled (they were archived settled); the settle pass
-// re-derives the flag on the first poll anyway, so a stale archive record
-// re-activates if its order gained a live session or its stored depth no
-// longer clears settleDepth.
-func (n *Node) restoreSettledTracked(bc []persistedBroadcast) {
-	if len(bc) == 0 {
-		return
-	}
-	n.insertTracked(bc, true)
-}
-
-// insertTracked is the shared restore insert for the active and settled
-// sections. Corrupt/duplicate entries are skipped, never fatal.
-func (n *Node) insertTracked(bc []persistedBroadcast, settled bool) {
+// insertTracked is the restore insert for the active section.
+// Corrupt/duplicate entries are skipped, never fatal.
+func (n *Node) insertTracked(bc []persistedBroadcast) {
 	if n.tracked == nil {
 		n.tracked = make(map[string]*trackedBroadcast, len(bc))
 	}
@@ -130,7 +111,6 @@ func (n *Node) insertTracked(bc []persistedBroadcast, settled bool) {
 			OrderID: p.OrderID, Kind: broadcastKind(p.Kind), Coin: p.Coin,
 			TxID: p.TxID, Hex: p.Hex, Seq: p.Seq, Confs: p.Confs,
 			FirstSeenMicro: p.FirstSeenMicro, Attempts: p.Attempts,
-			Settled: settled,
 		}
 		if p.FirstSeenMicro == 0 {
 			// Pre-rebroadcast persistence: don't mass-rebroadcast on
@@ -143,21 +123,54 @@ func (n *Node) insertTracked(bc []persistedBroadcast, settled bool) {
 		restored++
 	}
 	// New records must sort after restored ones for oldest-first pruning.
-	// restoreLocalSwaps calls insertTracked once per file section (active,
-	// then settled), each seeing only its own section's Seqs — the counter
-	// must therefore only ever move UP: a second section with lower Seqs
-	// must not drag the base below already-restored entries, or a newly
-	// recorded broadcast (Add(1)) could collide with a restored Seq.
+	// The counter must therefore only ever move UP, or a newly recorded
+	// broadcast (Add(1)) could collide with a restored Seq.
 	if cur := n.trackedSeq.Load(); maxSeq > cur {
 		n.trackedSeq.Store(maxSeq)
 	}
 	if restored > 0 {
-		if settled {
-			xlog.Info("restored settled broadcast archive from disk", "count", restored)
-		} else {
-			xlog.Info("restored broadcast tracking from disk", "count", restored)
-		}
+		xlog.Info("restored broadcast tracking from disk", "count", restored)
 	}
+}
+
+// watchNeeded reports whether a tracked broadcast must stay watched: below
+// the coin's finalize depth, bound to a live session, or carrying an
+// unreconciled refund. Single predicate shared by finalizeWatchEntries and
+// migrateSettledArchive so the two paths cannot drift apart.
+func (n *Node) watchNeeded(coin, orderID string, kind broadcastKind, confs int, depths map[string]int) bool {
+	depth, ok := depths[coin]
+	if !ok {
+		depth = n.settleDepth(coin)
+		depths[coin] = depth
+	}
+	live := false
+	if orderID != "" {
+		_, live = n.sessions[orderID]
+	}
+	return confs < depth || live || !n.refundSettleable(orderID, kind)
+}
+
+// migrateSettledArchive handles the settled section of pre-finalize files:
+// entries that still need watching rejoin the watch table as active,
+// finalized ones are dropped (history keeps the audit trail). Runs
+// single-threaded at restore, before the engine starts.
+func (n *Node) migrateSettledArchive(settled []persistedBroadcast) {
+	var kept []persistedBroadcast
+	depths := make(map[string]int)
+	for _, p := range settled {
+		if p.TxID == "" || p.Coin == "" {
+			continue
+		}
+		if !n.watchNeeded(p.Coin, p.OrderID, broadcastKind(p.Kind), p.Confs, depths) {
+			continue // finalized: never polled again
+		}
+		kept = append(kept, p)
+	}
+	if len(kept) > 0 {
+		n.insertTracked(kept)
+	}
+	xlog.Info("settled broadcast archive migrated (finalized entries dropped, watch-worthy restored)",
+		"dropped", len(settled)-len(kept), "restored", len(kept))
 }
 
 // trackedSnapshot returns a copy of the tracked table for tests and the
@@ -173,44 +186,33 @@ func (n *Node) trackedSnapshot() map[string]trackedBroadcast {
 }
 
 // pollBroadcastConfirmations refreshes confirmation depth for every tracked
-// broadcast — active entries each sweep, settled (archived) entries only on
-// the hourly recheck. Engine-tick entry point: it snapshots connector handles
-// and posts the wallet I/O to the worker pool (never blocks the engine on RPC
-// — the established pendingRefunds/pendingWatch pattern), with a single-flight
-// guard so sweeps never stack. The apply also runs the settle pass
-// (updateSettled) so depth changes immediately move entries in/out of the
-// archive. Inline mode (tests) runs synchronously.
+// broadcast, each sweep. Finalized entries are deleted by the finalize pass,
+// so they are never polled: a completed order costs zero wallet RPC on every
+// tick and every restart. Engine-tick entry point: it snapshots connector
+// handles and posts the wallet I/O to the worker pool (never blocks the
+// engine on RPC — the established pendingRefunds/pendingWatch pattern), with
+// a single-flight guard so sweeps never stack. The apply also runs the
+// finalize pass so depth changes immediately drop finalized entries.
+// Inline mode (tests) runs synchronously.
 func (n *Node) pollBroadcastConfirmations() {
 	if !n.pendingConfirm.CompareAndSwap(false, true) {
 		return // a poll is already in flight; next tick retries
 	}
-	now := uint64(NowMicro())
 	type pair struct {
 		txid string
 		coin string
 	}
 	var pairs []pair
-	recheck := false
 	n.trackedMu.Lock()
 	for txid, tb := range n.tracked {
-		if tb.Settled {
-			// Archive tier: an hourly deep-reorg / SPV-reset detector, not a
-			// per-tick refresh — every settled-state consumer acts on Confs
-			// 0/>=1 or liveness, which a deep entry cannot change.
-			if now-n.settledPollAt < settleRecheckInterval {
-				continue
-			}
-			recheck = true
-		}
 		pairs = append(pairs, pair{txid, tb.Coin})
 	}
 	n.trackedMu.Unlock()
 	if len(pairs) == 0 {
 		n.pendingConfirm.Store(false)
-		// Nothing due on the wire: still run the settle pass (no wallet I/O)
-		// so flag transitions — e.g. a re-registered session re-activating
-		// an archived entry — never wait behind the hourly recheck.
-		if n.updateSettled() {
+		// Nothing due on the wire: still run the finalize pass (no wallet
+		// I/O) so newly sessionless entries drop without waiting a tick.
+		if n.finalizeWatchEntries() {
 			n.persist()
 		}
 		return // nothing due: no connector resolution, no worker task
@@ -238,7 +240,7 @@ func (n *Node) pollBroadcastConfirmations() {
 	}
 	if len(byTx) == 0 {
 		n.pendingConfirm.Store(false)
-		if n.updateSettled() {
+		if n.finalizeWatchEntries() {
 			n.persist()
 		}
 		return
@@ -273,18 +275,10 @@ func (n *Node) pollBroadcastConfirmations() {
 				}
 			}
 			n.trackedMu.Unlock()
-			if recheck {
-				// Stamp only after a completed round: a dropped/failed task
-				// leaves the recheck due so the next tick retries it. A coin
-				// whose connector failed to resolve skips its probe this
-				// round but the next due recheck picks it up — an hourly
-				// deep-reorg detector tolerates a skipped interval.
-				n.settledPollAt = now
-			}
-			// Settle pass: runs on the engine goroutine (apply contract),
+			// Finalize pass: runs on the engine goroutine (apply contract),
 			// reading n.sessions and the store — never under trackedMu.
-			settledChanged := n.updateSettled()
-			if confsChanged || settledChanged {
+			finalized := n.finalizeWatchEntries()
+			if confsChanged || finalized {
 				n.persist()
 			}
 			if confsChanged {
@@ -305,16 +299,11 @@ func (n *Node) pollBroadcastConfirmations() {
 	}
 }
 
-// settleRecheckInterval is how often settled (archived) broadcast entries are
-// re-probed: a cheap deep-reorg / SPV-reset detector. A regression below the
-// settle depth on such a recheck re-activates the entry (updateSettled), so
-// the rebroadcast and refund sweeps regain ownership.
-const settleRecheckInterval uint64 = 60 * 60 * 1000000
-
 // settleDepth returns the confirmation depth past which a sessionless tracked
-// broadcast settles into the archive tier: the deeper of the global
-// trackedRetainDepth floor and the coin's own required Confirmations — the
-// port never stops watching below the depth the swap logic itself requires.
+// broadcast is finalized and dropped from the watch table: the deeper of the
+// global trackedRetainDepth floor and the coin's own required Confirmations —
+// the port never stops watching below the depth the swap logic itself
+// requires.
 func (n *Node) settleDepth(coin string) int {
 	depth := trackedRetainDepth
 	if cfg := n.cfg(); cfg != nil && cfg.Confs != nil {
@@ -342,85 +331,73 @@ func (n *Node) refundSettleable(orderID string, kind broadcastKind) bool {
 	return isOrderTerminal(o.Status) || statusString(o.Status) == "rolled back"
 }
 
-// updateSettled reconciles every entry's Settled flag against the settle
-// predicate: deep-confirmed + sessionless + refund-reconciled settles it
-// (per-tick polling stops, hourly recheck takes over); a live session, a
-// conf reload deepening settleDepth, or a recheck-observed regression
-// re-activates it. Engine-goroutine pass (reads n.sessions and the store —
-// never under trackedMu); inline mode runs it single-threaded. Returns
-// whether any flag moved so the caller persists.
-func (n *Node) updateSettled() bool {
+// finalizeWatchEntries drops finalized entries from the watch table:
+// deep-confirmed + sessionless + refund-reconciled. A finalized entry is never
+// polled again — the durable trade record stays in Store.history, so order
+// visibility (dxGetOrder/MyOrders/Fills/History) is unchanged. A live
+// session or an unreconciled refund keeps its entry watched. If a swap
+// reopens later, recordBroadcast re-watches the txid.
+//
+// Tradeoff (operator decision): unlike the former hourly archive recheck, a
+// finalized tx that later regresses below depth (deep reorg / SPV reset) is
+// not re-detected — the entry is gone, so the rebroadcast sweep cannot regain
+// ownership of it. Accepted because finalize requires depth >= settleDepth
+// (>= 6, or the coin's own required Confirmations), past which a regression
+// is not recoverable by re-polling alone. Engine-goroutine pass
+// (reads n.sessions and the store — never under trackedMu); inline mode runs
+// it single-threaded. Returns whether any entry was dropped so the caller
+// persists.
+func (n *Node) finalizeWatchEntries() bool {
 	type snap struct {
 		txid    string
 		coin    string
 		kind    broadcastKind
 		orderID string
-		settled bool
 		confs   int
 	}
 	n.trackedMu.Lock()
 	snaps := make([]snap, 0, len(n.tracked))
 	for txid, tb := range n.tracked {
-		snaps = append(snaps, snap{txid, tb.Coin, tb.Kind, tb.OrderID, tb.Settled, tb.Confs})
+		snaps = append(snaps, snap{txid, tb.Coin, tb.Kind, tb.OrderID, tb.Confs})
 	}
 	n.trackedMu.Unlock()
 	if len(snaps) == 0 {
 		return false
 	}
 	depths := make(map[string]int)
-	var promote, demote []string
+	var drop []string
 	for _, s := range snaps {
-		depth, ok := depths[s.coin]
-		if !ok {
-			depth = n.settleDepth(s.coin)
-			depths[s.coin] = depth
-		}
-		live := false
-		if s.orderID != "" {
-			_, live = n.sessions[s.orderID]
-		}
-		want := s.confs >= depth && !live && n.refundSettleable(s.orderID, s.kind)
-		switch {
-		case want && !s.settled:
-			promote = append(promote, s.txid)
-		case !want && s.settled:
-			demote = append(demote, s.txid)
+		if !n.watchNeeded(s.coin, s.orderID, s.kind, s.confs, depths) {
+			drop = append(drop, s.txid)
 		}
 	}
-	if len(promote) == 0 && len(demote) == 0 {
+	if len(drop) == 0 {
 		return false
 	}
 	n.trackedMu.Lock()
-	for _, txid := range promote {
-		if tb, ok := n.tracked[txid]; ok && !tb.Settled {
-			tb.Settled = true
-			xlog.Info("reconcile: broadcast settled, watch archived", "order", tb.OrderID,
+	for _, txid := range drop {
+		if tb, ok := n.tracked[txid]; ok {
+			xlog.Info("reconcile: broadcast finalized, watch dropped", "order", tb.OrderID,
 				"kind", string(tb.Kind), "coin", tb.Coin, "txid", txid, "confs", tb.Confs)
-		}
-	}
-	for _, txid := range demote {
-		if tb, ok := n.tracked[txid]; ok && tb.Settled {
-			tb.Settled = false
-			xlog.Warn("reconcile: settled broadcast reactivated, watch resumed", "order", tb.OrderID,
-				"kind", string(tb.Kind), "coin", tb.Coin, "txid", txid, "confs", tb.Confs)
+			delete(n.tracked, txid)
 		}
 	}
 	n.trackedMu.Unlock()
 	return true
 }
 
-// Bounds on the in-memory/persisted watch tables. trackedCap bounds the
-// ACTIVE tier: fully-confirmed entries (depth >= trackedRetainDepth) for
-// orders with no live session are dropped once over the cap, oldest first by
-// Seq. Live-session entries are never dropped here (Phase 1+ drivers may
-// still need them). maxSettledWatch bounds the SETTLED archive: the
-// Store.history records remain the durable trade audit trail (uncapped, like
-// C++ m_historicTransactions); the archive is watch state only.
+// Bounds on the in-memory/persisted watch table. trackedCap bounds it:
+// fully-confirmed entries (depth >= trackedRetainDepth) for orders with no
+// live session are dropped once over the cap, oldest first by Seq.
+// Live-session entries are never dropped here (Phase 1+ drivers may still
+// need them). The Store.history records remain the durable trade audit trail
+// (uncapped, like C++ m_historicTransactions); the watch table holds only
+// in-flight broadcasts — finalized entries are deleted by
+// finalizeWatchEntries, never capped.
 const trackedCap = 500
 const trackedRetainDepth = 6
-const maxSettledWatch = 1000
 
-// pruneTracked bounds the watch tables (see trackedCap / maxSettledWatch).
+// pruneTracked bounds the watch table (see trackedCap).
 // Engine-tick only: it reads the engine-owned sessions map, so it must never
 // run on a worker goroutine.
 func (n *Node) pruneTracked() {
@@ -430,30 +407,16 @@ func (n *Node) pruneTracked() {
 	}
 	n.trackedMu.Lock()
 	defer n.trackedMu.Unlock()
-	// Settled archive bound: beyond maxSettledWatch, oldest (lowest Seq)
-	// settled entries drop first.
-	var settled []cand
-	for txid, tb := range n.tracked {
-		if tb.Settled {
-			settled = append(settled, cand{txid, tb.Seq})
-		}
-	}
-	if over := len(settled) - maxSettledWatch; over > 0 {
-		sort.Slice(settled, func(i, j int) bool { return settled[i].seq < settled[j].seq })
-		for _, c := range settled[:over] {
-			delete(n.tracked, c.txid)
-		}
-	}
 	if len(n.tracked) <= trackedCap {
 		return
 	}
-	// Active-cap fallback: collect droppable deep sessionless entries,
+	// Cap fallback: collect droppable deep sessionless entries,
 	// oldest (lowest Seq) first. A refund entry whose order is still live
 	// and unreconciled is kept — deleting it would let scanStoredRefunds
 	// re-post the refund every sweep (tracked => never re-posted).
 	var drop []cand
 	for txid, tb := range n.tracked {
-		if tb.Settled || tb.Confs < trackedRetainDepth {
+		if tb.Confs < trackedRetainDepth {
 			continue
 		}
 		if _, live := n.sessions[tb.OrderID]; live {

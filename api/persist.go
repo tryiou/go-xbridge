@@ -189,13 +189,14 @@ type persistedBroadcast struct {
 // orders.dat with a fixed RecordChecksum in SerializeFileDB; we instead hash
 // the actual data.
 //
-// Broadcasts ride in the same envelope (omitted when empty), split by watch
-// tier: "broadcasts" holds the ACTIVE confirmation-watch entries, "settled"
-// the archived ones (deep-confirmed, sessionless — api/reconcile.go). The
-// checksum covers swaps AND both broadcast sections; files written before
-// broadcasts existed verify through the legacy swaps-only fallback in
-// parseSwapFile, and pre-settled files (broadcasts only) verify through the
-// primary path unchanged (an empty omitted section hashes identically).
+// Broadcasts ride in the same envelope (omitted when empty). The "settled"
+// section is legacy: older files may carry it, but new files always write it
+// empty — finalized broadcasts are dropped from the watch table and never
+// polled again. The checksum covers swaps AND both broadcast sections; files
+// written before broadcasts existed verify through the legacy swaps-only
+// fallback in parseSwapFile, and pre-settled files (broadcasts only) verify
+// through the primary path unchanged (an empty omitted section hashes
+// identically).
 // Downgrade note: an older binary reading a file with any broadcast section
 // fails closed (checksum mismatch) — upgrade is one-way for the state file,
 // back it up first.
@@ -248,9 +249,12 @@ func snapshotSwaps(n *Node) []persistedSwap {
 }
 
 // snapshotBroadcasts flattens the confirmation-watch table for the swap-file
-// envelope, split by watch tier: active entries under "broadcasts", settled
-// (archived) ones under "settled". Mutex-guarded (record sites are not
-// engine-confined); the marshal runs on the background persistLoop like swaps.
+// envelope. Only in-flight entries are persisted — finalized broadcasts are
+// dropped from the watch table and never polled again, so the "settled"
+// section is always empty on write (kept in the envelope only so older files
+// still parse; their settled section is dropped on load). Mutex-guarded
+// (record sites are not engine-confined); the marshal runs on the background
+// persistLoop like swaps.
 func snapshotBroadcasts(n *Node) (active, settled []persistedBroadcast) {
 	n.trackedMu.Lock()
 	defer n.trackedMu.Unlock()
@@ -260,13 +264,9 @@ func snapshotBroadcasts(n *Node) (active, settled []persistedBroadcast) {
 			TxID: tb.TxID, Hex: tb.Hex, Seq: tb.Seq, Confs: tb.Confs,
 			FirstSeenMicro: tb.FirstSeenMicro, Attempts: tb.Attempts,
 		}
-		if tb.Settled {
-			settled = append(settled, pb)
-		} else {
-			active = append(active, pb)
-		}
+		active = append(active, pb)
 	}
-	return active, settled
+	return active, nil
 }
 
 // runs on the background persistLoop goroutine, never the engine. A var so
