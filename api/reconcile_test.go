@@ -580,9 +580,12 @@ func TestSessionlessSkipsConfirmedRefund(t *testing.T) {
 
 // TestSessionlessSkipsIneligible proves the complement guards: live session,
 // foreign, hex-less, unsent, terminal, connector-less, and bad-hex orders are
-// never swept from the store.
+// never swept from the store. Every case runs against its OWN freshly-set-up
+// order: sharing one order made each guard depend on Go's random
+// map-iteration order — an earlier mutation (foreign/unsent/terminal) could
+// gate the order off before a later case ever reached its guard, letting that
+// case pass vacuously without exercising the guard it claims to prove.
 func TestSessionlessSkipsIneligible(t *testing.T) {
-	n, conn, idHex, _ := storedRefundSetup(t, 900)
 	cases := map[string]func(o *Order){
 		"foreign":  func(o *Order) { o.Mine = false },
 		"no hex":   func(o *Order) { o.RefundTx = "" },
@@ -592,7 +595,10 @@ func TestSessionlessSkipsIneligible(t *testing.T) {
 		"bad hex":  func(o *Order) { o.RefundTx = "zz" },
 	}
 	for name, mut := range cases {
-		n.store.Update(idHex, mut)
+		n, conn, idHex, _ := storedRefundSetup(t, 900)
+		if !n.store.Update(idHex, mut) {
+			t.Fatalf("%s: mutation target not found", name)
+		}
 		n.scanStoredRefunds()
 		if len(conn.broadcasts) != 0 {
 			t.Fatalf("%s: swept: %v", name, conn.broadcasts)
@@ -605,7 +611,6 @@ func TestSessionlessSkipsIneligible(t *testing.T) {
 	if len(conn2.broadcasts) != 0 {
 		t.Fatalf("live-session order swept from store: %v", conn2.broadcasts)
 	}
-	_ = n
 }
 
 // TestRefundFailureBackoff proves R2b: a failed refund schedules an

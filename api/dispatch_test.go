@@ -137,6 +137,45 @@ func TestRpcTypeCheckErrors(t *testing.T) {
 	}
 }
 
+// TestRtcBoolBranches covers what TestRpcTypeCheckErrors leaves open on the
+// bool checker (dispatch.go:425-435): an absent param is a no-op, null and the
+// container types carry their C++ json_spirit names in the -3 message, and
+// both bool values parse — with an explicit err==nil check, since a false
+// result carrying an error would slip past a bare !b assertion.
+func TestRtcBoolBranches(t *testing.T) {
+	assertRtc := func(t *testing.T, name string, err *rpcError, wantMsg string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected envelope error, got nil", name)
+		}
+		if !err.envelope {
+			t.Errorf("%s: not an envelope error: %+v", name, err)
+		}
+		if err.Code != -3 {
+			t.Errorf("%s: code = %d, want -3 (RPC_TYPE_ERROR)", name, err.Code)
+		}
+		if err.Error != wantMsg {
+			t.Errorf("%s: message = %q, want %q", name, err.Error, wantMsg)
+		}
+	}
+
+	if b, err := rtcBool(nil, 0); err != nil || b {
+		t.Errorf("rtcBool absent = (%v, %v), want (false, nil)", b, err)
+	}
+	_, err := rtcBool([]json.RawMessage{raw(`null`)}, 0)
+	assertRtc(t, "rtcBool null", err, "Expected type bool, got null")
+	_, err = rtcBool([]json.RawMessage{raw(`{}`)}, 0)
+	assertRtc(t, "rtcBool object", err, "Expected type bool, got object")
+	_, err = rtcBool([]json.RawMessage{raw(`[]`)}, 0)
+	assertRtc(t, "rtcBool array", err, "Expected type bool, got array")
+	if b, err := rtcBool([]json.RawMessage{raw(`true`)}, 0); err != nil || !b {
+		t.Errorf("rtcBool(true) = (%v, %v), want (true, nil)", b, err)
+	}
+	if b, err := rtcBool([]json.RawMessage{raw(`false`)}, 0); err != nil || b {
+		t.Errorf("rtcBool(false) = (%v, %v), want (false, nil)", b, err)
+	}
+}
+
 func TestJsonTypeOf(t *testing.T) {
 	cases := []struct {
 		in   string

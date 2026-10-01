@@ -423,12 +423,12 @@ func TestRemoteCancelAfterRolledBackIgnored(t *testing.T) {
 	}
 }
 
-// TestRemoteCancelAfterRollbackFailedIgnored pins the C++ re-drive
+// TestRemoteCancelAfterRollbackFailedRedriven pins the C++ re-drive
 // boundary on the failed side: an inbound Cancel for a "rollback failed"
 // order re-drives the rollback (status returns to "rolled back", refund
 // re-enqueued — xbridgesession.cpp:3511-3517) without touching history.
 // Like its rolled-back twin, this handler stays verbatim.
-func TestRemoteCancelAfterRollbackFailedIgnored(t *testing.T) {
+func TestRemoteCancelAfterRollbackFailedRedriven(t *testing.T) {
 	snodePriv := make([]byte, 32)
 	snodePriv[0] = 0x44
 	_, idHex := mustID(t)

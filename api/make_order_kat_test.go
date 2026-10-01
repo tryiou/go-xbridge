@@ -13,7 +13,7 @@ import (
 )
 
 // runningHub returns a registry with one running hub advertising BTC+SYS (the
-// protocol version match Pick requires, servicenode.go:459).
+// protocol version match Pick requires, servicenode.go:715).
 func runningHub(t *testing.T) (*servicenode.Registry, [33]byte) {
 	t.Helper()
 	_, hubPub, _, _ := hubKey(t, 0x51)

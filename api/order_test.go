@@ -341,24 +341,3 @@ func TestMakePartialOrderResponse(t *testing.T) {
 		t.Errorf("partial_repost = %v, want false", res2.PartialRepost)
 	}
 }
-
-// TestMakeOrderResponseExact locks in that dxMakeOrder (exact) renders the
-// partial_* fields as literal "0" (rpcxbridge.cpp:1060-1062) and order_type
-// "exact".
-func TestMakeOrderResponseExact(t *testing.T) {
-	o := &Order{
-		ID:             [32]byte{0xab},
-		FromCurrency:   "LTC",
-		FromAmount:     1500000,
-		ToCurrency:     "BLOCK",
-		ToAmount:       300000,
-		PartialAllowed: false,
-	}
-	res := o.makeOrderResponse()
-	if res.OrderType != "exact" {
-		t.Errorf("order_type = %q, want exact", res.OrderType)
-	}
-	if res.PartialMinimum != "0" || res.PartialOrigMakerSize != "0" || res.PartialOrigTakerSize != "0" {
-		t.Errorf("partial fields = %q/%q/%q, want \"0\"", res.PartialMinimum, res.PartialOrigMakerSize, res.PartialOrigTakerSize)
-	}
-}

@@ -14,9 +14,10 @@ package api
 // real tickStages() table over halted swaps to prove recovery-before-
 // termination instead of asserting piecemeal sweeps.
 //
-// No production code is exercised differently than production exercises it:
-// packets are hub-signed, bodies are wire-decoded, broadcasts hit the shared
-// fake connectors' chain view. All fixtures are in-memory — no live hub.
+// Sessions are seeded directly (via newMakerSession/newTakerSession, not
+// through MakeOrder/TakeOrder); otherwise packets are hub-signed, bodies are
+// wire-decoded, broadcasts hit the shared fake connectors' chain view. All
+// fixtures are in-memory — no live hub.
 
 import (
 	"encoding/hex"

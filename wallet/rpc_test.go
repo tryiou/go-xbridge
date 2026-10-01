@@ -1503,3 +1503,243 @@ func TestRPCConnectorGetBlockTxsDegradesOnIdList(t *testing.T) {
 		t.Fatalf("GetBlockTxs fanned out or accepted id list: %+v", txs)
 	}
 }
+
+// TestRPCConnectorGetTxOut drives GetTxOut's contract (rpc.go:708-732): the
+// full bitcoind gettxout shape, the minimal value-only shape, a null-result
+// miss, an RPC error object, a 401, and the singular "address" key the parser
+// ignores (it reads the plural addresses[] only). The wire request itself —
+// method gettxout with [txid, vout] — is asserted inside every handler, so a
+// wrong-method or wrong-arity call cannot pass silently. Each subtest runs its
+// own server, keeping the fixture free of shared mutable state.
+func TestRPCConnectorGetTxOut(t *testing.T) {
+	const txid = "396ddcdaf9bcd6beeedb0951b982bb1af8f935e3d906a39a1f1fc7365487636d"
+	const addr = "mipcBbRv1HwQpCojNQXtm4KgVLLmvkd3oG"
+
+	handler := func(t *testing.T, status int, resp rpcResponse) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode request: %v", err)
+				return
+			}
+			if req.Method != "gettxout" {
+				t.Errorf("method = %q, want gettxout", req.Method)
+			}
+			if len(req.Params) != 2 {
+				t.Errorf("params = %v, want [txid vout]", req.Params)
+			} else if got, ok := req.Params[0].(string); !ok || got != txid {
+				t.Errorf("params[0] = %v, want %s", req.Params[0], txid)
+			} else if got, ok := req.Params[1].(float64); !ok || got != 1 {
+				t.Errorf("params[1] = %v, want vout 1", req.Params[1])
+			}
+			resp.ID = req.ID
+			w.Header().Set("Content-Type", "application/json")
+			if status != http.StatusOK {
+				w.WriteHeader(status)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		}
+	}
+	connector := func(t *testing.T, h http.HandlerFunc) *RPCConnector {
+		t.Helper()
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		return NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	}
+	result := func(raw string) rpcResponse {
+		return rpcResponse{Result: json.RawMessage(raw)}
+	}
+	assertZero := func(t *testing.T, u Utxo, ok bool) {
+		t.Helper()
+		if ok {
+			t.Error("ok = true, want false")
+		}
+		if u != (Utxo{}) {
+			t.Errorf("utxo = %+v, want zero value", u)
+		}
+	}
+
+	t.Run("found-full", func(t *testing.T) {
+		c := connector(t, handler(t, http.StatusOK, result(
+			`{"value":0.5,"confirmations":3,"scriptPubKey":{"addresses":["`+addr+`"]}}`)))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err != nil {
+			t.Fatalf("GetTxOut: %v", err)
+		}
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if u.TxID != txid || u.Vout != 1 {
+			t.Errorf("outpoint = %s:%d, want %s:1", u.TxID, u.Vout, txid)
+		}
+		if u.Value != 0.5 {
+			t.Errorf("value = %v, want 0.5", u.Value)
+		}
+		if u.Confirmations != 3 {
+			t.Errorf("confirmations = %d, want 3", u.Confirmations)
+		}
+		if u.Address != addr {
+			t.Errorf("address = %q, want %q", u.Address, addr)
+		}
+	})
+
+	t.Run("found-minimal", func(t *testing.T) {
+		c := connector(t, handler(t, http.StatusOK, result(`{"value":1.25}`)))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err != nil {
+			t.Fatalf("GetTxOut: %v", err)
+		}
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if u.Value != 1.25 {
+			t.Errorf("value = %v, want 1.25", u.Value)
+		}
+		if u.Address != "" {
+			t.Errorf("address = %q, want empty when the wallet reports none", u.Address)
+		}
+		if u.Confirmations != 0 {
+			t.Errorf("confirmations = %d, want 0 when absent", u.Confirmations)
+		}
+	})
+
+	t.Run("null-result-miss", func(t *testing.T) {
+		c := connector(t, handler(t, http.StatusOK, result(`null`)))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err != nil {
+			t.Fatalf("GetTxOut: %v", err)
+		}
+		assertZero(t, u, ok)
+	})
+
+	t.Run("rpc-error", func(t *testing.T) {
+		c := connector(t, handler(t, http.StatusOK, rpcResponse{
+			Error: &rpcError{Code: -5, Message: "No such transaction"},
+		}))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err == nil {
+			t.Fatal("expected an RPC error")
+		}
+		assertZero(t, u, ok)
+		if code, have := RPCErrorCode(err); !have || code != -5 {
+			t.Errorf("RPCErrorCode = (%d, %v), want (-5, true)", code, have)
+		}
+	})
+
+	t.Run("unauthorized", func(t *testing.T) {
+		c := connector(t, handler(t, http.StatusUnauthorized, rpcResponse{}))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err == nil {
+			t.Fatal("expected an error on 401")
+		}
+		if !strings.Contains(err.Error(), "unauthorized") {
+			t.Errorf("err = %q, want it to mention unauthorized (rpc.go:169-171)", err)
+		}
+		assertZero(t, u, ok)
+	})
+
+	t.Run("singular-address-key-ignored", func(t *testing.T) {
+		// The parser reads the plural scriptPubKey.addresses only; a singular
+		// "address" key yields the empty string rather than a wrong guess.
+		c := connector(t, handler(t, http.StatusOK, result(
+			`{"value":0.25,"confirmations":1,"scriptPubKey":{"address":"`+addr+`"}}`)))
+		u, ok, err := c.GetTxOut(txid, 1)
+		if err != nil {
+			t.Fatalf("GetTxOut: %v", err)
+		}
+		if !ok {
+			t.Fatal("ok = false, want true (value is present)")
+		}
+		if u.Address != "" {
+			t.Errorf("address = %q, want empty: the parser reads addresses[] only (rpc.go:712-714,728-730)", u.Address)
+		}
+		if u.Value != 0.25 {
+			t.Errorf("value = %v, want 0.25", u.Value)
+		}
+	})
+}
+
+// TestRPCConnectorGetRawMempool pins GetRawMempool's contract (rpc.go:737-743):
+// method getrawmempool with an empty params array, the populated list, the
+// empty list, a null result (no deserialization attempt → nil, nil), and an
+// RPC error surfaced with its code intact for the -32601 capability fallbacks.
+func TestRPCConnectorGetRawMempool(t *testing.T) {
+	handler := func(t *testing.T, resp rpcResponse) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode request: %v", err)
+				return
+			}
+			if req.Method != "getrawmempool" {
+				t.Errorf("method = %q, want getrawmempool", req.Method)
+			}
+			if len(req.Params) != 0 {
+				t.Errorf("params = %v, want empty array", req.Params)
+			}
+			resp.ID = req.ID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}
+	}
+	connector := func(t *testing.T, resp rpcResponse) *RPCConnector {
+		t.Helper()
+		srv := httptest.NewServer(handler(t, resp))
+		t.Cleanup(srv.Close)
+		return NewRPCConnector(Chain{Ticker: "BTC", Endpoint: srv.URL, User: "u", Pass: "p", Decimals: 8})
+	}
+	result := func(raw string) rpcResponse {
+		return rpcResponse{Result: json.RawMessage(raw)}
+	}
+
+	t.Run("list", func(t *testing.T) {
+		txids, err := connector(t, result(
+			`["396ddcdaf9bcd6beeedb0951b982bb1af8f935e3d906a39a1f1fc7365487636d","0f4f8a2b6e0d9c1a3b5d7f9e2c4a6b8d0f2e4c6a8b0d2f4e6c8a0b2d4f6e8c0a"]`)).
+			GetRawMempool()
+		if err != nil {
+			t.Fatalf("GetRawMempool: %v", err)
+		}
+		if len(txids) != 2 {
+			t.Fatalf("len = %d, want 2: %v", len(txids), txids)
+		}
+		if txids[0] != "396ddcdaf9bcd6beeedb0951b982bb1af8f935e3d906a39a1f1fc7365487636d" {
+			t.Errorf("txids[0] = %q", txids[0])
+		}
+	})
+
+	t.Run("empty-list", func(t *testing.T) {
+		txids, err := connector(t, result(`[]`)).GetRawMempool()
+		if err != nil {
+			t.Fatalf("GetRawMempool: %v", err)
+		}
+		if len(txids) != 0 {
+			t.Errorf("len = %d, want 0", len(txids))
+		}
+	})
+
+	t.Run("null-result", func(t *testing.T) {
+		txids, err := connector(t, result(`null`)).GetRawMempool()
+		if err != nil {
+			t.Fatalf("GetRawMempool: %v", err)
+		}
+		if txids != nil {
+			t.Errorf("txids = %v, want nil (null result skips deserialization)", txids)
+		}
+	})
+
+	t.Run("method-not-found", func(t *testing.T) {
+		txids, err := connector(t, rpcResponse{
+			Error: &rpcError{Code: -32601, Message: "Method not found"},
+		}).GetRawMempool()
+		if err == nil {
+			t.Fatal("expected an RPC error")
+		}
+		if txids != nil {
+			t.Errorf("txids = %v, want nil on error", txids)
+		}
+		if code, have := RPCErrorCode(err); !have || code != -32601 {
+			t.Errorf("RPCErrorCode = (%d, %v), want (-32601, true)", code, have)
+		}
+	})
+}

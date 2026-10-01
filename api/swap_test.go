@@ -1397,7 +1397,7 @@ func TestCreateBBadLocktimeCancels(t *testing.T) {
 	n.newTakerSession(&Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6},
 		TakeOrderParams{FromAddress: addrFor(0, "from"), ToAddress: addrFor(0, "to")}, arr32(tkPriv), to33(tkPub))
 	// Seed the store order (the taker's copy) so the self-cancel's local rollback
-	// can find it and cancel it. MakerKey = OUR per-trade M pubkey (order.go:96).
+	// can find it and cancel it. MakerKey = OUR per-trade M pubkey (order.go:117-120).
 	n.store.Add(&Order{
 		ID: orderID, FromCurrency: "BTC", ToCurrency: "BTC", FromAmount: 2.5e6, ToAmount: 2.5e6,
 		Status: "open", MakerKey: hexEncode(tkPub[:]),

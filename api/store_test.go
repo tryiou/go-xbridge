@@ -130,7 +130,7 @@ func testStoreOrder(seed byte) *Order {
 // these checks.
 func TestStoreSnapshotIndependence(t *testing.T) {
 	s := NewStore()
-	id := testStoreOrder(1)
+	id := testStoreOrder(2)
 	key := hexEncode(id.ID[:])
 	s.Add(id)
 
@@ -163,7 +163,9 @@ func TestStoreSnapshotIndependence(t *testing.T) {
 		t.Fatalf("Get copy leaked Utxos element mutation: vout=%d", live.Utxos[0].Vout)
 	}
 
-	// List / Mine / Locked must also hand out independent snapshots.
+	// List / Mine must also hand out independent snapshots (Mine seeded true
+	// so the Mine loop iterates; Locked is excluded — it has no writer in
+	// production, dxGetLockedUtxos never consults the store's locked set).
 	func() {
 		for _, o := range s.List() {
 			o.Status = "canceled"
@@ -171,12 +173,9 @@ func TestStoreSnapshotIndependence(t *testing.T) {
 		for _, o := range s.Mine() {
 			o.Status = "canceled"
 		}
-		for _, o := range s.Locked() {
-			o.Status = "canceled"
-		}
 	}()
 	if live := s.Get(key); live.Status != "open" {
-		t.Fatalf("List/Mine/Locked leaked mutation: %q", live.Status)
+		t.Fatalf("List/Mine leaked mutation: %q", live.Status)
 	}
 }
 

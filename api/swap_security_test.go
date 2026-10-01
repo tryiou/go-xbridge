@@ -19,7 +19,9 @@ import (
 
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an
 // error (not a nil-interface panic) when the destination currency's wallet
-// connector is absent — the nil-interface panic at api/swap.go:225.
+// connector is absent: computeLockTimeFor's nil guard (api/swap.go:2637-2641)
+// reports height 0, which the claim build surfaces as "locktime unavailable"
+// (api/swap_retry.go:231-233).
 // Before the fix, s.n.cfg().Connectors[cur] returned a nil interface and the
 // SendRawTransaction call panicked, killing the feed goroutine (and process).
 func TestOnConfirmAMissingConnectorIsError(t *testing.T) {
@@ -134,7 +136,7 @@ func seedHub(node *Node, pub [33]byte) {
 // TestDispatchSwapDropsForgedFinished is the trusted-hub-key regression test: a Finished
 // packet NOT signed by the session's trusted hub key must be dropped before it
 // reaches OnFinished, so it can never set csFinished and disable the refund
-// watcher (swap.go:473). A Finished signed by the real hub still processes.
+// watcher (guard at node.go:1572-1577). A Finished signed by the real hub still processes.
 func TestDispatchSwapDropsForgedFinished(t *testing.T) {
 	node := newWalletTestCtx().Node
 	node.sessions = map[string]*SwapSession{}
@@ -348,7 +350,7 @@ func TestUnvalidatedDepositRefusedBothLegs(t *testing.T) {
 	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
 	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
 	// The store orders must carry OUR per-trade M pubkey (Order.MakerKey,
-	// order.go:96) so the self-signed Cancel packets pass handleRemoteCancel's
+	// order.go:117-120) so the self-signed Cancel packets pass handleRemoteCancel's
 	// iCanceled check and the local rollback actually runs.
 	makerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(mkMPub[:]) })
 	takerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(tkPub[:]) })

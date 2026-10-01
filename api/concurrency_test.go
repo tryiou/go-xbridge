@@ -383,7 +383,7 @@ func TestConcurrentTakeOrderSingleSession(t *testing.T) {
 			// gate with BAD_REQUEST ("not accepting, order already accepted", C++
 			// xbridgeapp.cpp:2122-2125); a distinct-order loser still collides on
 			// a shared key with INSUFFICIENT_FUNDS ("cannot reuse utxo inputs").
-			// A stale locked-set snapshot (node.go:1428) can also route a
+			// A stale locked-set snapshot (node.go:2495) can also route a
 			// same-order loser to the collision path, so accept either code.
 			// A loser snapshotting after the winner's commit sees Mine and gets
 			// 1025 "own order" — matching C++ (accept stamps from/to at

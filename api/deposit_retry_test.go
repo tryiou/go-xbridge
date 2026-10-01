@@ -132,7 +132,7 @@ func TestTakerDepositRetryScheduledOnBuildFailure(t *testing.T) {
 		t.Fatal("depositRetryAt not scheduled after failed deposit build")
 	}
 	if takerSession.depositRetryAt <= NowMicro() {
-		t.Fatal("depositRetryAt not in the future (no backoff)")
+		t.Fatal("depositRetryAt must be scheduled in the future")
 	}
 }
 

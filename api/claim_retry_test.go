@@ -153,7 +153,7 @@ func TestTakerClaimRetryScheduledOnBuildFailure(t *testing.T) {
 		t.Fatal("claimRetryAt not scheduled after failed claim build")
 	}
 	if takerSession.claimRetryAt <= NowMicro() {
-		t.Fatal("claimRetryAt not in the future (no backoff)")
+		t.Fatal("claimRetryAt must be scheduled in the future")
 	}
 }
 

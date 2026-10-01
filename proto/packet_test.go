@@ -82,7 +82,7 @@ func TestUnmarshalTrailingBytes(t *testing.T) {
 // declared body is otherwise oversized, proving the gate fires before body
 // validation.
 func TestUnmarshalRejectsWrongVersion(t *testing.T) {
-	for _, ver := range []uint32{0, 54, 56, 0xFFFFFFFF} {
+	for _, ver := range []uint32{0, version.XBridgeProtocolVersion - 1, version.XBridgeProtocolVersion + 1, 0xFFFFFFFF} {
 		buf := make([]byte, HeaderSize)
 		binary.LittleEndian.PutUint32(buf[offVersion:], ver)
 		binary.LittleEndian.PutUint32(buf[offCommand:], uint32(XbcTransaction))

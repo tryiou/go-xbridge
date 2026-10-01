@@ -251,8 +251,9 @@ func TestTakeRetryDroppedOnDeterministicReject(t *testing.T) {
 }
 
 // TestTakeRetrySkippedWhenOrderCancelled: a remote cancel between the reject
-// and the backoff timer ends the retry — the timer fires, finds the order no
-// longer open, and broadcasts nothing.
+// and the backoff timer drops the retry entry synchronously (handleRemoteCancel
+// -> dropTakeRetry), so the timer later fires against a missing entry and
+// broadcasts nothing.
 func TestTakeRetrySkippedWhenOrderCancelled(t *testing.T) {
 	shortenTakeRetryBackoff(t)
 	retryOID := retryOrderID()
@@ -399,4 +400,218 @@ func TestTakeRetryConfigReloadRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// The failure half of runTakeRetry (take_retry.go:187-228) and the branches no
+// existing test reaches: backoff clamp, schedule-miss, not-open drop,
+// both abandon arms, the pre-broadcast reschedule + cap chain, and the
+// config-disabled drop.
+// ---------------------------------------------------------------------------
+
+// TestTakeRetryBackoffForClampsToLastEntry: an attempt past the end of the
+// backoff list clamps to the last entry (take_retry.go:61) instead of
+// indexing out of range.
+func TestTakeRetryBackoffForClampsToLastEntry(t *testing.T) {
+	orig := takeRetryBackoff
+	takeRetryBackoff = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
+	t.Cleanup(func() { takeRetryBackoff = orig })
+	if got := takeRetryBackoffFor(1); got != 10*time.Millisecond {
+		t.Errorf("backoff(1) = %v, want 10ms", got)
+	}
+	if got := takeRetryBackoffFor(2); got != 20*time.Millisecond {
+		t.Errorf("backoff(2) = %v, want 20ms", got)
+	}
+	if got := takeRetryBackoffFor(3); got != 20*time.Millisecond {
+		t.Errorf("backoff(3) = %v, want 20ms (clamp to last entry)", got)
+	}
+	if got := takeRetryBackoffFor(99); got != 20*time.Millisecond {
+		t.Errorf("backoff(99) = %v, want 20ms (clamp to last entry)", got)
+	}
+}
+
+// TestScheduleTakeRetryUnknownOrderIsNoop: scheduling an id with no entry
+// returns before arming a timer — no goroutine, no wire traffic, no entry
+// created (take_retry.go:117-120).
+func TestScheduleTakeRetryUnknownOrderIsNoop(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	n.scheduleTakeRetry("no-such-order-id")
+	if takeRetryEntryPresent(n, "no-such-order-id") {
+		t.Fatal("scheduling an unknown id must not create an entry")
+	}
+	// Long enough for any (buggy) 10ms timer to have fired by now.
+	time.Sleep(50 * time.Millisecond)
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0 (no timer may be armed)", got)
+	}
+}
+
+// TestRunTakeRetrySkipsWhenOrderNotOpen covers both halves of the not-open
+// branch (take_retry.go:169, :174-177): the order's status changed after the
+// entry was armed, or the order is gone — either way the entry is dropped
+// synchronously and TakeOrder never runs.
+func TestRunTakeRetrySkipsWhenOrderNotOpen(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	oid := retryOrderID()
+	idHex := hexEncode(oid[:])
+
+	// (a) status no longer "open" (e.g. a remote cancel progressed it).
+	seedTakeRetryEntry(n, idHex)
+	if !n.store.Update(idHex, func(o *Order) { o.Status = "hold" }) {
+		t.Fatal("seeded order not found")
+	}
+	n.runTakeRetry(idHex, TakeOrderParams{}, 1)
+	if takeRetryEntry(n) != nil {
+		t.Error("entry must be dropped when the order is no longer open")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0 (TakeOrder must not run)", got)
+	}
+	if o := n.store.Get(idHex); o == nil {
+		t.Error("order must remain in the store")
+	} else if o.Status != "hold" {
+		t.Errorf("order status = %q, want hold (untouched)", o.Status)
+	}
+
+	// (b) the order was removed entirely.
+	seedTakeRetryEntry(n, idHex)
+	n.store.Remove(idHex)
+	n.runTakeRetry(idHex, TakeOrderParams{}, 1)
+	if takeRetryEntry(n) != nil {
+		t.Error("entry must be dropped when the order is gone")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0 after order removal", got)
+	}
+}
+
+// TestRunTakeRetryAbandonsOnMissingOrderID: runTakeRetry is keyed by idHex
+// but TakeOrder looks up params.ID — a mismatch misses the lookup with 1021,
+// which the abandon switch treats as "order no longer takeable": the entry is
+// dropped and nothing is broadcast (take_retry.go:187-194).
+func TestRunTakeRetryAbandonsOnMissingOrderID(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	oid := retryOrderID()
+	idHex := hexEncode(oid[:])
+	bad := TakeOrderParams{
+		ID:          "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		FromAddress: btcAddr, ToAddress: btcAddr2,
+	}
+
+	// Pin the exact error the abandon switch will see.
+	if _, rerr := n.TakeOrder(bad); rerr == nil {
+		t.Fatal("TakeOrder with an unknown id must fail")
+	} else {
+		if rerr.Code != errTxNotFound {
+			t.Fatalf("code = %d, want %d (errTxNotFound)", rerr.Code, errTxNotFound)
+		}
+		if rerr.Error != "Transaction  not found" {
+			t.Errorf("error = %q, want %q", rerr.Error, "Transaction  not found")
+		}
+		if rerr.Name != "dxTakeOrder" {
+			t.Errorf("name = %q, want dxTakeOrder", rerr.Name)
+		}
+	}
+
+	seedTakeRetryEntry(n, idHex)
+	n.runTakeRetry(idHex, bad, 1)
+	if takeRetryEntry(n) != nil {
+		t.Error("entry must be abandoned (dropped) on errTxNotFound")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0", got)
+	}
+}
+
+// TestRunTakeRetryAbandonsOnReservationBusy: the other abandon arm — the
+// order is reserved for another taker, TakeOrder returns 1004 before any
+// broadcast, and the retry gives up (take_retry.go:187-194).
+func TestRunTakeRetryAbandonsOnReservationBusy(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	oid := retryOrderID()
+	idHex := hexEncode(oid[:])
+	params := TakeOrderParams{ID: orderIDString(oid), FromAddress: btcAddr, ToAddress: btcAddr2}
+
+	// Hold the reservation as a concurrent taker would.
+	if got := n.store.ReserveForTake(idHex, []string{"pre:0"}, nil, "BTC"); got != reserveOK {
+		t.Fatalf("pre-reserve = %v, want reserveOK", got)
+	}
+	// Pin the error the abandon switch will see from the same call.
+	if _, rerr := n.TakeOrder(params); rerr == nil {
+		t.Fatal("TakeOrder against a reserved order must fail")
+	} else if rerr.Code != errBadRequest {
+		t.Fatalf("code = %d, want %d (errBadRequest)", rerr.Code, errBadRequest)
+	}
+
+	seedTakeRetryEntry(n, idHex)
+	n.runTakeRetry(idHex, params, 1)
+	if takeRetryEntry(n) != nil {
+		t.Error("entry must be abandoned (dropped) on errBadRequest")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0", got)
+	}
+}
+
+// TestRunTakeRetryReschedulesAndCapsOnPreBroadcastFailure drives the whole
+// failure half (take_retry.go:187 fallthrough, :197-228): a failure that never
+// reaches the wire (same from/to address → 1025) reschedules on every attempt
+// — attempts climb 0→1→2 under TakeRetry=2, the next failure sees the cap and
+// drops the entry — and no packet is ever broadcast.
+func TestRunTakeRetryReschedulesAndCapsOnPreBroadcastFailure(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	oid := retryOrderID()
+	idHex := hexEncode(oid[:])
+	bad := TakeOrderParams{ID: orderIDString(oid), FromAddress: btcAddr, ToAddress: btcAddr}
+
+	// Pin the pre-broadcast failure the chain will keep hitting.
+	if _, rerr := n.TakeOrder(bad); rerr == nil {
+		t.Fatal("same-address take must fail")
+	} else if rerr.Code != errInvalidParameters {
+		t.Fatalf("code = %d, want %d (errInvalidParameters)", rerr.Code, errInvalidParameters)
+	} else if want := "Invalid parameters: The from_address and to_address cannot be the same: " + btcAddr; rerr.Error != want {
+		t.Errorf("error = %q, want %q", rerr.Error, want)
+	}
+
+	seedTakeRetryEntry(n, idHex)
+	n.runTakeRetry(idHex, bad, 1) // synchronous attempt #1; attempts 0→1 arms a 10ms timer
+	waitForTakeRetry(t, 2*time.Second, func() bool { return takeRetryEntry(n) == nil })
+	if takeRetryEntry(n) != nil {
+		t.Fatal("entry must be dropped once the cap is exhausted")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0 — every failure was pre-broadcast", got)
+	}
+	if o := n.store.Get(idHex); o == nil || o.Status != "open" {
+		t.Errorf("order must stay open, got %v", o)
+	}
+}
+
+// TestRunTakeRetryDropsWhenConfigDisabledMidFlight: a config reload turning
+// TakeRetry off after the entry is armed makes the failure path drop the entry
+// at the max<=0 check instead of rescheduling (take_retry.go:197-210).
+func TestRunTakeRetryDropsWhenConfigDisabledMidFlight(t *testing.T) {
+	shortenTakeRetryBackoff(t)
+	n, cc := newTakeRetryNode(t, 2)
+	oid := retryOrderID()
+	idHex := hexEncode(oid[:])
+	bad := TakeOrderParams{ID: orderIDString(oid), FromAddress: btcAddr, ToAddress: btcAddr}
+
+	seedTakeRetryEntry(n, idHex)
+	n.cfgMu.Lock()
+	n.config.TakeRetry = 0
+	n.cfgMu.Unlock()
+
+	n.runTakeRetry(idHex, bad, 1)
+	if takeRetryEntry(n) != nil {
+		t.Error("entry must be dropped when max <= 0")
+	}
+	if got := len(cc.snapshot()); got != 0 {
+		t.Errorf("packets = %d, want 0", got)
+	}
 }

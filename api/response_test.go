@@ -180,7 +180,7 @@ func TestStatusString(t *testing.T) {
 
 func TestMakeOrderResponseShapes(t *testing.T) {
 	// dxMakeOrder (exact) must report partial_* = literal "0" (C++
-	// rpcxbridge.cpp:1060-1062) and status = "created".
+	// rpcxbridge.cpp:1064-1066) and status = "created" (rpcxbridge.cpp:1069).
 	o := &Order{
 		ID:             [32]byte{0x01},
 		FromCurrency:   "SYS",
@@ -409,6 +409,9 @@ func TestXFloat8Marshal(t *testing.T) {
 		{0, "0.00000000"},
 		{1000.5, "1000.50000000"},
 		{1.1, "1.10000000"},
+		{-2.25, "-2.25000000"},      // sign preserved
+		{0.123456789, "0.12345679"}, // rounds at the 8th decimal
+		{1e-10, "0.00000000"},       // 'f' format: no exponent fallback
 	} {
 		b, err := json.Marshal(xfloat8(c.v))
 		if err != nil {

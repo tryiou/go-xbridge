@@ -282,7 +282,8 @@ func TestRestoreGenuineFinishStaysHistory(t *testing.T) {
 	}
 }
 
-// records stranded by the pre-gate behavior: a "finished" record with the
+// TestRestoreFinishedWithDepositOwedRestoresLive covers records stranded by
+// the pre-gate behavior: a "finished" record with the
 // deposit out, a pre-signed refund, and no claim evidence on either side must
 // come back live (session state demoted to the deposit-broadcast state) so
 // the sweep can still recover it. A genuinely finished record (claim tracked)

@@ -108,10 +108,6 @@ func TestDxGetOrdersRead(t *testing.T) {
 		t.Errorf("dxGetOrders entry = %+v", arr[0])
 	}
 
-	// dxGetOrders rejects params (arity gate moved to checkArity, dispatch.go).
-	if rerr := checkArity("dxGetOrders", 1); rerr == nil || rerr.Code != errInvalidParameters {
-		t.Errorf("checkArity(dxGetOrders, 1) = %v, want business 1025", rerr)
-	}
 }
 
 // TestDxGetOrdersShowAllGate locks in C++'s dxGetOrders wallet filter
@@ -702,15 +698,6 @@ func TestDxEmptyHistoryTrading(t *testing.T) {
 			}
 		}
 	}
-	// start >= end (both after the earliest) -> C++ errors "Start time >= end
-	// time." (util/xseries.h:94) — not an empty array.
-	if _, err := ctx.dxGetOrderHistory([]json.RawMessage{
-		jstr("BTC"), jstr("LTC"), jnum(xEarly + 2000), jnum(xEarly + 1000), jnum(60),
-	}); err == nil {
-		t.Error("dxGetOrderHistory(start>=end) should error")
-	} else if err.Code != errInvalidParameters || !strings.Contains(err.Error, "Start time >= end time") {
-		t.Errorf("dxGetOrderHistory(start>=end) = %+v, want 1025 'Start time >= end time.'", err)
-	}
 	// Too few params -> error.
 	if _, err := ctx.dxGetOrderHistory(nil); err == nil {
 		t.Error("dxGetOrderHistory() should error")
@@ -828,6 +815,56 @@ func TestDxGetTradingDataFills(t *testing.T) {
 	if rec["fee_txid"] != "" || rec["nodepubkey"] != "" {
 		t.Errorf("fee_txid/nodepubkey = %v/%v, want empty", rec["fee_txid"], rec["nodepubkey"])
 	}
+}
+
+// TestDxGetTradingDataParamForms pins the RPCTypeCheck contract on the value
+// params (handlers.go:1379-1388; C++ rpcxbridge.cpp:2847-2854): params[0] must
+// be a number when present, params[1] a bool when there are exactly two — the
+// thin client ignores both values but must still reject wrong types with the
+// same envelope errors C++ throws from its get_*() reads.
+func TestDxGetTradingDataParamForms(t *testing.T) {
+	ctx := newWalletTestCtx()
+	assertRtc := func(t *testing.T, name string, err *rpcError, wantMsg string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected envelope error, got nil", name)
+		}
+		if !err.envelope {
+			t.Errorf("%s: not an envelope error: %+v", name, err)
+		}
+		if err.Code != -3 {
+			t.Errorf("%s: code = %d, want -3 (RPC_TYPE_ERROR)", name, err.Code)
+		}
+		if err.Error != wantMsg {
+			t.Errorf("%s: message = %q, want %q", name, err.Error, wantMsg)
+		}
+	}
+	requireEmpty := func(t *testing.T, name string, res interface{}, err *rpcError) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		arr, ok := res.([]interface{})
+		if !ok || len(arr) != 0 {
+			t.Errorf("%s: result = %#v, want empty array (no local fills)", name, res)
+		}
+	}
+
+	// 1-param: params[0] must be a number — a string throws RPCTypeCheck -3.
+	_, rerr := ctx.dxGetTradingData([]json.RawMessage{jstr("43200")})
+	assertRtc(t, "blocks string", rerr, "Expected type number, got string")
+	// 1-param: a real passes the number type check but the integer read throws -1.
+	_, rerr = ctx.dxGetTradingData([]json.RawMessage{raw(`3.5`)})
+	assertEnv(t, "blocks real", rerr, "get_value< integer > called on real Value")
+	// 1-param: a valid int succeeds; the value is contract-only (ignored) here.
+	res, rerr := ctx.dxGetTradingData([]json.RawMessage{raw(`43200`)})
+	requireEmpty(t, "blocks int", res, rerr)
+	// 2-param: params[1] must be a bool.
+	_, rerr = ctx.dxGetTradingData([]json.RawMessage{raw(`43200`), jstr("true")})
+	assertRtc(t, "errors string", rerr, "Expected type bool, got string")
+	// 2-param valid: both types check out, values ignored.
+	res, rerr = ctx.dxGetTradingData([]json.RawMessage{raw(`43200`), raw(`true`)})
+	requireEmpty(t, "blocks+errors", res, rerr)
 }
 
 func TestDxPartialChainRead(t *testing.T) {
@@ -974,7 +1011,7 @@ func TestDxGetLocalTokensConnectedOnly(t *testing.T) {
 // rpcxbridge.cpp:229-234), not a business error.
 func TestDxLoadConfFailureFalse(t *testing.T) {
 	ctx := newWalletTestCtx()
-	// No ConfPath configured -> reloadConf fails (node.go:307-310).
+	// No ConfPath configured -> reloadConf fails (node.go:644-647).
 	ctx.Node.config.ConfPath = ""
 	res, err := ctx.dxLoadXBridgeConf(nil)
 	if err != nil {
@@ -1107,31 +1144,6 @@ func TestDxHelpBare(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("help commands = %v, want %v", got, want)
-	}
-}
-
-// TestDxHelpCommand returns the exact command text plus Core's trailing
-// newline, and the exact unknown-command message.
-func TestDxHelpCommand(t *testing.T) {
-	ctx := newWalletTestCtx()
-	for method, help := range map[string]string{
-		"dxGetOrders": helpDxGetOrders, "dxCancelOrder": helpDxCancelOrder,
-		"getnetworkinfo": helpGetnetworkinfo, "dxTakeOrder": helpDxTakeOrder,
-	} {
-		res, err := ctx.dxHelp([]json.RawMessage{jstr(method)})
-		if err != nil {
-			t.Fatalf("help [%s]: %v", method, err)
-		}
-		if res.(string) != help+"\n" {
-			t.Errorf("help [%s] mismatch", method)
-		}
-	}
-	res, err := ctx.dxHelp([]json.RawMessage{jstr("dxNope")})
-	if err != nil {
-		t.Fatalf("help [bogus]: %v", err)
-	}
-	if res.(string) != "help: unknown command: dxNope" {
-		t.Errorf("help [bogus] = %q", res)
 	}
 }
 

@@ -154,9 +154,6 @@ func mustBody(t *testing.T, cmd proto.XBridgeCommand, hexBody string) interface{
 // error string template rendered with the argument C++ passes. The rows use
 // the exact quoted strings from the C++ writers.
 func TestRPCErrorCodeText(t *testing.T) {
-	if fxXbridgeErrorText == nil {
-		t.Skip("FIXME fixture: wire fxXbridgeErrorText to go-xbridge/api xbridgeErrorText")
-	}
 	type ec struct {
 		code int
 		arg  string // third argument C++ passes to makeError(code, __FUNCTION__, arg)
@@ -236,9 +233,6 @@ func TestRPCErrorCodeText(t *testing.T) {
 // dispatch entry — dispatch.go:38-63 — so the server answers the envelope
 // -32601 "Method not found" with no business name).
 func TestRPCMethodNameField(t *testing.T) {
-	if fxErrorName == nil {
-		t.Skip("conformance fixture unavailable (fxErrorName not wired by conformance_fixture.go)")
-	}
 	cases := []struct {
 		method string // C++ handler (rpcxbridge.cpp commands[] + getnetworkinfo)
 		want   string // C++ __FUNCTION__ name
@@ -305,9 +299,6 @@ func TestRPCMethodNameField(t *testing.T) {
 // method-keyed fixture cannot drive both variants); gettradingdata has no
 // go-xbridge dispatch entry (dispatch.go:38-63).
 func TestRPCResponseShape(t *testing.T) {
-	if fxResponseKeys == nil {
-		t.Skip("conformance fixture unavailable (fxResponseKeys not wired by conformance_fixture.go)")
-	}
 	type shape struct {
 		method  string
 		refKeys []string // C++ insertion order (source of truth)
@@ -506,9 +497,6 @@ func TestRPCResponseShape(t *testing.T) {
 // (xutil.cpp:202-207, %.6f(amt/1e6 + 1/::COIN)) vectors verified byte-identical
 // to go-xbridge formatXAmount for integer base units (response_test.go rows).
 func TestFormatXAmountVectors(t *testing.T) {
-	if fxFormatXAmount == nil {
-		t.Skip("FIXME fixture: wire fxFormatXAmount to go-xbridge/api formatXAmount")
-	}
 	cases := []struct {
 		amt  uint64
 		want string
@@ -527,18 +515,17 @@ func TestFormatXAmountVectors(t *testing.T) {
 			t.Errorf("formatXAmount(%d) = %q, want %q", c.amt, got, c.want)
 		}
 	}
-	// DIVERGENT: dxMakeOrder/dxMakePartialOrder success and dryrun emit the C++
-	// literal "0" for the three partial_* fields (rpcxbridge.cpp:1062-1064)
-	// where CAND renders formatXAmount(0) = "0.000000".
+	// DIVERGENT: dxMakeOrder success and dryrun emit the C++ literal "0" for
+	// the three partial_* fields (rpcxbridge.cpp:1064-1066; dryrun :1018-1020)
+	// where CAND renders formatXAmount(0) = "0.000000". dxMakePartialOrder is
+	// NOT part of this divergence: it emits real formatted amounts on both
+	// sides (C++ rpcxbridge.cpp:3139-3141 dryrun, :3188-3190 success).
 	expect(t, "dxMakeOrder/partial-literal", true, fxFormatXAmount(0), "0")
 }
 
 // TestFormatBalanceNativeVectors encodes xBridgeStringValueFromPrice (%.6f
 // nearest, native/10^Decimals) rows from response_test.go TestFormatBalanceNative.
 func TestFormatBalanceNativeVectors(t *testing.T) {
-	if fxFormatBalanceNative == nil {
-		t.Skip("FIXME fixture: wire fxFormatBalanceNative to go-xbridge/api formatBalanceNative")
-	}
 	cases := []struct {
 		decimals, native uint64
 		want             string
@@ -560,9 +547,6 @@ func TestFormatBalanceNativeVectors(t *testing.T) {
 
 // TestFormatXPriceVectors encodes xBridgeStringValueFromPrice %.6f vectors.
 func TestFormatXPriceVectors(t *testing.T) {
-	if fxFormatXPrice == nil {
-		t.Skip("FIXME fixture: wire fxFormatXPrice to go-xbridge/api formatXPrice")
-	}
 	cases := []struct {
 		from, to uint64
 		want     string
@@ -592,9 +576,6 @@ func TestFormatXPriceVectors(t *testing.T) {
 // golden baked). Empty sides render [] (C++ default-constructs an empty
 // Array).
 func TestOrderBookDetail4FlatShape(t *testing.T) {
-	if fxOrderBookResultJSON == nil {
-		t.Skip("FIXME fixture: wire fxOrderBookResultJSON to go-xbridge/api OrderBookResultJSON")
-	}
 	row := func(price, amount string, ids ...string) []interface{} {
 		out := []interface{}{price, amount}
 		iids := make([]interface{}, 0, len(ids))
@@ -637,9 +618,6 @@ func TestOrderBookDetail4FlatShape(t *testing.T) {
 
 // TestISO8601Vectors encodes xutil::iso8601 (ms, Z) vectors.
 func TestISO8601Vectors(t *testing.T) {
-	if fxISO8601 == nil {
-		t.Skip("FIXME fixture: wire fxISO8601 to go-xbridge/api iso8601")
-	}
 	cases := []struct {
 		us   uint64
 		want string
@@ -659,9 +637,6 @@ func TestISO8601Vectors(t *testing.T) {
 // TestParseXAmountVectors encodes parseXAmount rows (response_test.go), the
 // uint64 base-unit parse used by all amount params.
 func TestParseXAmountVectors(t *testing.T) {
-	if fxParseXAmount == nil {
-		t.Skip("FIXME fixture: wire fxParseXAmount to go-xbridge/api parseXAmount")
-	}
 	cases := []struct {
 		s    string
 		want uint64
@@ -693,17 +668,6 @@ func TestParseXAmountVectors(t *testing.T) {
 			t.Errorf("parseXAmount(%q) expected error, got %d", c.s, got)
 		}
 	}
-}
-
-// TestOHLCVEncodingVectors encodes the dxGetOrderHistory OHLCV double-encoding
-// divergence: C++ emits fixed-8 decimals via uret/json_spirit precision-8
-// (rpcxbridge.cpp:49-53), CAND emits shortest-roundtrip floats (handlers.go:22-32).
-func TestOHLCVEncodingVectors(t *testing.T) {
-	// These are reference strings; the CAND rendering is produced by encoding/json
-	// Marshal of a float64. Assert the C++ reference form is fixed-8 (documented
-	// divergence): dxGetOrderHistory/encoding.
-	expect(t, "dxGetOrderHistory/encoding", true, "0.0", "0.00000000")
-	expect(t, "dxGetOrderHistory/encoding", true, "6.0", "6.00000000")
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,11 +1344,6 @@ func TestWireAddrVectors(t *testing.T) {
 	if got := hex.EncodeToString(p2p.MarshalAddr(entries)); got != addrHex {
 		t.Errorf("MarshalAddr round-trip:\n got %s\nwant %s", got, addrHex)
 	}
-	// VECTOR 6.1 — ping/pong echo nonces (8 B each; Go echoes the ping verbatim).
-	if !bytes.Equal(hx("0000000000000000"), make([]byte, 8)) {
-		t.Error("ping nonce 0 vector wrong")
-	}
-	_ = hx("7877767574737271") // pong echo nonce
 }
 
 // TestWireEnvelopeVectors asserts the broadcast/addressed envelope payloads.
@@ -1416,7 +1375,8 @@ func TestWireEnvelopeVectors(t *testing.T) {
 	// regenerated on a default bump (they predate version.DefaultXBridgeProtocolVersion
 	// as a symbol and stay byte-identical by design).
 	// The capture supplies only the packet PREFIX of the 408-byte packet; the
-	// full payload must come from the envelope_test.go fixture (FIXME fixture).
+	// full payload is not pinned anywhere (known gap: only the documented
+	// prefix is available offline).
 	// The 4.3 vector continues into the packet ("37 00 00 00 03 00 00
 	// 00 ..."); include that documented prefix so the full envelope prefix is
 	// present for the offset math.
@@ -1575,9 +1535,6 @@ func TestTTLConstants(t *testing.T) {
 // unexported in go-xbridge/api; asserted via the fxLocktimeConstants fixture).
 // VECTOR 5.1 — locktime constants.
 func TestLocktimeConstants(t *testing.T) {
-	if fxLocktimeConstants == nil {
-		t.Skip("FIXME fixture: wire fxLocktimeConstants to go-xbridge/api (swap.go, locktime.go) unexported constants")
-	}
 	rows := []struct {
 		name string
 		want int64
@@ -1607,15 +1564,17 @@ func TestLocktimeConstants(t *testing.T) {
 // result/error/id field order, compact no-space JSON + trailing newline,
 // business-errors-in-result, and the envelope codes the server emits
 // (-32700/-32600/-32601/-32603). HTTP status follows C++ routing: 400 for
-// -32600, 404 for -32601, 500 otherwise (api/httpStatusForCode). The fixture
-// renders the go-xbridge server's actual response bytes (FIXME). The
+// -32600, 404 for -32601, 500 otherwise (api/httpStatusForCode). The
 // envelope & transport conventions were verified on BOTH sides against the C++
-// writers; the transport rows below are now strict.
+// writers: the envelope shapes below are pinned as literals, and the transport
+// rows are strict where cand is populated — rows without cand are
+// reference-only and log the C++ contract.
 func TestEnvelopeTransport(t *testing.T) {
 	// Reference byte strings (compact, no spaces, trailing \n; envelope key
 	// order result,error,id; envelope error object {code,message}). These are
-	// the exact conventions C++ and CAND both emit; the fixture replaces the
-	// literals with the CAND server's bytes. (FIXME fixture.)
+	// the exact conventions C++ and CAND both emit; they are pinned here as
+	// literals, and the transport table below asserts the fixture's bytes for
+	// every row with cand populated.
 	type envelopeErr struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -1638,7 +1597,7 @@ func TestEnvelopeTransport(t *testing.T) {
 	}
 	// Compact no-space + trailing newline: encoding/json emits no structural
 	// whitespace (pinned by the byte-equality asserts above) and the Encoder
-	// appends '\n' (server.go:190-194; C++ protocol.cpp:55). A structural-space
+	// appends '\n' (server.go:450-457; C++ src/rpc/server.cpp:503). A structural-space
 	// scan is not used because string values legitimately contain spaces.
 
 	// Reference transport rows. `ref` is the C++ behavior; `cand` is the

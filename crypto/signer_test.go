@@ -219,6 +219,11 @@ func TestSignDeterministicKAT(t *testing.T) {
 
 	sign := func(signer *BtcSigner) *proto.Packet {
 		p := proto.NewPacket(proto.XbcTransaction, digest[:])
+		// Pin the packet version: the golden was generated at protocol
+		// version 55, and Digest() hashes the full marshal (version field
+		// included) — without the pin the next protocol bump would re-stamp
+		// the version into the signed bytes and invalidate this KAT.
+		p.Version = 55
 		p.Timestamp = 1700000000
 		if err := signer.Sign(p, priv); err != nil {
 			t.Fatalf("sign: %v", err)
