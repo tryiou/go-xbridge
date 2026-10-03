@@ -206,8 +206,8 @@ func TestRPCErrorCodeText(t *testing.T) {
 		// The pure formatter is CONFORMANT for any arg (template renders
 		// code+arg per C++). The former INSUFFICIENT_FUNDS-arg divergence was a
 		// CALL-SITE divergence (the port passed the literal "insufficient funds";
-		// C++ passes the currency/address) — fixed so node.go:1683,1699
-		// now pass fromAddress. Promoted to a strict formatter assertion; the
+		// C++ passes the currency/address) — fixed so checkAcceptParams now passes
+		// fromAddress at both sites. Promoted to a strict formatter assertion; the
 		// call-site arg-selection behavior is asserted by the fxErrorName
 		// harness (TestRPCMethodNameField).
 		{1019, "insufficient funds", "Insufficient funds for insufficient funds", false, ""},
@@ -223,7 +223,7 @@ func TestRPCErrorCodeText(t *testing.T) {
 // TestRPCMethodNameField asserts, for every dx* method, the C++ __FUNCTION__
 // name carried in the business-error `name` field. Every method's handlers
 // pass the calling method name into makeError (connector(ticker, method),
-// handlers.go:233-241; decodeAddr(method, ...), node.go:1177; the split and
+// handlers.go:233-241; decodeAddr (node.go); the split and
 // cancel paths pass their own method too), so the fixture asserts a strict
 // name==method on the business error each method produces. Two methods have
 // NO business-error path and are skipped as documented gaps: dxGetTradingData

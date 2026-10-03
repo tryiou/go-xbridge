@@ -465,11 +465,10 @@ func conformanceErrorParams(method string) (*HandlerCtx, []json.RawMessage, erro
 			conformanceJstr("partial"),
 		}, nil
 	case "dxMakePartialOrder":
-		// Reaches the partial gate (node.go:1311-1312) only after requireWrite
-		// (node.go:1214) and hub Pick (node.go:1266-1284) succeed, so this row
-		// runs on the hub node. If Pick ever fails, MakeOrder surfaces the
-		// errNoServiceNode path named "dxMakeOrder" (node.go:1275) — the suite
-		// would then report "got dxMakeOrder, want dxMakePartialOrder".
+		// Reaches the partial gate only after requireWrite and hub Pick (both in
+		// node.go) succeed, so this row runs on the hub node. If Pick ever fails,
+		// MakeOrder surfaces the errNoServiceNode path named "dxMakeOrder" — the
+		// suite would then report "got dxMakeOrder, want dxMakePartialOrder".
 		return hub(), []json.RawMessage{
 			conformanceJstr("BTC"), conformanceJstr("1.5"), conformanceJstr(conformanceAddr),
 			conformanceJstr("SYS"), conformanceJstr("0.3"), conformanceJstr(conformanceAddr2),

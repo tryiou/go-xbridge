@@ -136,7 +136,7 @@ func seedHub(node *Node, pub [33]byte) {
 // TestDispatchSwapDropsForgedFinished is the trusted-hub-key regression test: a Finished
 // packet NOT signed by the session's trusted hub key must be dropped before it
 // reaches OnFinished, so it can never set csFinished and disable the refund
-// watcher (guard at node.go:1572-1577). A Finished signed by the real hub still processes.
+// watcher (guard in processSwap). A Finished signed by the real hub still processes.
 func TestDispatchSwapDropsForgedFinished(t *testing.T) {
 	node := newWalletTestCtx().Node
 	node.sessions = map[string]*SwapSession{}

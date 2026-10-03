@@ -1011,7 +1011,7 @@ func TestDxGetLocalTokensConnectedOnly(t *testing.T) {
 // rpcxbridge.cpp:229-234), not a business error.
 func TestDxLoadConfFailureFalse(t *testing.T) {
 	ctx := newWalletTestCtx()
-	// No ConfPath configured -> reloadConf fails (node.go:644-647).
+	// No ConfPath configured -> reloadConf fails (its no-path branch).
 	ctx.Node.config.ConfPath = ""
 	res, err := ctx.dxLoadXBridgeConf(nil)
 	if err != nil {

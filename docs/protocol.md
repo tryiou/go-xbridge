@@ -316,8 +316,9 @@ Addressing and trust model (client side):
   **not** `GetID` of the signing key — and a relayed copy never re-orders a
   known order (`processPendingTransaction`, `xbridgesession.cpp:725,753-788`).
   Orders for any currency pair are ingested so the client can watch them;
-  taking is gated on the order's `SNodePubkey` being a known, running
-  servicenode in the local registry (C++ `acceptXBridgeTransaction` getSn,
+  taking is gated on the order's `SNodePubkey` being a known servicenode in
+  the local registry — membership only, the gate does not check running
+  state (C++ `acceptXBridgeTransaction` getSn,
   `xbridgeapp.cpp:2165-2197`).
 
 Timing constants (`xbridgetransaction.h:54-67`):

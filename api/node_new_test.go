@@ -8,8 +8,8 @@ import (
 	discovery "go-xbridge/p2p/discovery"
 )
 
-// TestNewNodeRegtestDiscoveryLifecycle drives the real NewNode constructor
-// (node.go:445-513) — every other fixture builds a Node by struct literal and
+// TestNewNodeRegtestDiscoveryLifecycle drives the real NewNode constructor —
+// every other fixture builds a Node by struct literal and
 // never starts the engine. Hermetic by construction: NodeAddr empty selects
 // the discovery branch, "regtest" has no public seeds (p2p/seeds.go:75-76),
 // AddNodes is nil, and with Connectors/Confs unset the sweep loop has nothing
@@ -95,7 +95,7 @@ func TestNewNodeRegtestDiscoveryLifecycle(t *testing.T) {
 }
 
 // TestNewNodeExplicitPeerDialFailure covers the explicit-peer error branch
-// (node.go:470-473): when the only configured service node refuses the
+// (NewNode's single-peer dial): when the only configured service node refuses the
 // connection, NewNode returns both the partial node and the error, the engine
 // never starts, and Close on the partial node is safe. The dial target is a
 // just-closed loopback listener, so the refusal is immediate and local — the

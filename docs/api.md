@@ -241,7 +241,9 @@ defaulted or trailing parameter.
   `dryrun` (literal `"dryrun"`) [optional — only when exactly 9 params].
 - `result`: order object (status `"open"` (trPending), `order_type` `"exact"`, plus
   `maker_address`, `taker_address`, `block_id`).
-- `errors`: 1025 (missing params, non-`exact` type, invalid `use_all_funds`,
+- `errors`: 1018 (no wallet for either currency — the connector gate runs
+  before address decoding, so an unknown currency is NO_SESSION, not 1025),
+  1025 (missing params, non-`exact` type, invalid `use_all_funds`,
   misspelled/extra `dryrun`).
 
 **`dxMakePartialOrder`**
@@ -250,7 +252,16 @@ defaulted or trailing parameter.
   `use_all_funds` (bool, default `true`), `auto_split` (bool, default `true`),
   `dryrun` (literal) [optional — only when exactly 11 params].
 - `result`: order object (status `"open"` (trPending), `order_type` `"partial"`).
-- `errors`: 1025 (same rules as `dxMakeOrder`).
+- `errors`: 1018 (no wallet for either currency — the shared connector gate
+  runs before address decoding; it tags `name` `dxMakeOrder` on this path too,
+  a Go/C++ divergence — C++ tags `dxMakePartialOrder`),
+  1025 (same rules as `dxMakeOrder`).
+  - **`minimum_size`**: not precision-checked (unlike the maker/taker sizes);
+    sub-6-decimal values truncate to 6 decimals before the dust test, so a
+    minimum whose native value lands in the narrow band just under the dust
+    threshold (e.g. `0.0000546` → 5400 vs the 5460 fallback) is rejected as
+    dust where C++'s full-precision comparison accepts it — accepted divergence,
+    behavior pinned by `TestMakePartialDustNativeScale`.
 
 **`dxTakeOrder`**
 - `params`: `id` (string), `from_address` (string), `to_address` (string),

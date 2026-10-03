@@ -344,8 +344,8 @@ so the swap handshake and the refund sweep can never race each other.
 - **`submit(run, await)`** queues a handler/HTTP command for the engine; when
   the engine is not started (single-threaded tests) it runs inline. Off-engine
   callers marshal work onto the engine with `submit`: the RPC handlers
-  (`MakeOrder` node.go:1503, `TakeOrder` node.go:2039, `CancelOrder`
-  node.go:2505) and the `BroadcastRefund` escape hatch (swap.go:1923); tests
+  (`MakeOrder`, `TakeOrder`, `CancelOrder` in node.go) and the `BroadcastRefund`
+  escape hatch (swap.go:1923); tests
   drive the same path. Code already on the engine calls the internal functions
   directly (`processSwap`, `handleRemoteCancel`/`Reject`, `scanRefunds`).
 - **Ticker duties**: `scanRefunds` auto-broadcasts due pre-signed refunds (posting
@@ -362,6 +362,18 @@ so the swap handshake and the refund sweep can never race each other.
 - **`Close()`** closes `n.stop`, then waits (`wg.Wait`) for every goroutine —
   including an in-flight wallet task — to drain *before* closing the connection,
   so no task ever writes after teardown.
+- **Status-log counters**: `packetsDropped` counts inbound packets lost only
+  at reader shutdown (its sole loss path), so a nonzero count while the engine
+  is live means a drop-on-full regression; `persistFailures` nonzero means
+  on-disk swap state may lag memory, so a restart could be unable to
+  refund/claim an in-flight swap; `startedAtMicro` is the process-start wall
+  clock the silence recorder uses to treat pre-restart parked time as downtime
+  rather than hub silence (zero — directly constructed test nodes — disables
+  the guard).
+- **Take-retry disarm**: every honoring cancel path disarms its pending
+  `crNotAccepted` retry (`dropTakeRetry`) — the take already left the wire and
+  must not fire again; the counterparty-already-redeemed path deliberately
+  stays armed, because that cancel was refused.
 
 ### `log/` — logging
 
@@ -530,7 +542,7 @@ family is waived (§0):
 
 | Phase | C++ | Go | Verdict |
 |---|---|---|---|
-| Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898);   Go mirrors it (`persist()` every 60 s, `api/engine.go:263-266`; `restoreLocalSwaps`, `api/node.go:283-290,338+`; format, `api/persist.go:18-24`) |
+| Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898);   Go mirrors it (`persist()` every 60 s, `api/engine.go:263-266`; `restoreLocalSwaps`, `api/node.go`; format, `api/persist.go:18-24`) |
 | Hold/Init handshake | `processTransactionHold/Init` + replies | `OnHold/OnInit` + replies | fix-queued (STATE-F84: Go rejects any mismatch, C++ `&&` bug accepts single-field mismatches, so Go can stall against a Core hub emitting them) |
 | Maker/taker deposits | build → pre-signed refund → broadcast; `trCreated` | build → intent persist → broadcast; `csCreatedA/B` | identical |
 | Claims (maker/taker) | verify → build → broadcast; `trFinished` at claim | verify → intent persist → broadcast; `csConfirmedA/B` | fix-queued (STATE-F80: Go waits for hub `Finished` instead of finishing at claim) |
