@@ -19,9 +19,9 @@ import (
 
 // TestOnConfirmAMissingConnectorIsError verifies the swap handler returns an
 // error (not a nil-interface panic) when the destination currency's wallet
-// connector is absent: computeLockTimeFor's nil guard (api/swap.go:2637-2641)
-// reports height 0, which the claim build surfaces as "locktime unavailable"
-// (api/swap_retry.go:231-233).
+// connector is absent: computeLockTimeFor's nil guard (swap.go) reports
+// height 0, which makerClaimBuildTask surfaces as "locktime unavailable"
+// (api/swap_retry.go).
 // Before the fix, s.n.cfg().Connectors[cur] returned a nil interface and the
 // SendRawTransaction call panicked, killing the feed goroutine (and process).
 func TestOnConfirmAMissingConnectorIsError(t *testing.T) {

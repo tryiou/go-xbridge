@@ -248,8 +248,10 @@ side of the Maker ⇄ ServiceNode HUB ⇄ Taker protocol: the local `SwapSession
 responds to hub-originated packets and performs the on-chain work
 (build/broadcast the HTLC deposit, redeem the counterparty's deposit revealing
 the secret, pre-build the CLTV refund). Its progression is the `clientState`
-enum (`csMaker → csHoldApplied → csInitialized → csCreatedA/B → csConfirmedA/B →
-csFinished`). Driven end-to-end by `TestSwapHandshake` in `api/swap_test.go`
+enum (`csMaker → csHoldApplied → csInitialized → csCreatedA/B → csFinished`);
+the claim broadcast jumps straight to `csFinished` — `csConfirmedA/B` is never
+assigned by the live path; tests and restores of records from older releases still
+produce it. Driven end-to-end by `TestSwapHandshake` in `api/swap_test.go`
 with fake connectors. At `Hold` the maker adopts the hub-relayed partial
 amounts into the session and the stored order (C++ `fromAmount=damount;
 toAmount=samount`, `xbridgesession.cpp:1525-1528`), so the maker deposit locks
@@ -281,7 +283,10 @@ are in [`api.md`](api.md).
 - `handlers.go` / `order.go` / `store.go` — per-command handlers, order model,
   bounded copy-on-write fills/history store.
 - `swap.go` — the three-party swap client driver, with the two-phase handshake
-  (wallet I/O on workers) and the engine-scheduled refund sweep.
+  (wallet I/O on workers) and the engine-scheduled refund sweep. Divergence: an
+  empty-deposit `CreateB` self-cancels only after the role gate, where C++
+  checks the empty deposit first (`processTransactionCreateB` cancels before
+  its `role` test), so a gossiped wrong-role packet cannot cancel a Go swap.
 - `engine.go` — the single-owner engine goroutine + worker pool (below).
 - `persist.go` — per-trade state + keypair persistence to
   `<datadir>/xbridged-swaps.json`, flattened on the engine goroutine; the
@@ -345,7 +350,7 @@ so the swap handshake and the refund sweep can never race each other.
   the engine is not started (single-threaded tests) it runs inline. Off-engine
   callers marshal work onto the engine with `submit`: the RPC handlers
   (`MakeOrder`, `TakeOrder`, `CancelOrder` in node.go) and the `BroadcastRefund`
-  escape hatch (swap.go:1923); tests
+  escape hatch; tests
   drive the same path. Code already on the engine calls the internal functions
   directly (`processSwap`, `handleRemoteCancel`/`Reject`, `scanRefunds`).
 - **Ticker duties**: `scanRefunds` auto-broadcasts due pre-signed refunds (posting
@@ -408,7 +413,9 @@ pre-signed refund), then broadcast as a separate gated step → claim/refund as
 the hub advances the state → hub-pinned inbound packets re-verified before any
 state mutation. A restart reconciles ambiguous intents (built but unconfirmed
 deposits) against the chain before the engine starts, so the refund sweep owns
-confirmed deposits immediately.
+confirmed deposits immediately. Broadcasts are tracked by the txid derived
+locally from the transaction hex; deposits and claims log a differing
+wallet-reported sent txid without adopting it (the refund transcript records the wallet's returned id).
 
 **Cancellation/refund:** `dxCancelOrder` or the engine-scheduled refund sweep on
 expiry; refund spends are built locally (`coins.BuildRefundScriptSig`) and
@@ -521,8 +528,8 @@ Long-standing open work:
   order/accept/cancel UTXO-entry encoding vs a C++ node (one captured packet
   today), `p2p/seeds.go` vs `chainparamsseeds.h`, and a real C++ node accepting
   a Go deposit.
-- Swap-identity fix queue (`docs/audit/register.md` open rows): Init `&&` (STATE-F84), finished-at-claim
-  (STATE-F80), watch-claim (STATE-F81), processLater (STATE-F82),
+- Swap-identity fix queue (open items): Init `&&` (STATE-F84),
+  watch-claim (STATE-F81), processLater (STATE-F82),
   already-in-chain (STATE-F83), cancel-vs-rollback (STATE-F85), sweep 60 s→15 s
   (STATE-F86), fee fallback 0 (CRYPTO-F79), address leniency (CRYPTO-F81),
   own-fills recording (RPC-F19), accepting-window
@@ -545,8 +552,8 @@ family is waived (§0):
 | Make/broadcast/take-accept | `sendXBridgeTransaction` / `acceptXBridgeTransaction` | `MakeOrder` / `commitTake` (durable-write-before-send: same wire/RPC sequence plus a disk write before the same send) | identical on §0 observables (§0 in `docs/audit/register.md` names wire bytes, state transitions, RPC shapes, error codes/messages, help texts, fee/locktime math — and crash-restart durability is not in that list). Crash-restart resume is likewise mirrored, not divergent: C++ persists local orders via orders.dat (`saveOrders`/`loadOrders`, xbridgeapp.cpp:3744,3828,3868-3898);   Go mirrors it (`persist()` every 60 s, `api/engine.go:263-266`; `restoreLocalSwaps`, `api/node.go`; format, `api/persist.go:18-24`) |
 | Hold/Init handshake | `processTransactionHold/Init` + replies | `OnHold/OnInit` + replies | fix-queued (STATE-F84: Go rejects any mismatch, C++ `&&` bug accepts single-field mismatches, so Go can stall against a Core hub emitting them) |
 | Maker/taker deposits | build → pre-signed refund → broadcast; `trCreated` | build → intent persist → broadcast; `csCreatedA/B` | identical |
-| Claims (maker/taker) | verify → build → broadcast; `trFinished` at claim | verify → intent persist → broadcast; `csConfirmedA/B` | fix-queued (STATE-F80: Go waits for hub `Finished` instead of finishing at claim) |
-| Finished | hub `Finished` → history | `OnFinished` → history | identical |
+| Claims (maker/taker) | verify → build → broadcast; `trFinished` at claim | verify → intent persist → broadcast; `csFinished` at claim | identical (STATE-F80 landed: Go finishes at the claim broadcast, not at hub `Finished`) |
+| Finished | hub `Finished` → history | `OnFinished` → history | identical for an honest hub; Go additionally defers an early or hostile `Finished` while our deposit is still out and unclaimed (C++ `processTransactionFinished` terminates unconditionally) |
 | Refunds | locktime-gated `redeemOrderDeposit`, 15 s watch | locktime-gated sweep, 60 s cadence | fix-queued (STATE-F86: 60 s cadence vs 15 s watch) |
 | Cancel (pre-deposit) | tx lookup + key + packet, `trCancelled` | order lookup + session key + packet, `"canceled"` | identical |
 | Cancel (deposit-sent) | `trRollback` path | `"canceled"` path | fix-queued (STATE-F85) |
