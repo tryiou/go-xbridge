@@ -248,7 +248,7 @@ type orderBookResult struct {
 // onto the top-level asks/bids array (rpcxbridge.cpp:1952-1985), so its JSON
 // is ["price","amount",["id",...]] — not [["price","amount",["id",...]]].
 // Detail 4 stores at most one best row per side (the handler emits a single
-// best bid/ask, handlers.go:973-982), so the codec un-wraps Asks[0]/Bids[0]
+// best bid/ask, handlers.go dxGetOrderBook), so the codec un-wraps Asks[0]/Bids[0]
 // to the flat form; an empty side renders [] (C++ default-constructs an empty
 // Array). A nil side slice renders [] for every detail — the codec is total
 // even when a caller did not pre-initialize the side arrays.

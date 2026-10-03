@@ -223,7 +223,7 @@ func TestRPCErrorCodeText(t *testing.T) {
 // TestRPCMethodNameField asserts, for every dx* method, the C++ __FUNCTION__
 // name carried in the business-error `name` field. Every method's handlers
 // pass the calling method name into makeError (connector(ticker, method),
-// handlers.go:233-241; decodeAddr (node.go); the split and
+// handlers.go connector; decodeAddr (node.go); the split and
 // cancel paths pass their own method too), so the fixture asserts a strict
 // name==method on the business error each method produces. Two methods have
 // NO business-error path and are skipped as documented gaps: dxGetTradingData
@@ -363,7 +363,7 @@ func TestRPCResponseShape(t *testing.T) {
 			"taker_address", "refund_tx", "updated_at", "created_at", "status"}},
 		// dxGetOrderHistory row: 6 keys (+ order_ids when 6th param true). The
 		// rows are POSITIONAL arrays in BOTH implementations (C++ ArrayIL,
-		// rpcxbridge.cpp:681-682; handlers.go:753), so there are no object keys
+		// rpcxbridge.cpp:681-682; handlers.go dxGetOrderHistory), so there are no object keys
 		// to extract. Known-gap skip; the field-name order stays documented.
 		{method: "dxGetOrderHistory", mode: "exact", skip: true, refKeys: []string{
 			"time", "low", "high", "open", "close", "volume"}},
@@ -446,7 +446,7 @@ func TestRPCResponseShape(t *testing.T) {
 			"split_utxo_count", "split_total", "txid", "rawtx"}},
 		// dxGetUtxos entry: 7 keys, C++ order (rpcxbridge.cpp:3480-3492). The
 		// amount is fixed-8 and listunspent failure is a 1004 error; the
-		// remaining divergence is CAND map -> sorted key order (handlers.go:2016-2075). DIVERGENT
+		// remaining divergence is CAND map -> sorted key order (handlers.go dxGetUtxos). DIVERGENT
 		// (dxGetUtxos/key-order).
 		{method: "dxGetUtxos", mode: "set", div: true, id: "dxGetUtxos/key-order", refKeys: []string{
 			"txid", "vout", "amount", "address", "scriptPubKey", "confirmations", "orderid"}},
@@ -561,7 +561,7 @@ func TestFormatXPriceVectors(t *testing.T) {
 	}
 	// DIVERGENT: dxGetOrderBook price formula. C++ adds 1/::COIN to each amount
 	// before dividing (xutil.cpp:293-312); CAND uses a plain ratio
-	// (handlers.go:663-669). Observable only for tiny base-unit amounts.
+	// (handlers.go dxGetOrderBook). Observable only for tiny base-unit amounts.
 	expect(t, "dxGetOrderBook/price-formula", true, fxFormatXPrice(3, 1), "0.335548")
 }
 

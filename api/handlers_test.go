@@ -818,7 +818,7 @@ func TestDxGetTradingDataFills(t *testing.T) {
 }
 
 // TestDxGetTradingDataParamForms pins the RPCTypeCheck contract on the value
-// params (handlers.go:1379-1388; C++ rpcxbridge.cpp:2847-2854): params[0] must
+// params (handlers.go dxGetTradingData; C++ rpcxbridge.cpp:2847-2854): params[0] must
 // be a number when present, params[1] a bool when there are exactly two — the
 // thin client ignores both values but must still reject wrong types with the
 // same envelope errors C++ throws from its get_*() reads.

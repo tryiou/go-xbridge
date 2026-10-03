@@ -187,7 +187,7 @@ type Connector interface {
   `config.CoinConf` — endpoint, credentials, decimals, segwit, RPC version and
   content-type all come from conf; nothing is hardcoded. Fees come from the conf
   `FeePerByte` (and the wallet's `getinfo` relay fee); **no `estimatesmartfee` /
-  `estimatefee` RPC is used**, matching C++ (`api/handlers.go:1429`). Amounts
+  `estimatefee` RPC is used**, matching C++ (`api/handlers.go estimateFee`). Amounts
   cross the JSON boundary as floats; `wallet` converts via string formatting to
   avoid IEEE-754 drift (`coins.FormatAmount` ⇄ `strconv.FormatFloat` ⇄
   `coins.ParseAmount`).

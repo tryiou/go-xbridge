@@ -86,7 +86,7 @@ var helpGolden = map[string]string{
 
 // TestHelpTextGolden asserts the Go dxHelp output byte-for-byte against the
 // frozen C++ captures. For the 24 methods the handler's constant + "\n"
-// (handlers.go:1313-1314) equals the golden exactly. "help" is the PINNED
+// (handlers.go dxHelp) equals the golden exactly. "help" is the PINNED
 // DIVERGENCE: helpDxHelp includes its final newline (C++ CRPCTable::help
 // appends then re-strips it, src/rpc/server.cpp:225,:230), so the golden
 // equals the constant while the uniform Go append yields 214 bytes against
@@ -140,7 +140,7 @@ func TestHelpTextGolden(t *testing.T) {
 	}
 }
 
-// TestDxHelpLoop pins the dispatch loop (handlers.go:1300-1316): the command
+// TestDxHelpLoop pins the dispatch loop (handlers.go dxHelp): the command
 // list and the help registry stay in lockstep, every advertised command
 // resolves to its own text (never the unknown-command fallback) with the
 // result starting at the method name, and the unknown-command string is

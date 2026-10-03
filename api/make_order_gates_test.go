@@ -17,7 +17,7 @@ func dxMakeOrderGateParams() []json.RawMessage {
 }
 
 // TestDxMakeOrderTypeGateExactOnly: a non-"exact" order_type is rejected with
-// business 1025 before MakeOrder runs (handlers.go:346-348; C++ parity
+// business 1025 before MakeOrder runs (handlers.go dxMakeOrder; C++ parity
 // rpcxbridge.cpp:940-943 — the only supported type for dxMakeOrder).
 func TestDxMakeOrderTypeGateExactOnly(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -53,7 +53,7 @@ func TestDxMakeOrderBadUseAllFundsThrow(t *testing.T) {
 }
 
 // TestDxMakeOrderMisspelledDryrun: 9 params where params[8] is a string other
-// than "dryrun" is business 1025 echoing the raw value (handlers.go:339-341;
+// than "dryrun" is business 1025 echoing the raw value (handlers.go dxMakeOrder;
 // C++ parity rpcxbridge.cpp:994-996).
 func TestDxMakeOrderMisspelledDryrun(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -78,7 +78,7 @@ func TestDxMakeOrderMisspelledDryrun(t *testing.T) {
 }
 
 // TestDxMakeOrderDryrunTypeThrow: 9 params where params[8] is not a string
-// throws the UniValue string error as an envelope -1 (spStr handlers.go:335-338;
+// throws the UniValue string error as an envelope -1 (spStr in dxMakeOrder;
 // C++ json_spirit get_str).
 func TestDxMakeOrderDryrunTypeThrow(t *testing.T) {
 	ctx := newWalletTestCtx()
@@ -92,7 +92,7 @@ func TestDxMakeOrderDryrunTypeThrow(t *testing.T) {
 
 // TestDxMakeOrderGateOrderDivergesFromCpp_TypeAfterOptionals pins the CURRENT
 // Go gate order as a documented divergence: with type AND use_all_funds both
-// invalid, Go reads use_all_funds first (handlers.go:326) and returns the
+// invalid, Go reads use_all_funds first (handlers.go dxMakeOrder) and returns the
 // envelope -1 boolean error, while C++ checks order_type first
 // (rpcxbridge.cpp:940 before :988) and would return business 1025
 // "Only the exact type is supported at this time.". Single-violation cases are
