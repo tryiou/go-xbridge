@@ -134,10 +134,8 @@ func (l *LocalConnector) GetRawTransaction(txid string) (string, error) {
 	return "", errors.New("wallet: LocalConnector has no block source")
 }
 
-// CheckDepositTransaction has no local blockchain source: a local-only
-// connector cannot fetch the counterparty's deposit tx or prevouts to validate
-// it. The api layer treats ErrNoChainSource as fatal (deposits cannot be
-// trusted), never as a "wait".
+// CheckDepositTransaction has no local chain source: a local-only connector cannot
+// fetch the counterparty's deposit tx or prevouts to validate it; the api backoff-retries it, never fatal.
 func (l *LocalConnector) CheckDepositTransaction(depositTxID, expectedScriptHex string, expectedAmount uint64, requiredConfirmations int) (DepositCheck, error) {
 	return DepositCheck{}, ErrNoChainSource
 }
