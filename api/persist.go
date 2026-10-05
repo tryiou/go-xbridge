@@ -502,10 +502,11 @@ func (n *Node) persistNow() error {
 // silently erased: a past build wiped finished-swap history at runtime with
 // no trace in the surviving logs precisely because nothing logged snapshot
 // counts. A decrease is WARNed: the only legitimate shrink paths are
-// dxFlushCancelledOrders (operator RPC, trCancelled records only) and the
-// 1000-entry history cap; any other drop is finished-swap history loss. An
-// increase is INFO (normal: a new order, a finished trade moving to
-// history). The count is observed at snapshot time, before the marshal/write
+// dxFlushCancelledOrders (operator RPC, trCancelled records only) and a
+// rolled-back dxMakeOrder (its order removed when the persist or hub send
+// fails); any other drop is finished-swap history loss. An increase is INFO
+// (normal: a new order, a finished trade moving to history). The count is
+// observed at snapshot time, before the marshal/write
 // boundary — a failed disk write is a separate, already-counted failure
 // (persistFailures), not a history loss. Both call sites (persist,
 // persistNow) snapshot on the engine goroutine, so plain atomics suffice —
@@ -518,7 +519,7 @@ func (n *Node) noteSnapshotCount(m int) {
 			// Steady state: the overwhelmingly common case stays silent.
 		case int64(m) < prev:
 			xlog.Warn("swap snapshot record count shrank", "from", prev, "to", m,
-				"note", "legitimate only via dxFlushCancelledOrders or the history cap; any other decrease is silent history loss")
+				"note", "legitimate only via dxFlushCancelledOrders or a rolled-back dxMakeOrder; any other decrease is silent history loss")
 		default:
 			xlog.Info("swap snapshot record count grew", "from", prev, "to", m)
 		}

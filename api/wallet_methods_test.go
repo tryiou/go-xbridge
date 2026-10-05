@@ -489,7 +489,7 @@ func TestDxSplitInputsTxidVoutOnly(t *testing.T) {
 func TestDxSplitInputsLockedUtxo(t *testing.T) {
 	ctx := newWalletTestCtx()
 	// Reserve the stub utxo on a live order via the store's mutation path
-	// (direct post-Add writes violate the ownership contract, store.go:125-126).
+	// (direct post-Add writes violate the ownership contract, store.go Add).
 	o := seedOrder(ctx)
 	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
 		ord.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}

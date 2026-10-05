@@ -338,7 +338,7 @@ func TestDxLockedUtxoExclusion(t *testing.T) {
 	o := seedOrder(ctx)
 	// Reserve the stub BTC utxo (TxID all-zero, vout 0) on the order via the
 	// store's mutation path (direct post-Add writes violate the ownership
-	// contract, store.go:125-126).
+	// contract, store.go Add).
 	if !ctx.Store.Update(hexEncode(o.ID[:]), func(ord *Order) {
 		ord.Utxos = []proto.UtxoEntry{{TxID: [32]byte{}, Vout: 0}}
 	}) {

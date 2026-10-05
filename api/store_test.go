@@ -306,8 +306,8 @@ func TestStoreUpdateTouchSemantics(t *testing.T) {
 }
 
 // TestStoreHasOrder verifies that HasOrder reports orders in both the live
-// orders map (including canceled-but-not-moved records) and the bounded
-// history. This backs the ingestPending history guard.
+// orders map (including canceled-but-not-moved records) and the history.
+// This backs the ingestPending history guard.
 func TestStoreHasOrder(t *testing.T) {
 	s := NewStore()
 	o := testStoreOrder(11)
