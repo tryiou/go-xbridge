@@ -14,14 +14,8 @@ import (
 	"go-xbridge/wallet"
 )
 
-// persistedSwap is the on-disk record of one local (Mine) swap, merging the
-// durable fields of Order and SwapSession so a restart can fully rebuild the
-// trade — including its per-trade M keypair. It mirrors C++ orders.dat (the
-// set of local transactions saved by saveOrders / restored by loadOrders).
-//
-// Byte arrays ([32]/[33]/[20]byte) and []proto.UtxoEntry marshal via the
-// default JSON codec (base64) and round-trip losslessly, so no bespoke
-// serializer is needed.
+// Byte arrays and []proto.UtxoEntry round-trip losslessly through the default JSON codec,
+// so no bespoke serializer; changing their encoding would break existing files.
 type persistedSwap struct {
 	ID               [32]byte          `json:"id"`
 	IsMaker          bool              `json:"isMaker"`
@@ -56,10 +50,8 @@ type persistedSwap struct {
 	Utxos            []proto.UtxoEntry `json:"utxos"`
 	UtxoCurrency     string            `json:"utxoCurrency"`
 
-	// UsedCoins is the recorded funding UTXO selection (C++ xtx->usedCoins,
-	// xbridgetransactiondescr.h:136 READWRITE(usedCoins)). C++ persists it and
-	// rebuilds the deposit from it after a restart; mirror that so a pre-deposit
-	// crash can resume the maker/taker deposit instead of stalling.
+	// The funding selection must survive restart: without it a pre-deposit
+	// crash cannot rebuild the deposit and the swap stalls.
 	UsedCoins []wallet.Utxo `json:"usedCoins"`
 
 	SNodePubkey          string   `json:"sNodePubkey"`
@@ -90,62 +82,36 @@ type persistedSwap struct {
 	OurDepositTxID string `json:"ourDepositTxID"`
 	RefundHex      string `json:"refundHex"`
 	RefundDone     bool   `json:"refundDone"`
-	// SecretHunt re-arms taker-side secret recovery after a restart: a
-	// hunting session must keep hunting (mempool watch), never fail its
-	// first post-restart refund with "rollback failed". omitempty keeps
-	// pre-hunt snapshots decodable; absent means not hunting.
+	// SecretHunt re-arms taker-side secret recovery after a restart: a hunting
+	// session must keep hunting, never fail its first post-restart refund.
 	SecretHunt bool `json:"secretHunt,omitempty"`
-	// HuntSince stamps when the hunt armed (wall micros), feeding the
-	// hourly hunt WARN's elapsed time. omitempty like SecretHunt; restore
-	// backfills a zero stamp with the restore time (downtime unknown).
-	HuntSince uint64 `json:"huntSince,omitempty"`
-	// ScanCursor is the confirmed-spend rescan's next height (0 = unseeded;
-	// the first rescan round derives it). omitempty like the hunt flags.
+	// HuntSince is wall micros from the hunt start (NowMicro); 0 = not clocked yet.
+	// ScanCursor is the rescan's next chain height, 0 = unseeded.
+	HuntSince  uint64 `json:"huntSince,omitempty"`
 	ScanCursor uint32 `json:"scanCursor,omitempty"`
-	// DepositHex is the signed deposit raw hex for tick-driven repost of a
-	// failed broadcast (swap_retry.go). omitempty: pre-upgrade records lack
-	// it and simply never repost.
+	// DepositHex is the signed deposit hex that lets the tick repost a failed
+	// broadcast; pre-upgrade records lack it and simply never repost.
 	DepositHex string `json:"depositHex,omitempty"`
 
 	TheirDepositTxID string   `json:"theirDepositTxID"`
 	TheirLockTime    uint32   `json:"theirLockTime"`
 	TheirSecretHash  [20]byte `json:"theirSecretHash"`
-	// TheirPayTxID is the counterparty's claim payTx id (taker side: the
-	// maker's APayTxID from ConfirmB): the trigger the tick-driven claim
-	// retry rebuilds from when the hub never redelivers (swap_retry.go).
-	TheirPayTxID string `json:"theirPayTxID,omitempty"`
-	// ClaimRetryAt/ClaimRetries schedule that retry (wall micros, 0 = none;
-	// consecutive-failure count driving the backoff). omitempty keeps
-	// pre-upgrade snapshots decodable; a zero value simply never fires.
-	ClaimRetryAt uint64 `json:"claimRetryAt,omitempty"`
-	ClaimRetries uint32 `json:"claimRetries,omitempty"`
-	// DepositRetryAt/DepositRetries schedule the tick-driven rebuild of a
-	// failed HTLC deposit build (swap_retry.go). Same omitempty upgrade rule
-	// as the claim slot.
+	TheirPayTxID     string   `json:"theirPayTxID,omitempty"`
+	// ClaimRetryAt, DepositRetryAt and NotReadySince are wall micros (NowMicro()); 0 = none.
+	ClaimRetryAt   uint64 `json:"claimRetryAt,omitempty"`
+	ClaimRetries   uint32 `json:"claimRetries,omitempty"`
 	DepositRetryAt uint64 `json:"depositRetryAt,omitempty"`
 	DepositRetries uint32 `json:"depositRetries,omitempty"`
-	// NotReadySince stamps the not-ready fast-lane wait start (wall micros,
-	// swap_retry.go). Same omitempty upgrade rule as the retry slots.
-	NotReadySince uint64 `json:"notReadySince,omitempty"`
-	// NotReadySeen is the visibility verdict of the latest fast-lane
-	// admission (true = watched tx observed). Same omitempty upgrade rule
-	// (pre-upgrade snapshots predate the fields entirely): a restarted
-	// unseen wait slows immediately past the taper age, which is the
-	// correct posture for an already-degraded wait.
+	NotReadySince  uint64 `json:"notReadySince,omitempty"`
+	// NotReadySeen is the admission's visibility verdict; absent on pre-upgrade
+	// records, so a restarted wait resumes unseen and slows past the taper age.
 	NotReadySeen bool `json:"notReadySeen,omitempty"`
-	// Validated counterparty-deposit out-params (C++ oBinTxVout /
-	// oBinTxP2SHAmount / oOverpayment): needed to rebuild a claim after a
-	// restart without re-running the deposit check. All three ride the
-	// session record — the phase-1 claim intent persists BEFORE the order
-	// record's OBinTx* copy is updated (phase-2 broadcast), so restoring
-	// from the order copy would resurrect a stale (usually zero)
-	// overpayment after a build/broadcast-window crash.
+	// The out-params must ride the session record: the claim's order copy
+	// updates only at phase-2 broadcast, so a claim rebuilt from it is stale.
 	TheirDepositVout uint32 `json:"theirDepositVout,omitempty"`
 	TheirP2SHNative  uint64 `json:"theirP2SHNative,omitempty"`
 	TheirOverpayment uint64 `json:"theirOverpayment,omitempty"`
 
-	// Built-claim intent (C++ in-memory payTx equivalent): the signed claim
-	// hex plus its locally-derived id and chain, persisted before broadcast.
 	ClaimHex  string `json:"claimHex,omitempty"`
 	ClaimTxID string `json:"claimTxID,omitempty"`
 	ClaimCur  string `json:"claimCur,omitempty"`
@@ -154,52 +120,28 @@ type persistedSwap struct {
 	HubKey [33]byte    `json:"hubKey"`
 	State  clientState `json:"state"`
 
-	// HoldApplySentAt is the last HoldApply send time (api/hold_resend.go):
-	// the resender and the silent-hub recorder key off it, so it rides the
-	// session record like lastProgress-equivalent clocks. omitempty keeps
-	// pre-upgrade snapshots decodable; restoreSwap re-stamps a zero value
-	// for a still-parked session so old records resume resending instead
-	// of skipping forever.
+	// HoldApplySentAt is the last HoldApply send time; restore re-stamps a zero
+	// value so a pre-upgrade parked session resumes resending instead of skipping.
 	HoldApplySentAt uint64 `json:"holdApplySentAt,omitempty"`
 
-	// Historical marks a terminal record persisted from Store.history (C++
-	// saveOrders writes m_historicTransactions alongside the live map).
-	// restoreSwap routes these straight back into history, never the live set.
 	Historical bool `json:"historical,omitempty"`
 }
 
-// persistedBroadcast is the durable form of one tracked broadcast
-// (api/reconcile.go): the locally-derived txid plus the exact bytes, so a
-// restart resumes confirmation watch (and later phases can rebroadcast the
-// identical bytes). Confs is the last confirmed depth (0 = unknown).
 type persistedBroadcast struct {
-	OrderID        string        `json:"orderID"`
-	Kind           broadcastKind `json:"kind"`
-	Coin           string        `json:"coin"`
-	TxID           string        `json:"txid"`
-	Hex            string        `json:"hex"`
-	Seq            uint64        `json:"seq,omitempty"`
-	Confs          int           `json:"confs,omitempty"`
-	FirstSeenMicro uint64        `json:"firstSeenMicro,omitempty"`
-	Attempts       int           `json:"attempts,omitempty"`
+	OrderID string        `json:"orderID"`
+	Kind    broadcastKind `json:"kind"`
+	Coin    string        `json:"coin"`
+	TxID    string        `json:"txid"`
+	Hex     string        `json:"hex"`
+	Seq     uint64        `json:"seq,omitempty"`
+	// Confs is the last observed confirmation depth; 0 = unknown (not the required depth).
+	Confs          int    `json:"confs,omitempty"`
+	FirstSeenMicro uint64 `json:"firstSeenMicro,omitempty"`
+	Attempts       int    `json:"attempts,omitempty"`
 }
 
-// swapFile is the on-disk envelope: a sha256 checksum of the swaps blob plus
-// the blob, so loadSwaps can detect a truncated/corrupted file. C++ guards
-// orders.dat with a fixed RecordChecksum in SerializeFileDB; we instead hash
-// the actual data.
-//
-// Broadcasts ride in the same envelope (omitted when empty). The "settled"
-// section is legacy: older files may carry it, but new files always write it
-// empty — finalized broadcasts are dropped from the watch table and never
-// polled again. The checksum covers swaps AND both broadcast sections; files
-// written before broadcasts existed verify through the legacy swaps-only
-// fallback in parseSwapFile, and pre-settled files (broadcasts only) verify
-// through the primary path unchanged (an empty omitted section hashes
-// identically).
-// Downgrade note: an older binary reading a file with any broadcast section
-// fails closed (checksum mismatch) — upgrade is one-way for the state file,
-// back it up first.
+// swapFile is the on-disk envelope, checksummed across swaps plus both broadcast sections:
+// C++ pins a fixed RecordChecksum in SerializeFileDB, we hash the actual data — downgrades fail closed, back up first.
 type swapFile struct {
 	Sum        string               `json:"sum"`
 	Swaps      []persistedSwap      `json:"swaps"`
@@ -207,54 +149,35 @@ type swapFile struct {
 	Settled    []persistedBroadcast `json:"settled,omitempty"`
 }
 
-// swapStatePath returns the local swap-state file path inside dir (the
-// xbridged-swaps.json analogue of C++ orders.dat).
 func swapStatePath(dir string) string {
 	return filepath.Join(dir, "xbridged-swaps.json")
 }
 
-// snapshotSwaps flattens the swap-file snapshot (live local swaps AND local
-// history) into []persistedSwap. It mirrors C++ saveOrders, which serializes
-// the live local transactions AND the local history: live orders are persisted
-// with their session state (so an in-flight trade can be rebuilt post-restart,
-// including its per-trade M keypair), while terminal orders that moved to
-// Store.history are persisted as historical records so finished/cancelled
-// trades remain visible after restart. The flatten runs on the engine
-// goroutine — it reads n.sessions, which the engine alone owns — while the
-// marshal to bytes runs on the background persistLoop goroutine, so the engine
-// never does O(orders) JSON reflection work or blocks on fsync.
+// snapshotSwaps must run on the engine goroutine: it reads n.sessions, which the engine alone owns (no lock).
 func snapshotSwaps(n *Node) []persistedSwap {
 	ps := make([]persistedSwap, 0, len(n.sessions))
 	for _, o := range n.store.List() {
 		if !o.Mine {
-			continue // only persist local orders, like C++ saveOrders' isLocal()
+			continue
 		}
 		idHex := hexEncode(o.ID[:])
 		if s := n.sessions[idHex]; s != nil && !n.sessionIsTerminal(idHex, s) {
-			// Live in-flight swap: persist the session so a restart can resume.
 			ps = append(ps, persistFromSession(s, o))
 		} else {
-			// Live order with no live session (terminal session pruned, or a
-			// rolled-back order after refundDone): order-only record.
 			ps = append(ps, persistFromOrder(o))
 		}
 	}
 	for _, e := range n.store.History() {
 		if e.Order == nil || !e.Order.Mine {
-			continue // only persist local history, like C++ saveOrders
+			continue
 		}
 		ps = append(ps, persistFromHistoryEntry(e))
 	}
 	return ps
 }
 
-// snapshotBroadcasts flattens the confirmation-watch table for the swap-file
-// envelope. Only in-flight entries are persisted — finalized broadcasts are
-// dropped from the watch table and never polled again, so the "settled"
-// section is always empty on write (kept in the envelope only so older files
-// still parse; their settled section is dropped on load). Mutex-guarded
-// (record sites are not engine-confined); the marshal runs on the background
-// persistLoop like swaps.
+// snapshotBroadcasts always returns nil settled: the watch table holds active watches
+// only; settled records exist only in legacy files and are migrated at load (migrateSettledArchive).
 func snapshotBroadcasts(n *Node) (active, settled []persistedBroadcast) {
 	n.trackedMu.Lock()
 	defer n.trackedMu.Unlock()
@@ -269,12 +192,7 @@ func snapshotBroadcasts(n *Node) (active, settled []persistedBroadcast) {
 	return active, nil
 }
 
-// runs on the background persistLoop goroutine, never the engine. A var so
-// marshalSwapFile builds the swap-file envelope (sha256 checksum over swaps
-// plus both broadcast sections) from flattened snapshots. Pure CPU over the
-// slices, so it runs on the background persistLoop goroutine, never the
-// engine. A var so tests can instrument (count/block) the marshal boundary
-// without touching the engine-owned flatten.
+// A var (not a func) so tests can instrument the marshal boundary.
 var marshalSwapFile = func(swaps []persistedSwap, broadcasts, settled []persistedBroadcast) ([]byte, error) {
 	if broadcasts == nil {
 		broadcasts = []persistedBroadcast{}
@@ -292,20 +210,16 @@ var marshalSwapFile = func(swaps []persistedSwap, broadcasts, settled []persiste
 	return data, nil
 }
 
-// swapEnvelope is the checksummed body: swaps plus both broadcast watch
-// sections, with nil normalized to [] so old-shape and empty-shape files hash
-// deterministically.
+// swapEnvelope is the checksummed body; nil Broadcasts normalize to [] so an
+// absent section hashes like an empty one, and Settled is omitted when empty.
 type swapEnvelope struct {
 	Swaps      []persistedSwap      `json:"swaps"`
 	Broadcasts []persistedBroadcast `json:"broadcasts"`
 	Settled    []persistedBroadcast `json:"settled,omitempty"`
 }
 
-// writeSwaps durably writes a marshaled swap-file blob via temp-write, fsync
-// and atomic rename (C++ SerializeFileDB is atomic; this mirrors that). Runs on
-// the background persistLoop goroutine, or synchronously in inline/test mode.
-// A var so tests can instrument the disk-write boundary (count/block) without
-// touching the engine snapshot path.
+// writeSwaps writes via temp + fsync + atomic rename, mirroring C++ SerializeFileDB's
+// atomic file write; it stays a var so tests can instrument the disk-write boundary.
 var writeSwaps = func(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("api: mkdir swap dir: %w", err)
@@ -332,10 +246,8 @@ var writeSwaps = func(path string, data []byte) error {
 	return nil
 }
 
-// loadSwaps reads the swap-state file. A missing file is not an error (returns
-// (nil, nil, nil)); a present but unparseable/corrupt file returns an error so
-// the caller can decide whether to start fresh rather than silently lose
-// state.
+// loadSwaps treats a missing file as first boot (nils, not an error);
+// a present file must parse and pass checksum, else it errors so the caller decides.
 func loadSwaps(path string) ([]persistedSwap, []persistedBroadcast, []persistedBroadcast, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -347,12 +259,8 @@ func loadSwaps(path string) ([]persistedSwap, []persistedBroadcast, []persistedB
 	return parseSwapFile(data, path)
 }
 
-// parseSwapFile verifies and splits a swap-file blob. The checksum covers
-// swaps AND both broadcast sections (nil normalized to [] for determinism);
-// files written before broadcasts existed verify through the legacy
-// swaps-only checksum, and pre-settled files (broadcasts only) verify through
-// the primary path unchanged — an empty omitted Settled section hashes
-// identically to the old two-section envelope.
+// parseSwapFile verifies the section set its writer hashed: files predating
+// the broadcast sections carry a swaps-only checksum and verify through that path.
 func parseSwapFile(data []byte, path string) ([]persistedSwap, []persistedBroadcast, []persistedBroadcast, error) {
 	var env swapFile
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -379,20 +287,10 @@ func parseSwapFile(data []byte, path string) ([]persistedSwap, []persistedBroadc
 	return nil, nil, nil, fmt.Errorf("api: swap file %s checksum mismatch", path)
 }
 
-// errSwapEnvelopeUnusable marks a swap-state file whose envelope cannot even
-// be listed (not JSON, or missing the record array): per-record salvage is
-// impossible, so the caller quarantines the file and starts fresh.
 var errSwapEnvelopeUnusable = fmt.Errorf("api: swap file envelope unusable")
 
-// loadSwapsLenient salvages individually-valid records from a file the strict
-// loadSwaps rejected (one bad record fails a typed slice, dooming every
-// healthy swap). Records decode independently; the good ones return with the
-// count of dropped ones. Checksum-free by necessity: the envelope checksum is
-// whole-blob, so it cannot attest records once the blob fails — salvage is
-// best-effort and the quarantined original stays the evidence. Zero-ID
-// records drop: they restore as a live order under the 64-zeros key and would
-// be re-persisted forever. Pure function over read bytes (no I/O). Fallback
-// only — valid files keep the exact strict path including checksum.
+// loadSwapsLenient salvages individually-valid records after the strict load
+// failed; zero-ID records drop — they restore as a live order and re-persist forever.
 func loadSwapsLenient(data []byte) (good []persistedSwap, dropped int, err error) {
 	var raw struct {
 		Swaps []json.RawMessage `json:"swaps"`
@@ -422,11 +320,8 @@ func loadSwapsLenient(data []byte) (good []persistedSwap, dropped int, err error
 	return good, dropped, nil
 }
 
-// quarantineSwapFile preserves a corrupt swap-state file as
-// "<path>.bad.<unixnano>": same bytes, same mode, atomic same-dir rename —
-// no copy, no second format. A collision loop covers the same-nanosecond
-// double-corrupt case. Stale files accumulate for operator cleanup; the
-// daemon never deletes evidence itself.
+// quarantineSwapFile renames a corrupt file aside as evidence: the daemon
+// never deletes it, so stale .bad files accumulate for operator cleanup.
 func quarantineSwapFile(path string) (string, error) {
 	base := fmt.Sprintf("%s.bad.%d", path, time.Now().UnixNano())
 	qpath := base
@@ -444,11 +339,6 @@ func quarantineSwapFile(path string) (string, error) {
 	return "", fmt.Errorf("api: quarantine swap file: no free evidence name for %s", path)
 }
 
-// persistJob is one background swap-file write: the on-disk path plus the
-// flattened snapshot (built on the engine goroutine, where n.sessions is
-// owned). The marshal to bytes and the disk I/O both run on the background
-// persistLoop goroutine, so the engine never does the O(orders) JSON reflection
-// work nor blocks on fsync.
 type persistJob struct {
 	path    string
 	swaps   []persistedSwap
@@ -456,25 +346,16 @@ type persistJob struct {
 	settled []persistedBroadcast
 }
 
-// persistNow durably writes the current swap snapshot to disk synchronously
-// (marshal + fsync + atomic rename), blocking the caller. It is used at the
-// critical boundary immediately before sending an outbound swap/make-order
-// response, so a crash after the send can never leave the hub knowing state the
-// local durable copy lacks (which would strand a restarted swap — fund loss).
-// C++ App::saveOrders (xbridgeapp.cpp:3868-3898) writes on a timer with no
-// before-send guarantee; this port makes the durable write precede the send.
-// Runs on the engine goroutine (snapshotSwaps reads the engine-owned session
-// map), never from a test/HTTP goroutine on a started node.
+// persistNow runs on the engine goroutine (snapshotSwaps reads the engine-owned session map), never off-engine
+// on a started node; it gates the swap/make-order send, so a crash after the send never leaves state the local copy lacks.
 func (n *Node) persistNow() error {
 	cfg := n.cfg()
 	if cfg == nil || cfg.DataDir == "" {
 		return nil
 	}
 	path := swapStatePath(cfg.DataDir)
-	// Invalidate any queued async snapshot BEFORE writing, so the background
-	// persistLoop cannot later flush a stale snapshot (taken before this one)
-	// over the just-written state. Lock order matches writeLatestPersist
-	// (persistMu then persistWriteMu) to avoid a deadlock.
+	// Clear the queued snapshot first or persistLoop can flush a stale one over
+	// this write; locks take persistMu before persistWriteMu, as writeLatestPersist does.
 	n.persistMu.Lock()
 	n.persistLatest = nil
 	n.persistMu.Unlock()
@@ -497,20 +378,8 @@ func (n *Node) persistNow() error {
 	return nil
 }
 
-// noteSnapshotCount tracks the swap-record count of each freshly built
-// snapshot and logs every transition, so local swap history can never be
-// silently erased: a past build wiped finished-swap history at runtime with
-// no trace in the surviving logs precisely because nothing logged snapshot
-// counts. A decrease is WARNed: the only legitimate shrink paths are
-// dxFlushCancelledOrders (operator RPC, trCancelled records only) and a
-// rolled-back dxMakeOrder (its order removed when the persist or hub send
-// fails); any other drop is finished-swap history loss. An increase is INFO
-// (normal: a new order, a finished trade moving to history). The count is
-// observed at snapshot time, before the marshal/write
-// boundary — a failed disk write is a separate, already-counted failure
-// (persistFailures), not a history loss. Both call sites (persist,
-// persistNow) snapshot on the engine goroutine, so plain atomics suffice —
-// no lock held.
+// noteSnapshotCount runs on the engine goroutine (plain atomics suffice); counting at snapshot
+// time makes a shrink warning mean silent history loss, never a failed disk write (persist failure).
 func (n *Node) noteSnapshotCount(m int) {
 	if !n.swapCountSeen.CompareAndSwap(false, true) {
 		prev := n.lastSwapCount.Swap(int64(m))
@@ -519,7 +388,7 @@ func (n *Node) noteSnapshotCount(m int) {
 			// Steady state: the overwhelmingly common case stays silent.
 		case int64(m) < prev:
 			xlog.Warn("swap snapshot record count shrank", "from", prev, "to", m,
-				"note", "legitimate only via dxFlushCancelledOrders or a rolled-back dxMakeOrder; any other decrease is silent history loss")
+				"note", "legitimate only via dxFlushCancelledOrders, a rolled-back dxMakeOrder or dxTakeOrder, or a reject restoring the order; any other decrease is silent history loss")
 		default:
 			xlog.Info("swap snapshot record count grew", "from", prev, "to", m)
 		}
@@ -528,16 +397,8 @@ func (n *Node) noteSnapshotCount(m int) {
 	n.lastSwapCount.Store(int64(m))
 }
 
-// persist flushes local swap state to disk without blocking the engine on
-// marshal or fsync. The snapshot flatten (reading the engine-owned n.sessions)
-// runs on the engine goroutine; the marshal + checksum + temp-write/fsync/rename
-// run on the background persistLoop goroutine, so a slow disk or a large book
-// never stalls packet processing — C++ saveOrders likewise runs on the
-// timer/worker threads, never the message thread (xbridgeapp.cpp:3744).
-// Coalescing: publishLatest overwrites the slot, so a burst of engine persists
-// collapses into the newest flattened snapshot. When the engine is not started
-// (tests, inline mode) the marshal and the write run synchronously, preserving
-// the single-threaded behaviour the test suite relies on.
+// persist flattens on the engine goroutine on a started node and hands marshal + fsync to the background
+// persistLoop, so a slow disk never stalls packet processing; with no loop running (tests/inline) they run synchronously.
 func (n *Node) persist() {
 	cfg := n.cfg()
 	if cfg == nil || cfg.DataDir == "" {
@@ -563,8 +424,6 @@ func (n *Node) persist() {
 	n.publishLatest(&persistJob{path: path, swaps: swaps, bc: bc, settled: settled})
 }
 
-// publishLatest records the newest swap-file write job and wakes the background
-// persistLoop (non-blocking; a pending signal already covers it).
 func (n *Node) publishLatest(job *persistJob) {
 	n.persistMu.Lock()
 	n.persistLatest = job
@@ -575,8 +434,6 @@ func (n *Node) publishLatest(job *persistJob) {
 	}
 }
 
-// orderFields flattens the durable Order fields shared by every persisted
-// record (live sessions, order-only records, and history entries alike).
 func orderFields(o *Order) persistedSwap {
 	return persistedSwap{
 		ID:               o.ID,
@@ -625,15 +482,10 @@ func orderFields(o *Order) persistedSwap {
 	}
 }
 
-// persistFromOrder builds an order-only persisted record for a live order with
-// no live session (its terminal session was pruned). The session fields are
-// zeroed; restoreSwap re-adds the order without a session.
 func persistFromOrder(o *Order) persistedSwap {
 	return orderFields(o)
 }
 
-// persistFromHistoryEntry builds a historical persisted record from a
-// Store.history entry (C++ saveOrders writes local historic transactions).
 func persistFromHistoryEntry(e historyEntry) persistedSwap {
 	ps := orderFields(e.Order)
 	ps.Status = e.Status
@@ -643,7 +495,6 @@ func persistFromHistoryEntry(e historyEntry) persistedSwap {
 	return ps
 }
 
-// persistFromSession flattens a live session + its order into a persistedSwap.
 func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	ps := orderFields(o)
 	ps.IsMaker = s.isMaker
@@ -689,66 +540,35 @@ func persistFromSession(s *SwapSession, o *Order) persistedSwap {
 	return ps
 }
 
-// restoreSwap rebuilds an Order (and, for live records, a SwapSession) from a
-// persisted record and registers them on n (mirroring C++ loadOrders). Active
-// swaps are re-driven by processSwap when the hub's packets arrive
-// post-restart; terminal records (finished, or terminal-status with no refund
-// still owed) route into Store.history like C++ routes trFinished/trCancelled
-// to m_historicTransactions. The caller is the NewNode restore block
-// (single-threaded, before the engine starts).
+// restoreSwap runs single-threaded from NewNode's restore block, before the engine starts,
+// so its unsynchronized writes to n.sessions are safe (no concurrent readers yet).
 func (n *Node) restoreSwap(ps persistedSwap) {
 	o := buildOrder(ps)
 
-	// Terminal records are restored to history, never re-registered as live
-	// swaps: they would otherwise leak back into the live set on every restart.
-	// Refund-pending cancelled swaps are kept live so the sweep can still
-	// recover the deposit post-restart. The refundPending override must NOT
-	// key on ps.State: an order-only persist (session already pruned) stores
-	// State=csIdle, which read as "State < csCreatedA" filed a canceled swap
-	// with the deposit locked in the P2SH into history — invisible to
-	// scanStoredRefunds forever (live 2026-09-15, order a4198f2d…). C++
-	// redeems trCancelled transactions in its redeem scan, so canceled +
-	// deposit-out + pre-signed refund always owes a recovery sweep. Key on
-	// RefundTx — the order-record refund bytes (set exactly when the deposit
-	// was built); the session-scoped RefundHex is empty on order-only records.
+	// Key this override on RefundTx, never State: an order-only record stores
+	// csIdle, which would file a refund-owed swap into history.
 	refundPending := ps.Status == "canceled" && ps.DepositSent && ps.RefundTx != "" && !ps.RefundDone
-	// A "finished" record with the deposit out, a pre-signed refund, and no
-	// claim evidence on either side is a pre-gate early finish (OnFinished
-	// terminated unconditionally before the finishedMayTerminate gate): the
-	// deposit is still locked and still owes a recovery sweep. Key on the
-	// order-record RefundTx — set exactly when the deposit was built
-	// (applyCreatedA/B) — and require both no local claim (ClaimTxID) and
-	// no counterparty redeem, so genuinely finished records (claim tracked,
-	// counterparty redeemed) still route to history. Mirrors the
-	// refundPending override above.
+	// A "finished" record with deposit out, a pre-signed refund and no claim
+	// evidence never claimed: the deposit is still locked and owes a recovery sweep, not history.
 	finishedRefundPending := ps.Status == "finished" && ps.DepositSent && ps.RefundTx != "" && !ps.RefundDone && ps.ClaimTxID == "" && !ps.CounterpartyRedeemed
 	if (ps.Historical || ps.State == csFinished || (isOrderTerminal(ps.Status) && (ps.RefundDone || ps.RefundHex == "" || ps.State < csCreatedA))) && !refundPending && !finishedRefundPending {
 		n.store.AddToHistory(o, ps.Status, uint64(ps.Reason), ps.Updated)
 		return
 	}
-	// A rescued early finish kept its pre-gate "finished" status on the
-	// record, but the swap never completed: restore the deposit-broadcast
-	// status so the live book, the sweeps, and the watchdog see a
-	// pre-claim deposit-out order (which is what it is). The txlog and the
-	// pre-signed refund hex remain the audit trail of what happened.
+	// This never-claimed finish is restored to the deposit-broadcast status so the
+	// book, the sweeps, and the watchdog see a pre-claim deposit-out order.
 	if finishedRefundPending {
 		o.Status = "created"
 		o.Updated = uint64(NowMicro())
 	}
 	n.store.Add(o)
 
-	// Order-only records (persistFromOrder) carry no session: the terminal
-	// session was pruned, so there is nothing to resume.
 	if !hasSessionData(ps) {
 		return
 	}
 
-	// A rescued early finish recorded the pre-gate csFinished over the live
-	// state; restoring it verbatim would make sessionIsTerminal prune the
-	// session on the next tick and re-strand the refund. The deposit
-	// broadcast is proven by DepositSent, so restore the deposit-broadcast
-	// state by role — the exact state the session held when the early
-	// Finished arrived.
+	// Never restore csFinished verbatim: sessionIsTerminal would prune the
+	// session on the next tick and re-strand the refund — restore it by role.
 	restoredState := ps.State
 	if finishedRefundPending {
 		if ps.IsMaker {
@@ -791,11 +611,6 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		depositRetries:   ps.DepositRetries,
 		notReadySince:    ps.NotReadySince,
 		notReadySeen:     ps.NotReadySeen,
-		// Validated out-params ride the session record (adopted at
-		// claim-build, before the order record is updated) so a restarted
-		// claim rebuilds against the exact deposit output without
-		// re-running the check; the order's OBinTx* copy stays the display
-		// source of truth once broadcast.
 		theirDepositVout: ps.TheirDepositVout,
 		theirP2SHNative:  ps.TheirP2SHNative,
 		theirOverpayment: ps.TheirOverpayment,
@@ -806,30 +621,17 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 		hubKey:           ps.HubKey,
 		state:            restoredState,
 		holdApplySentAt:  ps.HoldApplySentAt,
-		// Watchdog clock restarts at restore: pre-upgrade records predate
-		// the stamp, and the downtime itself is not hub silence.
+		// The watchdog clock restarts at restore: downtime is not hub silence.
 		lastProgress: uint64(NowMicro()),
 	}
-	// A pre-upgrade record (no HoldApplySentAt field) for a still-parked
-	// session would otherwise skip the resender and the silence recorder
-	// forever on its zero stamp. Re-stamp to restore time: the resender
-	// waits one fresh interval (no post-restart burst) and the silence
-	// clock restarts alongside the watchdog above.
 	if s.state == csHoldApplied && s.holdApplySentAt == 0 {
 		s.holdApplySentAt = uint64(NowMicro())
 	}
-	// A hunted record predating the hunt clock (zero stamp) restarts its
-	// visibility window at restore: the downtime itself is unknown, so the
-	// elapsed-hunting clock starts now rather than reporting a bogus age.
 	if s.secretHunt && s.huntSince == 0 {
 		s.huntSince = uint64(NowMicro())
 	}
-	// Restore reconciliation: a session persisted after its claim broadcast
-	// (csConfirmedA/B, claimTxID set) whose claimRetryAt was consumed has no
-	// retry trigger left. Schedule one immediate adoption pass — the tick's
-	// adoption verifies the claim on-chain and drives the terminal finish
-	// (C++ trFinished, xbridgesession.cpp:3002/:3185); a hub Finished packet
-	// that may still arrive stays idempotent behind it.
+	// A restored claim already broadcast has no retry trigger left, so arm one
+	// immediate pass: the tick adopts the confirmed claim and drives the finish.
 	if s.state == csConfirmedA || s.state == csConfirmedB {
 		if s.claimTxID != "" && s.claimHex != "" && s.claimRetryAt == 0 {
 			s.claimRetryAt = uint64(NowMicro())
@@ -838,9 +640,6 @@ func (n *Node) restoreSwap(ps persistedSwap) {
 	n.sessions[hexEncode(ps.ID[:])] = s
 }
 
-// hasSessionData reports whether a persisted record carries a live session
-// (persisted via persistFromSession) as opposed to an order-only record
-// (persistFromOrder, whose session fields are all zero).
 func hasSessionData(ps persistedSwap) bool {
 	return ps.State > csIdle ||
 		ps.PrivKey != ([32]byte{}) ||
@@ -850,7 +649,6 @@ func hasSessionData(ps persistedSwap) bool {
 		ps.SecretHash != ([20]byte{})
 }
 
-// buildOrder reconstructs the durable Order from a persisted record.
 func buildOrder(ps persistedSwap) *Order {
 	return &Order{
 		ID:               ps.ID,
