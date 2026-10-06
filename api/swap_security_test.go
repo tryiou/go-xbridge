@@ -349,9 +349,8 @@ func TestUnvalidatedDepositRefusedBothLegs(t *testing.T) {
 	mkMPriv, mkMPub := newKey(t)
 	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
 	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
-	// The store orders must carry OUR per-trade M pubkey (Order.MakerKey,
-	// order.go:117-120) so the self-signed Cancel packets pass handleRemoteCancel's
-	// iCanceled check and the local rollback actually runs.
+	// Store orders must carry OUR per-trade M pubkey (Order.MakerKey in order.go)
+	// so the self-signed Cancel passes handleRemoteCancel's iCanceled and rollback runs.
 	makerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(mkMPub[:]) })
 	takerNode.store.Update(hexEncode(orderID[:]), func(o *Order) { o.MakerKey = hexEncode(tkPub[:]) })
 	var hub [20]byte

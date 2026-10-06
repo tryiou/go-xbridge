@@ -284,7 +284,10 @@ are in [`api.md`](api.md).
   copy-on-write fills/history store (history unbounded). Divergence: an order
   finished locally (claim broadcast, no hub `Finished` yet) still renders in
   `dxGetOrderFills`, where C++ (`rpcxbridge.cpp`) renders only `trFinished`
-  records, so fills/OHLC never wait on hub confirmation.
+  records, so fills/OHLC never wait on hub confirmation. A second divergence:
+  `Order.BlockNumber` stamps the chain tip at first sighting instead of
+  resolving the order's block height at expiry time as C++ does — the thin
+  client keeps no chain index.
 - `swap.go` — the three-party swap client driver, with the two-phase handshake
   (wallet I/O on workers) and the engine-scheduled refund sweep. Divergence: an
   empty-deposit `CreateB` self-cancels only after the role gate, where C++

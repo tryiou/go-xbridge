@@ -50,8 +50,9 @@ func contains(s, sub string) bool {
 
 // helpGolden pins every help constant byte-for-byte against frozen live
 // captures of blocknet-cli against Blocknet Core 4.4.1 (the version named in
-// help_texts.go:66-69), taken verbatim and embedded as literals per
-// docs/architecture.md:486-490. The golden is the capture minus the ONE
+// help_texts.go:66-69), taken verbatim and embedded as literals per the
+// docs/architecture.md Conventions bullets "Fidelity over shortcuts" and
+// "Vectors/goldens". The golden is the capture minus the ONE
 // newline bitcoin-cli appends to string results (src/bitcoin-cli.cpp:476-477,
 // :501-502): for the 24 method entries the C++ RPC result already carries
 // ToString's final newline, so the capture holds two and the golden equals
