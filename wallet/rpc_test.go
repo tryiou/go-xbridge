@@ -1504,7 +1504,7 @@ func TestRPCConnectorGetBlockTxsDegradesOnIdList(t *testing.T) {
 	}
 }
 
-// TestRPCConnectorGetTxOut drives GetTxOut's contract (rpc.go:708-732): the
+// TestRPCConnectorGetTxOut drives GetTxOut's contract in rpc.go: the
 // full bitcoind gettxout shape, the minimal value-only shape, a null-result
 // miss, an RPC error object, a 401, and the singular "address" key the parser
 // ignores (it reads the plural addresses[] only). The wire request itself —
@@ -1634,7 +1634,7 @@ func TestRPCConnectorGetTxOut(t *testing.T) {
 			t.Fatal("expected an error on 401")
 		}
 		if !strings.Contains(err.Error(), "unauthorized") {
-			t.Errorf("err = %q, want it to mention unauthorized (rpc.go:169-171)", err)
+			t.Errorf("err = %q, want it to mention unauthorized", err)
 		}
 		assertZero(t, u, ok)
 	})
@@ -1652,7 +1652,7 @@ func TestRPCConnectorGetTxOut(t *testing.T) {
 			t.Fatal("ok = false, want true (value is present)")
 		}
 		if u.Address != "" {
-			t.Errorf("address = %q, want empty: the parser reads addresses[] only (rpc.go:712-714,728-730)", u.Address)
+			t.Errorf("address = %q, want empty: the parser reads addresses[] only", u.Address)
 		}
 		if u.Value != 0.25 {
 			t.Errorf("value = %v, want 0.25", u.Value)
@@ -1660,7 +1660,7 @@ func TestRPCConnectorGetTxOut(t *testing.T) {
 	})
 }
 
-// TestRPCConnectorGetRawMempool pins GetRawMempool's contract (rpc.go:737-743):
+// TestRPCConnectorGetRawMempool pins GetRawMempool's contract in rpc.go:
 // method getrawmempool with an empty params array, the populated list, the
 // empty list, a null result (no deserialization attempt → nil, nil), and an
 // RPC error surfaced with its code intact for the -32601 capability fallbacks.

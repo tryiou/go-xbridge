@@ -191,6 +191,10 @@ type Connector interface {
   cross the JSON boundary as floats; `wallet` converts via string formatting to
   avoid IEEE-754 drift (`coins.FormatAmount` ⇄ `strconv.FormatFloat` ⇄
   `coins.ParseAmount`).
+
+  `GetTxOut` fills `Utxo.Address` from `scriptPubKey.addresses[0]`, but no
+  production caller consumes it — proof verification rebuilds the address from
+  the entry's own `RawAddress` (`verifyOrderUtxos`).
 - **`LocalConnector`** — implements `Connector` for the case where the library
   itself holds the keys. Signs each input with a caller-supplied `LocalSigner`
   (`SignInput(tx *coins.Tx, idx int, prev PrevTx) ([]byte, error)`), e.g. via
