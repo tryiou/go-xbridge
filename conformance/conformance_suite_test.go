@@ -327,21 +327,21 @@ func TestRPCResponseShape(t *testing.T) {
 		{method: "dxLoadXBridgeConf", mode: "scalar"}, // JSON bool true/false
 		{method: "dxGetNewTokenAddress", mode: "array"},
 		{method: "dxGetNetworkTokens", mode: "array"},
-		// dxMakeOrder: C++ interleaves addresses at 2/5 and block_id at 10
-		// (rpcxbridge.cpp:1048-1067). CAND embeds orderBase then appends
-		// maker_address/taker_address/block_id at 15/16/17 (response.go:57-62)
-		// and swaps updated_at/created_at. DIVERGENT (set-compare). This row is
+		// dxMakeOrder: C++ interleaves addresses at 2/5 and block_id at 10 (the
+		// dxMakeOrder success writer); response.go makeOrderResult declares the
+		// same interleaved field order. CONFORMANT. This row is
 		// a known-gap skip: the fixture would need a live hub + stub XConn +
 		// funded connectors to reach a real make SUCCESS (covered by
 		// TestMakeOrderAutoSplitPrepTx); the C++ refKeys stay documented here.
-		{method: "dxMakeOrder", mode: "set", div: true, id: "dxMakeOrder/field-order", skip: true, refKeys: []string{
+		{method: "dxMakeOrder", mode: "exact", id: "dxMakeOrder/field-order", skip: true, refKeys: []string{
 			"id", "maker_address", "maker", "maker_size", "taker_address", "taker",
 			"taker_size", "created_at", "updated_at", "block_id", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
 			"partial_repost", "partial_parent_id", "status"}},
-		// dxMakePartialOrder: same 17-field interleave (rpcxbridge.cpp:3169-3188).
-		// Known-gap skip (same fixture reason as dxMakeOrder).
-		{method: "dxMakePartialOrder", mode: "set", div: true, id: "dxMakePartialOrder/field-order", skip: true, refKeys: []string{
+		// dxMakePartialOrder: same 17-field interleave as dxMakeOrder (the
+		// dxMakePartialOrder success writer). CONFORMANT. Known-gap skip
+		// (same fixture reason as dxMakeOrder).
+		{method: "dxMakePartialOrder", mode: "exact", id: "dxMakePartialOrder/field-order", skip: true, refKeys: []string{
 			"id", "maker_address", "maker", "maker_size", "taker_address", "taker",
 			"taker_size", "created_at", "updated_at", "block_id", "order_type",
 			"partial_minimum", "partial_orig_maker_size", "partial_orig_taker_size",
@@ -355,7 +355,7 @@ func TestRPCResponseShape(t *testing.T) {
 			"partial_orig_taker_size", "partial_repost", "partial_parent_id", "status"}},
 		// dxCancelOrder: 11 fields incl. maker_address/taker_address at 4/7 and
 		// refund_tx; NO partial_*/order_type on either side. CONFORMANT
-		// (rpcxbridge.cpp:1386-1400 vs cancelOrderResult response.go:67-79).
+		// (the dxCancelOrder success writer vs cancelOrderResult).
 		// Known-gap skip: a real cancel needs a Mine order + a per-trade session
 		// key (TestCancelOrderBroadcastsCrRpcRequest).
 		{method: "dxCancelOrder", mode: "exact", skip: true, refKeys: []string{
