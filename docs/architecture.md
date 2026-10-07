@@ -89,10 +89,23 @@ chain index requires — block ancestry and collateral-utxo
 existence/amount/ownership (`servicenode.h:401,447-478`) — cannot be made by a
 thin client (register WIRE-F71 FIXED (B1) for the enforceable subset; on-chain
 index checks remain thin-client-unreachable — see Rulings pending below).
+Config version fields parse through the same strict gate as C++ `get_int()`
+(`servicenode.h`) — quoted, float, exponent, or out-of-range values are
+rejected; a bad `xrouterversion` keeps the parsed `xbridgeversion` and drops
+only wallet services.
+
 `Pick` ports `findShuffledNodesWithService` including the `notIn` exclusion
 set (failed hubs are never re-picked); `running()` has no `invalid` grace
 state because invalid pings are never admitted — strictly fail-closed
 relative to C++ (fewer eligible hubs, never more).
+
+The `Pick` shuffle uses
+`math/rand` rather than C++'s seed-0 `default_random_engine` — no wire
+effect. SNLIST is a list request that only XRouter peers send
+(`xrouter/xrouterpeermgr.cpp:537`, `xrouter/rpcxrouter.cpp:1785` in the
+reference implementation); a stock XBridge wallet never sends it. SNPING
+copies arrive once per connected peer, so ping success is logged once in
+`AddPing`, never in the parser.
 
 ### `crypto/` — signing
 
