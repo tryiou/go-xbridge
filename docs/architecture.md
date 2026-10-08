@@ -449,7 +449,7 @@ leaving them stranded.
 **Engine channels:** the reader pushes decoded packets onto `n.packets` (a
 full channel parks the reader until the engine drains — backpressure, matching
 C++'s synchronous net-thread processing, `xbridgeapp.cpp:645-723,763`, and the
-discovery reader, `peer_manager.go:405-409`; the only loss is the in-flight
+discovery reader, `readLoop (peer_manager.go)`; the only loss is the in-flight
 packet at shutdown, counted by `packetsDropped` and surfaced in the status
 log); HTTP handlers submit commands to `n.cmds` (backpressure — never dropped);
 the engine dispatches wallet I/O to `n.tasks` (drop-on-full, fund-safe: the

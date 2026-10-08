@@ -251,7 +251,7 @@ func (n *Node) readerLoop() {
 		// until the engine drains, matching C++'s synchronous net thread
 		// (onMessageReceived/onBroadcastReceived process in place,
 		// xbridgeapp.cpp:645-723,763) and the discovery readLoop
-		// (peer_manager.go:405-409). The only loss is the in-flight packet at
+		// (peer_manager.go). The only loss is the in-flight packet at
 		// shutdown, counted by packetsDropped.
 		select {
 		case n.packets <- in:
