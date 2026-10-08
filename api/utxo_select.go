@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"sort"
+	"strconv"
 
 	"go-xbridge/config"
 	"go-xbridge/p2p"
@@ -85,7 +86,7 @@ func isDustNative(v float64, cc *config.CoinConf, relayFee float64, nativeCoin u
 }
 
 // selectUtxos picks the maker's spendable utxos funding an exact order,
-// mirroring C++ App::selectUtxos (src/xbridge/xbridgeapp.cpp:2977-3087). It
+// mirroring C++ App::selectUtxos (src/xbridge/xbridgeapp.cpp:2973-3086). It
 // returns the chosen outputs, their total value in XBridge base units
 // (utxoAmount), and the prep fee fee1 (XBridge base units).
 //
@@ -98,7 +99,7 @@ func selectUtxos(addr string, outputs []wallet.Utxo, cc *config.CoinConf, requir
 		return amt + minTxFeeWhole(cc, inputs, o) + minTxFeeWhole(cc, 1, 1)
 	}
 
-	// selUtxos is C++'s inner fee-utxo selector lambda (:2989-3058).
+	// selUtxos is C++'s inner fee-utxo selector lambda (:2985-3054).
 	selUtxos := func(a []wallet.Utxo, o *[]wallet.Utxo, amt float64) {
 		var gt, lt []wallet.Utxo
 		minAmount := feeAmount(amt, 1, 3)
@@ -160,6 +161,39 @@ func selectUtxos(addr string, outputs []wallet.Utxo, cc *config.CoinConf, requir
 	// selection total above stays floored — resources, not provisions).
 	fee1 = ceilFeeXB(cc, estimateFee(cc, len(o), 3))
 	return o, utxoAmount, fee1, true
+}
+
+// selectTakeFunding selects a take's funding utxos FIRST from the full
+// spendable set and returns the funding pick plus the fee candidate set
+// minus the funding inputs, or ok=false when funding cannot be covered.
+// fundAvail is the P2PKH/lock-filtered taker-chain set, feeAvail the
+// 1-conf/P2PKH/lock-filtered BLOCK set. Funding keys leave the fee set
+// under the same txid:vout key form TakeOrder's feeKey uses
+// (node.go:1821-1824), so the later fee build can never reuse a funding
+// input. The caller passes the returned fee set to buildServiceNodeFeeTx
+// unchanged.
+//
+// Order matters: the fee selector's single-gt rule (fee_tx.go:118-123,
+// C++ bitcoinrpcconnector.cpp:131-132) eats a dominating utxo when the fee
+// is built first, starving funding selection afterward (1019 at
+// node.go:1795). Funding first, the fee combines the remainder instead.
+// The selectors themselves are untouched (C++ xbridgeapp.cpp:2973-3086).
+func selectTakeFunding(fromAddr string, fundAvail, feeAvail []wallet.Utxo, ccTo *config.CoinConf, fromSize uint64) (funding, feeRest []wallet.Utxo, ok bool) {
+	funding, _, _, ok = selectUtxos(fromAddr, fundAvail, ccTo, fromSize)
+	if !ok {
+		return nil, nil, false
+	}
+	skip := make(map[string]bool, len(funding))
+	for _, u := range funding {
+		skip[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] = true
+	}
+	feeRest = make([]wallet.Utxo, 0, len(feeAvail))
+	for _, u := range feeAvail {
+		if !skip[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] {
+			feeRest = append(feeRest, u)
+		}
+	}
+	return funding, feeRest, true
 }
 
 // selectPartialUtxos picks the maker's spendable utxos funding a partial order,

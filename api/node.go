@@ -1735,6 +1735,38 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if !ok {
 		return orderListResult{}, makeError(errNoServiceNode, "dxTakeOrder", "")
 	}
+	lockedKeys := n.store.LockedUtxoInfoFor(o.ToCurrency)
+	// The fee filter must use the ALL-token locked set, not this per-token snapshot: it has to
+	// match ReserveForTake's check or a fee input locked as another order's funding dies with 1019.
+	feeLocked, _ := n.store.LockedUtxoInfo()
+
+	// Take funding is selected FIRST from the full spendable set; the
+	// service-node fee is built afterward from the remainder (see
+	// selectTakeFunding). Fee-first starves funding when one utxo dominates
+	// the wallet: the fee selector's single-gt rule eats it and funding
+	// selection fails on what is left.
+	//
+	// This repeats the balance gate's scan (checkAcceptParams): same wallet, same
+	// minconf, so the gate's verdict and this selection draw from one spendable set.
+	conn := toConn
+	outputs, err := conn.ListUnspent(1)
+	if err != nil {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
+	}
+	filtered := make([]wallet.Utxo, 0, len(outputs))
+	for _, u := range outputs {
+		// Funding must be 25-byte P2PKH: the deposit path cannot spend a P2SH,
+		// multisig, or OP_RETURN output, so those must never fund a taker entry.
+		if !isP2PKH25(u.ScriptPubKey) {
+			continue
+		}
+		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
+		if lockedKeys[k] {
+			continue
+		}
+		filtered = append(filtered, u)
+	}
+
 	blk := n.blockConnector()
 	blkCoin, _ := coins.Get("BLOCK")
 	blkConf := n.cfg().Confs["BLOCK"]
@@ -1742,10 +1774,6 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	if err != nil {
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "")
 	}
-	lockedKeys := n.store.LockedUtxoInfoFor(o.ToCurrency)
-	// The fee filter must use the ALL-token locked set, not this per-token snapshot: it has to
-	// match ReserveForTake's check or a fee input locked as another order's funding dies with 1019.
-	feeLocked, _ := n.store.LockedUtxoInfo()
 	feeUtxos := make([]wallet.Utxo, 0, len(feeUtxoAvail))
 	for _, u := range feeUtxoAvail {
 		// Fee inputs need at least 1 conf (C++ unspentP2PKH): a 0-conf fee parent the
@@ -1762,6 +1790,10 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		}
 		feeUtxos = append(feeUtxos, u)
 	}
+	usedCoins, feeAvailRest, ok := selectTakeFunding(p.FromAddress, filtered, feeUtxos, ccTo, fromSize)
+	if !ok {
+		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "insufficient funds")
+	}
 	info, ierr := feeOrderInfo(o.ID, o.ToCurrency, fromSize, o.FromCurrency, toSize)
 	if ierr != nil {
 		if errors.Is(ierr, errOrderInfoOverflow) {
@@ -1769,7 +1801,7 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		}
 		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "")
 	}
-	rawFeeHex, feeInputs, rerr := buildServiceNodeFeeTx(blk, blkCoin, blkConf, feeDest, info, feeUtxos)
+	rawFeeHex, feeInputs, rerr := buildServiceNodeFeeTx(blk, blkCoin, blkConf, feeDest, info, feeAvailRest)
 	if rerr != nil {
 		return orderListResult{}, rerr
 	}
@@ -1786,33 +1818,9 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 	xlog.Info("take: service-node fee prepared", "order", p.ID, "fee",
 		formatXAmount(feeSum), "dest", feeDest, "inputs", len(feeInputs))
 
-	// This repeats the balance gate's scan (checkAcceptParams): same wallet, same
-	// minconf, so the gate's verdict and this selection draw from one spendable set.
-	conn := toConn
-	outputs, err := conn.ListUnspent(1)
-	if err != nil {
-		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", err.Error())
-	}
 	feeKey := make(map[string]bool, len(feeInputs))
 	for _, u := range feeInputs {
 		feeKey[u.TxID+":"+strconv.FormatUint(uint64(u.Vout), 10)] = true
-	}
-	filtered := make([]wallet.Utxo, 0, len(outputs))
-	for _, u := range outputs {
-		// Funding must be 25-byte P2PKH: the deposit path cannot spend a P2SH,
-		// multisig, or OP_RETURN output, so those must never fund a taker entry.
-		if !isP2PKH25(u.ScriptPubKey) {
-			continue
-		}
-		k := u.TxID + ":" + strconv.FormatUint(uint64(u.Vout), 10)
-		if lockedKeys[k] || feeKey[k] {
-			continue
-		}
-		filtered = append(filtered, u)
-	}
-	usedCoins, _, _, ok := selectUtxos(p.FromAddress, filtered, ccTo, fromSize)
-	if !ok {
-		return orderListResult{}, makeError(errInsufficientFunds, "dxTakeOrder", "insufficient funds")
 	}
 	coin, _ := coins.Get(o.ToCurrency)
 	proofs, err := buildUtxoProofs(conn, usedCoins, coin)
