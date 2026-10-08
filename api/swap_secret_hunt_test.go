@@ -532,7 +532,9 @@ func TestStoredSpentShortCircuitsCandidates(t *testing.T) {
 
 	var doneErr error
 	var doneTx string
-	n.tryStoredRefund(idHex, "deadbeefrefund", []string{"LTC", "BTC"}, func(txid string, err error) {
+	// Decodable refund (LockTime 0: the gate passes at any height) so the
+	// spent-verdict short-circuit — not hex decoding — is what's exercised.
+	n.tryStoredRefund(idHex, refundHexFixture(), 0, []string{"LTC", "BTC"}, func(txid string, err error) {
 		doneTx, doneErr = txid, err
 	})
 

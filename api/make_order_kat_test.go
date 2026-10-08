@@ -172,14 +172,15 @@ func TestMakeOrderAutoSplitPrepTx(t *testing.T) {
 }
 
 // TestMakeOrderExactMatchPartial drives a non-dry partial make whose selection
-// exactly matches the ideal utxo set (two 1.000009 utxos for 2.0/1.0). No prep
-// tx is needed: the order lists immediately as "created" with a single SEND
-// carrying both ideal utxo proofs (C++ partialExactUtxoMatch).
+// exactly matches the ideal utxo set (two 1.000011 utxos for 2.0/1.0: the ideal
+// size is minFrom + partialPerUtxoFees with ceiled provisions, 1000000 + 11).
+// No prep tx is needed: the order lists immediately as "created" with a single
+// SEND carrying both ideal utxo proofs (C++ partialExactUtxoMatch).
 func TestMakeOrderExactMatchPartial(t *testing.T) {
 	reg, _ := runningHub(t)
 	utxos := []wallet.Utxo{
-		{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 100000900, Value: 1.000009, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
-		{TxID: strings.Repeat("bb", 32), Vout: 1, Amount: 100000900, Value: 1.000009, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+		{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 100001100, Value: 1.000011, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
+		{TxID: strings.Repeat("bb", 32), Vout: 1, Amount: 100001100, Value: 1.000011, ScriptPubKey: "76a914000000000000000000000000000000000000000088ac", Address: btcAddr},
 	}
 	n, cc := newHubNodeUtxos(reg, utxos)
 	fromID, _ := decodeAddr("dxMakeOrder", "BTC", btcAddr)

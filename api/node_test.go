@@ -344,7 +344,8 @@ func TestRemoteCancelLocalOpenRebroadcast(t *testing.T) {
 }
 
 // TestRemoteCancelCreatedDepositSent rolls a created order with a sent deposit
-// back to "rolled back".
+// back to "canceled" (refund pending — the sweep broadcasts past lockTime,
+// flipping to "rolled back" on success).
 func TestRemoteCancelCreatedDepositSent(t *testing.T) {
 	snodePriv := make([]byte, 32)
 	snodePriv[0] = 0x33
@@ -363,8 +364,8 @@ func TestRemoteCancelCreatedDepositSent(t *testing.T) {
 	if got == nil {
 		t.Fatal("created order must remain in the live store (rollback)")
 	}
-	if got.Status != "rolled back" {
-		t.Fatalf("status = %q, want 'rolled back'", got.Status)
+	if got.Status != "canceled" {
+		t.Fatalf("status = %q, want 'canceled'", got.Status)
 	}
 	if got.Reason != 2 {
 		t.Fatalf("reason = %d, want 2", got.Reason)
@@ -395,12 +396,12 @@ func TestRemoteCancelAlreadyCanceled(t *testing.T) {
 	}
 }
 
-// TestRemoteCancelAfterRolledBackIgnored characterizes the preserved C++
-// re-drive boundary: an inbound Cancel for a rolled-back order keeps its
-// status and history (the handler is verbatim C++, re-drive included) —
-// the duplicate-suppression fix lives at the emission decision points,
-// never here.
-func TestRemoteCancelAfterRolledBackIgnored(t *testing.T) {
+// TestRemoteCancelAfterRolledBackRedrives characterizes the C++ re-drive
+// boundary: an inbound Cancel for a rolled-back order re-drives the refund
+// (status returns to "canceled", refund re-enqueued — the handler re-drives
+// like C++ redeemOrderDeposit) without touching history. Pre-broadcast
+// "rolled back" is never written: nothing has gone out yet at this point.
+func TestRemoteCancelAfterRolledBackRedrives(t *testing.T) {
 	snodePriv := make([]byte, 32)
 	snodePriv[0] = 0x44
 	_, idHex := mustID(t)
@@ -418,16 +419,16 @@ func TestRemoteCancelAfterRolledBackIgnored(t *testing.T) {
 	if len(n.store.History()) != before {
 		t.Fatal("rolled-back order must not produce a new history entry")
 	}
-	if got := n.store.Get(idHex); got == nil || got.Status != "rolled back" {
-		t.Fatal("rolled-back order must stay 'rolled back'")
+	if got := n.store.Get(idHex); got == nil || got.Status != "canceled" {
+		t.Fatal("rolled-back order must re-drive to 'canceled' (refund pending)")
 	}
 }
 
 // TestRemoteCancelAfterRollbackFailedRedriven pins the C++ re-drive
 // boundary on the failed side: an inbound Cancel for a "rollback failed"
-// order re-drives the rollback (status returns to "rolled back", refund
-// re-enqueued — xbridgesession.cpp:3511-3517) without touching history.
-// Like its rolled-back twin, this handler stays verbatim.
+// order re-drives the rollback (status returns to "canceled", refund
+// re-enqueued) without touching history. The re-drive shape is preserved;
+// only the recorded status changed (nothing broadcast yet at write time).
 func TestRemoteCancelAfterRollbackFailedRedriven(t *testing.T) {
 	snodePriv := make([]byte, 32)
 	snodePriv[0] = 0x44
@@ -446,8 +447,8 @@ func TestRemoteCancelAfterRollbackFailedRedriven(t *testing.T) {
 	if len(n.store.History()) != before {
 		t.Fatal("rollback-failed order must not produce a new history entry")
 	}
-	if got := n.store.Get(idHex); got == nil || got.Status != "rolled back" {
-		t.Fatal("rollback-failed order must re-drive to 'rolled back'")
+	if got := n.store.Get(idHex); got == nil || got.Status != "canceled" {
+		t.Fatal("rollback-failed order must re-drive to 'canceled' (refund pending)")
 	}
 }
 

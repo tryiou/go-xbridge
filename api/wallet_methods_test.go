@@ -437,8 +437,10 @@ func TestDxSplitAddressNoConnector(t *testing.T) {
 
 // TestDxSplitFeesPerUtxo locks in the fee math: split_amount_with_fees is the split
 // size plus feesPerUtxo = minTxFee1(1,3) + minTxFee2(1,1), added only when
-// include_fees. For BTC (FeePerByte=2): fee1 = (192+102)*2 = 588 -> 5 XB units,
-// fee2 = (192+34)*2 = 452 -> 4 XB units, feesPerUtxo = 9.
+// include_fees. For BTC (FeePerByte=2): fee1 = ceil((192+102)*2) = ceil(588) = 6 XB,
+// fee2 = ceil((192+34)*2) = ceil(452) = 5 XB, feesPerUtxo = 11. Provisions round
+// UP to XBridge units (C++ xBridgeFeeProvisionDescr, splitUtxos :2684-2686):
+// a truncated floor (5+4=9) would starve the exact-sats builders downstream.
 func TestDxSplitFeesPerUtxo(t *testing.T) {
 	ctx := newWalletTestCtx()
 	withFees, err := ctx.dxSplitAddress([]json.RawMessage{
@@ -448,8 +450,8 @@ func TestDxSplitFeesPerUtxo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dxSplitAddress(include_fees): %v", err)
 	}
-	if m := mustJSONMap(t, withFees); m["split_amount_with_fees"] != "0.500009" {
-		t.Errorf("split_amount_with_fees = %v, want 0.500009 (target + feesPerUtxo 9)", m["split_amount_with_fees"])
+	if m := mustJSONMap(t, withFees); m["split_amount_with_fees"] != "0.500011" {
+		t.Errorf("split_amount_with_fees = %v, want 0.500011 (target + feesPerUtxo 11)", m["split_amount_with_fees"])
 	}
 	noFees, err := ctx.dxSplitAddress([]json.RawMessage{
 		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
@@ -548,14 +550,16 @@ func TestDxSplitChangeToRequestedAddress(t *testing.T) {
 	}
 }
 
-// TestDxSplitOutputsCarryOneSatBump locks in C++ output-value parity: C++
-// createTransaction builds CTxOut(out.second * COIN)
-// (xbridgewalletconnectorbtc.cpp:2451) where out.second already carries the
-// +1sat nudge from xBridgeValueFromAmount (xutil.cpp:276-280). A clean 0.5
-// split output is therefore 50000001 sats, not 50000000 — verified against a
-// live Core template (split-show baseline: 57 outputs at 50000001 on Core vs
-// 50000000 on go-xbridge).
-func TestDxSplitOutputsCarryOneSatBump(t *testing.T) {
+// TestDxSplitOutputsExact locks in C++ output-value parity: C++ converts the
+// integer descr split outputs with xBridgeDescrToSats (pure integer multiply,
+// xbridgewalletconnectorbtc.cpp:2747-2750) into CTxOut values verbatim
+// (createTransaction :2444, vout push :2468 — no scaling, no nudge; exact
+// since the "exact integer amounts" refactor, blocknet commit 8540e9086). A clean 0.5
+// split output is therefore 50000000 sats, not 50000001: the former +1sat
+// bump mirrored pre-refactor C++ (xBridgeValueFromAmount's +1e-8 nudge) and
+// is stale. Split values are wallet-local policy (any value is chain-valid),
+// so this is display/dust-accounting parity, not consensus.
+func TestDxSplitOutputsExact(t *testing.T) {
 	ctx := newWalletTestCtx()
 	res, err := ctx.dxSplitAddress([]json.RawMessage{
 		jstr("BTC"), jstr("0.5"), jstr(btcAddr),
@@ -577,8 +581,8 @@ func TestDxSplitOutputsCarryOneSatBump(t *testing.T) {
 		t.Fatal("no outputs in split tx")
 	}
 	// The first output is always a full split (fee claw-back hits the last).
-	if tx.Outputs[0].Value != 50000001 {
-		t.Errorf("split output = %d sats, want 50000001 (C++ +1sat bump)", tx.Outputs[0].Value)
+	if tx.Outputs[0].Value != 50000000 {
+		t.Errorf("split output = %d sats, want 50000000 (exact integer XB->native)", tx.Outputs[0].Value)
 	}
 }
 

@@ -171,8 +171,37 @@ func TestSelectPartialUtxosVectors(t *testing.T) {
 	}
 }
 
-// shortSigConn wraps the stub connector but always returns a non-65-byte
-// signmessage proof.
+// TestCeilFeeXB locks the provision-space ceiling: fractional-sub-descr
+// fees round UP to XBridge base units (mirrors C++ xBridgeFeeProvisionDescr;
+// a truncating floor would starve the exact-sats builders downstream).
+func TestCeilFeeXB(t *testing.T) {
+	cc8 := &config.CoinConf{Coin: 100000000}
+	cc6 := &config.CoinConf{Coin: 1000000}
+	cases := []struct {
+		name string
+		cc   *config.CoinConf
+		fee  uint64
+		want uint64
+	}{
+		{"ltc-class", cc8, 678, 7},
+		{"exact-descr", cc8, 600, 6},
+		{"hub-fee1", cc8, 588, 6},
+		{"hub-fee2", cc8, 452, 5},
+		{"floor-hit", cc8, 1000, 10},
+		{"prep-3-4", cc8, 1424, 15},
+		{"zero", cc8, 0, 0},
+		{"native-1e6-identity", cc6, 678, 678},
+		{"nil-conf-defaults-1e8", nil, 678, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ceilFeeXB(tc.cc, tc.fee); got != tc.want {
+				t.Errorf("ceilFeeXB(fee %d) = %d, want %d", tc.fee, got, tc.want)
+			}
+		})
+	}
+}
+
 type shortSigConn struct{ *stubConn }
 
 func (s *shortSigConn) SignMessage(address, message string) ([]byte, error) {

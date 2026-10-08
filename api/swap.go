@@ -1704,7 +1704,10 @@ func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) 
 		if n.engineRunning.Load() {
 			n.pendingRefunds[orderID] = true
 		}
-		n.postRefundTask(orderID, s.srcCur, s.refundHex, 0, false, done)
+		// Locktime parity with the background sweep (scanRefunds): a
+		// pre-locktime force-refund defers ("", nil) instead of broadcasting
+		// a CLTV-locked spend the network must reject.
+		n.postRefundTask(orderID, s.srcCur, s.refundHex, s.ourLockTime, true, done)
 		return
 	}
 	o := n.store.Get(orderID)
@@ -1714,18 +1717,44 @@ func (n *Node) enqueueRefund(orderID string, done func(txid string, err error)) 
 		}
 		return
 	}
-	cands := make([]string, 0, 2)
-	for _, cur := range []string{o.FromCurrency, o.ToCurrency} {
-		if cur != "" && n.cfg().Connectors[cur] != nil {
+	// Decode once for the refund's lockTime (the same bytes the stored sweep
+	// reads in scanStoredRefunds); an undecodable hex is reported, never
+	// broadcast blind against a candidate chain.
+	raw, derr := hex.DecodeString(o.RefundTx)
+	if derr != nil {
+		xlog.Warn("stored refund bad hex, skipping force-refund", "order", orderID)
+		if done != nil {
+			done("", fmt.Errorf("api: stored refund for %s undecodable: %w", orderID, derr))
+		}
+		return
+	}
+	rtx, derr := coins.Deserialize(raw)
+	if derr != nil {
+		xlog.Warn("stored refund undeserializable, skipping force-refund", "order", orderID)
+		if done != nil {
+			done("", fmt.Errorf("api: stored refund for %s undeserializable: %w", orderID, derr))
+		}
+		return
+	}
+	// Own chain first (utxoCurrency tag, else the legacy Role rule): a
+	// deferral on the right chain must stop here, never chain onto others.
+	seen := map[string]bool{}
+	cands := make([]string, 0, 3)
+	for _, cur := range append([]string{utxoCurrency(o)}, o.FromCurrency, o.ToCurrency) {
+		if cur != "" && !seen[cur] && n.cfg().Connectors[cur] != nil {
+			seen[cur] = true
 			cands = append(cands, cur)
 		}
 	}
-	n.tryStoredRefund(orderID, o.RefundTx, cands, done)
+	n.tryStoredRefund(orderID, o.RefundTx, rtx.LockTime, cands, done)
 }
 
 // tryStoredRefund broadcasts the stored refund against each candidate currency
-// in order, stopping at the first success; the callbacks chain so no currency is broadcast twice.
-func (n *Node) tryStoredRefund(orderID, refundHex string, cands []string, done func(txid string, err error)) {
+// in order, stopping at the first success or deferral; the callbacks chain so
+// no currency is broadcast twice. A locktime deferral (nil error, empty txid)
+// and a spent-deposit verdict both stop the chain: the former must not touch
+// other chains, the latter is chain-independent.
+func (n *Node) tryStoredRefund(orderID, refundHex string, lockTime uint32, cands []string, done func(txid string, err error)) {
 	if len(cands) == 0 {
 		if done != nil {
 			done("", fmt.Errorf("api: could not broadcast stored refund for %s", orderID))
@@ -1733,8 +1762,11 @@ func (n *Node) tryStoredRefund(orderID, refundHex string, cands []string, done f
 		return
 	}
 	cur := cands[0]
-	n.postRefundTask(orderID, cur, refundHex, 0, false, func(txid string, err error) {
-		if err == nil && txid != "" {
+	n.postRefundTask(orderID, cur, refundHex, lockTime, true, func(txid string, err error) {
+		// Deferral (err == nil, txid == "") and success both stop here:
+		// chaining onto the next currency would broadcast the same bytes
+		// against the wrong chain. Only a genuine error chains.
+		if err == nil {
 			if done != nil {
 				done(txid, nil)
 			}
@@ -1750,11 +1782,13 @@ func (n *Node) tryStoredRefund(orderID, refundHex string, cands []string, done f
 			}
 			return
 		}
-		n.tryStoredRefund(orderID, refundHex, cands[1:], done)
+		n.tryStoredRefund(orderID, refundHex, lockTime, cands[1:], done)
 	})
 }
 
 // BroadcastRefund force-broadcasts an order's pre-signed CLTV refund without waiting for the background sweep, returning the accepted txid.
+// Pre-locktime it defers like the sweep: ("", nil) means not yet due (retry
+// past the deposit lockTime), never a failure and never a broadcast.
 func (n *Node) BroadcastRefund(orderID string) (string, error) {
 	if !n.engineRunning.Load() {
 		var txid string
@@ -2064,7 +2098,16 @@ func (c *swapCtx) redeemCounterparty(isMaker bool) (payHex, depositCur string, e
 		PrevOut:  coins.OutPoint{Hash: h, Index: c.theirDepositVout},
 		Sequence: 0xffffffff,
 	})
-	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: p2shNative - fee, ScriptPubKey: dest})
+	// C++ redeem rule (redeemOrderCounterpartyDeposit / xBridgeExcessSats):
+	// pay the full order amount whenever the deposit does not strictly cover
+	// amount + fee2; only a strict excess is added on top. In-band deposits
+	// (legacy truncated escrows inside the 5% acceptance band) therefore pay
+	// the redeemer whole instead of short-changing by the fee gap.
+	payout := theirSpec.Amount
+	if p2shNative > theirSpec.Amount+fee {
+		payout = p2shNative - fee
+	}
+	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: payout, ScriptPubKey: dest})
 
 	inner := theirSpec.RedeemScript()
 	sig, err := coins.SignTxInputForCoin(tx, 0, inner, p2shNative, c.privKey[:], depositCoin)

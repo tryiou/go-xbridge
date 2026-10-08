@@ -74,7 +74,7 @@ func (d *DepositSpec) P2SHScript() []byte {
 // the P2SH HTLC, spending funding UTXOs and returning change to changeAddr.
 // fee is the deposit's own network fee (C++ minTxFee1); fee2 is the p2sh redeem
 // margin (C++ minTxFee2(1,1)) that is locked into the HTLC output on top of
-// Amount: C++ locks outAmount+fee2 (xbridgesession.cpp:2094 maker, :2615 taker)
+// Amount: C++ locks outAmount+fee2 (xbridgesession.cpp:2090 maker, :2628 taker)
 // and checkDepositTransaction requires depositP2SHAmount >= amount + 0.95*fee2
 // (xbridgewalletconnectorbtc.cpp:2183), so the redeem fee is collected when the
 // deposit is later claimed/refunded.

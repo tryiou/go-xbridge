@@ -37,6 +37,23 @@ func camount(u wallet.Utxo) uint64 {
 	return xBridgeIntFromReal(u.Value)
 }
 
+// ceilFeeXB rounds a native base-unit fee UP to XBridge base units (1e6):
+// selectors and fee provisions must never under-provision the exact-sats
+// fees a later builder will need. Mirrors C++ xBridgeFeeProvisionDescr
+// (src/xbridge/util/xutil.cpp): the same ceiling on the same integer fee.
+// Scales below 1e6 have no configured coin (XBridge scale is 1e6); they take
+// the 1e8-grid default rather than a reinterpreted grid.
+func ceilFeeXB(cc *config.CoinConf, feeNative uint64) uint64 {
+	perXB := uint64(100)
+	if cc != nil && cc.Coin >= 1000000 {
+		perXB = cc.Coin / 1000000
+	}
+	if perXB <= 1 {
+		return feeNative
+	}
+	return (feeNative + perXB - 1) / perXB
+}
+
 // minTxFeeWhole returns the per-tx fee as a whole-coin double, mirroring C++
 // minTxFee1/minTxFee2 (xbridgewalletconnectorbtc.cpp:1948-1972). Both C++
 // functions are identical (each floored at minTxFee), so the Go port uses a
@@ -68,7 +85,7 @@ func isDustNative(v float64, cc *config.CoinConf, relayFee float64, nativeCoin u
 }
 
 // selectUtxos picks the maker's spendable utxos funding an exact order,
-// mirroring C++ App::selectUtxos (src/xbridge/xbridgeapp.cpp:2972-3077). It
+// mirroring C++ App::selectUtxos (src/xbridge/xbridgeapp.cpp:2977-3087). It
 // returns the chosen outputs, their total value in XBridge base units
 // (utxoAmount), and the prep fee fee1 (XBridge base units).
 //
@@ -81,7 +98,7 @@ func selectUtxos(addr string, outputs []wallet.Utxo, cc *config.CoinConf, requir
 		return amt + minTxFeeWhole(cc, inputs, o) + minTxFeeWhole(cc, 1, 1)
 	}
 
-	// selUtxos is C++'s inner fee-utxo selector lambda (:3003-3066).
+	// selUtxos is C++'s inner fee-utxo selector lambda (:2989-3058).
 	selUtxos := func(a []wallet.Utxo, o *[]wallet.Utxo, amt float64) {
 		var gt, lt []wallet.Utxo
 		minAmount := feeAmount(amt, 1, 3)
@@ -139,12 +156,14 @@ func selectUtxos(addr string, outputs []wallet.Utxo, cc *config.CoinConf, requir
 	for _, u := range o {
 		utxoAmount += uint64(u.Value * float64(coinScale))
 	}
-	fee1 = uint64(minTxFeeWhole(cc, len(o), 3) * float64(coinScale))
+	// The reported prep fee is a provision: round UP to the XB grid (the
+	// selection total above stays floored — resources, not provisions).
+	fee1 = ceilFeeXB(cc, estimateFee(cc, len(o), 3))
 	return o, utxoAmount, fee1, true
 }
 
 // selectPartialUtxos picks the maker's spendable utxos funding a partial order,
-// mirroring C++ App::selectPartialUtxos (src/xbridge/xbridgeapp.cpp:3079-3237).
+// mirroring C++ App::selectPartialUtxos (src/xbridge/xbridgeapp.cpp:3089-3248).
 // All comparisons run on camount() (XBridge base units); the addr argument is
 // dropped because C++ never reads it. It returns the chosen outputs, their
 // total value (utxoAmount), the accumulated fees, and whether the selection
@@ -229,7 +248,7 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 		count := len(outputsForUse) - idealUtxoCount + 1
 		for i := 0; i < len(utxos); {
 			utxo := utxos[i]
-			requiredPrepTxFees = int64(xBridgeIntFromReal(minTxFeeWhole(cc, count, requiredPrepTxVouts)))
+			requiredPrepTxFees = int64(ceilFeeXB(cc, estimateFee(cc, count, requiredPrepTxVouts)))
 			totalAmountNeeded = totalExactSplitSizeNeeded + totalRemainderNeeded + requiredPrepTxFees
 			if totalAmountNeeded-usedAmount <= 0 {
 				break // reached the required amount
@@ -250,7 +269,7 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 	// Incorporate prep fees. Ideal utxos (matching size+fees) are not resent,
 	// so they don't count toward the prep-tx input fee estimate; assume at least
 	// one more utxo is added (+1) to cover the remainder.
-	requiredPrepTxFees = int64(xBridgeIntFromReal(minTxFeeWhole(cc, len(outputsForUse)-idealUtxoCount+1, requiredPrepTxVouts)))
+	requiredPrepTxFees = int64(ceilFeeXB(cc, estimateFee(cc, len(outputsForUse)-idealUtxoCount+1, requiredPrepTxVouts)))
 	totalAmountNeeded = totalExactSplitSizeNeeded + totalRemainderNeeded + requiredPrepTxFees
 
 	// Find the largest utxo to cover the remainder.
@@ -273,7 +292,7 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 		count := len(outputsForUse) - idealUtxoCount + 1
 		for i := 0; i < len(utxos); {
 			utxo := utxos[i]
-			requiredPrepTxFees = int64(xBridgeIntFromReal(minTxFeeWhole(cc, count, requiredPrepTxVouts)))
+			requiredPrepTxFees = int64(ceilFeeXB(cc, estimateFee(cc, count, requiredPrepTxVouts)))
 			totalAmountNeeded = totalExactSplitSizeNeeded + totalRemainderNeeded + requiredPrepTxFees
 			if totalAmountNeeded-usedAmount <= 0 {
 				break
@@ -286,7 +305,7 @@ func selectPartialUtxos(outputs []wallet.Utxo, cc *config.CoinConf,
 	}
 
 	// Final update.
-	requiredPrepTxFees = int64(xBridgeIntFromReal(minTxFeeWhole(cc, len(outputsForUse)-idealUtxoCount, requiredPrepTxVouts)))
+	requiredPrepTxFees = int64(ceilFeeXB(cc, estimateFee(cc, len(outputsForUse)-idealUtxoCount, requiredPrepTxVouts)))
 	totalAmountNeeded = totalExactSplitSizeNeeded + totalRemainderNeeded + requiredPrepTxFees
 	fees = uint64(len(outputsForUse)) * requiredFeePerUtxo
 

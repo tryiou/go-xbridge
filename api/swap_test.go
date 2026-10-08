@@ -1024,6 +1024,78 @@ func TestRedeemCounterpartyPayout(t *testing.T) {
 	}
 }
 
+// TestRedeemCounterpartyBandPayout: a counterparty deposit inside the 5%
+// acceptance band (amount + 0.95*fee2 <= p2sh < amount + fee2) pays the FULL
+// order amount on claim — the C++ redeem rule (toSats + excess, excess 0
+// in-band: xbridgesession.cpp redeemOrderCounterpartyDeposit) — never the
+// shortfall p2sh − fee2. Matters for legacy truncated-escrow interop (a
+// 678-class deposit lands at amount+600, inside the band when accepted).
+func TestRedeemCounterpartyBandPayout(t *testing.T) {
+	if err := coins.InitFromConf(map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, ScriptPrefix: 5, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, ScriptPrefix: 50, CreateTxMethod: "LTC", BlockTime: 60},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mkPriv, mkPub := newKey(t)
+	tkPriv, tkPub := newKey(t)
+	mkAddr := addrFor(0, "maker-btc-dest")
+	ltcAddr := addrFor(48, "taker-ltc-source")
+	mkBtc := &fakeConnector{ticker: "BTC", funding: wallet.Utxo{TxID: strings.Repeat("aa", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(mkPub)))}, fundingPriv: mkPriv, fundingPub: mkPub, changeAddr: addrFor(0, "btc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	tkLtc := &fakeConnector{ticker: "LTC", funding: wallet.Utxo{TxID: strings.Repeat("bb", 32), Vout: 0, Amount: 5e8, ScriptPubKey: hex.EncodeToString(coins.BuildP2PKHScript(coins.KeyID(tkPub)))}, fundingPriv: tkPriv, fundingPub: tkPub, changeAddr: addrFor(48, "ltc-change"), blockHeight: 1000, rawTx: map[string]string{}}
+	confs := map[string]*config.CoinConf{
+		"BTC": {Ticker: "BTC", Coin: 1e8, AddressPrefix: 0, CreateTxMethod: "BTC", BlockTime: 60},
+		"LTC": {Ticker: "LTC", Coin: 1e8, AddressPrefix: 48, CreateTxMethod: "LTC", BlockTime: 60},
+	}
+	makerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+	takerNode := newTestNode(t, confs, map[string]wallet.Connector{"BTC": mkBtc, "LTC": tkLtc})
+
+	var orderID [32]byte
+	rcpH := hash20("redeem-band-order")
+	copy(orderID[:], rcpH[:])
+	mkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	tkOrder := &Order{ID: orderID, FromCurrency: "BTC", ToCurrency: "LTC", FromAmount: 2.5e6, ToAmount: 2e6}
+	mkMPriv, mkMPub := newKey(t)
+	makerNode.newMakerSession(withUsedCoins(t, makerNode, mkOrder, []wallet.Utxo{mkBtc.funding}), MakeOrderParams{MakerAddress: mkAddr, TakerAddress: ltcAddr}, arr32(mkMPriv), toArr33(mkMPub))
+	takerNode.newTakerSession(withUsedCoins(t, takerNode, tkOrder, []wallet.Utxo{tkLtc.funding}), TakeOrderParams{FromAddress: ltcAddr, ToAddress: mkAddr}, arr32(tkPriv), to33(tkPub))
+	var hub [20]byte
+	hubH := hash20("hub")
+	copy(hub[:], hubH[:])
+	makerSession := makerNode.sessions[hexEncode(orderID[:])]
+	takerSession := takerNode.sessions[hexEncode(orderID[:])]
+	makerSession.hub = hub
+	takerSession.hub = hub
+
+	_, bodyA, err := makerSession.OnCreateA(&proto.CreateABody{HubAddress: hub, ID: orderID, BPubKey: to33(tkPub)})
+	if err != nil {
+		t.Fatalf("maker OnCreateA: %v", err)
+	}
+	createdA := bodyA.(*proto.CreatedABody)
+
+	// In-band B deposit: fee2 (fallback 2 sat/vB) is 452; p2sh = to + 440
+	// sits inside [to + 0.95*fee2, to + fee2).
+	ltcCoin, _ := coins.Get("LTC")
+	fundingInternal, _ := reverseTxidHex(strings.Repeat("bb", 32))
+	fee2 := estimateFee(confs["LTC"], 1, 1)
+	nativeTaker := fromXBridgeAmt(ltcCoin, 2e6)
+	inner := coins.BuildDepositUnlockScript(tkPub[:], mkMPub[:], createdA.HashedSecret[:], createdA.ALockTime)
+	bandB := &coins.Tx{Version: 1}
+	bandB.Inputs = append(bandB.Inputs, coins.TxIn{PrevOut: coins.OutPoint{Hash: fundingInternal, Index: 0}, Sequence: seqFinal})
+	bandB.Outputs = append(bandB.Outputs, coins.TxOut{Value: nativeTaker + fee2 - 12, ScriptPubKey: coins.BuildP2SHScript(coins.KeyID(inner))})
+	bandB.Outputs = append(bandB.Outputs, coins.TxOut{Value: 5e8 - nativeTaker - fee2 + 12, ScriptPubKey: []byte{0x51}})
+	bandBTxID := strings.Repeat("ec", 32)
+	tkLtc.setRawTx(bandBTxID, hex.EncodeToString(bandB.Serialize()))
+
+	_, bodyCA, err := makerSession.OnConfirmA(&proto.ConfirmABody{HubAddress: hub, ID: orderID, BDepositTxID: bandBTxID, BLockTime: createdA.ALockTime})
+	if err != nil {
+		t.Fatalf("maker OnConfirmA: %v", err)
+	}
+	payA := deserializeBroadcast(t, tkLtc, bodyCA.(*proto.ConfirmedABody).APayTxID)
+	if got := payA.Outputs[0].Value; got != nativeTaker {
+		t.Fatalf("in-band claim output = %d, want full amount %d (C++ pays toSats in-band, not p2sh-fee2)", got, nativeTaker)
+	}
+}
+
 // TestHoldInitVerification proves the hub-driven Hold/Init packets
 // are re-verified against the order: a mismatched amount (Hold) or ANY
 // single-field mismatch (Init, intended-OR) is dropped with NO response and no
@@ -1911,7 +1983,8 @@ func TestRefundWatcher(t *testing.T) {
 }
 
 // TestRefundEscapeHatch exercises the manual escape hatch: BroadcastRefund
-// force-broadcasts the stored refund and records it on the connector.
+// defers pre-locktime (no broadcast, empty txid) and force-broadcasts the
+// stored refund past lockTime, recording it on the connector.
 func TestRefundEscapeHatch(t *testing.T) {
 	_, s, conn := setupSwapPair(t)
 	if _, _, err := s.OnCreateA(&proto.CreateABody{HubAddress: s.hub, ID: s.id, BPubKey: to33(s.pubKey[:])}); err != nil {
@@ -1919,12 +1992,26 @@ func TestRefundEscapeHatch(t *testing.T) {
 	}
 	orderIDHex := hexEncode(s.id[:])
 	before := len(conn.broadcasts)
+	// Pre-locktime the hatch defers: parity with the background sweep, which
+	// is the only path that may broadcast a CLTV-locked refund.
 	txid, err := s.n.BroadcastRefund(orderIDHex)
 	if err != nil {
 		t.Fatalf("BroadcastRefund: %v", err)
 	}
+	if txid != "" {
+		t.Fatalf("pre-locktime BroadcastRefund = %q, want deferral", txid)
+	}
+	if len(conn.broadcasts) != before {
+		t.Errorf("escape-hatch refund broadcast pre-locktime (broadcasts %d, want %d)", len(conn.broadcasts), before)
+	}
+	// Past lockTime it broadcasts and records.
+	conn.blockHeight = int64(s.ourLockTime)
+	txid, err = s.n.BroadcastRefund(orderIDHex)
+	if err != nil {
+		t.Fatalf("BroadcastRefund: %v", err)
+	}
 	if txid == "" {
-		t.Fatal("BroadcastRefund returned empty txid")
+		t.Fatal("BroadcastRefund returned empty txid past locktime")
 	}
 	if len(conn.broadcasts) != before+1 {
 		t.Errorf("escape-hatch refund not broadcast (broadcasts %d, want %d)", len(conn.broadcasts), before+1)

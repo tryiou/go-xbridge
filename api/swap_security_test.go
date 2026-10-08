@@ -412,15 +412,25 @@ func TestUnvalidatedDepositRefusedBothLegs(t *testing.T) {
 	if !errors.As(err, &sce) || sce.reason != crBadBDepositTx {
 		t.Fatalf("maker ConfirmA err = %v, want crBadBDepositTx self-cancel", err)
 	}
-	// The maker's A deposit rolls back: status "rolled back" and the pre-signed
-	// refund is enqueued (C++ processLater; in production the wallet rejects the
-	// pre-lockTime CLTV spend and the background sweep retries once the
-	// deposit's lockTime passes — never a second deposit).
-	if o := makerNode.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "rolled back" {
-		t.Fatalf("maker order status = %+v, want rolled back", o)
+	// The maker's A deposit rolls back: status "canceled" (refund pending,
+	// never "rolled back" before any broadcast) and NO pre-locktime
+	// broadcast — the force path defers to the lockTime sweep, which retries
+	// once the deposit's lockTime passes (never a second deposit).
+	if o := makerNode.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "canceled" {
+		t.Fatalf("maker order status = %+v, want canceled", o)
 	}
+	if got := len(mkBtc.broadcasts); got != 1 {
+		t.Fatalf("maker BTC broadcasts = %d, want 1 (deposit A only; refund deferred pre-locktime)", got)
+	}
+	// Past lockTime the background sweep completes the refund.
+	mkBtc.blockHeight = int64(createdA.ALockTime)
+	makerNode.scanRefunds()
+	makerNode.scanStoredRefunds()
 	if got := len(mkBtc.broadcasts); got != 2 {
-		t.Fatalf("maker BTC broadcasts = %d, want 2 (deposit A + its enqueued refund)", got)
+		t.Fatalf("maker BTC broadcasts = %d, want 2 (deposit A + swept refund)", got)
+	}
+	if o := makerNode.store.Get(hexEncode(orderID[:])); o == nil || o.Status != "rolled back" {
+		t.Fatalf("maker order status = %+v, want rolled back after post-locktime sweep", o)
 	}
 	// The maker's Cancel (crBadBDepositTx) is on the wire; NO ConfirmedA.
 	mkPkts := makerCC.snapshot()

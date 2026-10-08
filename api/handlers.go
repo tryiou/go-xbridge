@@ -1202,8 +1202,11 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		return nil, makeError(errBadRequest, method, "address is invalid or not in the wallet for token "+ticker)
 	}
 
-	fee1XB := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 3))
-	fee2XB := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 1))
+	// Fee provisions round UP to XBridge base units: split sizes must cover
+	// the exact-sats fees the funding session will later need (a truncated
+	// floor starves per-fill deposits on 678-class coins).
+	fee1XB := ceilFeeXB(cc, estimateFee(cc, 1, 3))
+	fee2XB := ceilFeeXB(cc, estimateFee(cc, 1, 1))
 	feesPerUtxoXB := fee1XB + fee2XB
 	splitSizeXB := targetXB
 	if includeFees {
@@ -1292,7 +1295,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		return nil, makeError(errBadRequest, method, "already split all unused utxos in address ["+address+"]")
 	}
 	remainderXB := vinsTotalXB - uint64(nSplits)*splitSizeXB
-	txFeesXB := xBridgeIntFromReal(minTxFeeWhole(cc, len(utxos), nSplits))
+	txFeesXB := ceilFeeXB(cc, estimateFee(cc, len(utxos), nSplits))
 
 	outs := make([]uint64, 0, nSplits+1)
 	for i := 0; i < nSplits; i++ {
@@ -1341,7 +1344,9 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		})
 	}
 	for _, v := range outs {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: splitNativeValue(c, v), ScriptPubKey: destScript})
+		// Exact integer XB -> native conversion (== C++ xBridgeDescrToSats,
+		// splitUtxos :2762): split outputs carry no nudge.
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: fromXBridgeAmt(c, v), ScriptPubKey: destScript})
 	}
 
 	unsigned := hex.EncodeToString(tx.Serialize())
@@ -1459,7 +1464,7 @@ func txidOfRawTx(rawHex string) (string, *rpcError) {
 
 type prepVout struct {
 	addr   string
-	amount float64
+	amount uint64 // native base units (exact integer, == C++ prep vouts)
 }
 
 // buildPrepTx returns the local double-SHA256 of the signed prep tx, never a
@@ -1490,12 +1495,8 @@ func buildPrepTx(conn wallet.Connector, cc *config.CoinConf, coin coins.Coin, vi
 		})
 		prevTxs = append(prevTxs, wallet.PrevTx{TxID: u.TxID, Vout: u.Vout, ScriptPubKey: u.ScriptPubKey, Amount: u.Amount})
 	}
-	scale := uint64(coinScale)
-	if cc != nil {
-		scale = cc.Coin
-	}
 	for _, vo := range vouts {
-		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: uint64(vo.amount * float64(scale)), ScriptPubKey: destScript})
+		tx.Outputs = append(tx.Outputs, coins.TxOut{Value: vo.amount, ScriptPubKey: destScript})
 	}
 	unsigned := hex.EncodeToString(tx.Serialize())
 	signedHex, complete, err := conn.SignRawTransaction(unsigned, prevTxs)
@@ -1540,12 +1541,6 @@ func isP2PKHScript(scriptHex string) bool {
 	}
 	return script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 &&
 		script[23] == 0x88 && script[24] == 0xac
-}
-
-// splitNativeValue truncates xBridgeValueFromAmount's +1/1e8-nudged double into
-// native units — intentionally separate from fromXBridgeAmt's integer math.
-func splitNativeValue(c coins.Coin, xb uint64) uint64 {
-	return uint64(xBridgeValueFromAmount(xb) * float64(coinNativeScale(c)))
 }
 
 func fromXBridgeAmt(c coins.Coin, xb uint64) uint64 {

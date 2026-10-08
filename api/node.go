@@ -1305,8 +1305,10 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		} else if fromAmt%minFrom != 0 {
 			partialRemainderRequired = true
 		}
-		partialFee1 := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 3))
-		partialFee2 := xBridgeIntFromReal(minTxFeeWhole(cc, 1, 1))
+		// Per-utxo fee provisions round UP: split sizes must cover the
+		// exact-sats fees the per-fill session will later need.
+		partialFee1 := ceilFeeXB(cc, estimateFee(cc, 1, 3))
+		partialFee2 := ceilFeeXB(cc, estimateFee(cc, 1, 1))
 		partialPerUtxoFees = partialFee1 + partialFee2
 		partialFees := uint64(partialUtxosRequiredForMinimum) * partialPerUtxoFees
 		if partialRemainderRequired {
@@ -1404,7 +1406,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		} else if p.AutoSplit {
 			existing := outputsForUse[:0]
 			var vins []wallet.Utxo
-			vinsTotal := 0.0
+			var vinsTotal uint64
 			remaining := partialUtxosRequiredForMinimum
 			voutsTotal := int64(partialVoutsTotal)
 			for _, vin := range outputsForUse {
@@ -1414,22 +1416,31 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 					voutsTotal -= int64(minFrom + partialPerUtxoFees)
 					continue
 				}
-				vinsTotal += vin.Value
+				vinsTotal += vin.Amount
 				vins = append(vins, vin)
 			}
+			// Exact integer native outputs (== C++ prep tx, xbridgeapp.cpp
+			// :1801-1807: DescrToSats of the XB split sizes, no doubles).
 			var vouts []prepVout
 			for i := 0; i < remaining; i++ {
-				vouts = append(vouts, prepVout{p.MakerAddress, xBridgeValueFromAmount(minFrom + partialPerUtxoFees)})
+				vouts = append(vouts, prepVout{p.MakerAddress, fromXBridgeAmt(coin, minFrom+partialPerUtxoFees)})
 			}
 			if partialRemainderRequired && !partialRemainderIsDust {
-				vouts = append(vouts, prepVout{p.MakerAddress, xBridgeValueFromAmount(partialRemainderVoutTotal + partialPerUtxoFees)})
+				vouts = append(vouts, prepVout{p.MakerAddress, fromXBridgeAmt(coin, partialRemainderVoutTotal+partialPerUtxoFees)})
 			}
-			changeAmount := vinsTotal - xBridgeValueFromAmount(uint64(voutsTotal)) - minTxFeeWhole(cc, len(vins), len(vouts)+1)
-			if changeAmount < 2.220446049250313e-16 {
+			prepFee := estimateFee(cc, len(vins), len(vouts)+1)
+			var voutsTotalNative uint64
+			for _, vo := range vouts {
+				voutsTotalNative += vo.amount
+			}
+			// C++ rejects non-positive change (xbridgeapp.cpp :1812); the
+			// dust comparison below stays double-based exactly like C++
+			// (:1821) — a threshold policy, not construction.
+			if vinsTotal <= voutsTotalNative+prepFee {
 				return nil, makeError(errInvalidAmount, "dxMakePartialOrder", "failed to create order, insufficient funds on partial order")
 			}
-			if !isDustNative(changeAmount, cc, relayFee, nativeCoin) {
-				vouts = append(vouts, prepVout{p.MakerAddress, changeAmount})
+			if changeNative := vinsTotal - voutsTotalNative - prepFee; !isDustNative(float64(changeNative)/float64(nativeCoin), cc, relayFee, nativeCoin) {
+				vouts = append(vouts, prepVout{p.MakerAddress, changeNative})
 			}
 			signedHex, txid, rerr := buildPrepTx(conn, cc, coin, vins, vouts)
 			if rerr != nil {
@@ -1445,13 +1456,18 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			prepTxID = txid
 			used := existing
 			partialNew := int64(0)
+			// Rebuilt-utxo accounting stays in XB via camount(): the Value
+			// double is the nearest double to the exact native amount, so
+			// camount's +1e-8 nudge recovers the integer XB exactly (double
+			// error ~6e-11 XB against a 0.01-XB margin) — no drift versus the
+			// XB-space voutsTotal cap.
 			for i, vo := range vouts {
 				if voutsTotal-partialNew <= 0 {
 					break
 				}
 				used = append(used, wallet.Utxo{
 					TxID: prepTxID, Vout: uint32(i), Address: p.MakerAddress,
-					Value: vo.amount, Amount: uint64(vo.amount * float64(nativeCoin)),
+					Value: float64(vo.amount) / float64(nativeCoin), Amount: vo.amount,
 				})
 				partialNew += int64(camount(used[len(used)-1]))
 			}
@@ -2183,8 +2199,15 @@ func (n *Node) handleRemoteCancel(pkt *proto.Packet, b *proto.CancelBody) {
 	}
 
 	n.store.RemovePendingPackets(idHex)
+	// "canceled" (refund pending), never "rolled back" (refund done): the
+	// broadcast below may defer to the locktime sweep, and every recovery
+	// path keys on "canceled" — the success flip in postRefundTask, the
+	// stored sweep's skip-list, and restoreSwap's refund-pending rule.
+	// Writing "rolled back" pre-broadcast strands sessionless records (the
+	// stored sweep skips "rolled back") and poisons nothing on redelivery
+	// (already-canceled dedups before this branch).
 	n.store.Update(idHex, func(o *Order) {
-		o.Status = "rolled back"
+		o.Status = "canceled"
 		o.Reason = b.Reason
 		o.Updated = NowMicro()
 	})
