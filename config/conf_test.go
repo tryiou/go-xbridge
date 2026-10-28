@@ -149,6 +149,68 @@ func TestLoadMissing(t *testing.T) {
 	}
 }
 
+// TestLoadDisablesCoinWithUnusableDustAmount locks the per-coin rule: a coin
+// whose DustAmount is absent, empty or non-numeric is disabled with a reason
+// and is absent from Coins, so nothing can read its threshold as 0. The rest
+// of the config still loads, and the file is never treated as malformed
+// (C++ xbridgeapp.cpp:1015-1025 removes that one connector and continues).
+func TestLoadDisablesCoinWithUnusableDustAmount(t *testing.T) {
+	const good = "\n[BTC]\nTitle=Bitcoin\nCOIN=100000000\nBlockTime=600\nDustAmount=546\n"
+	for _, tc := range []struct {
+		name    string
+		section string
+		want    string
+	}{
+		{"absent", "\n[LTC]\nCOIN=100000000\nBlockTime=150\n", "has no DustAmount in the config"},
+		{"empty", "\n[LTC]\nCOIN=100000000\nBlockTime=150\nDustAmount=\n", "has an invalid DustAmount in the config <>"},
+		{"non-numeric", "\n[LTC]\nCOIN=100000000\nBlockTime=150\nDustAmount=zero\n", "has an invalid DustAmount in the config <zero>"},
+		// The two inputs xBridgeParseDustAmount is pinned on: ERANGE overflow and
+		// a leading '+' (strtoull accepts it, the helper rejects it explicitly).
+		{"overflow", "\n[LTC]\nCOIN=100000000\nBlockTime=150\nDustAmount=18446744073709551616\n", "has an invalid DustAmount in the config <18446744073709551616>"},
+		{"leading-plus", "\n[LTC]\nCOIN=100000000\nBlockTime=150\nDustAmount=+546\n", "has an invalid DustAmount in the config <+546>"},
+		// Same value with surrounding whitespace is not a rejection: the helper trims.
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf, err := Load(writeConf(t, "[Main]\nExchangeWallets=BTC,LTC\n"+good+tc.section))
+			if err != nil {
+				t.Fatalf("Load must not fail for one unusable coin: %v", err)
+			}
+			if _, ok := conf.Coins["LTC"]; ok {
+				t.Error("LTC must be absent from Coins so its dust can never read as 0")
+			}
+			if _, ok := conf.Coins["BTC"]; !ok {
+				t.Error("BTC must still load")
+			}
+			if len(conf.Disabled) != 1 {
+				t.Fatalf("Disabled = %+v, want exactly one entry", conf.Disabled)
+			}
+			if got := conf.Disabled[0]; got.Coin != "LTC" || got.Reason != tc.want {
+				t.Errorf("Disabled[0] = %+v, want LTC / %q", got, tc.want)
+			}
+			// The disabled coin must not reach the activator: it would add a
+			// second, false "not found in config" drop for a section that is there.
+			if got := conf.Wallets(); len(got) != 1 || got[0] != "BTC" {
+				t.Errorf("Wallets() = %v, want [BTC]", got)
+			}
+		})
+	}
+
+	// Zero is a value, not an absence: the coin stays enabled.
+	conf, err := Load(writeConf(t, "[Main]\nExchangeWallets=BTC,FIRO\n"+good+"\n[FIRO]\nCOIN=100000000\nDustAmount=0\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := conf.Coins["FIRO"]; !ok {
+		t.Error("DustAmount=0 must keep the coin enabled")
+	}
+	if len(conf.Disabled) != 0 {
+		t.Errorf("Disabled = %+v, want none", conf.Disabled)
+	}
+	if got := conf.Wallets(); len(got) != 2 || got[0] != "BTC" || got[1] != "FIRO" {
+		t.Errorf("Wallets() = %v, want [BTC FIRO] — a zero threshold keeps the coin", got)
+	}
+}
+
 // TestLoadSkipsRpcSection locks the [Rpc] handling: [Rpc] is a dead section in C++
 // (util/settings.h:49-65) and must not be parsed as a coin (which would abort
 // startup with "COIN not set"). The section must simply not appear in Coins.

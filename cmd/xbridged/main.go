@@ -276,6 +276,10 @@ func main() {
 	if err != nil {
 		fatalf("xbridge.conf", "err", err)
 	}
+	// A coin whose DustAmount cannot be used is disabled, not fatal: log each
+	// one once at startup so an operator sees exactly which market disappeared
+	// and why.
+	api.ReportDisabled(conf)
 	admitted := config.Admitted(conf.Coins)
 	if err := coins.InitFromConf(admitted); err != nil {
 		fatalf("coin config", "err", err)
@@ -286,7 +290,7 @@ func main() {
 	// Node so failed-startup wallets stay "bad" for the retry window across the
 	// 30s sweep.
 	activator := wallet.NewActivator()
-	connectors, drops := activator.Activate(admitted, conf.Main.ExchangeWallets, true)
+	connectors, drops := activator.Activate(admitted, conf.Wallets(), true)
 	for _, d := range drops {
 		xlog.Warn("wallet not activated", "coin", d.Ticker, "reason", d.Reason)
 	}
@@ -309,7 +313,7 @@ func main() {
 		Magic:            magic,
 		Confs:            admitted,
 		Connectors:       connectors,
-		ExchangeWallets:  conf.Main.ExchangeWallets,
+		ExchangeWallets:  conf.Wallets(),
 		WalletVersion:    *walletVersion,
 		WalletVersionStr: *walletVersionStr,
 		DataDir:          dataDir,

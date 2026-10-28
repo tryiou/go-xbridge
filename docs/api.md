@@ -386,7 +386,10 @@ defaulted or trailing parameter.
 **`dxLoadXBridgeConf`**
 - `params`: none.
 - `result`: `true` on success, `false` when the reload fails (keeps the last
-  good config — C++ `uret(success)`, never a business error).
+  good config — C++ `uret(success)`, never a business error). Success means the
+  file parsed: a coin with an unusable `DustAmount` is disabled and reported,
+  not a failure — it leaves `dxGetLocalTokens`, and with `ShowAllOrders` off
+  the reload prunes its non-local orders.
 
 **`getnetworkinfo`**
 - `params`: none.

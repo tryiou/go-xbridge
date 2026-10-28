@@ -5,16 +5,18 @@
 // in the library — the schema below is a faithful mirror of the **createConf()
 // reader** (src/xbridge/xbridgeapp.cpp:976-997). Every field is a real
 // `[TICKER]` conf key; nothing here is invented. `DustAmount` is the coin's
-// dust threshold in native base units and the only definition of it: it is
-// required, and a coin without it (or with a non-numeric value) fails Load
-// rather than falling back to a computed or hardcoded number. `MinimumAmount`
-// is the order minimum and says nothing about dust.
+// dust threshold in native base units and the only definition of it: nothing
+// falls back to a computed or hardcoded number, and a coin whose value is
+// absent, empty or non-numeric is disabled rather than loaded with a default
+// (see Conf.Disabled). `MinimumAmount` is the order minimum and says nothing
+// about dust.
 package config
 
 import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -58,7 +60,8 @@ type CoinConf struct {
 	MinimumAmount uint64
 	TxVersion     int
 	// DustAmount is the coin's dust threshold in native base units: the sole
-	// definition of dust. Required — Load fails for a coin without it.
+	// definition of dust. A coin whose value does not parse is disabled at load
+	// (see Conf.Disabled) rather than loaded with a default.
 	DustAmount    uint64
 	MinTxFee      uint64
 	BlockTime     int // seconds per block
@@ -90,10 +93,49 @@ type CoinConf struct {
 type Conf struct {
 	Main  Main
 	Coins map[string]*CoinConf // keyed by ticker (section name)
+	// Disabled lists coin sections excluded while parsing, with the reason, so
+	// the daemon can report them. A disabled coin is absent from Coins, so no
+	// later lookup can read its threshold as 0 and skip a dust gate. C++ reaches
+	// the same state from the other direction: it fills in the whole WalletParam,
+	// then `continue`s out of the wallet loop at the dust check
+	// (xbridgeapp.cpp:1015-1025), skipping the conns.push_back that would have
+	// added the coin's connector (xbridgeapp.cpp:1125). Sorted by ticker for a
+	// stable startup log.
+	Disabled []Disable
+}
+
+// Wallets returns the [Main].ExchangeWallets tickers that will actually be
+// connected: the configured order minus every coin disabled at load. Handing a
+// disabled coin to the activator would add a second, false drop ("not found in
+// config") for a section that is present; C++ reports such a coin once, at the
+// dust gate, and skips it (xbridgeapp.cpp:1015-1025).
+func (c *Conf) Wallets() []string {
+	out := make([]string, 0, len(c.Main.ExchangeWallets))
+	for _, ticker := range c.Main.ExchangeWallets {
+		disabled := false
+		for _, d := range c.Disabled {
+			if d.Coin == ticker {
+				disabled = true
+				break
+			}
+		}
+		if !disabled {
+			out = append(out, ticker)
+		}
+	}
+	return out
+}
+
+// Disable is one coin section rejected at load time and why.
+type Disable struct {
+	Coin   string
+	Reason string
 }
 
 // Load reads and parses the xbridge.conf at path. It returns an error if the
-// file is missing or malformed. It NEVER creates the file.
+// file is missing or malformed. It NEVER creates the file. A single coin with
+// an unusable DustAmount does not make the file malformed: that coin is
+// recorded in Conf.Disabled and the rest of the config loads.
 func Load(path string) (*Conf, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -120,12 +162,17 @@ func Load(path string) (*Conf, error) {
 		if name == "Rpc" {
 			continue
 		}
-		cc, err := parseCoinConf(name, kv)
-		if err != nil {
-			return nil, err
+		cc, dustProblem := parseCoinConf(name, kv)
+		// A coin whose DustAmount cannot be used is disabled, not fatal, and not
+		// defaulted: C++ drops the wallet, logs why, and keeps trading the rest
+		// (xbridgeapp.cpp:1015-1025).
+		if dustProblem != "" {
+			conf.Disabled = append(conf.Disabled, Disable{Coin: name, Reason: dustProblem})
+			continue
 		}
 		conf.Coins[name] = cc
 	}
+	sort.Slice(conf.Disabled, func(i, j int) bool { return conf.Disabled[i].Coin < conf.Disabled[j].Coin })
 	return conf, nil
 }
 
@@ -274,25 +321,37 @@ func validateSymbol(raw string) string {
 	return string(out)
 }
 
-// DustAmount is the only definition of a coin's dust threshold, so a missing or
-// unparseable value refuses the coin instead of defaulting to a number.
-func parseDustAmount(ticker string, s section) (uint64, error) {
+// parseDustAmount returns the coin's dust threshold in native base units and,
+// when the value cannot be used, the reason it was rejected ("" when usable).
+// Dust is never defaulted and never inferred: a value that does not parse
+// disables the coin (the caller records it), exactly as C++ does. "0" parses and
+// means the coin's daemon applies no dust gate. The two messages match
+// xbridgeapp.cpp:1016-1025 verbatim so one grep finds the cause in either
+// engine's log.
+func parseDustAmount(s section) (uint64, string) {
 	raw, ok := s.get("DustAmount")
-	if !ok || strings.TrimSpace(raw) == "" {
-		return 0, fmt.Errorf("config: coin %s is missing DustAmount", ticker)
+	if !ok {
+		return 0, "has no DustAmount in the config"
+	}
+	if strings.TrimSpace(raw) == "" {
+		return 0, "has an invalid DustAmount in the config <>"
 	}
 	n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("config: coin %s has a non-numeric DustAmount %q", ticker, raw)
+		return 0, fmt.Sprintf("has an invalid DustAmount in the config <%s>", raw)
 	}
-	return n, nil
+	return n, ""
 }
 
-func parseCoinConf(name string, kv map[string]string) (*CoinConf, error) {
+// parseCoinConf returns the section's conf, or nil plus the reason when its
+// DustAmount cannot be used. A rejected dust value disables that coin only; it
+// is never an error, because the rest of the file is still valid. The reject
+// happens before any field is read, so a disabled coin is never built.
+func parseCoinConf(name string, kv map[string]string) (*CoinConf, string) {
 	s := section(kv)
-	dust, err := parseDustAmount(name, s)
-	if err != nil {
-		return nil, err
+	dust, dustProblem := parseDustAmount(s)
+	if dustProblem != "" {
+		return nil, dustProblem
 	}
 	return &CoinConf{
 		Ticker:                    name,
@@ -322,5 +381,5 @@ func parseCoinConf(name string, kv map[string]string) (*CoinConf, error) {
 		JSONVersion:               s.str("JSONVersion", ""),
 		ContentType:               s.str("ContentType", ""),
 		OmitJSONVersion:           s.boolp("OmitJSONVersion"),
-	}, nil
+	}, ""
 }

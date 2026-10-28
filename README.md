@@ -103,7 +103,7 @@ never treated as a coin.
 | `MinimumAmount` | uint64 | Order minimum (XBridge base units). Says nothing about dust. |
 | `TxVersion` | int | Transaction version (default `1`). |
 | `MinTxFee` / `FeePerByte` | uint64 | Fee rules (base units / sat-per-byte). |
-| `DustAmount` | uint64 | **Required.** The coin's dust threshold in native base units, and the only definition of it. A coin without it (or with a non-numeric value) fails config load. `0` means the source has no dust gate. |
+| `DustAmount` | uint64 | **Required.** The coin's dust threshold in native base units, and the only definition of it. A coin whose value is missing, empty or non-numeric is **disabled** — it leaves `dxGetLocalTokens` and the daemon keeps running (same rule as C++). `0` means the source has no dust gate. |
 | `BlockTime` | int | Seconds per block (used for HTLC lock-time math and wallet admission gates). |
 | `Confirmations` | int | Required confirmations. |
 | `TxWithTimeField` | bool | Tx carries a time field. |
@@ -282,7 +282,10 @@ fills only) are documented under "Tier 3" there.
 - **`-conf` is required and fatal if missing** — `xbridged` never creates it.
 - The conf file is **read-only**; edit it yourself, don't expect regeneration.
   `dxLoadXBridgeConf` reloads it at runtime (keeps the last good config on
-  failure; answers `false`, not an error, when the reload fails).
+  failure; answers `false`, not an error, when the reload fails). A reload
+  succeeds when the file parses: a coin with an unusable `DustAmount` is
+  disabled, not a failure — it leaves `dxGetLocalTokens`, and with
+  `ShowAllOrders` off its non-local orders are pruned.
 - Discovery needs at least one reachable service node; if all seeds/peers are
   unreachable, use `-node <host:port>` to pin one. `-addnode` only augments
   discovery mode — it is ignored with `-node`.

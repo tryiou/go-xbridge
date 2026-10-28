@@ -87,7 +87,8 @@ type Config struct {
 	Confs map[string]*config.CoinConf
 	// Connectors maps ticker to the wallet connector built from xbridge.conf.
 	Connectors map[string]wallet.Connector
-	// ExchangeWallets is the local-wallet list from [Main].ExchangeWallets.
+	// ExchangeWallets is the local-wallet list from [Main].ExchangeWallets, minus
+	// any coin config.Load disabled for an unusable DustAmount (config.Conf.Wallets).
 	ExchangeWallets []string
 	// ShowAllOrders shows every order regardless of whether a wallet connector exists for its currencies.
 	ShowAllOrders bool
@@ -379,13 +380,17 @@ func (n *Node) reloadConf() error {
 	if err != nil {
 		return fmt.Errorf("dxLoadXBridgeConf: load %s: %w", path, err)
 	}
+	// Same rule as startup: a coin whose DustAmount cannot be used is disabled
+	// for this snapshot and reported, never fatal. A reload that repairs the file
+	// brings the coin back; one that breaks it drops only that coin.
+	ReportDisabled(conf)
 	admitted := config.Admitted(conf.Coins)
 	if err := coins.InitFromConf(admitted); err != nil {
 		return fmt.Errorf("dxLoadXBridgeConf: coin registry: %w", err)
 	}
 	a := n.walletActivator()
 	a.ClearBad()
-	connectors, drops := a.Activate(admitted, conf.Main.ExchangeWallets, n.cfg().CheckReachability)
+	connectors, drops := a.Activate(admitted, conf.Wallets(), n.cfg().CheckReachability)
 	for _, d := range drops {
 		xlog.Warn("wallet not activated after reload", "coin", d.Ticker, "reason", d.Reason)
 	}
@@ -395,7 +400,7 @@ func (n *Node) reloadConf() error {
 		Magic:              n.cfg().Magic,
 		Confs:              admitted,
 		Connectors:         connectors,
-		ExchangeWallets:    conf.Main.ExchangeWallets,
+		ExchangeWallets:    conf.Wallets(),
 		ForceShowAllOrders: n.cfg().ForceShowAllOrders,
 		ShowAllOrders:      conf.Main.ShowAllOrders || n.cfg().ForceShowAllOrders,
 		// TakeRetry is daemon-level (not conf): carried over, else a reload would
