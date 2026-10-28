@@ -234,8 +234,6 @@ func (f *fakeConnector) SendRawTransaction(txHex string) (string, error) {
 	return txid, nil
 }
 
-func (f *fakeConnector) GetRelayFee() (float64, error) { return 0.0001, nil }
-
 // broadcastSnapshot returns a copy of the recorded broadcasts under the lock,
 // so a started-engine test can observe worker RPCs from the test goroutine.
 func (f *fakeConnector) broadcastSnapshot() []string {

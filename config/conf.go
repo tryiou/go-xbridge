@@ -4,16 +4,11 @@
 // entirely by its [TICKER] section here. There is no hardcoded coin data anywhere
 // in the library — the schema below is a faithful mirror of the **createConf()
 // reader** (src/xbridge/xbridgeapp.cpp:976-997). Every field is a real
-// `[TICKER]` conf key; nothing here is invented. Note: C++ does NOT read a
-// `RelayFee` conf key — relay fee comes live from the wallet RPC
-// `getmininginfo.relayfee` (xbridgewalletconnectorbtc.cpp:74-76) and is used
-// only for dust fallback (`dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460`,
-// xbridgewalletconnectorbtc.cpp:1526). go-xbridge has no live relay-fee feed
-// (thin client), so dust resolves from the conf `MinimumAmount` key — C++ maps
-// that key onto the exchange wallets' dustAmount (xbridgeexchange.cpp:145) and
-// never reads a `DustAmount` key — else the C++-defined constant 5460.
-// `GetNewKeySupported`/`ImportWithNoScanSupported`/`DustAmount` are written by
-// the createConf() template but are not read back by the reader.
+// `[TICKER]` conf key; nothing here is invented. `DustAmount` is the coin's
+// dust threshold in native base units and the only definition of it: it is
+// required, and a coin without it (or with a non-numeric value) fails Load
+// rather than falling back to a computed or hardcoded number. `MinimumAmount`
+// is the order minimum and says nothing about dust.
 package config
 
 import (
@@ -62,10 +57,8 @@ type CoinConf struct {
 	Coin          uint64
 	MinimumAmount uint64
 	TxVersion     int
-	// DustAmount is written by the createConf() template but never read back by
-	// the C++ reader (xbridgeexchange.cpp:145 maps `MinimumAmount` onto the
-	// exchange wallets' dustAmount instead). Parsed here for template fidelity;
-	// go-xbridge's dust resolves from MinimumAmount (see the package comment).
+	// DustAmount is the coin's dust threshold in native base units: the sole
+	// definition of dust. Required — Load fails for a coin without it.
 	DustAmount    uint64
 	MinTxFee      uint64
 	BlockTime     int // seconds per block
@@ -127,7 +120,10 @@ func Load(path string) (*Conf, error) {
 		if name == "Rpc" {
 			continue
 		}
-		cc := parseCoinConf(name, kv)
+		cc, err := parseCoinConf(name, kv)
+		if err != nil {
+			return nil, err
+		}
 		conf.Coins[name] = cc
 	}
 	return conf, nil
@@ -278,8 +274,26 @@ func validateSymbol(raw string) string {
 	return string(out)
 }
 
-func parseCoinConf(name string, kv map[string]string) *CoinConf {
+// DustAmount is the only definition of a coin's dust threshold, so a missing or
+// unparseable value refuses the coin instead of defaulting to a number.
+func parseDustAmount(ticker string, s section) (uint64, error) {
+	raw, ok := s.get("DustAmount")
+	if !ok || strings.TrimSpace(raw) == "" {
+		return 0, fmt.Errorf("config: coin %s is missing DustAmount", ticker)
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: coin %s has a non-numeric DustAmount %q", ticker, raw)
+	}
+	return n, nil
+}
+
+func parseCoinConf(name string, kv map[string]string) (*CoinConf, error) {
 	s := section(kv)
+	dust, err := parseDustAmount(name, s)
+	if err != nil {
+		return nil, err
+	}
 	return &CoinConf{
 		Ticker:                    name,
 		Title:                     s.str("Title", ""), // C++ Settings::get defaults a missing key to "" (settings.h:75-84), not the section name
@@ -295,7 +309,7 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		Coin:                      s.uintp("COIN", 0),
 		MinimumAmount:             s.uintp("MinimumAmount", 0),
 		TxVersion:                 s.intp("TxVersion", 1), // C++ xbridgeapp.cpp: s.get<uint32_t>(*i+".TxVersion", 1)
-		DustAmount:                s.uintp("DustAmount", 0),
+		DustAmount:                dust,
 		MinTxFee:                  s.uintp("MinTxFee", 0),
 		BlockTime:                 s.intp("BlockTime", 0),
 		FeePerByte:                s.uintp("FeePerByte", 0),
@@ -308,5 +322,5 @@ func parseCoinConf(name string, kv map[string]string) *CoinConf {
 		JSONVersion:               s.str("JSONVersion", ""),
 		ContentType:               s.str("ContentType", ""),
 		OmitJSONVersion:           s.boolp("OmitJSONVersion"),
-	}
+	}, nil
 }

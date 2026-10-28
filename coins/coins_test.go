@@ -30,6 +30,7 @@ ScriptPrefix=5
 SecretPrefix=128
 COIN=100000000
 TxVersion=1
+DustAmount=546
 
 [BLOCK]
 Title=Blocknet
@@ -38,6 +39,7 @@ AddressPrefix=26
 ScriptPrefix=28
 SecretPrefix=154
 COIN=100000000
+DustAmount=546
 
 [DOGE]
 Title=Dogecoin
@@ -46,6 +48,7 @@ AddressPrefix=30
 ScriptPrefix=22
 SecretPrefix=158
 COIN=100000000
+DustAmount=1000000
 `
 	if _, err := f.WriteString(body); err != nil {
 		panic(err)

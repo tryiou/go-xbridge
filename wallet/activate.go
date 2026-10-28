@@ -44,7 +44,7 @@ type Activator struct {
 	// which performs a wallet getInfo (xbridgewalletconnectorbtc.cpp:1513-1525).
 	// Note the divergence: a wallet that answers getblockcount but otherwise
 	// misbehaves would pass the probe, where C++ init() also validates the
-	// relay-fee/mediantime fields. Overridable in tests and embeddings.
+	// mediantime field. Overridable in tests and embeddings.
 	Probe func(Connector) error
 }
 

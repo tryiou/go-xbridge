@@ -73,11 +73,11 @@ func newHubNodeUnfundedBlock(reg *servicenode.Registry) (*Node, *captureXConn) {
 
 func buildHubNode(reg *servicenode.Registry, btc []wallet.Utxo, block []wallet.Utxo) (*Node, *captureXConn) {
 	coinConfs := map[string]*config.CoinConf{
-		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
-		"SYS": {Ticker: "SYS", CreateTxMethod: "SYS", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
+		"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, DustAmount: 546},
+		"SYS": {Ticker: "SYS", CreateTxMethod: "SYS", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, DustAmount: 546},
 	}
 	if block != nil {
-		coinConfs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+		coinConfs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1, DustAmount: 546}
 	}
 	if err := coins.InitFromConf(coinConfs); err != nil {
 		panic(err)
@@ -85,8 +85,8 @@ func buildHubNode(reg *servicenode.Registry, btc []wallet.Utxo, block []wallet.U
 	cc := &captureXConn{}
 	cfg := &Config{
 		Confs: map[string]*config.CoinConf{
-			"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
-			"SYS": {Ticker: "SYS", CreateTxMethod: "SYS", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000},
+			"BTC": {Ticker: "BTC", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, DustAmount: 546},
+			"SYS": {Ticker: "SYS", CreateTxMethod: "SYS", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, DustAmount: 546},
 		},
 		Connectors: map[string]wallet.Connector{
 			"BTC": &stubConn{ticker: "BTC", addr: btcAddr, utxos: btc},
@@ -94,7 +94,7 @@ func buildHubNode(reg *servicenode.Registry, btc []wallet.Utxo, block []wallet.U
 		},
 	}
 	if block != nil {
-		cfg.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+		cfg.Confs["BLOCK"] = &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1, DustAmount: 546}
 		cfg.Connectors["BLOCK"] = &stubConn{ticker: "BLOCK", addr: btcAddr, matureUtxos: block}
 	}
 	n := &Node{
@@ -828,7 +828,7 @@ func TestTakeOrderDust(t *testing.T) {
 	id := [32]byte{0x74}
 	n.store.Add(&Order{
 		ID: id, Type: OrderTypeBroadcast, FromCurrency: "BTC", FromAmount: 1500000,
-		ToCurrency: "BTC", ToAmount: 10, Status: "open", Mine: false,
+		ToCurrency: "BTC", ToAmount: 5, Status: "open", Mine: false,
 		SNodePubkey: pubHex, HubAddress: hubAddr,
 	})
 	_, rerr := n.TakeOrder(TakeOrderParams{ID: dispID(id), FromAddress: btcAddr, ToAddress: btcAddr2})
@@ -920,16 +920,11 @@ func TestTakeOrderBadAddressAfterFundsGate(t *testing.T) {
 }
 
 // TestMakePartialDustNativeScale locks in the partial minimum_size being
-// compared in the coin's NATIVE base units (partialMinimum * COIN < dustAmount,
-// xbridgewalletconnectorbtc.cpp:1900-1904), NOT in XBridge 1e6 base against a
-// native dust value. buildHubNode confs set no conf dust (MinimumAmount), so
-// effectiveDust = 0.546 * relayFee * COIN; the stub wallet reports relayFee
-// 0.0001, giving 0.546 * 0.0001 * 1e8 = 5460 native (numerically equal to
-// cppDustFallback).
-// Native = minFrom * 1e8/1e6 = minFrom * 100: 0.000055 -> 5500 native (NOT
-// dust), 0.000054 -> 5400 native (dust). The old 1e6-vs-native comparison
-// rejected everything below 5460 XBridge base (i.e. 0.00546 coins), wrongly
-// rejecting 0.000055.
+// compared in the coin's NATIVE base units against the conf's DustAmount
+// (xbridgewalletconnectorbtc.cpp:1906-1910), NOT in XBridge 1e6 base against a
+// native dust value. buildHubNode sets BTC's DustAmount to 546.
+// Native = minFrom * 1e8/1e6 = minFrom * 100: 0.000006 -> 600 native (NOT
+// dust), 0.000005 -> 500 native (dust).
 func TestMakePartialDustNativeScale(t *testing.T) {
 	n, _ := newHubNode(nil) // dryrun skips the hub gate, so no registry needed
 	mk := func(min string) *rpcError {
@@ -940,11 +935,11 @@ func TestMakePartialDustNativeScale(t *testing.T) {
 		})
 		return rerr
 	}
-	if rerr := mk("0.000055"); rerr != nil {
-		t.Errorf("MakeOrder(min 0.000055) = %v, want NO dust error (native 5500 >= 5460)", rerr)
+	if rerr := mk("0.000006"); rerr != nil {
+		t.Errorf("MakeOrder(min 0.000006) = %v, want NO dust error (native 600 >= 546)", rerr)
 	}
-	if rerr := mk("0.000054"); rerr == nil || rerr.Code != errInvalidParameters || !strings.Contains(rerr.Error, "dust") {
-		t.Errorf("MakeOrder(min 0.000054) = %v, want 1025 dust error (native 5400 < 5460)", rerr)
+	if rerr := mk("0.000005"); rerr == nil || rerr.Code != errInvalidParameters || !strings.Contains(rerr.Error, "dust") {
+		t.Errorf("MakeOrder(min 0.000005) = %v, want 1025 dust error (native 500 < 546)", rerr)
 	}
 }
 

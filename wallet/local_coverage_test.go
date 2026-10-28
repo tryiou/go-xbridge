@@ -29,9 +29,6 @@ func TestLocalConnectorNoSourceContract(t *testing.T) {
 	if _, err := c.ListUnspentWithZeroConf(); err == nil {
 		t.Error("ListUnspentWithZeroConf: want error, got nil")
 	}
-	if _, err := c.GetRelayFee(); err == nil {
-		t.Error("GetRelayFee: want error, got nil")
-	}
 	if _, err := c.GetBlockCount(); err == nil {
 		t.Error("GetBlockCount: want error, got nil")
 	}

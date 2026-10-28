@@ -584,7 +584,6 @@ func (s *stubConnForHunt) SendRawTransaction(txHex string) (string, error) {
 	}
 	return "txid123", nil
 }
-func (s *stubConnForHunt) GetRelayFee() (float64, error) { return 0.0001, nil }
 func (s *stubConnForHunt) GetBlockCount() (int64, error) { return 1000, nil }
 func (s *stubConnForHunt) GetBlockHash(height int64) ([32]byte, error) {
 	return [32]byte{}, nil

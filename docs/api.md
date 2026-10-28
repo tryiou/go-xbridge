@@ -258,9 +258,9 @@ defaulted or trailing parameter.
   1025 (same rules as `dxMakeOrder`).
   - **`minimum_size`**: not precision-checked (unlike the maker/taker sizes);
     sub-6-decimal values truncate to 6 decimals before the dust test, so a
-    minimum whose native value lands in the narrow band just under the dust
-    threshold (e.g. `0.0000546` → 5400 vs the 5460 fallback) is rejected as
-    dust where C++'s full-precision comparison accepts it — accepted divergence,
+    minimum whose native value lands in the narrow band just under the coin's
+    dust threshold (e.g. Bitcoin's 546: `0.000006` → 600 passes, `0.000005` →
+    500 is dust) is judged at the truncated value — accepted divergence,
     behavior pinned by `TestMakePartialDustNativeScale`.
 
 **`dxTakeOrder`**

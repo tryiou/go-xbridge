@@ -118,8 +118,6 @@ type Connector interface {
 	SignRawTransaction(txHex string, prevTxs []PrevTx) (signedHex string, complete bool, err error)
 	// SendRawTransaction broadcasts txHex, returning the network txid.
 	SendRawTransaction(txHex string) (txid string, err error)
-	// GetRelayFee returns the wallet's relay fee in BTC per kB.
-	GetRelayFee() (float64, error)
 	// GetBlockCount returns the best block height of the coin's chain.
 	GetBlockCount() (int64, error)
 	// GetBlockHash returns the block hash in internal (little-endian) byte order, the order the XBridge wire uses.

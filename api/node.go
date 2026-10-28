@@ -529,12 +529,19 @@ func (n *Node) connector(t string) (wallet.Connector, error) {
 	return conn, nil
 }
 
-func (n *Node) relayFeeFor(ticker string) (float64, error) {
-	conn, err := n.connector(ticker)
-	if err != nil {
-		return 0, err
+// confFor returns the coin's conf from one config snapshot. A configured
+// connector always has a conf, so an absent one means the config was replaced
+// between two reads; refuse rather than treat the coin as having no dust gate.
+func (n *Node) confFor(t string) (*config.CoinConf, error) {
+	c := n.cfg()
+	if c == nil || c.Confs == nil {
+		return nil, fmt.Errorf("dx: no wallet configured")
 	}
-	return conn.GetRelayFee()
+	cc := c.Confs[t]
+	if cc == nil {
+		return nil, fmt.Errorf("dx: no wallet configured for %s", t)
+	}
+	return cc, nil
 }
 
 func (n *Node) blockContext(ticker string) (height uint32, hash [8]byte, err error) {
@@ -1229,6 +1236,12 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	if _, e := n.connector(p.Taker); e != nil {
 		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Taker)
 	}
+	// A connector always has a conf in the same snapshot. Refuse if it does not,
+	// so an absent conf can never present itself as a zero dust threshold.
+	cc, cerr := n.confFor(p.Maker)
+	if cerr != nil {
+		return nil, makeError(errNoSession, "dxMakeOrder", "Unable to connect to wallet: "+p.Maker)
+	}
 	fromID, e := decodeAddr("dxMakeOrder", p.Maker, p.MakerAddress)
 	if e != nil {
 		return nil, e
@@ -1265,12 +1278,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 
 	partial := false
 	minFrom := uint64(0)
-	cc := n.cfg().Confs[p.Maker]
-	nativeCoin := uint64(coinScale)
-	if cc != nil {
-		nativeCoin = cc.Coin
-	}
-	var relayFee float64
+	nativeCoin := cc.Coin
 	if p.Type == "partial" {
 		partial = true
 		if p.MinSize == "" {
@@ -1284,8 +1292,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 		if minFrom > fromAmt {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The minimum_size can't be more than maker_size")
 		}
-		relayFee, _ = n.relayFeeFor(p.Maker)
-		if cc != nil && float64(minFrom)/float64(coinScale)*float64(nativeCoin) < float64(effectiveDust(cc, relayFee)) {
+		if float64(minFrom)/float64(coinScale)*float64(nativeCoin) < float64(effectiveDust(cc)) {
 			return nil, makeError(errInvalidParameters, "dxMakePartialOrder", "The partial minimum_size is dust, i.e. it's too small.")
 		}
 	}
@@ -1319,7 +1326,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			return nil, makeError(errInsufficientFunds, "dxMakePartialOrder", "insufficient funds for partial order")
 		}
 		partialRemainderVoutTotal = fromAmt - partialSplitVoutsTotal
-		partialRemainderIsDust = isDustNative(xBridgeValueFromAmount(partialRemainderVoutTotal+partialPerUtxoFees), cc, relayFee, nativeCoin)
+		partialRemainderIsDust = isDustNative(xBridgeValueFromAmount(partialRemainderVoutTotal+partialPerUtxoFees), cc, nativeCoin)
 		partialVoutsTotal = partialFees + partialSplitVoutsTotal
 		if partialRemainderRequired && !partialRemainderIsDust {
 			partialVoutsTotal += partialRemainderVoutTotal
@@ -1331,10 +1338,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 	}
 
 	conn := makerConn
-	minConf := 0
-	if cc != nil {
-		minConf = cc.Confirmations
-	}
+	minConf := cc.Confirmations
 	locked := n.store.LockedUtxoInfoFor(p.Maker)
 	outputs, listErr := conn.ListUnspent(minConf)
 	if listErr != nil {
@@ -1439,7 +1443,7 @@ func (n *Node) MakeOrder(p MakeOrderParams) (*Order, *rpcError) {
 			if vinsTotal <= voutsTotalNative+prepFee {
 				return nil, makeError(errInvalidAmount, "dxMakePartialOrder", "failed to create order, insufficient funds on partial order")
 			}
-			if changeNative := vinsTotal - voutsTotalNative - prepFee; !isDustNative(float64(changeNative)/float64(nativeCoin), cc, relayFee, nativeCoin) {
+			if changeNative := vinsTotal - voutsTotalNative - prepFee; !isDustNative(float64(changeNative)/float64(nativeCoin), cc, nativeCoin) {
 				vouts = append(vouts, prepVout{p.MakerAddress, changeNative})
 			}
 			signedHex, txid, rerr := buildPrepTx(conn, cc, coin, vins, vouts)
@@ -1702,22 +1706,20 @@ func (n *Node) TakeOrder(p TakeOrderParams) (orderListResult, *rpcError) {
 		return o.toTakeDryrunResult(fromSize, toSize), nil
 	}
 
-	ccTo := n.cfg().Confs[o.ToCurrency]
-	ccFrom := n.cfg().Confs[o.FromCurrency]
-	nativeTo := uint64(coinScale)
-	if ccTo != nil {
-		nativeTo = ccTo.Coin
+	ccTo, cerr := n.confFor(o.ToCurrency)
+	if cerr != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", o.ToCurrency)
 	}
-	nativeFrom := uint64(coinScale)
-	if ccFrom != nil {
-		nativeFrom = ccFrom.Coin
+	ccFrom, cerr := n.confFor(o.FromCurrency)
+	if cerr != nil {
+		return orderListResult{}, makeError(errNoSession, "dxTakeOrder", o.FromCurrency)
 	}
-	relayTo, _ := n.relayFeeFor(o.ToCurrency)
-	relayFrom, _ := n.relayFeeFor(o.FromCurrency)
-	if isDustNative(xBridgeValueFromAmount(fromSize), ccTo, relayTo, nativeTo) {
+	nativeTo := ccTo.Coin
+	nativeFrom := ccFrom.Coin
+	if isDustNative(xBridgeValueFromAmount(fromSize), ccTo, nativeTo) {
 		return orderListResult{}, makeError(errDust, "dxTakeOrder", "")
 	}
-	if isDustNative(xBridgeValueFromAmount(toSize), ccFrom, relayFrom, nativeFrom) {
+	if isDustNative(xBridgeValueFromAmount(toSize), ccFrom, nativeFrom) {
 		return orderListResult{}, makeError(errDust, "dxTakeOrder", "")
 	}
 

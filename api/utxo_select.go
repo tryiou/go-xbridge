@@ -69,20 +69,11 @@ func minTxFeeWhole(cc *config.CoinConf, nIn, nOut int) float64 {
 }
 
 // isDustNative mirrors C++ isDustAmount(double)
-// (xbridgewalletconnectorbtc.cpp:1900-1904): a whole-coin double v is dust when
-// int64(v * COIN_native) < int64(dustAmount). dustAmount follows effectiveDust
-// (relay-fee-derived, conf MinimumAmount, or the C++ 5460 fallback), nil-safe so a
-// missing CoinConf cannot panic the make path.
-func isDustNative(v float64, cc *config.CoinConf, relayFee float64, nativeCoin uint64) bool {
-	var dust int64
-	if relayFee > 0 && cc != nil {
-		dust = int64(0.546 * relayFee * float64(cc.Coin))
-	} else if cc != nil && cc.MinimumAmount > 0 {
-		dust = int64(cc.MinimumAmount)
-	} else {
-		dust = cppDustFallback
-	}
-	return int64(v*float64(nativeCoin)) < dust
+// (xbridgewalletconnectorbtc.cpp:1906-1910): a whole-coin double v is dust when
+// its base-unit value is below the coin's DustAmount. Compared unsigned, as
+// xBridgeChangeIsDust does, so a threshold above INT64_MAX cannot invert it.
+func isDustNative(v float64, cc *config.CoinConf, nativeCoin uint64) bool {
+	return int64(v*float64(nativeCoin)) < 0 || uint64(v*float64(nativeCoin)) < effectiveDust(cc)
 }
 
 // selectUtxos picks the maker's spendable utxos funding an exact order,

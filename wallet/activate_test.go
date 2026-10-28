@@ -209,7 +209,6 @@ func (c *hangingProbeConnector) SignRawTransaction(string, []PrevTx) (string, bo
 func (c *hangingProbeConnector) SendRawTransaction(string) (string, error) {
 	return "", errors.New("unused")
 }
-func (c *hangingProbeConnector) GetRelayFee() (float64, error) { return 0, errors.New("unused") }
 func (c *hangingProbeConnector) GetBlockCount() (int64, error) {
 	<-c.block
 	close(c.returned)

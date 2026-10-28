@@ -134,7 +134,6 @@ func (s *conformanceStubConn) SignRawTransaction(txHex string, prevTxs []wallet.
 func (s *conformanceStubConn) SendRawTransaction(txHex string) (string, error) {
 	return "txid123", nil
 }
-func (s *conformanceStubConn) GetRelayFee() (float64, error) { return 0.0001, nil }
 func (s *conformanceStubConn) GetBlockCount() (int64, error) { return 100, nil }
 func (s *conformanceStubConn) GetBlockHash(height int64) ([32]byte, error) {
 	var h [32]byte

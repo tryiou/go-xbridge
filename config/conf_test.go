@@ -167,6 +167,7 @@ Ip=127.0.0.1
 Port=8332
 COIN=100000000
 BlockTime=600
+DustAmount=546
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -249,10 +250,12 @@ func TestCaseSensitiveKeys(t *testing.T) {
 	conf, err := Load(writeConf(t, `
 [main]
 ExchangeWallets=BTC
+DustAmount=546
 
 [BTC]
 coin=100000000
 BlockTime=600
+DustAmount=546
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -279,12 +282,14 @@ func TestTitleDefaultsEmpty(t *testing.T) {
 	conf, err := Load(writeConf(t, `
 [BTC]
 Title=Bitcoin
+DustAmount=546
 
 [LTC]
 Ip=127.0.0.1
 Port=9332
 COIN=100000000
 BlockTime=150
+DustAmount=5460
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)

@@ -63,8 +63,6 @@ func mockRPC(t *testing.T) *httptest.Server {
 			res(`{"hex":"deadbeef","complete":true}`)
 		case "sendrawtransaction":
 			res(`"txid1234567890"`)
-		case "getinfo":
-			res(`{"relayfee":0.0001}`)
 		case "getblockcount":
 			res(`100`)
 		case "getblockhash":
@@ -172,15 +170,6 @@ func TestRPCConnector(t *testing.T) {
 		}
 	})
 
-	t.Run("GetRelayFee", func(t *testing.T) {
-		fee, err := c.GetRelayFee()
-		if err != nil {
-			t.Fatalf("GetRelayFee: %v", err)
-		}
-		if fee != 0.0001 {
-			t.Fatalf("relayfee = %v, want 0.0001", fee)
-		}
-	})
 	t.Run("GetBlockCount", func(t *testing.T) {
 		h, err := c.GetBlockCount()
 		if err != nil {

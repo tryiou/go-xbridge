@@ -12,7 +12,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -155,9 +154,8 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 
 // RPCConnector drives a single coin wallet over JSON-RPC.
 type RPCConnector struct {
-	chain    Chain
-	cli      *RPCClient
-	relayFee relayFeeCache
+	chain Chain
+	cli   *RPCClient
 }
 
 // NewRPCConnector builds a Connector for the given chain endpoint.
@@ -326,49 +324,6 @@ func (c *RPCConnector) SendRawTransaction(txHex string) (string, error) {
 		return "", c.wrapErr("sendrawtransaction", err)
 	}
 	return txid, nil
-}
-
-// relayFeeCache memoizes the relay fee so dust calculations do not probe the wallet each time.
-type relayFeeCache struct {
-	mu   sync.Mutex
-	once bool
-	val  float64
-	err  error
-}
-
-// GetRelayFee returns the wallet's relay fee in BTC per kB, fetched once and
-// cached — failed probes are retried on the next call.
-func (c *RPCConnector) GetRelayFee() (float64, error) {
-	c.relayFee.mu.Lock()
-	defer c.relayFee.mu.Unlock()
-	if c.relayFee.once {
-		return c.relayFee.val, c.relayFee.err
-	}
-	var res struct {
-		RelayFee float64 `json:"relayfee"`
-	}
-	// Deliberate divergence from C++: getinfo is tried first, then getnetworkinfo;
-	// BtcWalletConnector::getInfo tries getblockchaininfo/getnetworkinfo before getinfo.
-	var err error
-	var getInfoErr error
-	if e := c.cli.Call("getinfo", nil, &res); e != nil {
-		getInfoErr = e
-	}
-	if res.RelayFee <= 0 {
-		if e2 := c.cli.Call("getnetworkinfo", nil, &res); e2 != nil {
-			if getInfoErr != nil {
-				err = c.wrapErr("getinfo/relayfee", getInfoErr)
-			} else {
-				err = c.wrapErr("getnetworkinfo/relayfee", e2)
-			}
-		}
-	}
-	if err == nil {
-		c.relayFee.once = true
-		c.relayFee.val = res.RelayFee
-		c.relayFee.err = err
-	}
-	return res.RelayFee, err
 }
 
 // GetBlockCount returns the best block height of the coin's chain.

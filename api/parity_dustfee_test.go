@@ -6,39 +6,55 @@ import (
 	"go-xbridge/config"
 )
 
+// DustAmount is the sole definition of a coin's dust threshold, in native base
+// units. Nothing derives it and nothing falls back to a constant.
 func TestEffectiveDust(t *testing.T) {
-	// C++: dustAmount = relayFee>0 ? 0.546*relayFee*COIN : 5460
-	// (xbridgewalletconnectorbtc.cpp:1526). The conf-provided dust source is
-	// `MinimumAmount` (C++ maps it onto the exchange wallets' dustAmount,
-	// xbridgeexchange.cpp:145; it never reads a `DustAmount` key).
-	// Coin=1e8 (BTC-like) unless noted.
-	const coin = uint64(100_000_000)
 	tests := []struct {
-		name     string
-		min      uint64
-		relayFee float64
-		want     uint64
+		name string
+		cc   *config.CoinConf
+		want uint64
 	}{
-		// Live relayfee wins (C++ order): 0.546*0.0001*1e8 = 5460.
-		{"relayFee set", 0, 0.0001, 5460},
-		// Relayfee differs from fallback (COIN=1e6) -> 0.546*0.0001*1e6 = 54.6 -> 54.
-		{"relayFee set small coin", 0, 0.0001, 54},
-		// No relayfee: conf MinimumAmount used directly when set.
-		{"minimumAmount set", 100, 0, 100},
-		{"minimumAmount set (large)", 546, 0, 546},
-		// No relayfee, no MinimumAmount: falls back to C++ constant 5460.
-		{"default 5460", 0, 0, cppDustFallback},
+		{"btc 546", &config.CoinConf{DustAmount: 546, Coin: 100_000_000}, 546},
+		{"ltc 5460", &config.CoinConf{DustAmount: 5460, Coin: 100_000_000}, 5460},
+		{"doge 1e6", &config.CoinConf{DustAmount: 1_000_000, Coin: 100_000_000}, 1_000_000},
+		{"coin with 1e6 scale", &config.CoinConf{DustAmount: 100, Coin: 1_000_000}, 100},
+		{"source disables dust", &config.CoinConf{DustAmount: 0, Coin: 100_000_000}, 0},
+		// Absent conf has no threshold and must not dereference.
+		{"nil conf", nil, 0},
+		// MinimumAmount is the order minimum; it must never leak into dust.
+		{"minimumAmount ignored", &config.CoinConf{DustAmount: 546, MinimumAmount: 1_000_000}, 546},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cc := &config.CoinConf{MinimumAmount: tc.min, Coin: coin}
-			if tc.name == "relayFee set small coin" {
-				cc.Coin = 1_000_000
-			}
-			if got := effectiveDust(cc, tc.relayFee); got != tc.want {
+			if got := effectiveDust(tc.cc); got != tc.want {
 				t.Errorf("effectiveDust = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// The 3288-sat change from the rejected LTC swap is dust at LTC's 5460
+// threshold, and correctly not dust at BTC's 546.
+func TestIsDustNative(t *testing.T) {
+	const coin = uint64(100_000_000)
+	ltc := &config.CoinConf{DustAmount: 5460, Coin: coin}
+	btc := &config.CoinConf{DustAmount: 546, Coin: coin}
+	firo := &config.CoinConf{DustAmount: 0, Coin: coin}
+
+	if !isDustNative(3288.0/1e8, ltc, coin) {
+		t.Error("3288 sat must be dust at LTC's 5460")
+	}
+	if isDustNative(3288.0/1e8, btc, coin) {
+		t.Error("3288 sat must not be dust at BTC's 546")
+	}
+	if !isDustNative(5459.0/1e8, ltc, coin) || isDustNative(5459.0/1e8, btc, coin) {
+		t.Error("5459: below LTC's threshold, above BTC's")
+	}
+	if isDustNative(5460.0/1e8, ltc, coin) {
+		t.Error("5460 == threshold is not dust")
+	}
+	if isDustNative(1.0/1e8, firo, coin) {
+		t.Error("a coin with DustAmount=0 has no dust gate")
 	}
 }
 

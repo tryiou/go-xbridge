@@ -22,10 +22,6 @@ const serviceNodeFeeReal = 0.015
 // independent of the conf FeePerByte / estimateFee model.
 const feeTxRelayPerByte = 40.0 / 100000000
 
-// minFeeChangeDust is the smallest native change output C++ keeps; smaller
-// change is folded back into the fee (bitcoinrpcconnector.cpp:206).
-const minFeeChangeDust = 5460
-
 // maxOrderInfoBytes mirrors C++ maxBytes = nMaxDatacarrierBytes-3 = 157
 // (xbridgeapp.cpp:2207; MAX_OP_RETURN_RELAY = 160, script/standard.h:34).
 const maxOrderInfoBytes = 160 - 3
@@ -200,7 +196,8 @@ func buildServiceNodeFeeTx(conn wallet.Connector, blkCoin coins.Coin, blkConf *c
 	// vouts: [OP_RETURN data, fee→registry payment addr, change?].
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: 0, ScriptPubKey: coins.BuildOpReturnScript(data)})
 	tx.Outputs = append(tx.Outputs, coins.TxOut{Value: uint64(serviceNodeFeeReal * native), ScriptPubKey: coins.BuildP2PKHScript(dest)})
-	if changeAmt >= minFeeChangeDust {
+	// The fee is paid in BLOCK, so its change is gated by BLOCK's threshold.
+	if changeAmt >= effectiveDust(blkConf) {
 		changeScript, e := legacyOutputScript(blkCoin, sel[0].Address)
 		if e != nil {
 			return "", nil, e

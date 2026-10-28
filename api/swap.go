@@ -1854,6 +1854,11 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 	if conn == nil {
 		return depositOutcome{}, fmt.Errorf("api: no connector for %s", cur)
 	}
+	if cc == nil {
+		// Every connector was built from a conf in the same snapshot, so a
+		// missing one is unsafe: the deposit's dust gate would silently vanish.
+		return depositOutcome{}, fmt.Errorf("api: no conf for %s", cur)
+	}
 	coin, ok := c.coin(cur)
 	if !ok {
 		return depositOutcome{}, fmt.Errorf("api: unknown coin %s", cur)
@@ -1913,7 +1918,7 @@ func (c *swapCtx) buildDeposit(isMaker bool) (depositOutcome, error) {
 		LockTime:        lockTime,
 		TxVersion:       c.txVersion(cur),
 	}
-	tx, err := spec.BuildDepositTx(coin, funding, change, fee, fee2, depositDustLimit(cc, conn))
+	tx, err := spec.BuildDepositTx(coin, funding, change, fee, fee2, depositDustLimit(cc))
 	if err != nil {
 		return depositOutcome{}, err
 	}
@@ -2170,12 +2175,8 @@ func (c *swapCtx) minConf(cc *config.CoinConf) int {
 	return cc.Confirmations
 }
 
-func depositDustLimit(cc *config.CoinConf, conn wallet.Connector) uint64 {
-	var relayFee float64
-	if conn != nil {
-		relayFee, _ = conn.GetRelayFee()
-	}
-	return effectiveDust(cc, relayFee)
+func depositDustLimit(cc *config.CoinConf) uint64 {
+	return effectiveDust(cc)
 }
 
 // ownDepositVout is the output index of our own deposit's P2SH HTLC output.

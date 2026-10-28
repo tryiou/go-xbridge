@@ -124,7 +124,7 @@ func TestIsP2PKH25(t *testing.T) {
 // as "signed", so the shape is fully deterministic) and asserts the C++
 // createFeeTransaction layout (bitcoinrpcconnector.cpp:132-234): version 1, no
 // nTime, Sequence 0xffffffff, [OP_RETURN data, 0.015 → registry payment
-// address, change ≥ 5460].
+// address, change ≥ BLOCK's dust threshold (546)].
 func TestBuildServiceNodeFeeTx(t *testing.T) {
 	if err := coins.InitFromConf(map[string]*config.CoinConf{
 		"BLOCK": {Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1},
@@ -132,7 +132,7 @@ func TestBuildServiceNodeFeeTx(t *testing.T) {
 		t.Fatal(err)
 	}
 	blkCoin, _ := coins.Get("BLOCK")
-	blkConf := &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1}
+	blkConf := &config.CoinConf{Ticker: "BLOCK", CreateTxMethod: "BTC", AddressPrefix: 0, ScriptPrefix: 5, Coin: 100000000, TxVersion: 1, DustAmount: 546}
 	dest := [20]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e}
 	data := []byte(`["0000000000000000000000000000000000000000000000000000000000000000","BTC",300000,"BTC",1500000]`)
 	avail := []wallet.Utxo{blkUtxo()}
@@ -176,8 +176,11 @@ func TestBuildServiceNodeFeeTx(t *testing.T) {
 	if got := tx.Outputs[1].ScriptPubKey; !equalP2PKH(got, dest) {
 		t.Errorf("fee output script = %x, want p2pkh(%x)", got, dest)
 	}
-	if tx.Outputs[2].Value < minFeeChangeDust {
-		t.Errorf("change output = %d, want >= %d", tx.Outputs[2].Value, minFeeChangeDust)
+	// Literal, not effectiveDust(): the assertion must fail if the gate is fed
+	// the wrong threshold, so the expected value comes from BLOCK's conf.
+	const blkDust = 546
+	if tx.Outputs[2].Value < blkDust {
+		t.Errorf("change output = %d, want >= %d", tx.Outputs[2].Value, blkDust)
 	}
 }
 

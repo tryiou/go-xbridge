@@ -183,7 +183,6 @@ type Connector interface {
     ListUnspentWithZeroConf() ([]Utxo, error)
     SignRawTransaction(txHex string, prevTxs []PrevTx) (signedHex string, complete bool, err error)
     SendRawTransaction(txHex string) (txid string, err error)
-    GetRelayFee() (float64, error)
     GetBlockCount() (int64, error)
     GetBlockHash(height int64) ([32]byte, error)
     GetRawTransaction(txid string) (string, error)
@@ -194,13 +193,14 @@ type Connector interface {
 
 - **`RPCConnector`** — drives a single coin over Bitcoin-Core-style JSON-RPC 1.0:
   `getnewaddress`, `listunspent`, `signrawtransaction` (with
-  `signrawtransactionwithwallet` fallback), `sendrawtransaction`, `getinfo`,
+  `signrawtransactionwithwallet` fallback), `sendrawtransaction`,
   `getblockcount`, `getblockhash`, `getrawtransaction`, `signmessage`,
   `verifymessage`. `conf.go` builds it from a
   `config.CoinConf` — endpoint, credentials, decimals, segwit, RPC version and
   content-type all come from conf; nothing is hardcoded. Fees come from the conf
-  `FeePerByte` (and the wallet's `getinfo` relay fee); **no `estimatesmartfee` /
-  `estimatefee` RPC is used**, matching C++ (`api/handlers.go estimateFee`). Amounts
+  `FeePerByte`, and dust from the conf `DustAmount`; the wallet's relay fee is
+  never read. **No `estimatesmartfee` / `estimatefee` RPC is used**, matching C++
+  (`api/handlers.go estimateFee`). Amounts
   cross the JSON boundary as floats; `wallet` converts via string formatting to
   avoid IEEE-754 drift (`coins.FormatAmount` ⇄ `strconv.FormatFloat` ⇄
   `coins.ParseAmount`).
@@ -213,7 +213,7 @@ type Connector interface {
   (`SignInput(tx *coins.Tx, idx int, prev PrevTx) ([]byte, error)`), e.g. via
   `coins.BuildRefundScriptSig` / `BuildPaymentScriptSig`. An optional
   `Broadcaster` backs `SendRawTransaction`; a nil broadcaster makes the connector
-  sign-only (offline/test signing). `GetNewAddress`/`ListUnspent`/`GetRelayFee`/
+  sign-only (offline/test signing). `GetNewAddress`/`ListUnspent`/
   `GetBlockCount`/`GetBlockHash`/`GetRawTransaction`/`SignMessage`/`VerifyMessage`
   have no local source and return an error — the deposit flow supplies inputs
   and `prevTxs` explicitly.

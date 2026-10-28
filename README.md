@@ -100,10 +100,10 @@ never treated as a coin.
 | `CashAddrPrefix` | string | BCH CashAddr HRP (e.g. `bitcoincash`); empty for non-BCH coins. |
 | `AddressPrefix` / `ScriptPrefix` / `SecretPrefix` | int | base58check version bytes (P2PKH / P2SH / WIF) as decimals. |
 | `COIN` | uint64 | Base-unit multiplier (e.g. `100000000`); decimals are derived from its trailing zeros. |
-| `MinimumAmount` | uint64 | Dust / minimum amount source (base units); effective dust is the wallet relay fee when available, else this key, else the `5460` fallback. |
+| `MinimumAmount` | uint64 | Order minimum (XBridge base units). Says nothing about dust. |
 | `TxVersion` | int | Transaction version (default `1`). |
 | `MinTxFee` / `FeePerByte` | uint64 | Fee rules (base units / sat-per-byte). |
-| `DustAmount` | uint64 | createConf-template key never read back by C++; parsed for fidelity only. |
+| `DustAmount` | uint64 | **Required.** The coin's dust threshold in native base units, and the only definition of it. A coin without it (or with a non-numeric value) fails config load. `0` means the source has no dust gate. |
 | `BlockTime` | int | Seconds per block (used for HTLC lock-time math and wallet admission gates). |
 | `Confirmations` | int | Required confirmations. |
 | `TxWithTimeField` | bool | Tx carries a time field. |
@@ -139,7 +139,7 @@ SecretPrefix=154
 COIN=100000000
 MinimumAmount=0
 TxVersion=1
-DustAmount=0
+DustAmount=546
 CreateTxMethod=BTC
 GetNewKeySupported=true
 ImportWithNoScanSupported=true
@@ -162,7 +162,7 @@ SecretPrefix=128
 COIN=100000000
 MinimumAmount=0
 TxVersion=2
-DustAmount=0
+DustAmount=546
 CreateTxMethod=BTC
 GetNewKeySupported=false
 ImportWithNoScanSupported=false

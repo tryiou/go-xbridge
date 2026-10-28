@@ -1193,9 +1193,11 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	if err != nil {
 		return nil, err
 	}
-	cc := h.Node.cfg().Confs[ticker]
-	relayFee, _ := conn.GetRelayFee()
-	if isDustNative(xBridgeValueFromAmount(targetXB), cc, relayFee, coinNativeScale(c)) {
+	cc, cerr := h.Node.confFor(ticker)
+	if cerr != nil {
+		return nil, makeError(errNoSession, method, ticker)
+	}
+	if isDustNative(xBridgeValueFromAmount(targetXB), cc, coinNativeScale(c)) {
 		return nil, makeError(errBadRequest, method, "split amount is dust ["+formatXAmount(targetXB)+"]")
 	}
 	if a, derr := c.DecodeAddress(address); derr != nil || (a.Kind != coins.P2PKH && a.Kind != coins.P2SH) {
@@ -1213,10 +1215,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 		splitSizeXB += feesPerUtxoXB
 	}
 
-	minConf := 0
-	if cc != nil {
-		minConf = cc.Confirmations
-	}
+	minConf := cc.Confirmations
 	walletUtxos, lerr := conn.ListUnspent(minConf)
 	if lerr != nil {
 		return nil, makeError(errBadRequest, method, lerr.Error())
@@ -1304,7 +1303,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	// A change is emitted only when positive and non-dust; otherwise the fee
 	// is clawed back from the split outputs.
 	change := int64(remainderXB) - int64(txFeesXB)
-	if change > 0 && !isDustNative(xBridgeValueFromAmount(uint64(change)), cc, relayFee, coinNativeScale(c)) {
+	if change > 0 && !isDustNative(xBridgeValueFromAmount(uint64(change)), cc, coinNativeScale(c)) {
 		// Change pays the requested address, not a fresh one.
 		outs = append(outs, uint64(change))
 	} else {
@@ -1317,7 +1316,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 				feesLeft -= last
 			} else {
 				outs[len(outs)-1] = last - feesLeft
-				if isDustNative(xBridgeValueFromAmount(outs[len(outs)-1]), cc, relayFee, coinNativeScale(c)) {
+				if isDustNative(xBridgeValueFromAmount(outs[len(outs)-1]), cc, coinNativeScale(c)) {
 					outs = outs[:len(outs)-1]
 				}
 				nSplits-- // the count drops even when this output is kept
@@ -1330,7 +1329,7 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}
 
 	tx := &coins.Tx{Version: 1}
-	if cc != nil && cc.TxVersion != 0 {
+	if cc.TxVersion != 0 {
 		tx.Version = int32(cc.TxVersion)
 	}
 	for _, u := range utxos {
@@ -1390,16 +1389,14 @@ func (h *HandlerCtx) splitTx(ticker, splitAmountStr, address string, includeFees
 	}, nil
 }
 
-const cppDustFallback = 5460
-
-func effectiveDust(cc *config.CoinConf, relayFee float64) uint64 {
-	if relayFee > 0 {
-		return uint64(0.546 * relayFee * float64(cc.Coin))
+// effectiveDust is the coin's dust threshold in native base units, from its
+// conf and nothing else. A nil conf has no threshold, so it yields 0 rather
+// than dereferencing; callers that need a coin must check the conf is present.
+func effectiveDust(cc *config.CoinConf) uint64 {
+	if cc == nil {
+		return 0
 	}
-	if cc != nil && cc.MinimumAmount > 0 {
-		return cc.MinimumAmount
-	}
-	return cppDustFallback
+	return cc.DustAmount
 }
 
 func estimateFee(cc *config.CoinConf, nIn, nOut int) uint64 {
