@@ -13,6 +13,7 @@ package api
 
 import (
 	"encoding/hex"
+	"errors"
 	"strings"
 
 	"go-xbridge/coins"
@@ -254,6 +255,83 @@ func TestOwnWatchExcludesMaker(t *testing.T) {
 	default:
 	}
 	n.engineRunning.Store(false)
+}
+
+// TestOwnWatchApplyAfterPrune ignores a result whose session finished while the
+// scan was in flight. The worker reads the chain for seconds; the swap can
+// complete and pruneSessions then drops the session and its seen-set. Writing
+// the seen-set for the pruned id used to index the deleted inner map and panic
+// on the engine goroutine. Nothing a scan learned applies to a gone session,
+// and the prune must leave no backoff entry for it either.
+func TestOwnWatchApplyAfterPrune(t *testing.T) {
+	_, n, _, takerSession, _, _, _, _, _ := blindTakerFixture(t)
+	n.engineRunning.Store(true)
+	n.tasks = make(chan workTask, 1)
+	n.pendingOwnWatch = map[string]bool{}
+	n.ownWatchSeen = map[string]map[string]struct{}{}
+	orderID := hexEncode(takerSession.id[:])
+	n.ownWatchSeen[orderID] = map[string]struct{}{}
+
+	if !n.postOwnWatchTask(orderID) {
+		t.Fatal("task not posted")
+	}
+	// The swap finishes while the scan is still running.
+	takerSession.state = csFinished
+	n.pruneSessions()
+	if _, still := n.ownWatchSeen[orderID]; still {
+		t.Fatal("precondition: prune kept the seen-set, the test would not reach the panic")
+	}
+
+	var task workTask
+	select {
+	case task = <-n.tasks:
+	default:
+		t.Fatal("no task queued")
+	}
+	// Must not panic. The result carries real work — a scanned txid and a page
+	// failure — so a guard that returned late would still be caught: the merge
+	// panics on the deleted inner map, and the failure would record a backoff
+	// entry that the assertions below reject.
+	task.apply(ownWatchResult{
+		scanned:      []string{strings.Repeat("11", 32)},
+		ranRescanLeg: true,
+		rescanErr:    errOwnWatchPruneProbe,
+	}, nil)
+
+	if _, ok := n.ownWatchSeen[orderID]; ok {
+		t.Error("apply re-created a seen-set for a pruned session")
+	}
+	if _, ok := n.rescanAttempts[orderID]; ok {
+		t.Error("apply recorded rescan backoff for a pruned session")
+	}
+	if _, ok := n.pendingOwnWatch[orderID]; ok {
+		t.Error("pendingOwnWatch not cleared on apply")
+	}
+	n.engineRunning.Store(false)
+}
+
+var errOwnWatchPruneProbe = errors.New("own-watch prune probe: page failure")
+
+// TestPruneSessionsClearsRescanBackoff: a session that recorded a rescan
+// page-failure backoff and was pruned later must not leave the schedule
+// behind — nothing else can ever clear an id that no longer has a session, so
+// it would accumulate for the life of the process. Mirrors clearRefundBackoff
+// on the same prune path.
+func TestPruneSessionsClearsRescanBackoff(t *testing.T) {
+	_, n, _, takerSession, _, _, _, _, _ := blindTakerFixture(t)
+	orderID := hexEncode(takerSession.id[:])
+	n.recordRescanFailure(orderID)
+	if _, ok := n.rescanRetryAt[orderID]; !ok {
+		t.Fatal("precondition: no backoff recorded")
+	}
+	takerSession.state = csFinished
+	n.pruneSessions()
+	if _, ok := n.rescanAttempts[orderID]; ok {
+		t.Error("prune kept rescanAttempts for a pruned session")
+	}
+	if _, ok := n.rescanRetryAt[orderID]; ok {
+		t.Error("prune kept rescanRetryAt for a pruned session")
+	}
 }
 
 // Compile-time interface guard for the fake used by the watch tests.

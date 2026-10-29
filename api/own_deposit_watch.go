@@ -419,6 +419,16 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 		apply: func(v any, err error) {
 			delete(n.pendingOwnWatch, orderID)
 			res, _ := v.(ownWatchResult)
+			// The scan outlives the session: the swap can finish while the
+			// worker is still reading the chain, and pruneSessions then drops
+			// the session together with its seen-set. Nothing the scan learned
+			// applies to a session that is gone, and writing the seen-set for a
+			// pruned id indexes a deleted inner map (panic). Identity, not id
+			// existence, so a future id-reuse cannot write into a new session's
+			// state; see dropGhostResult for the same rule elsewhere.
+			if !n.sessionAlive(s) {
+				return
+			}
 			// Merge the scanned txids into the engine-owned seen set so the
 			// next sweep is incremental (C++ per-tick incremental rescan,
 			// xbridgeapp.cpp:3384-3413). A spender lands on top of the set.
@@ -431,20 +441,18 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 			// The spender path below owns recovery when a spend is actually
 			// found — a live spend and a live outpoint cannot both hold,
 			// and the claim beats the refund.
-			if res.spender == "" {
-				if s := n.sessions[orderID]; s != nil && s.secretHunt && res.rechecked && res.depositLive {
-					s.secretHunt = false
-					s.huntSince = 0
-					n.persist()
-					xlog.Info("hunt cleared: deposit unspent again, refund path resumed", "order", orderID)
-				}
+			if res.spender == "" && s.secretHunt && res.rechecked && res.depositLive {
+				s.secretHunt = false
+				s.huntSince = 0
+				n.persist()
+				xlog.Info("hunt cleared: deposit unspent again, refund path resumed", "order", orderID)
 			}
 			// Confirmed-leg page progress persists even when the mempool
 			// leg failed: scanned pages stay scanned across ticks. A page
 			// failure spaces out re-tries with backoff (pruned backends
 			// fail permanently — retrying every tick would be the burst
 			// this design exists to avoid); progress clears it.
-			if s := n.sessions[orderID]; s != nil && res.cursorAdvanced {
+			if res.cursorAdvanced {
 				s.scanCursor = res.nextCursor
 				n.clearRescanFailure(orderID)
 				n.persist()
@@ -465,12 +473,6 @@ func (n *Node) postOwnWatchTask(orderID string) bool {
 				return
 			}
 			if res.spender == "" {
-				return
-			}
-			// Re-resolve the session: it may have finished, been cancelled,
-			// or been pruned while the scan was in flight.
-			s := n.sessions[orderID]
-			if s == nil {
 				return
 			}
 			xlog.Info("own-deposit watch: spender found, re-driving ConfirmB", "order", orderID,

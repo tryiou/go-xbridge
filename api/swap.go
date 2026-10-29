@@ -1680,6 +1680,12 @@ func (n *Node) pruneSessions() {
 		if n.sessionIsTerminal(id, s) {
 			delete(n.pendingRefunds, id)
 			n.clearRefundBackoff(id)
+			n.clearRescanFailure(id)
+			// Every watch guard, not just its own: a pruned session's in-flight
+			// task cannot squat the id, and no sweep loops over the session to
+			// clear it later. An in-flight task's apply handles the gone
+			// session itself (dropGhostResult / sessionAlive).
+			delete(n.pendingWatch, id)
 			delete(n.pendingOwnWatch, id)
 			delete(n.ownWatchSeen, id)
 			delete(n.stallWarned, id)
